@@ -62,10 +62,14 @@ def derive_features(
     atr = _compute_atr(df, atr_period)
     atr_safe = atr.replace(0, np.nan)
 
+    # bar_range can be 0 for zero-movement bars (common overnight/low liquidity).
+    # Use a safe version for division but don't let it propagate NaN everywhere.
+    bar_range = df["high"] - df["low"]
+    bar_range_safe = bar_range.replace(0, np.nan)
+
     features = pd.DataFrame(index=df.index)
 
     # --- Group 1: Bar Anatomy (8 features) ---
-    bar_range = df["high"] - df["low"]
     body = df["close"] - df["open"]
     upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
     lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
@@ -74,9 +78,9 @@ def derive_features(
     features["bar_body_atr"] = body / atr_safe
     features["bar_upper_wick_atr"] = upper_wick / atr_safe
     features["bar_lower_wick_atr"] = lower_wick / atr_safe
-    features["bar_body_pct"] = body.abs() / bar_range.replace(0, np.nan)
-    features["bar_upper_wick_pct"] = upper_wick / bar_range.replace(0, np.nan)
-    features["bar_lower_wick_pct"] = lower_wick / bar_range.replace(0, np.nan)
+    features["bar_body_pct"] = (body.abs() / bar_range_safe).fillna(0)
+    features["bar_upper_wick_pct"] = (upper_wick / bar_range_safe).fillna(0)
+    features["bar_lower_wick_pct"] = (lower_wick / bar_range_safe).fillna(0)
     features["bar_direction"] = np.sign(body)
 
     # --- Group 2: Returns & Momentum (8 features) ---
@@ -95,7 +99,7 @@ def derive_features(
         vol_ma = df["volume"].rolling(lb).mean()
         features[f"vol_ratio_{lb}"] = df["volume"] / vol_ma.replace(0, np.nan)
     features["vol_change"] = df["volume"].pct_change(1)
-    features["vol_close_position"] = (df["close"] - df["low"]) / bar_range.replace(0, np.nan)
+    features["vol_close_position"] = ((df["close"] - df["low"]) / bar_range_safe).fillna(0.5)
     features["vol_delta_proxy"] = (features["vol_close_position"] - 0.5) * df["volume"]
 
     # --- Group 4: Volatility Measures (6 features) ---
@@ -137,7 +141,7 @@ def derive_features(
         features[f"str_dist_from_high_{lb}"] = (df["close"] - rolling_high) / atr_safe
         features[f"str_dist_from_low_{lb}"] = (df["close"] - rolling_low) / atr_safe
         rng = (rolling_high - rolling_low).replace(0, np.nan)
-        features[f"str_range_position_{lb}"] = (df["close"] - rolling_low) / rng
+        features[f"str_range_position_{lb}"] = ((df["close"] - rolling_low) / rng).fillna(0.5)
 
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
@@ -226,15 +230,15 @@ def _classify_structure(swing_highs, swing_lows, length):
 
     if len(sh) >= 2:
         sh_diff = sh.diff()
-        hh = (sh_diff > 0).reindex(range(length), method="ffill").fillna(False)
-        lh = (sh_diff < 0).reindex(range(length), method="ffill").fillna(False)
+        hh = (sh_diff > 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
+        lh = (sh_diff < 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
     else:
         hh = lh = pd.Series(False, index=range(length))
 
     if len(sl) >= 2:
         sl_diff = sl.diff()
-        hl = (sl_diff > 0).reindex(range(length), method="ffill").fillna(False)
-        ll = (sl_diff < 0).reindex(range(length), method="ffill").fillna(False)
+        hl = (sl_diff > 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
+        ll = (sl_diff < 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
     else:
         hl = ll = pd.Series(False, index=range(length))
 
