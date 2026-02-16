@@ -213,18 +213,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
-## Citation
-
-```bibtex
-@software{futures_foundation_model,
-  title={Futures Foundation Model: Pretrained Transformers for Market Structure},
-  year={2025},
-  url={https://github.com/YOUR_USERNAME/futures-foundation-model}
-}
-```
-
----
-
 ## License
 
 Apache 2.0 — See [LICENSE](LICENSE) for details.
