@@ -1,0 +1,46 @@
+# Futures Foundation Model — Default Configuration
+
+model:
+  num_features: 42
+  hidden_size: 256
+  num_hidden_layers: 6
+  num_attention_heads: 8
+  intermediate_size: 512
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+  max_sequence_length: 128
+
+embeddings:
+  num_instruments: 8      # ES, NQ, RTY, YM + expansion room
+  num_sessions: 4         # Pre-market, London, NY AM, NY PM
+
+pretraining_tasks:
+  num_regime_labels: 4    # Trending Up/Down, Rotational, Volatile
+  num_volatility_labels: 4
+  num_structure_labels: 3
+  num_range_labels: 5
+
+data:
+  bar_size: "5min"
+  seq_len: 64
+  val_ratio: 0.15
+  atr_period: 14
+  structure_lookback: 10
+
+pretraining:
+  epochs: 50
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 1000
+  grad_clip: 1.0
+  patience: 10
+  seed: 42
+
+finetuning:
+  epochs: 30
+  batch_size: 128
+  learning_rate: 1.0e-4
+  freeze_ratio: 0.66
+  patience: 8
+  use_class_weights: true
