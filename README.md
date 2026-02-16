@@ -1,6 +1,6 @@
 # 🏛️ Futures Foundation Model (FFM)
 
-![Example Badge](https://github.com/OWNER/REPOSITORY/actions/workflows/main.yml/badge.svg)
+![Python Unit Tests](https://github.com/johnamcruz/Futures-Foundation-Model/actions/workflows/main.yml/badge.svg)
 
 **A pretrained transformer backbone for futures market structure and regime classification.**
 
