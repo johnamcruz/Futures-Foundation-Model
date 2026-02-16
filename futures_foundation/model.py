@@ -37,8 +37,9 @@ class TemporalEncoding(nn.Module):
 
     def __init__(self, config: FFMConfig):
         super().__init__()
+        # +1 for the prepended CLS token
         self.position_embeddings = nn.Embedding(
-            config.max_sequence_length, config.hidden_size
+            config.max_sequence_length + 1, config.hidden_size
         )
         self.time_of_day_proj = nn.Linear(2, config.hidden_size)
         self.day_of_week_embeddings = nn.Embedding(7, config.hidden_size)
