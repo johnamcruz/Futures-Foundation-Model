@@ -469,3 +469,281 @@ class FFMForClassification(PreTrainedModel):
             output["loss"] = nn.CrossEntropyLoss()(logits, labels)
 
         return output
+
+
+# =============================================================================
+# Regression Model (Dynamic SL/TP)
+# =============================================================================
+
+
+class FFMForRegression(PreTrainedModel):
+    """
+    FFM with a regression head for continuous value prediction.
+
+    Primary use: dynamic SL/TP distances in ATR units.
+
+    Examples:
+        - num_targets=2: [sl_distance_atr, tp_distance_atr]
+        - num_targets=3: [sl_distance_atr, tp1_distance_atr, tp2_distance_atr]
+        - num_targets=1: [max_rr] (predict R:R quality)
+
+    Outputs are forced positive via Softplus (distances can't be negative).
+    """
+
+    config_class = FFMConfig
+
+    def __init__(self, config: FFMConfig, num_targets: int = 2):
+        super().__init__(config)
+        self.num_targets = num_targets
+        self.backbone = FFMBackbone(config)
+
+        self.regressor = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size // 2, num_targets),
+            nn.Softplus(),  # Forces positive outputs
+        )
+
+    def load_backbone(self, path: str):
+        """Load pretrained backbone weights from file."""
+        state_dict = torch.load(path, map_location="cpu")
+        backbone_state = {}
+        for k, v in state_dict.items():
+            if k.startswith("backbone."):
+                backbone_state[k.replace("backbone.", "")] = v
+            elif not any(
+                k.startswith(prefix)
+                for prefix in [
+                    "regime_head", "volatility_head",
+                    "structure_head", "range_head", "task_log_vars",
+                ]
+            ):
+                backbone_state[k] = v
+        self.backbone.load_state_dict(backbone_state, strict=False)
+        print(f"Loaded backbone from {path}")
+
+    def freeze_backbone(self, freeze_ratio: float = 0.66):
+        """Freeze the bottom portion of the backbone."""
+        groups = self.backbone.get_layer_groups()
+        num_to_freeze = int(len(groups) * freeze_ratio)
+        for i, (name, params) in enumerate(groups):
+            for p in params:
+                p.requires_grad = i >= num_to_freeze
+
+    def trainable_parameters(self):
+        return (p for p in self.parameters() if p.requires_grad)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        time_of_day: Optional[torch.Tensor] = None,
+        day_of_week: Optional[torch.Tensor] = None,
+        instrument_ids: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            labels: (batch, num_targets) float — ground truth distances in ATR units
+
+        Returns:
+            predictions: (batch, num_targets) — predicted SL/TP distances
+            loss: SmoothL1Loss if labels provided
+        """
+        embedding = self.backbone(
+            features=features,
+            time_of_day=time_of_day,
+            day_of_week=day_of_week,
+            instrument_ids=instrument_ids,
+            session_ids=session_ids,
+            attention_mask=attention_mask,
+            output_sequence=False,
+        )
+
+        predictions = self.regressor(embedding)
+        output = {"predictions": predictions, "embedding": embedding}
+
+        if labels is not None:
+            output["loss"] = nn.SmoothL1Loss()(predictions, labels)
+
+        return output
+
+
+# =============================================================================
+# Combined Strategy + Risk Model (Classification + Regression)
+# =============================================================================
+
+
+class FFMForStrategyWithRisk(PreTrainedModel):
+    """
+    Combined model: classification head (BUY/SELL/HOLD) + regression head (SL/TP).
+
+    One forward pass through the backbone gives both the entry signal AND
+    dynamic risk management parameters.
+
+    Architecture:
+        Backbone Embedding (256-dim)
+                 │
+            ┌────┴────────┐
+        [Signal Head]  [Risk Head]
+             │              │
+        BUY/SELL/HOLD   sl=1.2 ATR, tp=2.8 ATR
+
+    Loss is a weighted combination:
+        total_loss = classification_loss + risk_weight * regression_loss
+
+    Usage:
+        model = FFMForStrategyWithRisk(config, num_labels=3, num_risk_targets=2)
+        model.load_backbone("checkpoints/pretrained/best_backbone.pt")
+        model.freeze_backbone(freeze_ratio=0.66)
+
+        outputs = model(features, signal_labels=labels, risk_labels=sl_tp_targets)
+        # outputs["signal_logits"]  → (batch, 3)  BUY/SELL/HOLD
+        # outputs["risk_predictions"] → (batch, 2)  [sl_atr, tp_atr]
+        # outputs["loss"]           → combined loss
+    """
+
+    config_class = FFMConfig
+
+    def __init__(
+        self,
+        config: FFMConfig,
+        num_labels: int = 3,
+        num_risk_targets: int = 2,
+        risk_weight: float = 1.0,
+    ):
+        super().__init__(config)
+        self.num_labels = num_labels
+        self.num_risk_targets = num_risk_targets
+        self.risk_weight = risk_weight
+
+        self.backbone = FFMBackbone(config)
+
+        # Classification head: BUY / SELL / HOLD
+        self.signal_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size // 2, num_labels),
+        )
+
+        # Regression head: SL/TP distances in ATR units
+        self.risk_head = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size // 2, num_risk_targets),
+            nn.Softplus(),  # Forces positive outputs
+        )
+
+    def load_backbone(self, path: str):
+        """Load pretrained backbone weights from file."""
+        state_dict = torch.load(path, map_location="cpu")
+        backbone_state = {}
+        for k, v in state_dict.items():
+            if k.startswith("backbone."):
+                backbone_state[k.replace("backbone.", "")] = v
+            elif not any(
+                k.startswith(prefix)
+                for prefix in [
+                    "regime_head", "volatility_head",
+                    "structure_head", "range_head", "task_log_vars",
+                ]
+            ):
+                backbone_state[k] = v
+        self.backbone.load_state_dict(backbone_state, strict=False)
+        print(f"Loaded backbone from {path}")
+
+    def freeze_backbone(self, freeze_ratio: float = 0.66):
+        """Freeze the bottom portion of the backbone."""
+        groups = self.backbone.get_layer_groups()
+        num_to_freeze = int(len(groups) * freeze_ratio)
+
+        frozen, trainable = 0, 0
+        for i, (name, params) in enumerate(groups):
+            freeze = i < num_to_freeze
+            for p in params:
+                p.requires_grad = not freeze
+                if freeze:
+                    frozen += p.numel()
+                else:
+                    trainable += p.numel()
+
+        head_params = (
+            sum(p.numel() for p in self.signal_head.parameters())
+            + sum(p.numel() for p in self.risk_head.parameters())
+        )
+        trainable += head_params
+
+        print(
+            f"Frozen {num_to_freeze}/{len(groups)} layer groups "
+            f"({frozen:,} frozen, {trainable:,} trainable)"
+        )
+
+    def trainable_parameters(self):
+        return (p for p in self.parameters() if p.requires_grad)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        time_of_day: Optional[torch.Tensor] = None,
+        day_of_week: Optional[torch.Tensor] = None,
+        instrument_ids: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        signal_labels: Optional[torch.Tensor] = None,
+        risk_labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            signal_labels: (batch,) long — 0=HOLD, 1=BUY, 2=SELL
+            risk_labels: (batch, num_risk_targets) float — SL/TP in ATR units
+
+        Returns:
+            signal_logits: (batch, num_labels)
+            risk_predictions: (batch, num_risk_targets)
+            loss: combined classification + regression loss
+        """
+        # Single backbone forward pass
+        embedding = self.backbone(
+            features=features,
+            time_of_day=time_of_day,
+            day_of_week=day_of_week,
+            instrument_ids=instrument_ids,
+            session_ids=session_ids,
+            attention_mask=attention_mask,
+            output_sequence=False,
+        )
+
+        # Both heads read from same embedding
+        signal_logits = self.signal_head(embedding)
+        risk_predictions = self.risk_head(embedding)
+
+        output = {
+            "signal_logits": signal_logits,
+            "risk_predictions": risk_predictions,
+            "embedding": embedding,
+        }
+
+        # Combined loss
+        total_loss = torch.tensor(0.0, device=features.device)
+        has_loss = False
+
+        if signal_labels is not None:
+            signal_loss = nn.CrossEntropyLoss()(signal_logits, signal_labels)
+            output["signal_loss"] = signal_loss
+            total_loss = total_loss + signal_loss
+            has_loss = True
+
+        if risk_labels is not None:
+            risk_loss = nn.SmoothL1Loss()(risk_predictions, risk_labels)
+            output["risk_loss"] = risk_loss
+            total_loss = total_loss + self.risk_weight * risk_loss
+            has_loss = True
+
+        if has_loss:
+            output["loss"] = total_loss
+
+        return output
