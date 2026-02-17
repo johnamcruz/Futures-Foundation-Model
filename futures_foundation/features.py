@@ -128,10 +128,10 @@ def derive_features(
     structure = _classify_structure(swing_highs, swing_lows, len(df))
 
     features["str_swing_high_dist"] = (
-        (df["close"] - swing_highs.reindex(df.index, method="ffill")) / atr_safe
+        (df["close"] - swing_highs.ffill()) / atr_safe
     )
     features["str_swing_low_dist"] = (
-        (df["close"] - swing_lows.reindex(df.index, method="ffill")) / atr_safe
+        (df["close"] - swing_lows.ffill()) / atr_safe
     )
     features["str_structure_state"] = structure
 
