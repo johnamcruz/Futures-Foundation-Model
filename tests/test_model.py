@@ -125,6 +125,10 @@ def test_pretrain_backward():
     m = FFMForPretraining(c)
     out = m(
         features=torch.randn(4, SEQ_LEN, c.num_features),
+        time_of_day=torch.rand(4, SEQ_LEN),
+        day_of_week=torch.randint(0, 5, (4, SEQ_LEN)),
+        instrument_ids=torch.randint(0, 4, (4,)),
+        session_ids=torch.randint(0, 4, (4, SEQ_LEN)),
         regime_labels=torch.randint(0, 4, (4,)),
         volatility_labels=torch.randint(0, 4, (4,)),
         structure_labels=torch.randint(0, 3, (4,)),
