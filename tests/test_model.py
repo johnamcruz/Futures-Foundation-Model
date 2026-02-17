@@ -17,8 +17,8 @@ from futures_foundation import (
 # Helpers
 # =============================================================================
 
-def make_dummy_ohlcv(n=1000, seed=42):
-    """Generate dummy OHLCV data. n>=1000 ensures enough valid rows after rolling warmup."""
+def make_dummy_ohlcv(n=2000, seed=42):
+    """Generate dummy OHLCV data. n>=2000 ensures enough valid rows after rolling warmup + forward-looking labels."""
     np.random.seed(seed)
     dates = pd.date_range("2024-01-02 09:30", periods=n, freq="5min")
     close = 5000 + np.cumsum(np.random.randn(n) * 2)
@@ -214,7 +214,7 @@ def test_strategy_with_risk_loss():
 # =============================================================================
 
 def test_features():
-    df = make_dummy_ohlcv(1000)
+    df = make_dummy_ohlcv()
     features = derive_features(df, instrument="ES")
     for col in get_model_feature_columns():
         assert col in features.columns, f"Missing: {col}"
@@ -222,7 +222,7 @@ def test_features():
 
 def test_features_valid_ratio():
     """Verify that the NaN fix works — should have >90% valid rows for clean data."""
-    df = make_dummy_ohlcv(1000)
+    df = make_dummy_ohlcv()
     features = derive_features(df, instrument="ES")
     feature_cols = get_model_feature_columns()
     valid = features[feature_cols].notna().all(axis=1).sum()
@@ -235,7 +235,7 @@ def test_features_valid_ratio():
 # =============================================================================
 
 def test_labels():
-    df = make_dummy_ohlcv(1000)
+    df = make_dummy_ohlcv()
     features = derive_features(df, instrument="ES")
     labels = generate_all_labels(features)
     expected_cols = ["regime_label", "volatility_label", "structure_label", "range_label"]
@@ -247,7 +247,7 @@ def test_labels():
 # =============================================================================
 
 def test_dataset():
-    df = make_dummy_ohlcv(1000)
+    df = make_dummy_ohlcv()
     features = derive_features(df, instrument="ES")
     labels = generate_all_labels(features)
     ds = FFMDataset(features, labels, seq_len=SEQ_LEN)
