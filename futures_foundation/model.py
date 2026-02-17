@@ -287,9 +287,6 @@ class FFMForPretraining(PreTrainedModel):
         self.structure_head = self._make_head(config, config.num_structure_labels)
         self.range_head = self._make_head(config, config.num_range_labels)
 
-        # Learnable task weights (log variance)
-        self.task_log_vars = nn.Parameter(torch.zeros(4))
-
     @staticmethod
     def _make_head(config: FFMConfig, num_labels: int) -> nn.Sequential:
         return nn.Sequential(
@@ -344,7 +341,10 @@ class FFMForPretraining(PreTrainedModel):
             "range_logits": range_logits,
         }
 
-        # Compute loss with uncertainty weighting
+        # Compute loss — simple equal-weight cross-entropy averaging.
+        # (Kendall uncertainty weighting was removed because the learnable
+        # log-variance terms could go to -inf, making total loss negative
+        # and allowing the model to "optimize" by ignoring the actual tasks.)
         labels_and_logits = [
             (regime_labels, regime_logits),
             (volatility_labels, volatility_logits),
@@ -356,11 +356,10 @@ class FFMForPretraining(PreTrainedModel):
         total_loss = torch.tensor(0.0, device=features.device)
         num_tasks = 0
 
-        for i, (labels, logits) in enumerate(labels_and_logits):
+        for labels, logits in labels_and_logits:
             if labels is not None:
                 task_loss = loss_fn(logits, labels)
-                precision = torch.exp(-self.task_log_vars[i])
-                total_loss = total_loss + precision * task_loss + self.task_log_vars[i]
+                total_loss = total_loss + task_loss
                 num_tasks += 1
 
         if num_tasks > 0:
@@ -409,7 +408,7 @@ class FFMForClassification(PreTrainedModel):
                 k.startswith(prefix)
                 for prefix in [
                     "regime_head", "volatility_head",
-                    "structure_head", "range_head", "task_log_vars",
+                    "structure_head", "range_head",
                 ]
             ):
                 backbone_state[k] = v
@@ -517,7 +516,7 @@ class FFMForRegression(PreTrainedModel):
                 k.startswith(prefix)
                 for prefix in [
                     "regime_head", "volatility_head",
-                    "structure_head", "range_head", "task_log_vars",
+                    "structure_head", "range_head",
                 ]
             ):
                 backbone_state[k] = v
@@ -650,7 +649,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
                 k.startswith(prefix)
                 for prefix in [
                     "regime_head", "volatility_head",
-                    "structure_head", "range_head", "task_log_vars",
+                    "structure_head", "range_head",
                 ]
             ):
                 backbone_state[k] = v
