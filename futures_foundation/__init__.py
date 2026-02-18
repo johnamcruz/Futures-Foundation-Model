@@ -9,7 +9,11 @@ Usage:
 
     config = FFMConfig(hidden_size=256, num_hidden_layers=6)
     model = FFMForPretraining(config)
+
+Strategy fine-tuning (e.g. ORB):
+    from strategies.orb import HybridORBModel, HybridORBDataset
 """
+
 
 from .config import FFMConfig
 from .model import (
@@ -27,7 +31,7 @@ from .dataset import (
     temporal_train_val_split, create_dataloaders,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "FFMConfig", "FFMBackbone", "FFMForPretraining", "FFMForClassification",
     "FFMForRegression", "FFMForStrategyWithRisk",
