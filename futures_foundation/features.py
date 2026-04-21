@@ -4,13 +4,14 @@ Feature derivation from raw OHLCV data.
 All features are instrument-agnostic via ATR normalization or z-scores,
 ensuring the backbone learns transferable patterns across instruments.
 
-Feature Groups (42 total):
+Feature Groups (52 total):
     1. Bar anatomy (8) — body, wicks, range normalized by ATR
     2. Returns & momentum (8) — multi-horizon returns + acceleration
     3. Volume dynamics (6) — relative volume, delta proxy
     4. Volatility measures (6) — ATR z-score, range ratios, realized vol
     5. Session-relative context (5) — distance from session OHLC + VWAP
     6. Market structure (9) — swing distances, range position multi-lookback
+    7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
 """
 
 import numpy as np
@@ -143,6 +144,46 @@ def derive_features(
         rng = (rolling_high - rolling_low).replace(0, np.nan)
         features[f"str_range_position_{lb}"] = ((df["close"] - rolling_low) / rng).fillna(0.5)
 
+    # --- Group 7: CRT Sweep State (10 features) ---
+    # Detect bar frequency to compute timeframe-agnostic expiry windows.
+    bar_minutes = max(1, int(df["datetime"].diff().dt.total_seconds().median() / 60))
+    expiry_1h = max(1, round(60 / bar_minutes))
+    expiry_4h = max(1, round(240 / bar_minutes))
+
+    df_1h = _resample_ohlcv(df, "60min")
+    df_4h = _resample_ohlcv(df, "240min")
+    atr_1h = _compute_atr(df_1h, 14)
+    atr_4h = _compute_atr(df_4h, 14)
+
+    bull_1h, bear_1h, bmag_1h, brmag_1h = _detect_crt_sweeps(df_1h, atr_1h)
+    bull_4h, bear_4h, bmag_4h, brmag_4h = _detect_crt_sweeps(df_4h, atr_4h)
+
+    base_ns = df["datetime"].values.astype(np.int64)
+    htf_1h_ns = df_1h.index.values.astype(np.int64)
+    htf_4h_ns = df_4h.index.values.astype(np.int64)
+
+    (b1h_act, br1h_act, b1h_age, br1h_age,
+     b1h_mag, br1h_mag) = _align_sweeps_to_base(
+        base_ns, htf_1h_ns, bull_1h, bear_1h, bmag_1h, brmag_1h, expiry_1h)
+
+    (b4h_act, br4h_act, b4h_age, br4h_age,
+     b4h_mag, br4h_mag) = _align_sweeps_to_base(
+        base_ns, htf_4h_ns, bull_4h, bear_4h, bmag_4h, brmag_4h, expiry_4h)
+
+    features["swp_1h_bull_active"] = b1h_act
+    features["swp_1h_bear_active"] = br1h_act
+    features["swp_1h_age_norm"] = np.minimum(b1h_age, br1h_age)
+    features["swp_1h_magnitude"] = np.maximum(b1h_mag, br1h_mag)
+    features["swp_4h_bull_active"] = b4h_act
+    features["swp_4h_bear_active"] = br4h_act
+    features["swp_4h_age_norm"] = np.minimum(b4h_age, br4h_age)
+    features["swp_4h_magnitude"] = np.maximum(b4h_mag, br4h_mag)
+
+    sweep_dir_1h = b1h_act - br1h_act
+    sweep_dir_4h = b4h_act - br4h_act
+    features["swp_tf_alignment"] = np.sign(sweep_dir_1h + sweep_dir_4h).astype(np.float32)
+    features["swp_dominant_dir"] = features["swp_tf_alignment"].copy()
+
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
     features["tmp_hour"] = df["datetime"].dt.hour
@@ -247,6 +288,95 @@ def _classify_structure(swing_highs, swing_lows, length):
     return structure
 
 
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample base OHLCV (datetime column) to a higher timeframe with a DatetimeIndex."""
+    df_idx = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
+    return df_idx.resample(rule, closed="right", label="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["close"])
+
+
+def _detect_crt_sweeps(
+    df_htf: pd.DataFrame, atr: pd.Series
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Detect CRT prior-candle sweeps on a higher-timeframe OHLCV DataFrame.
+
+    Bull sweep: low[i] < low[i-1] AND close[i] > low[i-1]
+    Bear sweep: high[i] > high[i-1] AND close[i] < high[i-1]
+
+    Returns bull_sweep, bear_sweep, bull_mag, bear_mag — all aligned to df_htf index.
+    Magnitude is ATR-normalized wick penetration clipped to [0, 3].
+    """
+    high = df_htf["high"].values
+    low = df_htf["low"].values
+    close = df_htf["close"].values
+    atr_vals = np.nan_to_num(atr.values, nan=1e-6)
+    n = len(df_htf)
+
+    bull_sweep = np.zeros(n, dtype=bool)
+    bear_sweep = np.zeros(n, dtype=bool)
+    bull_mag = np.zeros(n, dtype=np.float32)
+    bear_mag = np.zeros(n, dtype=np.float32)
+
+    for i in range(1, n):
+        atr_i = max(float(atr_vals[i]), 1e-6)
+        if low[i] < low[i - 1] and close[i] > low[i - 1]:
+            bull_sweep[i] = True
+            bull_mag[i] = float(np.clip((low[i - 1] - low[i]) / atr_i, 0, 3))
+        if high[i] > high[i - 1] and close[i] < high[i - 1]:
+            bear_sweep[i] = True
+            bear_mag[i] = float(np.clip((high[i] - high[i - 1]) / atr_i, 0, 3))
+
+    return bull_sweep, bear_sweep, bull_mag, bear_mag
+
+
+def _align_sweeps_to_base(
+    base_ns: np.ndarray,
+    htf_ns: np.ndarray,
+    bull_mask: np.ndarray,
+    bear_mask: np.ndarray,
+    bull_mag_htf: np.ndarray,
+    bear_mag_htf: np.ndarray,
+    expiry_bars: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Forward-fill HTF CRT sweep state onto the base timeframe.
+
+    Uses a vectorized countdown tent: each sweep event spreads a decaying
+    countdown [expiry_bars, expiry_bars-1, ..., 1] forward from its first
+    active base bar. Where two sweeps overlap the higher (more recent) value
+    wins. Loop is over sweep events (~hundreds), not over base bars.
+
+    Returns (bull_active, bear_active, bull_age_norm, bear_age_norm,
+             bull_magnitude, bear_magnitude) as float32 arrays.
+    """
+    n_base = len(base_ns)
+
+    def _spread(mask: np.ndarray, mag_htf: np.ndarray):
+        countdown = np.zeros(n_base, dtype=np.float32)
+        magnitude = np.zeros(n_base, dtype=np.float32)
+        for j in np.where(mask)[0]:
+            # First base bar strictly after this HTF bar's close timestamp
+            p = int(np.searchsorted(base_ns, htf_ns[j], side="right"))
+            if p >= n_base:
+                continue
+            end = min(p + expiry_bars, n_base)
+            length = end - p
+            new_counts = np.arange(expiry_bars, expiry_bars - length, -1, dtype=np.float32)
+            better = new_counts > countdown[p:end]
+            countdown[p:end] = np.where(better, new_counts, countdown[p:end])
+            magnitude[p:end] = np.where(better, mag_htf[j], magnitude[p:end])
+        active = (countdown > 0).astype(np.float32)
+        # age_norm: 0.0 = fresh (just fired), 1.0 = expired / no sweep
+        age_norm = np.where(countdown > 0, 1.0 - countdown / expiry_bars, 1.0).astype(np.float32)
+        return active, age_norm, magnitude
+
+    bull_active, bull_age, bull_mag = _spread(bull_mask, bull_mag_htf)
+    bear_active, bear_age, bear_mag = _spread(bear_mask, bear_mag_htf)
+    return bull_active, bear_active, bull_age, bear_age, bull_mag, bear_mag
+
+
 # =============================================================================
 # Feature Column Definitions
 # =============================================================================
@@ -268,4 +398,7 @@ def get_model_feature_columns() -> list:
         "str_swing_high_dist", "str_swing_low_dist", "str_structure_state",
         "str_dist_from_high_10", "str_dist_from_low_10", "str_range_position_10",
         "str_dist_from_high_20", "str_dist_from_low_20", "str_range_position_20",
+        "swp_1h_bull_active", "swp_1h_bear_active", "swp_1h_age_norm", "swp_1h_magnitude",
+        "swp_4h_bull_active", "swp_4h_bear_active", "swp_4h_age_norm", "swp_4h_magnitude",
+        "swp_tf_alignment", "swp_dominant_dir",
     ]
