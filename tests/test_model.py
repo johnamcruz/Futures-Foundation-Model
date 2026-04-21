@@ -52,7 +52,7 @@ def small_config():
 def test_config_creation():
     c = FFMConfig()
     assert c.hidden_size == 256
-    assert c.num_features == 42
+    assert c.num_features == 52
 
 
 def test_config_save_load():
