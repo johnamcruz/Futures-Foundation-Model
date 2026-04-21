@@ -9,7 +9,11 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "Running unit tests..."
 
-if ! "$PYTHON" -m pytest "$REPO_ROOT/tests/test_features_crt.py" -q; then
+if ! "$PYTHON" -m pytest \
+    "$REPO_ROOT/tests/test_features_crt.py" \
+    "$REPO_ROOT/tests/test_labels.py" \
+    "$REPO_ROOT/tests/test_features_core.py" \
+    -q; then
     echo ""
     echo "ERROR: Unit tests failed. Commit blocked."
     echo "Fix the failing tests and try again."
