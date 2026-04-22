@@ -271,15 +271,15 @@ def _classify_structure(swing_highs, swing_lows, length):
 
     if len(sh) >= 2:
         sh_diff = sh.diff()
-        hh = (sh_diff > 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
-        lh = (sh_diff < 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
+        hh = (sh_diff > 0).reindex(range(length), method="ffill").fillna(False).astype(bool)
+        lh = (sh_diff < 0).reindex(range(length), method="ffill").fillna(False).astype(bool)
     else:
         hh = lh = pd.Series(False, index=range(length))
 
     if len(sl) >= 2:
         sl_diff = sl.diff()
-        hl = (sl_diff > 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
-        ll = (sl_diff < 0).reindex(range(length), method="ffill").fillna(False).infer_objects(copy=False)
+        hl = (sl_diff > 0).reindex(range(length), method="ffill").fillna(False).astype(bool)
+        ll = (sl_diff < 0).reindex(range(length), method="ffill").fillna(False).astype(bool)
     else:
         hl = ll = pd.Series(False, index=range(length))
 
