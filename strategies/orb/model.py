@@ -86,7 +86,7 @@ class HybridORBModel(nn.Module):
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from pretraining checkpoint."""
-        state_dict = torch.load(path, map_location="cpu")
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
         backbone_state = {}
         for k, v in state_dict.items():
             if k.startswith("backbone."):

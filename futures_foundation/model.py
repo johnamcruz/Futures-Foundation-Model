@@ -399,7 +399,7 @@ class FFMForClassification(PreTrainedModel):
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""
-        state_dict = torch.load(path, map_location="cpu")
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
         backbone_state = {}
         for k, v in state_dict.items():
             if k.startswith("backbone."):
@@ -507,7 +507,7 @@ class FFMForRegression(PreTrainedModel):
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""
-        state_dict = torch.load(path, map_location="cpu")
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
         backbone_state = {}
         for k, v in state_dict.items():
             if k.startswith("backbone."):
@@ -640,7 +640,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""
-        state_dict = torch.load(path, map_location="cpu")
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
         backbone_state = {}
         for k, v in state_dict.items():
             if k.startswith("backbone."):
