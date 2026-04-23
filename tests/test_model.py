@@ -6,10 +6,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 import numpy as np
 import pandas as pd
+import torch.nn as nn
 from futures_foundation import (
     FFMConfig, FFMBackbone, FFMForPretraining, FFMForClassification,
     FFMForRegression, FFMForStrategyWithRisk,
     derive_features, generate_all_labels, get_model_feature_columns, FFMDataset,
+    LABEL_CONFIDENCE_SENTINEL,
 )
 
 
@@ -259,3 +261,163 @@ def test_dataset():
     assert "candle_types" in sample
     assert sample["candle_types"].shape == (SEQ_LEN,)
     assert sample["candle_types"].dtype == torch.int64
+
+
+# =============================================================================
+# Confidence masking and head-weight tests — pretraining loss
+# =============================================================================
+
+
+def test_config_default_head_weights():
+    """Default config encodes the intended per-head loss weights."""
+    c = FFMConfig()
+    assert c.volatility_loss_weight == 2.0,  "Volatility should be 2x (most reliable head)"
+    assert c.regime_loss_weight == 1.0,      "Regime at 1x baseline"
+    assert c.structure_loss_weight == 0.75,  "Structure at 0.75x (noisier head)"
+    assert c.range_loss_weight == 1.5,       "Range at 1.5x (reliable percentile head)"
+
+
+def test_pretrain_sentinel_regime_excluded_from_combined_loss():
+    """All-sentinel regime labels: model combined loss is finite (nan head is skipped, not propagated)."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    torch.manual_seed(0)
+    feats = torch.randn(4, SEQ_LEN, c.num_features)
+    sentinel_regime = torch.full((4,), LABEL_CONFIDENCE_SENTINEL, dtype=torch.long)
+
+    with torch.no_grad():
+        # PyTorch CrossEntropyLoss returns nan when ALL samples are ignored — that's expected.
+        raw_regime_loss = nn.CrossEntropyLoss(ignore_index=LABEL_CONFIDENCE_SENTINEL)(
+            m(features=feats)["regime_logits"], sentinel_regime
+        )
+        assert not torch.isfinite(raw_regime_loss), (
+            "Raw CE loss with all-sentinel labels should be nan — "
+            "this is PyTorch's documented behavior for an empty reduction."
+        )
+
+        # The model must guard against this and produce a finite combined loss.
+        out = m(
+            features=feats,
+            regime_labels=sentinel_regime,
+            volatility_labels=torch.randint(0, 4, (4,)),
+        )
+
+    assert torch.isfinite(out["loss"]), (
+        f"Combined loss must be finite when sentinel head produces nan, got {out['loss']}. "
+        "The model should skip nan heads (torch.isfinite guard in loss loop)."
+    )
+
+
+def test_pretrain_sentinel_structure_excluded_from_combined_loss():
+    """All-sentinel structure labels: model combined loss is finite (nan head is skipped)."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    torch.manual_seed(0)
+    feats = torch.randn(4, SEQ_LEN, c.num_features)
+    sentinel_struct = torch.full((4,), LABEL_CONFIDENCE_SENTINEL, dtype=torch.long)
+
+    with torch.no_grad():
+        raw_struct_loss = nn.CrossEntropyLoss(ignore_index=LABEL_CONFIDENCE_SENTINEL)(
+            m(features=feats)["structure_logits"], sentinel_struct
+        )
+        assert not torch.isfinite(raw_struct_loss), (
+            "Raw CE loss with all-sentinel labels should be nan."
+        )
+
+        out = m(
+            features=feats,
+            structure_labels=sentinel_struct,
+            range_labels=torch.randint(0, 5, (4,)),
+        )
+
+    assert torch.isfinite(out["loss"]), (
+        f"Combined loss must remain finite when structure head is all-sentinel, got {out['loss']}."
+    )
+
+
+def test_pretrain_combined_loss_with_sentinel_is_finite():
+    """Both masked heads all-sentinel: combined loss is finite from the real heads (vol + range)."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    torch.manual_seed(2)
+
+    with torch.no_grad():
+        out = m(
+            features=torch.randn(4, SEQ_LEN, c.num_features),
+            regime_labels=torch.full((4,), LABEL_CONFIDENCE_SENTINEL, dtype=torch.long),
+            volatility_labels=torch.randint(0, 4, (4,)),
+            structure_labels=torch.full((4,), LABEL_CONFIDENCE_SENTINEL, dtype=torch.long),
+            range_labels=torch.randint(0, 5, (4,)),
+        )
+
+    assert "loss" in out, "Loss must be present when at least one real head has labels"
+    assert torch.isfinite(out["loss"]), f"Loss must be finite even with both masked heads as sentinel, got {out['loss']}"
+    assert out["loss"].item() > 0.0, "Volatility + range heads must still produce positive loss"
+
+
+def test_pretrain_head_weights_scale_loss_correctly():
+    """Combined loss equals the weighted average of per-head CE losses per config weights.
+    Uses real (non-sentinel) labels for all heads to ensure all heads contribute."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    torch.manual_seed(3)
+    feats = torch.randn(4, SEQ_LEN, c.num_features)
+    # Use valid class indices only — no sentinel — so all 4 heads fire and the formula is clean.
+    regime_labels = torch.randint(0, 4, (4,))
+    vol_labels = torch.randint(0, 4, (4,))
+    struct_labels = torch.randint(0, 3, (4,))
+    range_labels = torch.randint(0, 5, (4,))
+
+    with torch.no_grad():
+        out = m(
+            features=feats,
+            regime_labels=regime_labels,
+            volatility_labels=vol_labels,
+            structure_labels=struct_labels,
+            range_labels=range_labels,
+        )
+        ls = c.label_smoothing
+        r_loss = nn.CrossEntropyLoss(ignore_index=LABEL_CONFIDENCE_SENTINEL, label_smoothing=ls)(
+            out["regime_logits"], regime_labels)
+        v_loss = nn.CrossEntropyLoss(label_smoothing=ls)(
+            out["volatility_logits"], vol_labels)
+        s_loss = nn.CrossEntropyLoss(ignore_index=LABEL_CONFIDENCE_SENTINEL, label_smoothing=ls)(
+            out["structure_logits"], struct_labels)
+        rng_loss = nn.CrossEntropyLoss(label_smoothing=ls)(
+            out["range_logits"], range_labels)
+
+        # All losses are finite (no sentinel in this batch), so the formula is straightforward.
+        w_r = c.regime_loss_weight
+        w_v = c.volatility_loss_weight
+        w_s = c.structure_loss_weight
+        w_rng = c.range_loss_weight
+        expected = (w_r * r_loss + w_v * v_loss + w_s * s_loss + w_rng * rng_loss) / (w_r + w_v + w_s + w_rng)
+
+    assert torch.allclose(out["loss"], expected, atol=1e-5), (
+        f"Combined loss {out['loss'].item():.6f} ≠ weighted sum {expected.item():.6f}. "
+        "Head weight formula may be incorrect."
+    )
+
+
+def test_sentinel_labels_not_dropped_by_dataset():
+    """LABEL_CONFIDENCE_SENTINEL (-100) is a valid Int64 integer, not NaN — dataset must not filter it out."""
+    df = make_dummy_ohlcv()
+    features = derive_features(df, instrument="ES")
+    labels = generate_all_labels(features)
+
+    labels_sentineled = labels.copy()
+    valid_idx = labels_sentineled["regime_label"].notna()
+    labels_sentineled.loc[valid_idx, "regime_label"] = LABEL_CONFIDENCE_SENTINEL
+
+    ds_normal = FFMDataset(features, labels, seq_len=SEQ_LEN)
+    ds_sentinel = FFMDataset(features, labels_sentineled, seq_len=SEQ_LEN)
+
+    assert len(ds_normal) == len(ds_sentinel), (
+        f"Sentinel-labeled rows were incorrectly dropped by the dataset: "
+        f"{len(ds_normal)} vs {len(ds_sentinel)} samples. "
+        "The dataset filter uses notna() which must pass -100 through."
+    )
