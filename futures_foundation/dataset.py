@@ -108,7 +108,7 @@ def temporal_train_val_split(features_df, labels_df, val_ratio=0.15, seq_len=64,
 
 
 def interleaved_train_val_split(
-    features_df, labels_df, val_ratio=0.20, seq_len=64, n_blocks=20
+    features_df, labels_df, val_ratio=0.20, seq_len=64, n_blocks=20, stride_train=1
 ) -> Tuple[List[FFMDataset], List[FFMDataset]]:
     """
     Distributes val uniformly across time rather than concentrating it at the end.
@@ -116,6 +116,10 @@ def interleaved_train_val_split(
     Divides the series into n_blocks equal blocks; every (1/val_ratio)-th block → val.
     With val_ratio=0.20, n_blocks=20: blocks 5,10,15,20 are val — covering the full
     time range instead of just the most recent 20%.
+
+    stride_train: stride for training blocks (>1 reduces overlap between sequences,
+                  cutting redundancy and training time while improving diversity).
+                  Val blocks always use stride=1 for thorough evaluation.
 
     Returns:
         train_datasets: List[FFMDataset] — one dataset per training block
@@ -137,8 +141,10 @@ def interleaved_train_val_split(
         l_blk = labels_df.iloc[start:end].reset_index(drop=True)
         if len(f_blk) < seq_len + 1:
             continue
-        ds = FFMDataset(f_blk, l_blk, seq_len=seq_len)
-        (val_datasets if (i + 1) % val_every == 0 else train_datasets).append(ds)
+        is_val = (i + 1) % val_every == 0
+        stride = 1 if is_val else stride_train
+        ds = FFMDataset(f_blk, l_blk, seq_len=seq_len, stride=stride)
+        (val_datasets if is_val else train_datasets).append(ds)
 
     return train_datasets, val_datasets
 

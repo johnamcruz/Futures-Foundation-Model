@@ -489,3 +489,35 @@ def test_sentinel_labels_not_dropped_by_dataset():
         f"{len(ds_normal)} vs {len(ds_sentinel)} samples. "
         "The dataset filter uses notna() which must pass -100 through."
     )
+
+
+def test_pretrain_per_task_losses_in_output():
+    """FFMForPretraining must return per-task losses keyed as <task>_loss."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    with torch.no_grad():
+        out = m(
+            features=torch.randn(4, SEQ_LEN, c.num_features),
+            regime_labels=torch.randint(0, 4, (4,)),
+            volatility_labels=torch.randint(0, 4, (4,)),
+            structure_labels=torch.randint(0, 2, (4,)),
+            range_labels=torch.randint(0, 5, (4,)),
+        )
+    for task in ("regime", "volatility", "structure", "range"):
+        key = f"{task}_loss"
+        assert key in out, f"Missing per-task loss key '{key}' in output"
+        assert torch.isfinite(out[key]), f"{key} is not finite"
+        assert out[key].item() > 0.0, f"{key} should be positive"
+
+
+def test_pretrain_per_task_losses_absent_without_labels():
+    """Per-task losses must not appear in output when no labels are provided."""
+    c = small_config()
+    m = FFMForPretraining(c)
+    m.eval()
+    with torch.no_grad():
+        out = m(features=torch.randn(4, SEQ_LEN, c.num_features))
+    for task in ("regime", "volatility", "structure", "range"):
+        assert f"{task}_loss" not in out, f"Unexpected '{task}_loss' key without labels"
+    assert "loss" not in out
