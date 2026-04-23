@@ -54,7 +54,7 @@ def small_config():
 def test_config_creation():
     c = FFMConfig()
     assert c.hidden_size == 256
-    assert c.num_features == 62
+    assert c.num_features == 66
 
 
 def test_config_save_load():
@@ -115,7 +115,7 @@ def test_pretrain_with_labels():
         features=torch.randn(4, SEQ_LEN, c.num_features),
         regime_labels=torch.randint(0, 4, (4,)),
         volatility_labels=torch.randint(0, 4, (4,)),
-        structure_labels=torch.randint(0, 3, (4,)),
+        structure_labels=torch.randint(0, 2, (4,)),
         range_labels=torch.randint(0, 5, (4,)),
     )
     assert "loss" in out
@@ -134,7 +134,7 @@ def test_pretrain_backward():
         session_ids=torch.randint(0, 4, (4, SEQ_LEN)),
         regime_labels=torch.randint(0, 4, (4,)),
         volatility_labels=torch.randint(0, 4, (4,)),
-        structure_labels=torch.randint(0, 3, (4,)),
+        structure_labels=torch.randint(0, 2, (4,)),
         range_labels=torch.randint(0, 5, (4,)),
     )
     out["loss"].backward()
@@ -369,7 +369,7 @@ def test_pretrain_head_weights_scale_loss_correctly():
     # Use valid class indices only — no sentinel — so all 4 heads fire and the formula is clean.
     regime_labels = torch.randint(0, 4, (4,))
     vol_labels = torch.randint(0, 4, (4,))
-    struct_labels = torch.randint(0, 3, (4,))
+    struct_labels = torch.randint(0, 2, (4,))
     range_labels = torch.randint(0, 5, (4,))
 
     with torch.no_grad():
