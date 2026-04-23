@@ -1,7 +1,7 @@
 # Futures Foundation Model — Default Configuration
 
 model:
-  num_features: 42
+  num_features: 58
   hidden_size: 256
   num_hidden_layers: 6
   num_attention_heads: 8

@@ -4,7 +4,7 @@ Feature derivation from raw OHLCV data.
 All features are instrument-agnostic via ATR normalization or z-scores,
 ensuring the backbone learns transferable patterns across instruments.
 
-Feature Groups (52 total):
+Feature Groups (58 total):
     1. Bar anatomy (8) — body, wicks, range normalized by ATR
     2. Returns & momentum (8) — multi-horizon returns + acceleration
     3. Volume dynamics (6) — relative volume, delta proxy
@@ -12,11 +12,22 @@ Feature Groups (52 total):
     5. Session-relative context (5) — distance from session OHLC + VWAP
     6. Market structure (9) — swing distances, range position multi-lookback
     7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
+    8. Candle psychology (6) — body/wick ratios, type, engulf, momentum speed
 """
 
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
+
+try:
+    from .candle_psychology import add_candle_features as _add_candle_features
+except ImportError:
+    import importlib.util as _iu, pathlib as _pl
+    _cp_path = str(_pl.Path(__file__).parent / "candle_psychology.py")
+    _cp_spec = _iu.spec_from_file_location("_candle_psychology", _cp_path)
+    _cp_mod = _iu.module_from_spec(_cp_spec)
+    _cp_spec.loader.exec_module(_cp_mod)
+    _add_candle_features = _cp_mod.add_candle_features
 
 
 # =============================================================================
@@ -183,6 +194,12 @@ def derive_features(
     sweep_dir_4h = b4h_act - br4h_act
     features["swp_tf_alignment"] = np.sign(sweep_dir_1h + sweep_dir_4h).astype(np.float32)
     features["swp_dominant_dir"] = features["swp_tf_alignment"].copy()
+
+    # --- Group 8: Candle Psychology (6 features) ---
+    df_cp = _add_candle_features(df)
+    for _col in ("body_ratio", "upper_wick_ratio", "lower_wick_ratio",
+                 "candle_type", "engulf_count", "momentum_speed_ratio"):
+        features[_col] = df_cp[_col].values
 
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
@@ -401,4 +418,7 @@ def get_model_feature_columns() -> list:
         "swp_1h_bull_active", "swp_1h_bear_active", "swp_1h_age_norm", "swp_1h_magnitude",
         "swp_4h_bull_active", "swp_4h_bear_active", "swp_4h_age_norm", "swp_4h_magnitude",
         "swp_tf_alignment", "swp_dominant_dir",
+        # Group 8: Candle Psychology
+        "body_ratio", "upper_wick_ratio", "lower_wick_ratio",
+        "candle_type", "engulf_count", "momentum_speed_ratio",
     ]

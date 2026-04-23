@@ -1,8 +1,16 @@
-"""Unit tests for core feature groups 1–6 in features.py — no torch dependency."""
+"""Unit tests for core feature groups 1–7 in features.py — no torch dependency."""
 import importlib.util
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+# Pre-register candle_psychology so features.py relative import resolves
+_CP_PATH = Path(__file__).parent.parent / "futures_foundation" / "candle_psychology.py"
+_cp_spec = importlib.util.spec_from_file_location("futures_foundation.candle_psychology", _CP_PATH)
+_cp_mod = importlib.util.module_from_spec(_cp_spec)
+sys.modules["futures_foundation.candle_psychology"] = _cp_mod
+_cp_spec.loader.exec_module(_cp_mod)
 
 _FEATURES_PATH = Path(__file__).parent.parent / "futures_foundation" / "features.py"
 _spec = importlib.util.spec_from_file_location("ffm_features", _FEATURES_PATH)
@@ -37,7 +45,7 @@ def make_ohlcv(n=300, seed=42, bar_freq_min=5):
 # =============================================================================
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 52
+    assert len(get_model_feature_columns()) == 58
 
 
 def test_all_model_columns_present():
