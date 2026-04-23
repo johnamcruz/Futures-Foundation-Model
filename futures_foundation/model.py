@@ -305,7 +305,7 @@ class FFMForPretraining(PreTrainedModel):
     Four simultaneous classification tasks:
         1. Regime: Trending Up / Trending Down / Rotational / Volatile
         2. Volatility: Low / Normal / Elevated / Extreme
-        3. Structure: Bullish / Bearish / Mixed
+        3. Structure: Bullish (confirmed) / Bearish (confirmed)
         4. Range Position: Quintile (0-20%, ..., 80-100%)
 
     Loss uses learnable uncertainty weighting (Kendall et al., 2018).
@@ -390,16 +390,16 @@ class FFMForPretraining(PreTrainedModel):
         _full_ce = nn.CrossEntropyLoss(label_smoothing=ls)
         cfg = self.config
         labels_and_logits = [
-            (regime_labels,     regime_logits,     _masked_ce, cfg.regime_loss_weight),
-            (volatility_labels, volatility_logits, _full_ce,   cfg.volatility_loss_weight),
-            (structure_labels,  structure_logits,  _masked_ce, cfg.structure_loss_weight),
-            (range_labels,      range_logits,      _full_ce,   cfg.range_loss_weight),
+            ("regime",     regime_labels,     regime_logits,     _masked_ce, cfg.regime_loss_weight),
+            ("volatility", volatility_labels, volatility_logits, _full_ce,   cfg.volatility_loss_weight),
+            ("structure",  structure_labels,  structure_logits,  _masked_ce, cfg.structure_loss_weight),
+            ("range",      range_labels,      range_logits,      _full_ce,   cfg.range_loss_weight),
         ]
 
         total_loss = torch.tensor(0.0, device=features.device)
         weight_sum = 0.0
 
-        for labels, logits, loss_fn, weight in labels_and_logits:
+        for task_name, labels, logits, loss_fn, weight in labels_and_logits:
             if labels is not None:
                 task_loss = loss_fn(logits, labels)
                 # CrossEntropyLoss returns nan when every sample in the batch is the
@@ -409,6 +409,7 @@ class FFMForPretraining(PreTrainedModel):
                 if torch.isfinite(task_loss):
                     total_loss = total_loss + weight * task_loss
                     weight_sum += weight
+                    output[f"{task_name}_loss"] = task_loss
 
         if weight_sum > 0:
             output["loss"] = total_loss / weight_sum
