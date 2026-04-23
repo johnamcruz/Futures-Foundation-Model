@@ -928,7 +928,10 @@ def make_balanced_loader(dataset, batch_size, sig_per_batch, shuffle=True, num_w
     target_signal_frac = sig_per_batch / batch_size
     w_signal = target_signal_frac / (n_signal / n_total) if n_signal > 0 else 1.0
     w_noise  = (1.0 - target_signal_frac) / (n_noise / n_total) if n_noise > 0 else 1.0
-    labels_last = [dataset._labels[s + dataset.seq_len - 1] for s in dataset.window_starts]
+    if hasattr(dataset, 'window_starts'):
+        labels_last = [dataset._labels[s + dataset.seq_len - 1] for s in dataset.window_starts]
+    else:
+        labels_last = list(dataset._labels)  # ConcatDataset: _labels already per-window
     weights = [w_signal if l > 0 else w_noise for l in labels_last]
     sampler = WeightedRandomSampler(weights, num_samples=n_total, replacement=True)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
