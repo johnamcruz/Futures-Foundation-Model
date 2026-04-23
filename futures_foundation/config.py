@@ -56,6 +56,7 @@ class FFMConfig(PretrainedConfig):
         # --- Training ---
         layer_norm_eps: float = 1e-6,
         initializer_range: float = 0.02,
+        label_smoothing: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -76,6 +77,7 @@ class FFMConfig(PretrainedConfig):
         self.num_range_labels = num_range_labels
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
+        self.label_smoothing = label_smoothing
 
         assert hidden_size % num_attention_heads == 0, (
             f"hidden_size ({hidden_size}) must be divisible by "

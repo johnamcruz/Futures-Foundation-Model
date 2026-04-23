@@ -28,7 +28,7 @@ from .labels import (
 )
 from .dataset import (
     FFMDataset, FFMMultiInstrumentDataset,
-    temporal_train_val_split, create_dataloaders,
+    temporal_train_val_split, interleaved_train_val_split, create_dataloaders,
 )
 
 __version__ = "0.2.0"
@@ -39,5 +39,6 @@ __all__ = [
     "generate_all_labels", "generate_regime_labels", "generate_volatility_labels",
     "generate_structure_labels", "generate_range_labels", "print_label_distribution",
     "REGIME_LABELS", "VOLATILITY_LABELS", "STRUCTURE_LABELS", "RANGE_LABELS",
-    "FFMDataset", "FFMMultiInstrumentDataset", "temporal_train_val_split", "create_dataloaders",
+    "FFMDataset", "FFMMultiInstrumentDataset",
+    "temporal_train_val_split", "interleaved_train_val_split", "create_dataloaders",
 ]
