@@ -21,17 +21,17 @@ Just as BERT learns language structure before being fine-tuned for sentiment or 
 ## Architecture
 
 ```
-Input: OHLCV Bars (sequence of N bars × 57 continuous features + candle_type embedding)
+Input: OHLCV Bars (sequence of N bars × 66 continuous features + candle_type embedding)
          │
     [Instrument Embedding + Session Embedding + Temporal Encoding]
          │
     [Transformer Encoder × 6 layers]
-      • Multi-head self-attention (8 heads)
+      • Multi-head self-attention (8 heads, optional causal mask)
       • Feed-forward network (512-dim)
       • Pre-norm LayerNorm + residual connections
       • Dropout regularization
          │
-    [CLS Token Pooling]
+    [CLS Token Pooling]  or  [Per-Bar Hidden States (output_sequence=True)]
          │
     BACKBONE OUTPUT: Market Context Embedding (256-dim)
          │
@@ -58,8 +58,10 @@ All labels are **forward-looking** — the model must predict what happens in th
 |------|---------|---------|-------------|
 | **Regime** | Trending Up, Trending Down, Rotational, Volatile | 20 bars | Future return direction + volatility expansion |
 | **Volatility State** | Low, Normal, Elevated, Extreme | 10 bars | Forward realized vol ranked vs recent history |
-| **Market Structure** | Bullish, Bearish, Mixed | 20 bars | Upside vs downside expansion asymmetry |
+| **Market Structure** | Bullish, Bearish | 20 bars | Two-factor confirmation: 1H causal structure AND forward expansion asymmetry must agree; conflicting signals → sentinel (skipped in loss) |
 | **Range Position** | 5 quintiles (0-20%, ..., 80-100%) | 10 bars | Where future close lands in current range |
+
+> **Structure labels use two-factor confirmation.** A bar is labeled bullish only when the 1H higher-timeframe structure is already bullish (majority of last 3 completed 1H closes moving higher) AND forward price shows upside > 1.5× downside over the next 20 bars. Both factors must agree — ambiguous bars are skipped via `ignore_index=-100`. This prevents the model from confusing counter-trend bounces with genuine structural trends.
 
 ---
 
@@ -116,6 +118,21 @@ outputs = model(features)
 # outputs["risk_predictions"] → (batch, 2)  [sl_atr, tp_atr]
 ```
 
+### Causal Attention Mask (Per-Bar Predictions)
+
+All model classes support a `causal=True` parameter that applies a strict lower-triangular mask so bar *i* cannot attend to any bar *j > i*. Use this when fine-tuning with `output_sequence=True` for per-bar predictions where lookahead must be eliminated:
+
+```python
+# Per-bar volatility prediction — no lookahead allowed
+logits = model(features, output_sequence=True, causal=True)
+# logits → (batch, seq_len, num_labels); each position only sees its own history
+
+# Global summary inference — use full bidirectional attention (default)
+embedding = backbone(features, causal=False)  # default; CLS aggregates all bars
+```
+
+> In causal mode the CLS token (position 0) is also restricted — it processes only itself, not the full sequence. For global sequence summary use `causal=False` (default).
+
 ---
 
 ## Data Preparation
@@ -149,20 +166,22 @@ data/raw/
 
 Each CSV should have columns: `datetime, open, high, low, close, volume`
 
-### Feature Derivation (58 Features: 57 Continuous + 1 Embedding)
+### Feature Derivation (67 Inputs: 66 Continuous + 1 Embedding)
 
 Features are instrument-agnostic via ATR normalization:
 
 | Group | Count | Examples |
 |-------|-------|---------|
-| Bar Anatomy | 8 | Body/wick ratios, range in ATR |
-| Returns & Momentum | 8 | Multi-horizon returns, acceleration |
-| Volume Dynamics | 6 | Relative volume, delta proxy |
-| Volatility Measures | 6 | ATR z-score, realized vol |
-| Session Context | 5 | Distance from session OHLC + VWAP |
-| Market Structure | 9 | Swing distances, range position |
-| CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
-| Candle Psychology | 5 + 1 emb | engulf count, momentum speed, wick rejection, dir consistency, bar size vs session; candle_type → dedicated model embedding |
+| 1 — Bar Anatomy | 8 | Body/wick ratios, range in ATR |
+| 2 — Returns & Momentum | 8 | Multi-horizon returns, acceleration |
+| 3 — Volume Dynamics | 6 | Relative volume, delta proxy |
+| 4 — Volatility Measures | 6 | ATR z-score, realized vol |
+| 5 — Session Context | 5 | Distance from session OHLC + VWAP |
+| 6 — Market Structure | 9 | Swing distances, range position |
+| 7 — CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
+| 8 — Candle Psychology | 5 + 1 emb | engulf count, momentum speed, wick rejection, dir consistency, bar size vs session; candle_type → dedicated model embedding |
+| 9 — HTF Price Context | 5 | Daily + weekly OHLC distances, higher-timeframe range position |
+| 10 — Volume Absorption & Order Flow | 4 | Cumulative signed delta, absorption ratio, volume-momentum alignment |
 
 #### CRT Sweep State Features
 
@@ -195,6 +214,29 @@ Strategy-agnostic price action descriptors computed from raw OHLCV. These captur
 | `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1]; positive = bullish rejection, negative = bearish rejection |
 | `dir_consistency` | Fraction of the last N bars (default 5) whose close-open direction matches the current bar; range [0, 1] |
 | `bar_size_vs_session` | Current bar range relative to the running session average range (resets at session open); >1 = larger than session average |
+
+#### HTF Price Context Features (Group 9)
+
+Where the current bar sits relative to the broader daily and weekly reference frames:
+
+| Feature | Description |
+|---------|-------------|
+| `htf_dist_daily_high` | `(close − daily_high) / daily_high`, range ≤ 0 |
+| `htf_dist_daily_low` | `(close − daily_low) / daily_low`, range ≥ 0 |
+| `htf_dist_weekly_high` | `(close − weekly_high) / weekly_high`, range ≤ 0 |
+| `htf_dist_weekly_low` | `(close − weekly_low) / weekly_low`, range ≥ 0 |
+| `htf_range_position` | `(close − weekly_low) / (weekly_high − weekly_low)`, range [0, 1]; where in the week's range is price right now? |
+
+#### Volume Absorption & Order Flow Features (Group 10)
+
+Order-flow proxies that reveal whether volume is confirming or absorbing price movement:
+
+| Feature | Description |
+|---------|-------------|
+| `vol_cum_signed_5` | Rolling 5-bar net buying/selling pressure: `Σ(vol_delta_proxy) / Σ(volume)`, range [−0.5, 0.5]; positive = buyers dominant |
+| `vol_cum_signed_20` | Same as above over 20 bars |
+| `vol_absorption` | `vol_ratio_5 × (1 − |body_pct|)`, range [0, 5]; high volume + small body = price being absorbed by opposing interest |
+| `vol_momentum_align` | `sign(momentum_5) × (vol_ratio_5 − 1)`, range [−3, 3]; positive = elevated volume confirming the trend direction |
 
 ---
 
@@ -237,7 +279,7 @@ Futures-Foundation-Model/
 │   ├── __init__.py
 │   ├── config.py               # FFMConfig (HuggingFace compatible)
 │   ├── model.py                # Backbone + Classification/Regression/Strategy heads
-│   ├── features.py             # OHLCV → 58 derived features (incl. CRT sweeps + candle psychology)
+│   ├── features.py             # OHLCV → 66 derived features (10 groups incl. HTF context + volume absorption)
 │   ├── candle_psychology.py    # Candle psychology feature derivation (6 features)
 │   ├── labels.py               # Forward-looking label generation
 │   └── dataset.py              # PyTorch Dataset + DataLoader
@@ -278,15 +320,19 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ## Roadmap
 
 - [x] Core transformer backbone with HuggingFace compatibility
-- [x] OHLCV feature derivation pipeline (58 ATR-normalized features)
+- [x] OHLCV feature derivation pipeline (66 ATR-normalized continuous features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
-- [x] Candle psychology features — 5 continuous features + candle_type via dedicated model embedding (58 total inputs)
+- [x] Candle psychology features — 5 continuous features + candle_type via dedicated model embedding
+- [x] HTF price context features — daily/weekly OHLC distances + range position (5 features, Group 9)
+- [x] Volume absorption & order flow features — cumulative signed delta, absorption ratio, vol-momentum alignment (4 features, Group 10)
 - [x] Forward-looking self-supervised label generation (4 tasks)
+- [x] Two-factor structure labels — 1H causal structure + forward expansion asymmetry must agree
+- [x] Causal attention mask — `causal=True` on all forward() for per-bar lookahead-free predictions
 - [x] Pretraining with overfitting detection + collapse monitoring
 - [x] Fine-tuning framework: Classification, Regression, Strategy+Risk
 - [x] Backbone freezing with differential layer groups
 - [x] 5-instrument pretraining (ES, NQ, RTY, YM, GC)
-- [x] Unit test suite (130 tests) with pre-commit hook enforcement
+- [x] Unit test suite (172 tests) with pre-commit hook enforcement
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (SI, CL, NKD)
