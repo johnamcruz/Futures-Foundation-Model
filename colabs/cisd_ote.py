@@ -1,20 +1,24 @@
 # ==============================================================================
-# CISD+OTE HYBRID FINE-TUNING TRAINER — v6.0
+# CISD+OTE HYBRID FINE-TUNING TRAINER — v7.0
 # ==============================================================================
-# Changes from v5.1:
-#   [Cell 2] BACKBONE_PATH: FFM_Checkpoints/ → 5min_FFM_Checkpoints/
-#            Aligns with the 5min pretraining pipeline output
-#   [Cell 2] PREPARED_DIR: FFM_Prepared → 5min_FFM_Prepared
-#            Same fix — FFM feature parquets now live in 5min_FFM_Prepared
-#   [Cell 2] SEQ_LEN: 64 → 96
-#            Matches pretraining context window; gives 2 extra hours of prior
-#            session structure for each CISD signal evaluation
-#   [Cell 4] candle_types wired through backbone end-to-end:
-#            HybridCISDDataset: extracts candle_type from feature parquet
-#            HybridCISDModel.forward(): accepts + passes candle_types to FFMBackbone
-#            train_one_epoch / evaluate: batch["candle_types"] passed to model
-#            Previously candle_types was silently dropped — backbone was pretrained
-#            with candle embeddings but fine-tuning never used them
+# Changes from v6.0:
+#   [Cell 2] CISD features: 28 → 10 (backbone-derivable market context removed)
+#            Remaining 10 features are zone geometry + CISD-specific trade mechanics:
+#            zone_height_vs_atr, price_vs_zone_top/bot, zone_age_bars,
+#            zone_is_bullish, cisd_displacement_str, had_liquidity_sweep,
+#            entry_distance_pct, risk_dollars_norm, in_optimal_session
+#   [Cell 3] compute_trend_60min removed → htf_1h_structure read from FFM parquet
+#            The prepared parquet already contains the causal 1H structure signal;
+#            resampling raw CSV and recomputing it was redundant and inconsistent
+#   [Cell 3] ATR recomputation removed → vty_atr_raw read from FFM parquet
+#            Zone geometry features (zone_height_vs_atr) now use the same ATR
+#            the backbone was trained on, ensuring consistent normalisation
+#   [Cell 3] Timestamp alignment: dict loop O(n) → pd.reindex O(n log n)
+#   [Cell 2] Cache dir v6 → v7; v6 outputs are preserved for baseline comparison
+# Changes from v5.1 (carried forward from v6.0):
+#   BACKBONE_PATH / PREPARED_DIR: 5min_ prefix fix
+#   SEQ_LEN: 64 → 96 (matches pretraining context window)
+#   candle_types wired end-to-end through backbone
 # ==============================================================================
 
 
@@ -62,8 +66,8 @@ import torch, shutil
 RAW_DATA_DIR   = '/content/drive/MyDrive/Futures Data/5min'
 PREPARED_DIR   = '/content/drive/MyDrive/AI_Cache/5min_FFM_Prepared'        # FIXED v6.0
 BACKBONE_PATH  = '/content/drive/MyDrive/AI_Cache/5min_FFM_Checkpoints/best_backbone.pt'  # FIXED v6.0
-CISD_CACHE_DIR = '/content/drive/MyDrive/AI_Cache/CISD_OTE_Labels_v6'
-OUTPUT_DIR     = '/content/drive/MyDrive/AI_Models/CISD_OTE_Hybrid_v6'
+CISD_CACHE_DIR = '/content/drive/MyDrive/AI_Cache/CISD_OTE_Labels_v7'
+OUTPUT_DIR     = '/content/drive/MyDrive/AI_Models/CISD_OTE_Hybrid_v7'
 
 # ── TICKERS ──
 DATA_TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC']
@@ -163,20 +167,23 @@ FOLDS = [
     {'name': 'F4', 'train_end': '2025-01-01', 'val_end': '2025-06-01', 'test_end': '2025-12-01'},
 ]
 
-# ── CISD+OTE FEATURES (28) ──
+# ── CISD+OTE FEATURES (10) ──
+# Only zone geometry and trade mechanics that the backbone cannot derive.
+# Market context (trend, wick, volume, session, EMA, HTF alignment, etc.) is
+# already captured by the 67-feature backbone sequence — no duplication.
 CISD_FEATURE_COLS = [
-    'zone_height_vs_atr', 'price_vs_zone_top', 'price_vs_zone_bot',
-    'zone_age_bars', 'zone_is_bullish', 'cisd_displacement_strength',
-    'had_liquidity_sweep', 'htf_trend_direction', 'trend_alignment',
-    'rejection_wick_ratio', 'close_position', 'volume_trend',
-    'cumulative_delta_ratio', 'price_vs_ema20', 'gap_from_prior_close',
-    'session_progress', 'day_of_week_feat', 'confluence_score',
-    'risk_dollars_norm', 'in_optimal_session', 'entry_distance_pct',
-    'ffm_sess_dist_from_vwap', 'ffm_str_structure_state', 'ffm_ret_acceleration',
-    'ffm_vty_atr_of_atr', 'ffm_sess_dist_from_open', 'ffm_ret_momentum_10',
-    'ffm_vol_delta_proxy',
+    'zone_height_vs_atr',    # OTE zone width relative to ATR
+    'price_vs_zone_top',     # price distance from zone top (ATR-normalised)
+    'price_vs_zone_bot',     # price distance from zone bottom (ATR-normalised)
+    'zone_age_bars',         # bars since zone was created
+    'zone_is_bullish',       # zone direction: +1 bull / -1 bear
+    'cisd_displacement_str', # displacement candle strength (sweep ratio)
+    'had_liquidity_sweep',   # liquidity swept before this CISD signal
+    'entry_distance_pct',    # depth into OTE zone at entry bar
+    'risk_dollars_norm',     # stop loss size (normalised by MAX_RISK_DOLLARS)
+    'in_optimal_session',    # 09:00–11:00 NY window flag
 ]
-NUM_CISD_FEATURES = len(CISD_FEATURE_COLS)  # 28
+NUM_CISD_FEATURES = len(CISD_FEATURE_COLS)  # 10
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\n🖥️  Device: {device}')
@@ -206,13 +213,6 @@ import pandas as pd
 from collections import Counter, deque
 
 
-def resample_ohlcv(df, tf):
-    return df.resample(tf, closed='right', label='right').agg({
-        'open': 'first', 'high': 'max', 'low': 'min',
-        'close': 'last', 'volume': 'sum'
-    }).dropna()
-
-
 def detect_pivots_vectorized(highs, lows, period):
     n = len(highs)
     if n < 2 * period + 1:
@@ -227,27 +227,6 @@ def detect_pivots_vectorized(highs, lows, period):
     return np.where(is_ph)[0] + period, np.where(is_pl)[0] + period
 
 
-def compute_atr_np(high, low, close, period=14):
-    tr = np.maximum(high - low,
-                    np.maximum(np.abs(high - np.roll(close, 1)),
-                               np.abs(low  - np.roll(close, 1))))
-    tr[0] = high[0] - low[0]
-    alpha = 1.0 / period
-    seed  = float(np.mean(tr[:period]))
-    atr   = np.empty(len(tr), dtype=np.float64)
-    atr[:period] = seed
-    atr[period]  = seed * (1 - alpha) + tr[period] * alpha
-    if len(tr) > period + 1:
-        rest = pd.Series(np.concatenate([[atr[period]], tr[period + 1:]])).ewm(
-            alpha=alpha, adjust=False).mean().values
-        atr[period:] = rest
-    return atr
-
-
-def compute_ema_np(arr, span):
-    return pd.Series(arr).ewm(span=span, adjust=False).mean().values
-
-
 def rolling_mean_np(arr, window):
     cumsum = np.cumsum(np.insert(arr, 0, 0))
     out = np.full_like(arr, np.nan)
@@ -255,36 +234,6 @@ def rolling_mean_np(arr, window):
     for i in range(window - 1):
         out[i] = np.mean(arr[:i + 1])
     return out
-
-
-def compute_trend_60min(df_60m, swing_period=5, structure_lookback=3):
-    highs = df_60m['high'].values; lows = df_60m['low'].values; n = len(df_60m)
-    piv_h, piv_l = detect_pivots_vectorized(highs, lows, swing_period)
-    trend = np.zeros(n, dtype=np.int8)
-    recent_h = deque(maxlen=structure_lookback); recent_l = deque(maxlen=structure_lookback)
-    sh_conf = {}; sl_conf = {}
-    for b in piv_h:
-        c = b + swing_period
-        if c < n: sh_conf.setdefault(c, []).append(highs[b])
-    for b in piv_l:
-        c = b + swing_period
-        if c < n: sl_conf.setdefault(c, []).append(lows[b])
-    for bar in range(n):
-        if bar in sh_conf:
-            for p in sh_conf[bar]: recent_h.appendleft(p)
-        if bar in sl_conf:
-            for p in sl_conf[bar]: recent_l.appendleft(p)
-        if len(recent_h) >= 2 and len(recent_l) >= 2:
-            hh = recent_h[0] > recent_h[1]; hl = recent_l[0] > recent_l[1]
-            ll = recent_l[0] < recent_l[1]; lh = recent_h[0] < recent_h[1]
-            if hh and hl:    trend[bar] = 1
-            elif ll and lh:  trend[bar] = -1
-            elif hh or hl:   trend[bar] = 1
-            elif ll or lh:   trend[bar] = -1
-        elif bar > 0:
-            trend[bar] = trend[bar - 1]
-    df_60m = df_60m.copy(); df_60m['trend'] = trend
-    return df_60m
 
 
 def detect_5min_cisd_signals(df_5m, tolerance, swing_period, expiry_bars,
@@ -463,19 +412,17 @@ def apply_rr_barriers(highs, lows, closes, is_session_end,
     return results
 
 
-def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
+def label_cisd_ote_zones_5min(df_5m, htf_1h_struct, ticker):
+    """
+    htf_1h_struct: float32 array aligned to df_5m.index, values in {-1, 0, +1}.
+                   Sourced directly from the FFM prepared parquet (htf_1h_structure).
+                   Replaces the old resample+compute_trend_60min pipeline.
+    """
     point_value = POINT_VALUES.get(ticker, 20.0)
     n = len(df_5m)
 
-    trend_times     = df_60m.index.values
-    ltf_times       = df_5m.index.values
-    trend_idx_align = np.clip(np.searchsorted(trend_times, ltf_times, side='right') - 1,
-                               0, len(df_60m) - 1)
-    trend_vals = df_60m['trend'].values
-
     o5 = df_5m['open'].values;  h5 = df_5m['high'].values
     l5 = df_5m['low'].values;   c5 = df_5m['close'].values
-    v5 = df_5m['volume'].values
     cisd_sig    = df_5m['cisd_signal'].values
     ft_arr      = df_5m['fib_top'].values
     fb_arr      = df_5m['fib_bot'].values
@@ -496,8 +443,6 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
     is_session_end = np.zeros(n, dtype=bool)
     is_session_end[:-1] = in_session[:-1] & ~in_session[1:]
 
-    atr          = compute_atr_np(h5, l5, c5, 14)
-    vol_sma      = rolling_mean_np(v5.astype(np.float64), 20)
     candle_range = h5 - l5
     candle_sma   = rolling_mean_np(candle_range, CANDLE_AVG_LEN)
 
@@ -511,9 +456,6 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
     zone_age     = np.zeros(n, dtype=np.float32)
     zone_sweep   = np.zeros(n, dtype=np.float32)
     zone_disp    = np.zeros(n, dtype=np.float32)
-    zone_trend   = np.zeros(n, dtype=np.float32)
-    zone_aligned = np.zeros(n, dtype=np.float32)
-    confluence_scores  = np.zeros(n, dtype=np.float32)
     risk_dollars_arr   = np.zeros(n, dtype=np.float32)
     in_optimal_arr     = np.zeros(n, dtype=np.float32)
     entry_distance_arr = np.zeros(n, dtype=np.float32)
@@ -526,7 +468,7 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
     stats = Counter()
 
     for bar in range(SWING_PERIOD * 3, n):
-        ti = trend_idx_align[bar]; cur_trend = trend_vals[ti]
+        cur_trend = int(htf_1h_struct[bar])
         sig = cisd_sig[bar]
 
         if sig in (1, 2) and not np.isnan(ft_arr[bar]):
@@ -563,16 +505,12 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
             if d < nearest_dist: nearest_dist = d; nearest_zone = z
 
         if nearest_zone is not None:
-            zone_top[bar]    = nearest_zone['fib_top']
-            zone_bot[bar]    = nearest_zone['fib_bot']
-            zone_bull[bar]   = 1.0 if nearest_zone['is_bullish'] else -1.0
-            zone_age[bar]    = bar - nearest_zone['created_bar']
-            zone_sweep[bar]  = 1.0 if nearest_zone['had_sweep'] else 0.0
-            zone_disp[bar]   = nearest_zone['disp_strength']
-            zone_trend[bar]  = float(cur_trend)
-            is_aligned = (nearest_zone['is_bullish'] and cur_trend >= 0) or \
-                         (not nearest_zone['is_bullish'] and cur_trend <= 0)
-            zone_aligned[bar] = 1.0 if is_aligned else 0.0
+            zone_top[bar]  = nearest_zone['fib_top']
+            zone_bot[bar]  = nearest_zone['fib_bot']
+            zone_bull[bar] = 1.0 if nearest_zone['is_bullish'] else -1.0
+            zone_age[bar]  = bar - nearest_zone['created_bar']
+            zone_sweep[bar]= 1.0 if nearest_zone['had_sweep'] else 0.0
+            zone_disp[bar] = nearest_zone['disp_strength']
 
         zones_to_remove = []
         for zi, z in enumerate(active_zones):
@@ -585,27 +523,9 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
 
             if z['entered_zone'] and not z['signal_fired'] and not invalidated \
                and bar > z['created_bar']:
-                cr   = candle_range[bar]; cb = abs(c5[bar] - o5[bar])
-                upper_wick = h5[bar] - max(o5[bar], c5[bar])
-                lower_wick = min(o5[bar], c5[bar]) - l5[bar]
-                touched    = l5[bar] <= z['fib_top'] and h5[bar] >= z['fib_bot']
-                closed_in  = z['fib_bot'] <= c5[bar] <= z['fib_top']
-                zh = z['fib_top'] - z['fib_bot']
-
-                score = 0
-                if z['had_sweep']:       score += 2
-                if z['is_bullish']:
-                    if c5[bar] > o5[bar]: score += 1
-                    if cb > 0 and lower_wick >= cb * 0.3: score += 1
-                    if c5[bar] >= (h5[bar] + l5[bar]) / 2: score += 1
-                else:
-                    if c5[bar] < o5[bar]: score += 1
-                    if cb > 0 and upper_wick >= cb * 0.3: score += 1
-                    if c5[bar] <= (h5[bar] + l5[bar]) / 2: score += 1
-                if cr > 0 and (cb / cr) >= 0.5: score += 1
-                if vol_sma[bar] > 0 and v5[bar] > vol_sma[bar] * 1.2: score += 1
-                if closed_in: score += 1
-                score += 1
+                cr  = candle_range[bar]; cb = abs(c5[bar] - o5[bar])
+                touched = l5[bar] <= z['fib_top'] and h5[bar] >= z['fib_bot']
+                zh  = z['fib_top'] - z['fib_bot']
 
                 entry_dist_pct = 0.0
                 if zh > 0:
@@ -628,7 +548,6 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
                             trade_ok = False
                     if trade_ok:
                         z['signal_fired']       = True
-                        confluence_scores[bar]  = score
                         risk_dollars_arr[bar]   = risk_dollars / MAX_RISK_DOLLARS
                         entry_distance_arr[bar] = entry_dist_pct
                         is_long = z['is_bullish']
@@ -650,80 +569,44 @@ def label_cisd_ote_zones_5min(df_5m, df_60m, ticker):
     meta = {
         'zone_top': zone_top, 'zone_bot': zone_bot, 'zone_bull': zone_bull,
         'zone_age': zone_age, 'zone_sweep': zone_sweep, 'zone_disp': zone_disp,
-        'zone_trend': zone_trend, 'zone_aligned': zone_aligned,
-        'confluence_scores': confluence_scores, 'risk_dollars_arr': risk_dollars_arr,
+        'risk_dollars_arr': risk_dollars_arr,
         'in_session_arr': in_optimal_arr, 'entry_distance_arr': entry_distance_arr,
     }
     return signal_labels, max_rr_arr, sl_dist_arr, meta, stats
 
 
-def create_cisd_features(df_5m, zone_meta, ffm_features=None):
-    o = df_5m['open'].values;  h = df_5m['high'].values
-    l = df_5m['low'].values;   c = df_5m['close'].values
-    v = df_5m['volume'].values.astype(np.float64)
+def create_cisd_features(df_5m, zone_meta, raw_atr):
+    """
+    Produces 10 CISD-specific features covering zone geometry and trade mechanics.
+
+    Market context (HTF trend, wick ratios, volume, session progress, EMA distance,
+    etc.) is already encoded in the 67-feature backbone sequence fed to FFMBackbone.
+    Only information that is unique to the CISD zone and trade setup lives here.
+
+    raw_atr: float64 array aligned to df_5m.index (vty_atr_raw from FFM parquet).
+    """
+    c = df_5m['close'].values
     n = len(df_5m)
-    atr      = compute_atr_np(h, l, c, 14)
-    ema20    = compute_ema_np(c, 20)
-    atr_safe = np.where(atr > 0, atr, 1e-6)
+
+    atr_safe = np.where(np.isnan(raw_atr) | (raw_atr <= 0), 1e-6, raw_atr)
+
     zt = zone_meta['zone_top']; zb = zone_meta['zone_bot']
-    zh = np.where(np.isnan(zt) | np.isnan(zb), 0, zt - zb)
+    zh = np.where(np.isnan(zt) | np.isnan(zb), 0.0, zt - zb)
     zh_safe = np.where(zh > 0, zh, 1e-6)
+
     features = np.zeros((n, NUM_CISD_FEATURES), dtype=np.float32)
-    features[:, 0]  = zh / atr_safe
-    features[:, 1]  = np.where(zh > 0, (c - zt) / zh_safe, 0)
-    features[:, 2]  = np.where(zh > 0, (c - zb) / zh_safe, 0)
-    features[:, 3]  = np.clip(zone_meta['zone_age'] / ZONE_MAX_BARS, 0, 5)
-    features[:, 4]  = zone_meta['zone_bull']
-    features[:, 5]  = np.clip(zone_meta['zone_disp'], 0, 5)
-    features[:, 6]  = zone_meta['zone_sweep']
-    features[:, 7]  = zone_meta['zone_trend']
-    features[:, 8]  = zone_meta['zone_aligned']
-    cr       = h - l; cr_safe = np.where(cr > 0, cr, 1e-6)
-    body     = np.abs(c - o)
-    upper_wick = h - np.maximum(o, c); lower_wick = np.minimum(o, c) - l
-    bull_mask  = zone_meta['zone_bull'] > 0
-    wick       = np.where(bull_mask, lower_wick, upper_wick)
-    body_safe  = np.where(body > 0, body, 1e-6)
-    features[:, 9]  = wick / body_safe
-    features[:, 10] = np.where(cr > 0, (c - l) / cr_safe, 0.5)
-    vol_sma20    = rolling_mean_np(v, 20); vol_sma5_arr = rolling_mean_np(v, 5)
-    vol5_safe    = np.where(vol_sma5_arr > 0, vol_sma5_arr, 1e-6)
-    vol_safe     = np.where(vol_sma20    > 0, vol_sma20,    1e-6)
-    features[:, 11] = vol5_safe / vol_safe
-    bar_delta = np.where(c > o, v, np.where(c < o, -v, 0.0))
-    _df_tmp = pd.DataFrame({'delta': bar_delta, 'vol': v, 'date': df_5m.index.date})
-    cum_delta = _df_tmp.groupby('date')['delta'].cumsum().values
-    cum_vol   = _df_tmp.groupby('date')['vol'].cumsum().values
-    cv_safe   = np.where(cum_vol > 0, cum_vol, 1e-6)
-    features[:, 12] = cum_delta / cv_safe
-    features[:, 13] = (c - ema20) / atr_safe
-    prev_close = np.roll(c, 1); prev_close[0] = c[0]
-    features[:, 14] = (c - prev_close) / atr_safe
-    hours_arr = df_5m.index.hour; mins_arr = df_5m.index.minute
-    sess_mins = (hours_arr * 60 + mins_arr - 9 * 60).astype(np.float64)
-    features[:, 15] = np.clip(sess_mins / 420.0, 0, 1)
-    features[:, 16] = df_5m.index.dayofweek.values.astype(np.float32)
-    features[:, 17] = zone_meta['confluence_scores'] / 10.0
-    features[:, 18] = np.clip(zone_meta['risk_dollars_arr'], 0, 5)
-    features[:, 19] = zone_meta['in_session_arr']
-    features[:, 20] = np.clip(zone_meta['entry_distance_arr'], -2, 5)
+    features[:, 0] = zh / atr_safe                                          # zone_height_vs_atr
+    features[:, 1] = np.where(zh > 0, (c - zt) / zh_safe, 0.0)            # price_vs_zone_top
+    features[:, 2] = np.where(zh > 0, (c - zb) / zh_safe, 0.0)            # price_vs_zone_bot
+    features[:, 3] = np.clip(zone_meta['zone_age'] / ZONE_MAX_BARS, 0, 5)  # zone_age_bars
+    features[:, 4] = zone_meta['zone_bull']                                  # zone_is_bullish
+    features[:, 5] = np.clip(zone_meta['zone_disp'], 0, 5)                  # cisd_displacement_str
+    features[:, 6] = zone_meta['zone_sweep']                                 # had_liquidity_sweep
+    features[:, 7] = np.clip(zone_meta['entry_distance_arr'], -2, 5)        # entry_distance_pct
+    features[:, 8] = np.clip(zone_meta['risk_dollars_arr'], 0, 5)           # risk_dollars_norm
+    features[:, 9] = zone_meta['in_session_arr']                             # in_optimal_session
 
-    def get_ffm(col, scale=1.0, clip=10.0):
-        if ffm_features is not None and col in ffm_features:
-            arr = np.array(ffm_features[col], dtype=np.float32)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=clip, neginf=-clip)
-            return np.clip(arr * scale, -clip, clip)
-        return np.zeros(n, dtype=np.float32)
-
-    features[:, 21] = get_ffm('sess_dist_from_vwap', clip=10.0)
-    features[:, 22] = get_ffm('str_structure_state',  clip=5.0)
-    features[:, 23] = get_ffm('ret_acceleration',     scale=100.0)
-    features[:, 24] = get_ffm('vty_atr_of_atr',       clip=5.0)
-    features[:, 25] = get_ffm('sess_dist_from_open',  clip=10.0)
-    features[:, 26] = get_ffm('ret_momentum_10',      scale=100.0)
-    features[:, 27] = get_ffm('vol_delta_proxy',      scale=0.001)
-    features = np.nan_to_num(features, nan=0.0, posinf=5.0, neginf=-5.0)
-    return np.clip(features, -10, 10)
+    return np.nan_to_num(np.clip(features, -10, 10), nan=0.0)
 
 
 # ── MAIN LABELING PIPELINE ──
@@ -758,6 +641,13 @@ for ticker in TICKERS:
     print(f"\n{'─'*60}\n  {ticker}{f' (micro → {data_ticker})' if is_micro else ''}\n{'─'*60}")
     t0 = time.time()
 
+    # Load FFM prepared features — htf_1h_structure and raw ATR already computed
+    ffm_df = pd.read_parquet(ffm_feat_path)
+    ffm_dt = pd.to_datetime(ffm_df['_datetime'])
+    if ffm_dt.dt.tz is None:
+        ffm_dt = ffm_dt.dt.tz_localize('UTC').tz_convert('America/New_York')
+    ffm_df.index = ffm_dt
+
     df_raw = pd.read_csv(csv_path)
     df_raw.columns = df_raw.columns.str.strip().str.lower()
     if 'date' in df_raw.columns and 'datetime' not in df_raw.columns:
@@ -772,8 +662,9 @@ for ticker in TICKERS:
             df_raw.index = df_raw.index.tz_convert('America/New_York')
     print(f'  Loaded {len(df_raw):,} 5m bars')
 
-    df_60m = resample_ohlcv(df_raw, '60min')
-    df_60m = compute_trend_60min(df_60m)
+    # Pull htf_1h_structure and ATR from FFM parquet — no recomputation needed
+    htf_struct = ffm_df['htf_1h_structure'].reindex(df_raw.index, fill_value=0.0).values.astype(np.float32)
+    raw_atr    = ffm_df['vty_atr_raw'].reindex(df_raw.index, fill_value=np.nan).values.astype(np.float64)
 
     df_raw = detect_5min_cisd_signals(df_raw, TOLERANCE, SWING_PERIOD, EXPIRY_BARS,
                                        LIQUIDITY_LOOKBACK, body_ratio_min=DISP_BODY_RATIO_MIN,
@@ -781,44 +672,21 @@ for ticker in TICKERS:
     cisd_count = (df_raw['cisd_signal'] > 0).sum()
     print(f'  5min CISDs: {cisd_count}')
 
-    sig_arr, rr_arr, sl_arr, zone_meta, stats = label_cisd_ote_zones_5min(df_raw, df_60m, ticker)
+    sig_arr, rr_arr, sl_arr, zone_meta, stats = label_cisd_ote_zones_5min(df_raw, htf_struct, ticker)
     print(f'  Labels: {stats["buys"]}B + {stats["sells"]}S from {stats["trades"]} evaluated')
 
-    ffm_df  = pd.read_parquet(ffm_feat_path)
-    ffm_dt  = pd.to_datetime(ffm_df['_datetime'])
-    if ffm_dt.dt.tz is None:
-        ffm_dt = ffm_dt.dt.tz_localize('UTC').tz_convert('America/New_York')
-    ffm_lookup = {dt: i for i, dt in enumerate(ffm_dt)}
-    FFM_PULL_COLS = ['sess_dist_from_vwap', 'str_structure_state', 'ret_acceleration',
-                     'vty_atr_of_atr', 'sess_dist_from_open', 'ret_momentum_10', 'vol_delta_proxy']
-    FFM_PULL_COLS = [c for c in FFM_PULL_COLS if c in ffm_df.columns]
-    raw_index = df_raw.index
-    ffm_aligned = {}
-    for col in FFM_PULL_COLS:
-        arr = np.zeros(len(df_raw), dtype=np.float32)
-        ffm_col_vals = ffm_df[col].values
-        for raw_i, raw_dt in enumerate(raw_index):
-            ffm_i = ffm_lookup.get(raw_dt)
-            if ffm_i is not None: arr[raw_i] = ffm_col_vals[ffm_i]
-        ffm_aligned[col] = arr
+    cisd_feats = create_cisd_features(df_raw, zone_meta, raw_atr)
 
-    cisd_feats = create_cisd_features(df_raw, zone_meta, ffm_features=ffm_aligned)
+    # Align raw 5min index → FFM index using pandas reindex
+    sig_s   = pd.Series(sig_arr.astype(np.int8),   index=df_raw.index)
+    rr_s    = pd.Series(rr_arr.astype(np.float32), index=df_raw.index)
+    sl_s    = pd.Series(sl_arr.astype(np.float32), index=df_raw.index)
+    feats_s = pd.DataFrame(cisd_feats, index=df_raw.index, columns=CISD_FEATURE_COLS)
 
-    n_ffm      = len(ffm_df)
-    raw_lookup = {dt: i for i, dt in enumerate(df_raw.index)}
-    aligned_sig   = np.zeros(n_ffm, dtype=np.int8)
-    aligned_rr    = np.zeros(n_ffm, dtype=np.float32)
-    aligned_sl    = np.zeros(n_ffm, dtype=np.float32)
-    aligned_feats = np.zeros((n_ffm, NUM_CISD_FEATURES), dtype=np.float32)
-
-    for i in range(n_ffm):
-        dt = ffm_dt.iloc[i]
-        if dt in raw_lookup:
-            j = raw_lookup[dt]
-            aligned_sig[i]   = 1 if sig_arr[j] > 0 else 0
-            aligned_rr[i]    = rr_arr[j]
-            aligned_sl[i]    = sl_arr[j] if not np.isnan(sl_arr[j]) else 0.0
-            aligned_feats[i] = cisd_feats[j]
+    aligned_sig   = (sig_s.reindex(ffm_df.index).fillna(0).values > 0).astype(np.int8)
+    aligned_rr    = rr_s.reindex(ffm_df.index).fillna(0.0).values.astype(np.float32)
+    aligned_sl    = sl_s.reindex(ffm_df.index).fillna(0.0).values.astype(np.float32)
+    aligned_feats = feats_s.reindex(ffm_df.index).fillna(0.0).values.astype(np.float32)
 
     labels_df = pd.DataFrame({'signal_label': aligned_sig, 'max_rr': aligned_rr,
                                'sl_distance': aligned_sl})
@@ -826,8 +694,8 @@ for ticker in TICKERS:
     labels_df.to_parquet(label_path, index=False)
     feats_df.to_parquet(feat_path,   index=False)
 
-    signals = (aligned_sig == 1).sum()
-    total_signals += signals; total_bars += n_ffm
+    signals = (aligned_sig > 0).sum()
+    total_signals += signals; total_bars += len(ffm_df)
     print(f'  ✓ {ticker}: {signals} signals | ({time.time() - t0:.1f}s)')
 
 print(f"\n{'='*60}")
@@ -911,7 +779,7 @@ class FocalLoss(nn.Module):
 
 
 class HybridCISDModel(nn.Module):
-    def __init__(self, config, num_cisd_features=28, num_labels=2,
+    def __init__(self, config, num_cisd_features=10, num_labels=2,
                  num_risk_targets=1, risk_weight=0.1):
         super().__init__()
         self.num_labels = num_labels; self.risk_weight = risk_weight
@@ -1463,3 +1331,21 @@ else:
 
     print(f'\n  ONNX model: {os.path.join(OUTPUT_DIR, "cisd_ote_hybrid.onnx")}')
     print(f'  Checkpoints: {OUTPUT_DIR}')
+
+# ── v6 vs v7 baseline comparison guide ──────────────────────────────────────
+print(f'\n{"="*60}')
+print(f'  v6 → v7 CHANGE SUMMARY (for comparison)')
+print(f'{"="*60}')
+print(f'  v7 changes vs v6 baseline:')
+print(f'    CISD features:  28 → 10 (removed backbone-derivable market context)')
+print(f'    HTF trend:      compute_trend_60min removed → htf_1h_structure from FFM parquet')
+print(f'    ATR source:     recomputed EMA-ATR removed → vty_atr_raw from FFM parquet')
+print(f'    Alignment:      dict loop O(n) removed → pd.reindex O(n log n)')
+print(f'  Kept features:  zone geometry + trade mechanics only')
+print(f'    zone_height_vs_atr, price_vs_zone_top/bot, zone_age_bars,')
+print(f'    zone_is_bullish, cisd_displacement_str, had_liquidity_sweep,')
+print(f'    entry_distance_pct, risk_dollars_norm, in_optimal_session')
+print(f'  v6 outputs (for baseline comparison):')
+print(f'    Labels:      /AI_Cache/CISD_OTE_Labels_v6/')
+print(f'    Checkpoints: /AI_Models/CISD_OTE_Hybrid_v6/')
+print(f'{"="*60}')
