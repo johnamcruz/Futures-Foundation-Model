@@ -38,6 +38,7 @@ _resample_ohlcv          = _feat._resample_ohlcv
 _detect_crt_sweeps       = _feat._detect_crt_sweeps
 _align_sweeps_to_base    = _feat._align_sweeps_to_base
 _compute_atr             = _feat._compute_atr
+_compute_htf_context     = _feat._compute_htf_context
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +71,26 @@ def make_ohlcv(n=600, freq="5min", seed=0):
     })
 
 
+def make_controlled_uptrend(n=600, start=5000, end=5100, freq="5min"):
+    """Steady monotone uptrend with small symmetric bar ranges and no noise."""
+    dates = pd.date_range("2024-01-02 09:30", periods=n, freq=freq)
+    close = np.linspace(start, end, n)
+    return pd.DataFrame({
+        "datetime": dates,
+        "open":   close - 0.1,
+        "high":   close + 0.5,
+        "low":    close - 0.5,
+        "close":  close,
+        "volume": np.ones(n) * 1000.0,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Feature column contract
 # ---------------------------------------------------------------------------
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 57
+    assert len(get_model_feature_columns()) == 62
 
 
 def test_sweep_column_names_in_list():
@@ -437,3 +452,166 @@ def test_sweep_expiry_adapts_to_bar_frequency():
     for col in swp_cols:
         assert f3[col].isna().sum() == 0, f"3-min: {col} has NaN"
         assert f5[col].isna().sum() == 0, f"5-min: {col} has NaN"
+
+
+# ---------------------------------------------------------------------------
+# Group 9: HTF Price Context
+# ---------------------------------------------------------------------------
+
+_HTF_COLS = ["htf_1h_close_pos", "htf_1h_ret", "htf_4h_close_pos", "htf_4h_ret", "htf_tf_alignment"]
+
+
+def test_htf_columns_present():
+    """All 5 HTF price context columns must appear in derive_features output."""
+    f = derive_features(make_ohlcv(n=600), instrument="ES")
+    for col in _HTF_COLS:
+        assert col in f.columns, f"Missing HTF column: {col}"
+
+
+def test_htf_no_nulls():
+    """HTF features must have no NaN values — ATR warmup defaults to 0 or 0.5."""
+    f = derive_features(make_ohlcv(n=600), instrument="ES")
+    for col in _HTF_COLS:
+        assert f[col].isna().sum() == 0, f"{col} has {f[col].isna().sum()} NaN values"
+
+
+def test_htf_close_pos_bounded():
+    """Close position features must lie in [0, 1] — fractional position within the HTF candle range."""
+    f = derive_features(make_ohlcv(n=600), instrument="ES")
+    assert f["htf_1h_close_pos"].between(0.0, 1.0).all(), "htf_1h_close_pos out of [0, 1]"
+    assert f["htf_4h_close_pos"].between(0.0, 1.0).all(), "htf_4h_close_pos out of [0, 1]"
+
+
+def test_htf_tf_alignment_ternary():
+    """HTF alignment must be in {-1, 0, 1} only."""
+    f = derive_features(make_ohlcv(n=600), instrument="ES")
+    unique = set(f["htf_tf_alignment"].unique())
+    assert unique <= {-1.0, 0.0, 1.0}, f"htf_tf_alignment has unexpected values: {unique}"
+
+
+def test_htf_context_open_is_first_bar_in_period():
+    """htf_open returned by _compute_htf_context must equal the open of the first bar in each period."""
+    df = make_controlled_uptrend(n=600)
+    htf_open, _, _ = _compute_htf_context(df, 60)
+
+    period = df["datetime"].dt.ceil("60min")
+    expected_open = df.groupby(period)["open"].transform("first")
+    assert (htf_open.values == expected_open.values).all(), (
+        "htf_open must equal the first bar's open in each 1H period"
+    )
+
+
+def test_htf_1h_resets_at_period_boundary():
+    """At the first bar of each new 1H period, cummax/cummin must equal that bar's high/low."""
+    df = make_controlled_uptrend(n=600)
+    _, htf_high, htf_low = _compute_htf_context(df, 60)
+
+    period = df["datetime"].dt.ceil("60min")
+    new_period = (period != period.shift()).values
+    first_bar_indices = np.where(new_period)[0]
+
+    for i in first_bar_indices[:8]:
+        assert htf_high.iloc[i] == df["high"].iloc[i], (
+            f"At 1H period start bar {i}: htf_high should reset to bar high "
+            f"({df['high'].iloc[i]:.3f}), got {htf_high.iloc[i]:.3f}"
+        )
+        assert htf_low.iloc[i] == df["low"].iloc[i], (
+            f"At 1H period start bar {i}: htf_low should reset to bar low "
+            f"({df['low'].iloc[i]:.3f}), got {htf_low.iloc[i]:.3f}"
+        )
+
+
+def test_htf_4h_continues_past_1h_boundary():
+    """4H cummax must NOT reset at 1H boundaries — it only resets at 4H period starts."""
+    df = make_controlled_uptrend(n=600)
+    _, htf_high_1h, _ = _compute_htf_context(df, 60)
+    _, htf_high_4h, _ = _compute_htf_context(df, 240)
+
+    period_1h = df["datetime"].dt.ceil("60min")
+    period_4h = df["datetime"].dt.ceil("240min")
+
+    # Find bars where 1H resets but 4H does NOT (mid-4H-candle 1H boundaries)
+    new_1h = (period_1h != period_1h.shift()).values
+    new_4h = (period_4h != period_4h.shift()).values
+    intra_4h_1h_starts = np.where(new_1h & ~new_4h)[0]
+
+    for i in intra_4h_1h_starts[:6]:
+        if i == 0:
+            continue
+        # At a mid-4H 1H boundary in an uptrend, 4H high >= previous 4H high
+        assert htf_high_4h.iloc[i] >= htf_high_4h.iloc[i - 1], (
+            f"htf_4h_high decreased at 1H boundary (bar {i}): "
+            f"prev={htf_high_4h.iloc[i - 1]:.3f}, curr={htf_high_4h.iloc[i]:.3f}. "
+            "4H cummax must not reset at 1H boundaries."
+        )
+        # And 4H high must be >= the current bar's high (cummax property)
+        assert htf_high_4h.iloc[i] >= df["high"].iloc[i], (
+            f"htf_4h_high < bar high at 1H boundary (bar {i}): "
+            f"4H_high={htf_high_4h.iloc[i]:.3f}, bar_high={df['high'].iloc[i]:.3f}"
+        )
+
+
+def test_htf_close_pos_rises_within_uptrend_period():
+    """Within a single 1H period, close_pos must be non-decreasing in a monotone uptrend."""
+    df = make_controlled_uptrend(n=600)
+    f = derive_features(df, instrument="ES")
+
+    period = df["datetime"].dt.ceil("60min")
+    # Use the 5th complete 1H period (well past ATR warmup)
+    unique_periods = period.unique()
+    target_period = unique_periods[5]
+    mask = (period == target_period).values
+    close_pos = f["htf_1h_close_pos"].values[mask]
+
+    diffs = np.diff(close_pos)
+    assert (diffs >= -1e-5).all(), (
+        f"htf_1h_close_pos decreased within uptrend period: min diff = {diffs.min():.6f}"
+    )
+
+
+def test_htf_alignment_positive_in_consistent_uptrend():
+    """Consistent uptrend: both 1H and 4H returns from their opens are positive → alignment = +1."""
+    df = make_controlled_uptrend(n=600)
+    f = derive_features(df, instrument="ES")
+
+    # After ATR warmup, both htf_1h_ret and htf_4h_ret are positive in an uptrend.
+    # Where both are strictly positive, alignment must be +1.
+    after_warmup = f.iloc[30:]
+    both_positive = after_warmup[
+        (after_warmup["htf_1h_ret"] > 0) & (after_warmup["htf_4h_ret"] > 0)
+    ]
+    assert len(both_positive) > 0, "Expected positive returns in uptrend after warmup"
+    assert (both_positive["htf_tf_alignment"] == 1.0).all(), (
+        "Both-positive timeframe returns must produce alignment = +1"
+    )
+
+
+def test_htf_alignment_negative_when_timeframes_oppose():
+    """When 1H is positive but 4H is still negative (HTF decline, LTF reversal), alignment = -1."""
+    n = 300
+    dates = pd.date_range("2024-01-02 09:30", periods=n, freq="5min")
+    close = np.concatenate([
+        np.linspace(5100, 4900, 240),   # 4H-scale decline
+        np.linspace(4900, 4950, 60),    # 1H-scale reversal within same 4H candle
+    ])
+    df = pd.DataFrame({
+        "datetime": dates,
+        "open":   close - 0.1,
+        "high":   close + 1.0,
+        "low":    close - 1.0,
+        "close":  close,
+        "volume": np.ones(n) * 1000.0,
+    })
+    f = derive_features(df, instrument="ES")
+
+    # In the reversal segment (bars 250-290): 1H ret positive, 4H ret still negative
+    reversal = f.iloc[250:290]
+    opposing = reversal[
+        (reversal["htf_1h_ret"] > 0) & (reversal["htf_4h_ret"] < 0)
+    ]
+    assert len(opposing) > 0, (
+        "Expected bars with opposing 1H/4H returns during LTF reversal within HTF decline"
+    )
+    assert (opposing["htf_tf_alignment"] == -1.0).all(), (
+        "Opposing 1H/4H returns must produce alignment = -1"
+    )
