@@ -18,6 +18,7 @@ _cp_spec.loader.exec_module(_cp_mod)
 add_candle_features = _cp_mod.add_candle_features
 ENGULF_LOOKBACK = _cp_mod.ENGULF_LOOKBACK
 MOMENTUM_WINDOW = _cp_mod.MOMENTUM_WINDOW
+DIRECTION_WINDOW = _cp_mod.DIRECTION_WINDOW
 
 # Also load features for integration tests
 _FEATURES_PATH = Path(__file__).parent.parent / "futures_foundation" / "features.py"
@@ -34,8 +35,8 @@ derive_features = _f_mod.derive_features
 get_model_feature_columns = _f_mod.get_model_feature_columns
 
 _CP_COLS = [
-    "body_ratio", "upper_wick_ratio", "lower_wick_ratio",
     "candle_type", "engulf_count", "momentum_speed_ratio",
+    "wick_rejection", "dir_consistency",
 ]
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,7 @@ def make_ohlcv(n=300, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# Contract: all 6 columns produced with correct dtype
+# Contract: all 5 columns produced with correct dtype
 # ---------------------------------------------------------------------------
 
 def test_all_columns_added():
@@ -102,80 +103,7 @@ def test_input_df_not_mutated():
 
 
 # ---------------------------------------------------------------------------
-# Feature 1: body_ratio
-# ---------------------------------------------------------------------------
-
-def test_body_ratio_range():
-    result = add_candle_features(make_ohlcv())
-    assert (result["body_ratio"] >= 0.0).all()
-    assert (result["body_ratio"] <= 1.0).all()
-
-
-def test_body_ratio_full_body():
-    """open=0, close=10, high=10, low=0 → body fills entire range → 1.0."""
-    result = add_candle_features(_bar(0, 10, 0, 10))
-    assert result["body_ratio"].iloc[0] == pytest.approx(1.0, abs=1e-5)
-
-
-def test_body_ratio_doji():
-    """open == close, high != low → body ratio near 0."""
-    result = add_candle_features(_bar(5, 10, 0, 5))
-    assert result["body_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-5)
-
-
-def test_body_ratio_zero_range_bar():
-    """All OHLC equal (zero-range bar) — should not raise."""
-    result = add_candle_features(_bar(100, 100, 100, 100))
-    assert 0.0 <= result["body_ratio"].iloc[0] <= 1.0
-
-
-# ---------------------------------------------------------------------------
-# Feature 2 & 3: upper/lower wick ratios
-# ---------------------------------------------------------------------------
-
-def test_upper_wick_ratio_range():
-    result = add_candle_features(make_ohlcv())
-    assert (result["upper_wick_ratio"] >= 0.0).all()
-    assert (result["upper_wick_ratio"] <= 1.0).all()
-
-
-def test_lower_wick_ratio_range():
-    result = add_candle_features(make_ohlcv())
-    assert (result["lower_wick_ratio"] >= 0.0).all()
-    assert (result["lower_wick_ratio"] <= 1.0).all()
-
-
-def test_wick_ratios_sum_to_one():
-    """body_ratio + upper_wick_ratio + lower_wick_ratio ≈ 1 for non-zero-range bars."""
-    df = make_ohlcv()
-    result = add_candle_features(df)
-    nonzero = (df["high"] - df["low"]) > 0
-    total = (
-        result["body_ratio"][nonzero]
-        + result["upper_wick_ratio"][nonzero]
-        + result["lower_wick_ratio"][nonzero]
-    )
-    np.testing.assert_allclose(total.values, 1.0, atol=1e-5)
-
-
-def test_pure_upper_wick():
-    """open == close == low, high > low → upper_wick_ratio ≈ 1, others ≈ 0."""
-    result = add_candle_features(_bar(0, 10, 0, 0))
-    assert result["upper_wick_ratio"].iloc[0] == pytest.approx(1.0, abs=1e-5)
-    assert result["lower_wick_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-5)
-    assert result["body_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-5)
-
-
-def test_pure_lower_wick():
-    """open == close == high, low < high → lower_wick_ratio ≈ 1, others ≈ 0."""
-    result = add_candle_features(_bar(10, 10, 0, 10))
-    assert result["lower_wick_ratio"].iloc[0] == pytest.approx(1.0, abs=1e-5)
-    assert result["upper_wick_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-5)
-    assert result["body_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Feature 4: candle_type
+# Feature 1: candle_type
 # ---------------------------------------------------------------------------
 
 def test_candle_type_valid_values():
@@ -229,7 +157,7 @@ def test_candle_type_neutral():
 
 
 # ---------------------------------------------------------------------------
-# Feature 5: engulf_count
+# Feature 2: engulf_count
 # ---------------------------------------------------------------------------
 
 def test_engulf_count_range():
@@ -289,7 +217,7 @@ def test_engulf_count_custom_lookback():
 
 
 # ---------------------------------------------------------------------------
-# Feature 6: momentum_speed_ratio
+# Feature 3: momentum_speed_ratio
 # ---------------------------------------------------------------------------
 
 def test_momentum_speed_ratio_range():
@@ -358,11 +286,97 @@ def test_momentum_speed_ratio_flat_stays_neutral():
 
 
 # ---------------------------------------------------------------------------
+# Feature 4: wick_rejection
+# ---------------------------------------------------------------------------
+
+def test_wick_rejection_range():
+    result = add_candle_features(make_ohlcv())
+    assert (result["wick_rejection"] >= -1.0).all()
+    assert (result["wick_rejection"] <= 1.0).all()
+
+
+def test_wick_rejection_pure_lower_wick_is_positive():
+    """open==close==high, long lower wick → bullish rejection → positive."""
+    result = add_candle_features(_bar(10, 10, 0, 10))
+    assert result["wick_rejection"].iloc[0] > 0.0
+
+
+def test_wick_rejection_pure_upper_wick_is_negative():
+    """open==close==low, long upper wick → bearish rejection → negative."""
+    result = add_candle_features(_bar(0, 10, 0, 0))
+    assert result["wick_rejection"].iloc[0] < 0.0
+
+
+def test_wick_rejection_symmetric_bar_near_zero():
+    """Equal upper and lower wicks → rejection near 0."""
+    result = add_candle_features(_bar(5, 10, 0, 5))
+    assert result["wick_rejection"].iloc[0] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_wick_rejection_full_body_near_zero():
+    """Full body bar (no wicks) → both wicks zero → rejection = 0."""
+    result = add_candle_features(_bar(0, 10, 0, 10))
+    assert result["wick_rejection"].iloc[0] == pytest.approx(0.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: dir_consistency
+# ---------------------------------------------------------------------------
+
+def test_dir_consistency_range():
+    result = add_candle_features(make_ohlcv())
+    assert (result["dir_consistency"] >= 0.0).all()
+    assert (result["dir_consistency"] <= 1.0).all()
+
+
+def test_dir_consistency_all_bullish_is_one():
+    """N consecutive bullish bars → all agree → 1.0 (after warmup)."""
+    n = 20
+    closes = np.arange(1, n + 1, dtype=np.float64)
+    df = pd.DataFrame({
+        "open":   closes - 0.5,
+        "high":   closes + 0.1,
+        "low":    closes - 0.6,
+        "close":  closes,
+        "volume": [1000.0] * n,
+    })
+    result = add_candle_features(df, direction_window=5)
+    assert result["dir_consistency"].iloc[-1] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_dir_consistency_alternating_is_low():
+    """Alternating up/down bars → no full agreement across the window.
+
+    With window=5 and strictly alternating directions the current bar's
+    direction appears either 2 or 3 times out of 5 (0.4 or 0.6), never
+    approaching the perfect-streak value of 1.0.
+    """
+    n = 20
+    closes = np.array([100.0 + (1 if i % 2 == 0 else -1) * 0.5 for i in range(n)])
+    df = pd.DataFrame({
+        "open":   np.roll(closes, 1),
+        "high":   closes + 0.1,
+        "low":    closes - 0.1,
+        "close":  closes,
+        "volume": [1000.0] * n,
+    })
+    result = add_candle_features(df, direction_window=5)
+    assert result["dir_consistency"].iloc[-1] < 1.0
+
+
+def test_dir_consistency_doji_is_neutral():
+    """Doji bar (open == close) → 0.5 regardless of prior bars."""
+    df = _bar(100, 101, 99, 100)  # open == close
+    result = add_candle_features(df)
+    assert result["dir_consistency"].iloc[0] == pytest.approx(0.5, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
 # Integration: candle psychology columns flow through derive_features
 # ---------------------------------------------------------------------------
 
 def test_derive_features_contains_cp_columns():
-    """All 6 candle psychology columns must appear in derive_features output."""
+    """All 5 candle psychology columns must appear in derive_features output."""
     df = pd.DataFrame({
         "datetime": pd.date_range("2024-01-02 09:30", periods=300, freq="5min"),
         **{col: make_ohlcv(300)[col] for col in ("open", "high", "low", "close", "volume")},
@@ -372,6 +386,16 @@ def test_derive_features_contains_cp_columns():
         assert col in features.columns, f"derive_features missing candle psychology col: {col}"
 
 
+def test_derive_features_bar_size_vs_session_present():
+    """bar_size_vs_session must appear in derive_features output."""
+    df = pd.DataFrame({
+        "datetime": pd.date_range("2024-01-02 09:30", periods=300, freq="5min"),
+        **{col: make_ohlcv(300)[col] for col in ("open", "high", "low", "close", "volume")},
+    })
+    features = derive_features(df, "ES")
+    assert "bar_size_vs_session" in features.columns
+
+
 def test_derive_features_cp_columns_no_all_nan():
     """Candle psychology columns should have valid (non-NaN) values after warm-up."""
     df = pd.DataFrame({
@@ -379,12 +403,14 @@ def test_derive_features_cp_columns_no_all_nan():
         **{col: make_ohlcv(300)[col] for col in ("open", "high", "low", "close", "volume")},
     })
     features = derive_features(df, "ES")
-    for col in _CP_COLS:
+    all_cp_cols = _CP_COLS + ["bar_size_vs_session"]
+    for col in all_cp_cols:
         assert features[col].notna().any(), f"{col} is entirely NaN"
 
 
 def test_derive_features_cp_in_model_feature_columns():
     """All 6 candle psychology features must be in get_model_feature_columns()."""
     cols = get_model_feature_columns()
-    for col in _CP_COLS:
+    all_cp_cols = _CP_COLS + ["bar_size_vs_session"]
+    for col in all_cp_cols:
         assert col in cols, f"{col} missing from get_model_feature_columns()"

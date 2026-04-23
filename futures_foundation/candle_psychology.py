@@ -7,13 +7,14 @@ No CISD, OTE, or strategy-specific logic here.
 Public API:
     add_candle_features(df) -> pd.DataFrame
         Accepts df with columns: open, high, low, close, volume
-        Returns df with 6 new columns appended:
-            body_ratio, upper_wick_ratio, lower_wick_ratio,
-            candle_type, engulf_count, momentum_speed_ratio
+        Returns df with 5 new columns appended:
+            candle_type, engulf_count, momentum_speed_ratio,
+            wick_rejection, dir_consistency
 
 Config params (pass overrides to add_candle_features):
     ENGULF_LOOKBACK = 5
     MOMENTUM_WINDOW = 20
+    DIRECTION_WINDOW = 5
 """
 
 import numpy as np
@@ -22,42 +23,41 @@ import pandas as pd
 
 ENGULF_LOOKBACK = 5
 MOMENTUM_WINDOW = 20
+DIRECTION_WINDOW = 5
 
 
 def add_candle_features(
     df: pd.DataFrame,
     engulf_lookback: int = ENGULF_LOOKBACK,
     momentum_window: int = MOMENTUM_WINDOW,
+    direction_window: int = DIRECTION_WINDOW,
 ) -> pd.DataFrame:
     """
-    Append 6 candle psychology features to an OHLCV DataFrame.
+    Append 5 candle psychology features to an OHLCV DataFrame.
 
     Args:
         df: DataFrame with columns [open, high, low, close, volume]
         engulf_lookback: Prior bars checked for body engulfing (default 5)
         momentum_window: Rolling window for impulse/retrace speed ratio (default 20)
+        direction_window: Rolling window for directional consistency (default 5)
 
     Returns:
-        Copy of df with 6 new float32 columns appended.
+        Copy of df with 5 new float32 columns appended.
     """
     df = df.copy()
 
     o, h, l, c = df["open"], df["high"], df["low"], df["close"]
     bar_range = h - l + 1e-9
 
-    body_abs = (c - o).abs()
     body_high = pd.concat([o, c], axis=1).max(axis=1)
     body_low = pd.concat([o, c], axis=1).min(axis=1)
     upper_wick = h - body_high
     lower_wick = body_low - l
 
-    body_ratio = (body_abs / bar_range).clip(0.0, 1.0)
+    body_ratio = ((c - o).abs() / bar_range).clip(0.0, 1.0)
     upper_wick_ratio = (upper_wick / bar_range).clip(0.0, 1.0)
     lower_wick_ratio = (lower_wick / bar_range).clip(0.0, 1.0)
 
-    df["body_ratio"] = body_ratio.astype(np.float32)
-    df["upper_wick_ratio"] = upper_wick_ratio.astype(np.float32)
-    df["lower_wick_ratio"] = lower_wick_ratio.astype(np.float32)
     df["candle_type"] = _classify_candle(
         body_ratio, upper_wick_ratio, lower_wick_ratio, c >= o
     ).astype(np.float32)
@@ -66,6 +66,12 @@ def add_candle_features(
     )
     df["momentum_speed_ratio"] = _compute_momentum_speed_ratio(
         c.values, window=momentum_window, index=df.index
+    )
+    # Signed wick asymmetry: positive = lower wick dominates (bullish rejection),
+    # negative = upper wick dominates (bearish rejection). Range [-1, 1].
+    df["wick_rejection"] = ((lower_wick - upper_wick) / bar_range).clip(-1.0, 1.0).astype(np.float32)
+    df["dir_consistency"] = _compute_dir_consistency(
+        c.values, o.values, window=direction_window, index=df.index
     )
 
     return df
@@ -171,5 +177,32 @@ def _compute_momentum_speed_ratio(
         impulse_speed = impulse_pts / impulse_bars
         retrace_speed = retrace_pts / retrace_bars
         result[idx] = float(np.clip(impulse_speed / (retrace_speed + 1e-9), 0.0, 10.0))
+
+    return pd.Series(result, index=index)
+
+
+def _compute_dir_consistency(
+    closes: np.ndarray,
+    opens: np.ndarray,
+    window: int = DIRECTION_WINDOW,
+    index=None,
+) -> pd.Series:
+    """
+    Fraction of the last `window` bars (including current) whose close-open
+    direction matches the current bar's direction.
+
+    Doji bars (close == open) return 0.5 (neutral). Range: [0.0, 1.0].
+    """
+    directions = np.sign(closes - opens)
+    n = len(directions)
+    result = np.full(n, 0.5, dtype=np.float32)
+
+    for i in range(n):
+        curr = directions[i]
+        if curr == 0:
+            continue
+        start = max(0, i - window + 1)
+        w = directions[start: i + 1]
+        result[i] = float((w == curr).sum() / len(w))
 
     return pd.Series(result, index=index)
