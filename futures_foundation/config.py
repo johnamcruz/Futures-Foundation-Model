@@ -58,6 +58,12 @@ class FFMConfig(PretrainedConfig):
         layer_norm_eps: float = 1e-6,
         initializer_range: float = 0.02,
         label_smoothing: float = 0.0,
+        # Per-head loss weights. Volatility is upweighted (most reliable signal);
+        # structure is downweighted (noisier even after confidence masking).
+        regime_loss_weight: float = 1.0,
+        volatility_loss_weight: float = 2.0,
+        structure_loss_weight: float = 0.75,
+        range_loss_weight: float = 1.5,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -80,6 +86,10 @@ class FFMConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
         self.label_smoothing = label_smoothing
+        self.regime_loss_weight = regime_loss_weight
+        self.volatility_loss_weight = volatility_loss_weight
+        self.structure_loss_weight = structure_loss_weight
+        self.range_loss_weight = range_loss_weight
 
         assert hidden_size % num_attention_heads == 0, (
             f"hidden_size ({hidden_size}) must be divisible by "

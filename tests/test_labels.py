@@ -18,6 +18,7 @@ REGIME_LABELS = _mod.REGIME_LABELS
 VOLATILITY_LABELS = _mod.VOLATILITY_LABELS
 STRUCTURE_LABELS = _mod.STRUCTURE_LABELS
 RANGE_LABELS = _mod.RANGE_LABELS
+LABEL_CONFIDENCE_SENTINEL = _mod.LABEL_CONFIDENCE_SENTINEL
 
 
 def make_features(close_array):
@@ -67,7 +68,7 @@ def test_regime_dtype_and_range():
     labels = generate_regime_labels(make_trend())
     valid = labels.dropna()
     assert str(valid.dtype) == "Int64"
-    assert set(valid.unique()).issubset({0, 1, 2, 3})
+    assert set(valid.unique()).issubset({LABEL_CONFIDENCE_SENTINEL, 0, 1, 2, 3})
 
 
 def test_regime_trailing_nans():
@@ -153,7 +154,7 @@ def test_structure_dtype_and_range():
     labels = generate_structure_labels(make_trend())
     valid = labels.dropna()
     assert str(valid.dtype) == "Int64"
-    assert set(valid.unique()).issubset({0, 1, 2})
+    assert set(valid.unique()).issubset({LABEL_CONFIDENCE_SENTINEL, 0, 1, 2})
 
 
 def test_structure_trailing_nans():
@@ -178,14 +179,15 @@ def test_structure_bullish_when_upside_dominates():
     assert (test_window == 0).any(), "Bullish label should appear when upside >> downside"
 
 
-def test_structure_all_labels_appear():
-    """Normal volatile data should produce all 3 structure labels (0, 1, 2)."""
+def test_structure_confident_labels_appear():
+    """Normal volatile data should produce both bullish and bearish structure labels."""
     np.random.seed(42)
     close = 100 + np.cumsum(np.random.randn(500) * 2)
     labels = generate_structure_labels(make_features(close))
-    valid = labels.dropna()
-    assert set(valid.unique()) == {0, 1, 2}, \
-        f"Expected labels {{0,1,2}}, got {sorted(valid.unique())}"
+    confident = labels.dropna()
+    confident = confident[confident != LABEL_CONFIDENCE_SENTINEL]
+    assert {0, 1}.issubset(set(confident.unique())), \
+        f"Expected both bullish (0) and bearish (1), got {sorted(confident.unique())}"
 
 
 def test_structure_downtrend_bearish():

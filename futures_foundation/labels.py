@@ -22,6 +22,11 @@ market behavior.
 import numpy as np
 import pandas as pd
 
+# Sentinel used in regime and structure labels to mark low-confidence samples.
+# CrossEntropyLoss(ignore_index=LABEL_CONFIDENCE_SENTINEL) skips these during training.
+# Distinct from pd.NA (forward data unavailable); these rows remain in the dataset
+# but contribute no gradient for the masked head.
+LABEL_CONFIDENCE_SENTINEL = -100
 
 REGIME_LABELS = {0: "trending_up", 1: "trending_down", 2: "rotational", 3: "volatile_expansion"}
 VOLATILITY_LABELS = {0: "low", 1: "normal", 2: "elevated", 3: "extreme"}
@@ -55,20 +60,30 @@ def generate_regime_labels(features, horizon=20, atr_expansion_threshold=1.5):
     ret_std = fwd_return.rolling(200, min_periods=50).std()
     ret_threshold = ret_std * 0.8  # ~0.8 sigma = meaningful move
 
-    labels = pd.Series(2, index=features.index, dtype="Int64")  # default: rotational
+    # Default to ambiguous — only assign a label when the signal is unambiguous.
+    # Borderline bars (near threshold) contribute noise, not signal; mask them out.
+    labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
 
-    # Mask rows where forward data is unavailable
+    # Mask rows where forward data is unavailable (tail of series)
     valid = fwd_return.notna() & fwd_volatility.notna() & vol_threshold.notna() & ret_threshold.notna()
 
-    # Volatile: high forward vol regardless of direction
+    # Volatile: fwd_vol clearly above threshold
     volatile_mask = (fwd_volatility > vol_threshold) & valid
     labels[volatile_mask] = 3
 
-    # Trending (only if not volatile)
-    labels[(fwd_return > ret_threshold) & (~volatile_mask) & valid] = 0
-    labels[(fwd_return < -ret_threshold) & (~volatile_mask) & valid] = 1
+    # Clear non-volatile: below 85% of threshold (avoids borderline expansion)
+    not_volatile_mask = (fwd_volatility < vol_threshold * 0.85) & valid
 
-    # NaN where we can't compute forward labels
+    # Trending: return clearly exceeds threshold AND not volatile
+    labels[(fwd_return > ret_threshold) & not_volatile_mask] = 0
+    labels[(fwd_return < -ret_threshold) & not_volatile_mask] = 1
+
+    # Rotational: return clearly below 60% of threshold AND clearly not volatile.
+    # This is the tightest class — only labeled when consolidation is unambiguous.
+    rotational_mask = (fwd_return.abs() < ret_threshold * 0.6) & not_volatile_mask
+    labels[rotational_mask] = 2
+
+    # pd.NA where forward data can't be computed (dataset will drop these rows)
     labels[~valid] = pd.NA
 
     return labels
@@ -123,11 +138,15 @@ def generate_structure_labels(features, horizon=20):
     # Asymmetry ratio: >1 = bullish, <1 = bearish
     asymmetry = upside / downside.replace(0, np.nan)
 
-    labels = pd.Series(2, index=features.index, dtype="Int64")  # default: mixed
+    # Default to ambiguous — only label when the directional bias is decisive.
+    # Thresholds of 2.5 / 0.4 (reciprocals) require upside or downside to be
+    # 2.5x the opposing move; the former 1.5 / 0.67 thresholds were too noisy
+    # at a 20-bar horizon, producing a large "mixed" class that was unlearnable.
+    labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
 
     valid = asymmetry.notna()
-    labels[valid & (asymmetry > 1.5)] = 0   # bullish
-    labels[valid & (asymmetry < 0.67)] = 1  # bearish
+    labels[valid & (asymmetry > 2.5)] = 0   # clearly bullish
+    labels[valid & (asymmetry < 0.4)] = 1   # clearly bearish
     labels[~valid] = pd.NA
 
     return labels
