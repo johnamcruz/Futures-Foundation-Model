@@ -108,6 +108,43 @@ def test_regime_output_length():
     assert len(labels) == 250
 
 
+def test_regime_sentinel_fires_in_mixed_market():
+    """Noisy random-walk market has borderline bars — sentinel fraction must be > 15%."""
+    np.random.seed(99)
+    close = 100 + np.cumsum(np.random.randn(600) * 1.5)
+    labels = generate_regime_labels(make_features(close))
+    non_nan = labels.dropna()
+    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
+    assert sentinel_frac > 0.15, (
+        f"Expected >15% ambiguous sentinel bars in mixed market, got {sentinel_frac:.1%}. "
+        "Confidence masking may not be firing."
+    )
+
+
+def test_regime_no_sentinel_in_monotone_trend():
+    """Strong monotone uptrend: every non-tail bar has a clear signal — sentinel fraction = 0%."""
+    labels = generate_regime_labels(make_trend(n=400, start=100, end=800))
+    non_nan = labels.dropna()
+    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
+    assert sentinel_frac < 0.05, (
+        f"Expected <5% sentinel in monotone uptrend, got {sentinel_frac:.1%}. "
+        "Strong trends should be unambiguously labeled."
+    )
+
+
+def test_regime_volatile_market_fires_class_3():
+    """High-vol regime: volatile-expansion label (3) appears — not masked as ambiguous."""
+    np.random.seed(11)
+    close = 100 + np.cumsum(np.random.randn(600) * 8)  # large per-bar moves
+    labels = generate_regime_labels(make_features(close))
+    non_nan = labels.dropna()
+    assert (non_nan == 3).sum() > 0, (
+        "High-volatility series must produce volatile-expansion label (3). "
+        "Confidence masking must not suppress class-3 from clear volatility spikes."
+    )
+
+
+
 # =============================================================================
 # generate_volatility_labels
 # =============================================================================
@@ -201,6 +238,144 @@ def test_structure_output_length():
     features = make_trend(n=250)
     labels = generate_structure_labels(features)
     assert len(labels) == 250
+
+
+def test_structure_sentinel_fires_in_random_walk():
+    """Random walk: ~equal up/down exploration puts many bars in the ambiguous asymmetry zone."""
+    np.random.seed(42)
+    close = 100 + np.cumsum(np.random.randn(600) * 2)
+    labels = generate_structure_labels(make_features(close))
+    non_nan = labels.dropna()
+    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
+    assert sentinel_frac > 0.20, (
+        f"Expected >20% sentinel in random walk (asymmetry near 1), got {sentinel_frac:.1%}. "
+        "Confidence masking may not be firing on structure."
+    )
+
+
+def test_structure_sentinel_low_in_strong_downtrend():
+    """Strong downtrend: downside clearly >> upside everywhere → low sentinel, mostly bearish."""
+    labels = generate_structure_labels(make_downtrend(n=400, start=800, end=100))
+    non_nan = labels.dropna()
+    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
+    bearish_frac = (non_nan == 1).sum() / len(non_nan)
+    assert sentinel_frac < 0.30, (
+        f"Expected <30% sentinel in clear downtrend, got {sentinel_frac:.1%}."
+    )
+    assert bearish_frac > 0.50, (
+        f"Expected >50% bearish in strong downtrend, got {bearish_frac:.1%}."
+    )
+
+
+def test_structure_no_class_2_produced():
+    """Confidence masking replaces 'mixed' (class 2) with sentinel — class 2 must never appear."""
+    np.random.seed(42)
+    close = 100 + np.cumsum(np.random.randn(500) * 2)
+    labels = generate_structure_labels(make_features(close))
+    non_nan = labels.dropna()
+    assert 2 not in set(non_nan.unique()), (
+        "Structure label class 2 (mixed) must not appear in output. "
+        "Ambiguous bars should be LABEL_CONFIDENCE_SENTINEL, not class 2."
+    )
+
+
+# =============================================================================
+# Market-scenario coverage — all four label types across all regime types
+# =============================================================================
+
+
+def test_all_four_label_types_in_trending_market():
+    """Trending market: all four label generators run without error and have valid output."""
+    labels = generate_all_labels(make_trend(n=400, start=100, end=800))
+    valid = labels.dropna()
+    assert len(valid) > 0
+    assert "regime_label" in labels.columns
+    assert "volatility_label" in labels.columns
+    assert "structure_label" in labels.columns
+    assert "range_label" in labels.columns
+
+
+def test_all_four_label_types_in_downtrend():
+    """Downtrend: all four label generators run without error and produce valid output."""
+    labels = generate_all_labels(make_downtrend(n=400, start=800, end=100))
+    valid = labels.dropna()
+    assert len(valid) > 0
+    assert (valid["regime_label"].isin([LABEL_CONFIDENCE_SENTINEL, 0, 1, 2, 3])).all()
+    assert (valid["structure_label"].isin([LABEL_CONFIDENCE_SENTINEL, 0, 1, 2])).all()
+
+
+def test_all_four_label_types_in_volatile_market():
+    """High-vol choppy market: all generators run; volatile-expansion labels appear for regime."""
+    np.random.seed(11)
+    close = 100 + np.cumsum(np.random.randn(600) * 8)
+    feat = make_features(close)
+    labels = generate_all_labels(feat)
+    non_nan = labels.dropna()
+    assert len(non_nan) > 0
+    assert (non_nan["regime_label"] == 3).any(), "Volatile-expansion (3) must appear in high-vol regime"
+    assert (non_nan["volatility_label"] >= 2).any(), "Elevated/extreme vol must appear in high-vol data"
+
+
+def test_all_four_label_types_in_sideways_market():
+    """Sideways choppy market: all generators run and return plausible label distributions."""
+    np.random.seed(21)
+    close = 100 + np.random.randn(500) * 0.5  # bounded noise, no trend
+    feat = make_features(close)
+    labels = generate_all_labels(feat)
+    non_nan = labels.dropna()
+    assert len(non_nan) > 0
+    # Rotational regime should be substantial in a flat market
+    regime_non_nan = non_nan["regime_label"]
+    assert (regime_non_nan == 2).sum() > len(regime_non_nan) * 0.20, (
+        "Rotational label (2) should dominate a flat sideways market"
+    )
+
+
+def test_regime_sentinel_does_not_replace_volatile_class():
+    """High-vol data: volatile bars are labeled 3, NOT masked as sentinel.
+    The sentinel only applies to trending/rotational ambiguity, not to clear volatility expansions.
+    """
+    np.random.seed(11)
+    close = 100 + np.cumsum(np.random.randn(600) * 8)
+    labels = generate_regime_labels(make_features(close))
+    non_nan = labels.dropna()
+    # Clearly volatile bars (fwd_vol >> vol_threshold) should get label 3, not sentinel
+    assert (non_nan == 3).sum() > 0, (
+        "Volatility-expansion bars should get label 3. "
+        "Confidence masking must not suppress class-3 for clear vol expansions."
+    )
+    assert (non_nan == 3).sum() > (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() * 0.1, (
+        "In high-vol market, there should be substantial class-3 labels relative to sentinel."
+    )
+
+
+# =============================================================================
+# No-sentinel invariant for reliable heads
+# =============================================================================
+
+
+def test_volatility_has_no_sentinel():
+    """Volatility labels are always real classes (0-3) — no confidence masking is applied."""
+    np.random.seed(5)
+    close = 100 + np.cumsum(np.random.randn(500) * 2)
+    labels = generate_volatility_labels(make_features(close))
+    non_nan = labels.dropna()
+    assert LABEL_CONFIDENCE_SENTINEL not in set(non_nan.unique()), (
+        "Volatility head must never produce LABEL_CONFIDENCE_SENTINEL; "
+        "it uses percentile ranking, not threshold masking."
+    )
+
+
+def test_range_has_no_sentinel():
+    """Range labels are always real classes (0-4) — no confidence masking is applied."""
+    np.random.seed(5)
+    close = 100 + np.cumsum(np.random.randn(500) * 2)
+    labels = generate_range_labels(make_features(close))
+    non_nan = labels.dropna()
+    assert LABEL_CONFIDENCE_SENTINEL not in set(non_nan.unique()), (
+        "Range head must never produce LABEL_CONFIDENCE_SENTINEL; "
+        "quintile bucketing is always well-defined."
+    )
 
 
 # =============================================================================

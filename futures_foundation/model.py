@@ -378,8 +378,14 @@ class FFMForPretraining(PreTrainedModel):
 
         for labels, logits, loss_fn, weight in labels_and_logits:
             if labels is not None:
-                total_loss = total_loss + weight * loss_fn(logits, labels)
-                weight_sum += weight
+                task_loss = loss_fn(logits, labels)
+                # CrossEntropyLoss returns nan when every sample in the batch is the
+                # ignore_index (all-sentinel batch for a masked head). Skip that head
+                # so the combined loss stays finite — semantically identical to not
+                # providing those labels at all.
+                if torch.isfinite(task_loss):
+                    total_loss = total_loss + weight * task_loss
+                    weight_sum += weight
 
         if weight_sum > 0:
             output["loss"] = total_loss / weight_sum
