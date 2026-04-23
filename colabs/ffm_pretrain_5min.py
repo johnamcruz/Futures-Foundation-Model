@@ -1,6 +1,6 @@
 # # 🚀 Futures Foundation Model — Pretraining Pipeline
 #
-# **Step 1:** Prepare data (derive 66 features + generate 4 labels from raw OHLCV)
+# **Step 1:** Prepare data (derive 67 features + generate 4 labels from raw OHLCV)
 # **Step 2:** Pretrain backbone (4-task self-supervised learning)
 #
 # ## Prerequisites
@@ -84,7 +84,8 @@ import torch
 if torch.cuda.is_available():
     print(f"🖥️  GPU: {torch.cuda.get_device_name(0)}")
     print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"   AMP: ✅ enabled — float16 forward passes")
+    bf16 = torch.cuda.is_bf16_supported()
+    print(f"   AMP: ✅ enabled — {'bfloat16 (A100/H100)' if bf16 else 'float16 (T4)'}")
 else:
     print("⚠️  No GPU detected! Go to Runtime → Change runtime type → T4 GPU")
 
@@ -263,7 +264,10 @@ np.random.seed(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = device.type == "cuda"
-print(f"Device: {device}  |  AMP: {'✅ float16' if USE_AMP else '❌ disabled (no GPU)'}")
+USE_BF16 = USE_AMP and torch.cuda.is_bf16_supported()   # A100/H100: no overflow, no GradScaler needed
+AMP_DTYPE = torch.bfloat16 if USE_BF16 else torch.float16
+amp_label = "bfloat16 (A100)" if USE_BF16 else ("float16 (T4)" if USE_AMP else "disabled")
+print(f"Device: {device}  |  AMP: {amp_label}")
 
 # ─── Training Config ───
 STABLE_EPOCHS   = 3
@@ -361,14 +365,17 @@ combined_val   = FFMMultiInstrumentDataset(val_datasets)
 
 total_seqs = len(combined_train) + len(combined_val)
 actual_val_pct = len(combined_val) / total_seqs if total_seqs > 0 else 0
-print(f"\n  Total: {len(combined_train):,} train / {len(combined_val):,} val "
-      f"({actual_val_pct:.1%} val — expected ~{VAL_RATIO:.0%})")
+# NOTE: val sequences appear inflated vs bar ratio because val uses stride=1 while
+# train uses stride=TRAIN_STRIDE. ~50% sequences is expected when TRAIN_STRIDE=4
+# and val_ratio=0.20 — what matters is ~20% of bars are in val blocks, not sequences.
+print(f"\n  Total: {len(combined_train):,} train / {len(combined_val):,} val sequences")
+print(f"  ({actual_val_pct:.1%} of sequences, ~{VAL_RATIO:.0%} of bars — stride inflates val count)")
 
 if actual_val_pct < 0.05:
     raise RuntimeError(
         f"Val set is only {actual_val_pct:.1%} — interleaved split may have failed."
     )
-print(f"  ✅ Split looks correct\n")
+print(f"  ✅ Split correct — {VAL_RATIO:.0%} of bars are in validation\n")
 
 train_loader, val_loader = create_dataloaders(
     combined_train, combined_val, batch_size=BATCH_SIZE, num_workers=2,
@@ -407,8 +414,8 @@ def lr_lambda(step):
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-# FIX #5: AMP GradScaler — only active when running on GPU
-scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
+# GradScaler only needed for float16 — bfloat16 has float32 exponent range, no gradient underflow
+scaler = torch.amp.GradScaler("cuda") if (USE_AMP and not USE_BF16) else None
 
 # ─── Save config ───
 ckpt_dir = Path(CHECKPOINT_DIR)
@@ -426,14 +433,14 @@ with open(ckpt_dir / "train_args.json", "w") as f:
         "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
         "val_ratio": VAL_RATIO, "patience": PATIENCE, "seed": SEED,
         "max_ratio": MAX_RATIO, "ratio_patience": RATIO_PATIENCE,
-        "amp": USE_AMP,
+        "amp": amp_label,
         "val_split": "interleaved_train_val_split (n_blocks=20)",
         "fixes": [
             "candle_types passed to model",
             "interleaved val split",
             f"stride_train={TRAIN_STRIDE}",
             f"label_smoothing={LABEL_SMOOTHING}",
-            "AMP float16",
+            f"AMP {amp_label}",
             "per-task loss logging",
         ],
     }, f, indent=2)
@@ -465,7 +472,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, device):
         }
         optimizer.zero_grad()
 
-        with torch.autocast("cuda", enabled=USE_AMP):  # FIX #5
+        with torch.autocast("cuda", dtype=AMP_DTYPE, enabled=USE_AMP):
             outputs = model(**kwargs)
 
         loss = outputs["loss"]
@@ -530,7 +537,7 @@ def evaluate(model, loader, device):
             "structure_labels":  batch["structure_label"].to(device),
             "range_labels":      batch["range_label"].to(device),
         }
-        with torch.autocast("cuda", enabled=USE_AMP):  # FIX #5
+        with torch.autocast("cuda", dtype=AMP_DTYPE, enabled=USE_AMP):
             outputs = model(**kwargs)
 
         total_loss += outputs["loss"].item()

@@ -4,7 +4,7 @@ Feature derivation from raw OHLCV data.
 All features are instrument-agnostic via ATR normalization or z-scores,
 ensuring the backbone learns transferable patterns across instruments.
 
-Feature Groups (66 continuous model features; candle_type uses its own embedding):
+Feature Groups (67 continuous model features; candle_type uses its own embedding):
     1. Bar anatomy (8) — body, wicks, range normalized by ATR
     2. Returns & momentum (8) — multi-horizon returns + acceleration
     3. Volume dynamics (6) — relative volume, delta proxy
@@ -13,7 +13,7 @@ Feature Groups (66 continuous model features; candle_type uses its own embedding
     6. Market structure (9) — swing distances, range position multi-lookback
     7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
     8. Candle psychology (5) — engulf count, momentum speed, wick rejection, dir consistency, bar size vs session
-    9. HTF price context (5) — position within ongoing 1H/4H candle, ATR-normalized return from HTF open, cross-TF alignment
+    9. HTF price context (6) — position within ongoing 1H/4H candle, ATR-normalized return from HTF open, cross-TF alignment, 1H structure
    10. Volume absorption & order flow (4) — cumulative signed volume, absorption signal, momentum alignment
 """
 
@@ -210,6 +210,8 @@ def derive_features(
     _1h_struct_htf[_1h_dir.shift(3).isna()] = pd.NA
     _1h_period = df["datetime"].dt.ceil("60min")
     features["_1h_structure"] = _1h_period.map(_1h_struct_htf).astype("Int64")
+    # Also expose as a continuous model feature (-1 / 0 / +1 → float32)
+    features["htf_1h_structure"] = features["_1h_structure"].astype(float).fillna(0.0).astype(np.float32)
 
     # --- Group 8: Candle Psychology (6 features) ---
     df_cp = _add_candle_features(df)
@@ -528,6 +530,7 @@ def get_model_feature_columns() -> list:
         "htf_1h_close_pos", "htf_1h_ret",
         "htf_4h_close_pos", "htf_4h_ret",
         "htf_tf_alignment",
+        "htf_1h_structure",
         # Group 10: Volume Absorption & Order Flow
         "vol_cum_signed_5", "vol_cum_signed_20",
         "vol_absorption", "vol_momentum_align",
