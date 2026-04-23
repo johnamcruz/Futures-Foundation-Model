@@ -376,7 +376,7 @@ def test_dir_consistency_doji_is_neutral():
 # ---------------------------------------------------------------------------
 
 def test_derive_features_contains_cp_columns():
-    """All 5 candle psychology columns must appear in derive_features output."""
+    """All candle psychology columns (including candle_type) must appear in derive_features output."""
     df = pd.DataFrame({
         "datetime": pd.date_range("2024-01-02 09:30", periods=300, freq="5min"),
         **{col: make_ohlcv(300)[col] for col in ("open", "high", "low", "close", "volume")},
@@ -403,14 +403,17 @@ def test_derive_features_cp_columns_no_all_nan():
         **{col: make_ohlcv(300)[col] for col in ("open", "high", "low", "close", "volume")},
     })
     features = derive_features(df, "ES")
-    all_cp_cols = _CP_COLS + ["bar_size_vs_session"]
+    all_cp_cols = _CP_COLS + ["bar_size_vs_session", "candle_type"]
     for col in all_cp_cols:
         assert features[col].notna().any(), f"{col} is entirely NaN"
 
 
 def test_derive_features_cp_in_model_feature_columns():
-    """All 6 candle psychology features must be in get_model_feature_columns()."""
+    """Numeric candle psychology features must be in get_model_feature_columns().
+    candle_type is excluded — it goes through its own model embedding, not the
+    continuous feature matrix."""
     cols = get_model_feature_columns()
-    all_cp_cols = _CP_COLS + ["bar_size_vs_session"]
-    for col in all_cp_cols:
+    numeric_cp_cols = [c for c in _CP_COLS if c != "candle_type"] + ["bar_size_vs_session"]
+    for col in numeric_cp_cols:
         assert col in cols, f"{col} missing from get_model_feature_columns()"
+    assert "candle_type" not in cols, "candle_type should use embedding, not feature matrix"

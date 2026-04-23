@@ -424,7 +424,7 @@ def get_model_feature_columns() -> list:
         "swp_1h_bull_active", "swp_1h_bear_active", "swp_1h_age_norm", "swp_1h_magnitude",
         "swp_4h_bull_active", "swp_4h_bear_active", "swp_4h_age_norm", "swp_4h_magnitude",
         "swp_tf_alignment", "swp_dominant_dir",
-        # Group 8: Candle Psychology
-        "candle_type", "engulf_count", "momentum_speed_ratio",
+        # Group 8: Candle Psychology (candle_type excluded — uses its own model embedding)
+        "engulf_count", "momentum_speed_ratio",
         "wick_rejection", "dir_consistency", "bar_size_vs_session",
     ]

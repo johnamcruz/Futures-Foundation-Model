@@ -75,7 +75,7 @@ def make_ohlcv(n=600, freq="5min", seed=0):
 # ---------------------------------------------------------------------------
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 58
+    assert len(get_model_feature_columns()) == 57
 
 
 def test_sweep_column_names_in_list():

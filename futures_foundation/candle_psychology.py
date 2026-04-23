@@ -19,6 +19,7 @@ Config params (pass overrides to add_candle_features):
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 ENGULF_LOOKBACK = 5
@@ -119,21 +120,14 @@ def _compute_engulf_count(
     the current bar's body (body-to-body engulfing).
 
     Range: [0.0, lookback]. First bar is always 0.0.
+    Vectorized: O(lookback) passes over the array, no Python per-bar loop.
     """
-    n = len(body_highs)
-    result = np.zeros(n, dtype=np.float32)
-
-    for idx in range(1, n):
-        cbh = body_highs[idx]
-        cbl = body_lows[idx]
-        count = 0
-        for i in range(1, lookback + 1):
-            if idx - i < 0:
-                break
-            if body_highs[idx - i] <= cbh and body_lows[idx - i] >= cbl:
-                count += 1
-        result[idx] = float(count)
-
+    result = np.zeros(len(body_highs), dtype=np.float32)
+    for i in range(1, lookback + 1):
+        # Prior bar at offset i is engulfed by the current bar when its body
+        # fits entirely within the current bar's body boundaries.
+        engulfed = (body_highs[:-i] <= body_highs[i:]) & (body_lows[:-i] >= body_lows[i:])
+        result[i:] += engulfed
     return pd.Series(result, index=index)
 
 
@@ -149,35 +143,46 @@ def _compute_momentum_speed_ratio(
     and the remaining bars to window end as the retrace.
 
     Range: [0.0, 10.0] (clipped). Default 1.0 for bars before `window`.
+    Vectorized via sliding_window_view — no Python per-bar loop.
     """
     n = len(closes)
     result = np.ones(n, dtype=np.float32)
 
-    for idx in range(window, n):
-        wc = closes[idx - window: idx]
-        peak_idx = int(np.argmax(wc))
-        trough_idx = int(np.argmin(wc))
+    if n <= window:
+        return pd.Series(result, index=index)
 
-        impulse_pts = wc[peak_idx] - wc[trough_idx]  # always >= 0 (max - min)
-        if impulse_pts == 0.0:
-            # Flat window — no meaningful move; leave as neutral 1.0
-            continue
+    # wc[k] = closes[k : k+window] for k=0..n-window-1
+    # result[window+k] gets the ratio for wc[k]
+    wc = sliding_window_view(closes.astype(np.float64), window_shape=window)[:-1]
 
-        if peak_idx > trough_idx:
-            # Trough → Peak: upward impulse
-            impulse_bars = max(peak_idx - trough_idx, 1)
-            retrace_bars = max((window - 1) - peak_idx, 1)
-            retrace_pts = abs(wc[-1] - wc[peak_idx])
-        else:
-            # Peak → Trough: downward impulse
-            impulse_bars = max(trough_idx - peak_idx, 1)
-            retrace_bars = max((window - 1) - trough_idx, 1)
-            retrace_pts = abs(wc[-1] - wc[trough_idx])
+    peak_idxs = np.argmax(wc, axis=1)
+    trough_idxs = np.argmin(wc, axis=1)
 
-        impulse_speed = impulse_pts / impulse_bars
-        retrace_speed = retrace_pts / retrace_bars
-        result[idx] = float(np.clip(impulse_speed / (retrace_speed + 1e-9), 0.0, 10.0))
+    rows = np.arange(len(wc))
+    peak_vals = wc[rows, peak_idxs]
+    trough_vals = wc[rows, trough_idxs]
+    impulse_pts = peak_vals - trough_vals  # always >= 0
 
+    is_up = peak_idxs > trough_idxs
+    last_vals = wc[:, -1]
+
+    impulse_bars = np.maximum(
+        np.where(is_up, peak_idxs - trough_idxs, trough_idxs - peak_idxs), 1
+    ).astype(np.float64)
+    retrace_pts = np.where(
+        is_up, np.abs(last_vals - peak_vals), np.abs(last_vals - trough_vals)
+    )
+    retrace_bars = np.maximum(
+        np.where(is_up, (window - 1) - peak_idxs, (window - 1) - trough_idxs), 1
+    ).astype(np.float64)
+
+    ratio = np.clip(
+        (impulse_pts / impulse_bars) / (retrace_pts / retrace_bars + 1e-9), 0.0, 10.0
+    )
+    # Flat windows (no meaningful move) stay at neutral 1.0
+    ratio = np.where(impulse_pts == 0.0, 1.0, ratio)
+
+    result[window:] = ratio.astype(np.float32)
     return pd.Series(result, index=index)
 
 

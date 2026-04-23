@@ -44,6 +44,7 @@ class FFMDataset(Dataset):
         self._session_ids = self.features_df.get("sess_id", pd.Series(0, index=self.features_df.index)).values.astype(np.int64)
         self._time_of_day = self.features_df.get("sess_time_of_day", pd.Series(0.0, index=self.features_df.index)).values.astype(np.float32)
         self._day_of_week = self.features_df.get("tmp_day_of_week", pd.Series(0, index=self.features_df.index)).values.astype(np.int64)
+        self._candle_types = self.features_df.get("candle_type", pd.Series(0, index=self.features_df.index)).fillna(0).values.astype(np.int64)
 
         if self.labels_df is not None:
             self._label_arrays = {col: self.labels_df[col].values.astype(np.int64) for col in self.labels_df.columns}
@@ -59,6 +60,7 @@ class FFMDataset(Dataset):
 
         sample = {
             "features": torch.from_numpy(self._feature_matrix[start:end]),
+            "candle_types": torch.from_numpy(self._candle_types[start:end]),
             "instrument_ids": torch.tensor(self._instrument_ids[start], dtype=torch.long),
             "session_ids": torch.from_numpy(self._session_ids[start:end]),
             "time_of_day": torch.from_numpy(self._time_of_day[start:end]),

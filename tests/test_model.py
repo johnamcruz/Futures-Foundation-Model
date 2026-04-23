@@ -52,7 +52,7 @@ def small_config():
 def test_config_creation():
     c = FFMConfig()
     assert c.hidden_size == 256
-    assert c.num_features == 58
+    assert c.num_features == 57
 
 
 def test_config_save_load():
@@ -125,6 +125,7 @@ def test_pretrain_backward():
     m = FFMForPretraining(c)
     out = m(
         features=torch.randn(4, SEQ_LEN, c.num_features),
+        candle_types=torch.randint(0, 6, (4, SEQ_LEN)),
         time_of_day=torch.rand(4, SEQ_LEN),
         day_of_week=torch.randint(0, 5, (4, SEQ_LEN)),
         instrument_ids=torch.randint(0, 4, (4,)),
@@ -255,3 +256,6 @@ def test_dataset():
     sample = ds[0]
     assert sample["features"].shape == (SEQ_LEN, len(get_model_feature_columns()))
     assert not torch.isnan(sample["features"]).any()
+    assert "candle_types" in sample
+    assert sample["candle_types"].shape == (SEQ_LEN,)
+    assert sample["candle_types"].dtype == torch.int64
