@@ -121,20 +121,14 @@ def generate_structure_labels(features, horizon=20):
     """
     Label current market structure confirmed by future price expansion.
 
-    Two-factor confirmation: a bar is labeled only when both signals agree:
-      1. Current 1H market structure (majority direction of last 3 completed 1H bars)
-      2. Future price expansion over the next horizon bars favors the same direction
+    A bar is labeled when future price expansion clearly favors one direction:
+      0 = bullish: upside / downside > 1.5  (upside is 1.5× the downside)
+      1 = bearish: upside / downside < 0.67 (downside is 1.5× the upside)
+      SENTINEL: asymmetry near 1.0 (ambiguous expansion), or forward data unavailable
 
-    This design keeps the forward-looking nature that drives useful pretraining
-    representations, while requiring current structure alignment so the backbone
-    learns that real structural moves have BOTH a recognizable current state AND
-    a confirming future expansion. Conflicting signals → SENTINEL (no gradient).
-
-    Classes:
-      0 = confirmed bullish: 1H structure bullish AND future expands more upward
-      1 = confirmed bearish: 1H structure bearish AND future expands more downward
-      SENTINEL: disagreement between current structure and future expansion, or
-                neutral 1H structure, or insufficient history
+    The 1H structure direction is NOT a gate here — it is provided to the model
+    as a soft input feature (htf_1h_structure) so the backbone can learn when
+    structure alignment matters without hard-filtering the label set.
     """
     close = features["_close"]
 
@@ -145,24 +139,15 @@ def generate_structure_labels(features, horizon=20):
     downside = (close - fwd_min) / close
     asymmetry = upside / downside.replace(0, np.nan)
 
-    # Current 1H structure state (metadata column, computed in derive_features)
-    # +1 = 1H bullish (≥2 of last 3 completed 1H bars closed higher)
-    # -1 = 1H bearish (≥2 of last 3 completed 1H bars closed lower)
-    #  0 / NaN = neutral or no history
-    struct_1h = features.get("_1h_structure", pd.Series(0, index=features.index))
-
     labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
 
-    # Both asymmetry and 1H structure must be available
-    valid = asymmetry.notna() & struct_1h.notna()
+    valid = asymmetry.notna()
 
-    # Confirmed bullish: current 1H is bullish AND future expansion favors upside
-    # Threshold 1.5/0.67 (reciprocal) is relaxed vs single-factor 2.5/0.4 because
-    # double confirmation compensates for the looser asymmetry requirement.
-    labels[valid & (struct_1h == 1) & (asymmetry > 1.5)] = 0
+    # Bullish: upside clearly dominates (upside > 1.5× downside)
+    labels[valid & (asymmetry > 1.5)] = 0
 
-    # Confirmed bearish: current 1H is bearish AND future expansion favors downside
-    labels[valid & (struct_1h == -1) & (asymmetry < 0.67)] = 1
+    # Bearish: downside clearly dominates (downside > 1.5× upside)
+    labels[valid & (asymmetry < 0.67)] = 1
 
     labels[~valid] = pd.NA
 

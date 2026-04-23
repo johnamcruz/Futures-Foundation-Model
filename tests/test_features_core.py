@@ -45,7 +45,14 @@ def make_ohlcv(n=300, seed=42, bar_freq_min=5):
 # =============================================================================
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 66
+    assert len(get_model_feature_columns()) == 67
+
+
+def test_htf_1h_structure_feature():
+    features = derive_features(make_ohlcv(), "ES")
+    assert "htf_1h_structure" in features.columns
+    assert features["htf_1h_structure"].dtype == np.float32
+    assert features["htf_1h_structure"].isin([-1.0, 0.0, 1.0]).all()
 
 
 def test_all_model_columns_present():

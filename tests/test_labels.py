@@ -192,10 +192,8 @@ def test_volatility_output_length():
 # =============================================================================
 
 def test_structure_dtype_and_range():
-    # Provide alternating 1H structure so some confirmed labels fire alongside sentinels
     n = 400
-    struct = np.where(np.arange(n) < n // 2, 1, -1)
-    labels = generate_structure_labels(make_features(np.linspace(100, 400, n), struct_1h=struct))
+    labels = generate_structure_labels(make_features(np.linspace(100, 400, n)))
     valid = labels.dropna()
     assert str(valid.dtype) == "Int64"
     assert set(valid.unique()).issubset({LABEL_CONFIDENCE_SENTINEL, 0, 1})  # no class 2
@@ -208,28 +206,26 @@ def test_structure_trailing_nans():
 
 def test_structure_bullish_when_upside_dominates():
     """
-    Bullish label (0) appears when upside >> downside AND 1H structure is bullish.
-    Construct: small dip, then large rally. Provide struct_1h=1 (bullish precondition).
+    Bullish label (0) appears when forward upside >> downside.
+    Construct: small dip, then large rally. Upside asymmetry fires the label.
     """
     n = 150
     close = np.full(n, 100.0)
     close[60:70] = np.linspace(100, 90, 10)    # dip: establishes downside
     close[70:110] = np.linspace(90, 300, 40)   # strong rally: establishes upside
     close[110:] = 300.0
-    features = make_features(close, struct_1h=1)   # 1H structure is bullish
+    features = make_features(close)
     labels = generate_structure_labels(features, horizon=30)
     test_window = labels.iloc[30:58].dropna()
     assert (test_window == 0).any(), \
-        "Bullish label should appear when upside >> downside AND 1H structure is bullish"
+        "Bullish label should appear when forward upside >> downside"
 
 
 def test_structure_confident_labels_appear():
-    """Volatile data with alternating 1H structure should produce both bullish and bearish labels."""
+    """Volatile data (random walk) should produce both bullish and bearish labels from asymmetry alone."""
     np.random.seed(42)
     close = 100 + np.cumsum(np.random.randn(500) * 2)
-    # First half bullish 1H structure, second half bearish — both directions should fire
-    struct = np.where(np.arange(500) < 250, 1, -1)
-    labels = generate_structure_labels(make_features(close, struct_1h=struct))
+    labels = generate_structure_labels(make_features(close))
     confident = labels.dropna()
     confident = confident[confident != LABEL_CONFIDENCE_SENTINEL]
     assert {0, 1}.issubset(set(confident.unique())), \
@@ -237,8 +233,8 @@ def test_structure_confident_labels_appear():
 
 
 def test_structure_downtrend_bearish():
-    """Strong downtrend + bearish 1H structure: confirmed bearish label (1) dominates."""
-    features = make_features(np.linspace(800, 100, 400), struct_1h=-1)
+    """Strong downtrend: downside asymmetry fires bearish label (1), which dominates."""
+    features = make_features(np.linspace(800, 100, 400))
     labels = generate_structure_labels(features)
     valid = labels.dropna()
     assert (valid == 1).sum() > len(valid) * 0.5
@@ -251,29 +247,27 @@ def test_structure_output_length():
 
 
 def test_structure_sentinel_fires_in_random_walk():
-    """Random walk with mixed 1H structure: many bars fail the two-factor confirmation → sentinel."""
+    """Random walk: many bars have asymmetry near 1.0 → sentinel (neither label fires)."""
     np.random.seed(42)
     close = 100 + np.cumsum(np.random.randn(600) * 2)
-    # Rapidly alternating 1H structure — disagreement between structure and expansion is common
-    struct = np.where(np.arange(600) % 40 < 15, 1, np.where(np.arange(600) % 40 < 30, -1, 0))
-    labels = generate_structure_labels(make_features(close, struct_1h=struct))
+    labels = generate_structure_labels(make_features(close))
     non_nan = labels.dropna()
     sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
-    assert sentinel_frac > 0.20, (
-        f"Expected >20% sentinel in random walk (asymmetry near 1 or structure disagreement), "
+    assert sentinel_frac > 0.10, (
+        f"Expected >10% sentinel in random walk (asymmetry near 1), "
         f"got {sentinel_frac:.1%}. Confidence masking may not be firing on structure."
     )
 
 
 def test_structure_sentinel_low_in_strong_downtrend():
-    """Strong downtrend + bearish 1H structure: two-factor confirmation fires → mostly bearish, low sentinel."""
-    features = make_features(np.linspace(800, 100, 400), struct_1h=-1)
+    """Strong downtrend: downside asymmetry dominates → mostly bearish, low sentinel."""
+    features = make_features(np.linspace(800, 100, 400))
     labels = generate_structure_labels(features)
     non_nan = labels.dropna()
     sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
     bearish_frac = (non_nan == 1).sum() / len(non_nan)
     assert sentinel_frac < 0.30, (
-        f"Expected <30% sentinel in clear downtrend with bearish 1H structure, got {sentinel_frac:.1%}."
+        f"Expected <30% sentinel in clear downtrend, got {sentinel_frac:.1%}."
     )
     assert bearish_frac > 0.50, (
         f"Expected >50% bearish in strong downtrend, got {bearish_frac:.1%}."

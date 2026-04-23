@@ -401,7 +401,7 @@ class FFMForPretraining(PreTrainedModel):
 
         for task_name, labels, logits, loss_fn, weight in labels_and_logits:
             if labels is not None:
-                task_loss = loss_fn(logits, labels)
+                task_loss = loss_fn(logits.float(), labels)  # fp32 for stable loss under AMP
                 # CrossEntropyLoss returns nan when every sample in the batch is the
                 # ignore_index (all-sentinel batch for a masked head). Skip that head
                 # so the combined loss stays finite — semantically identical to not
