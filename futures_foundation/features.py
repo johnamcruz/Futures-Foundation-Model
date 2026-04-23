@@ -4,7 +4,7 @@ Feature derivation from raw OHLCV data.
 All features are instrument-agnostic via ATR normalization or z-scores,
 ensuring the backbone learns transferable patterns across instruments.
 
-Feature Groups (58 total):
+Feature Groups (63 total):
     1. Bar anatomy (8) — body, wicks, range normalized by ATR
     2. Returns & momentum (8) — multi-horizon returns + acceleration
     3. Volume dynamics (6) — relative volume, delta proxy
@@ -13,6 +13,7 @@ Feature Groups (58 total):
     6. Market structure (9) — swing distances, range position multi-lookback
     7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
     8. Candle psychology (6) — candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session
+    9. HTF price context (5) — position within ongoing 1H/4H candle, ATR-normalized return from HTF open, cross-TF alignment
 """
 
 import numpy as np
@@ -207,6 +208,33 @@ def derive_features(
     _sess_avg_range = bar_range.groupby(_sess_keys).expanding().mean().reset_index(level=0, drop=True)
     features["bar_size_vs_session"] = (bar_range / _sess_avg_range.replace(0, np.nan)).fillna(1.0).astype(np.float32)
 
+    # --- Group 9: HTF Price Context (5 features) ---
+    # Where is the current bar within the *ongoing* 1H and 4H candle?
+    # These answer "early or late in an HTF move?" — information the sweep
+    # features don't carry. Using the ongoing candle (not last completed)
+    # matches what's observable in real-time at each bar.
+    htf1h_open, htf1h_high, htf1h_low = _compute_htf_context(df, 60)
+    htf4h_open, htf4h_high, htf4h_low = _compute_htf_context(df, 240)
+
+    htf1h_range = (htf1h_high - htf1h_low).replace(0, np.nan)
+    htf4h_range = (htf4h_high - htf4h_low).replace(0, np.nan)
+
+    features["htf_1h_close_pos"] = (
+        ((df["close"] - htf1h_low) / htf1h_range).fillna(0.5).clip(0.0, 1.0).astype(np.float32)
+    )
+    features["htf_1h_ret"] = (
+        ((df["close"] - htf1h_open) / atr_safe).fillna(0.0).astype(np.float32)
+    )
+    features["htf_4h_close_pos"] = (
+        ((df["close"] - htf4h_low) / htf4h_range).fillna(0.5).clip(0.0, 1.0).astype(np.float32)
+    )
+    features["htf_4h_ret"] = (
+        ((df["close"] - htf4h_open) / atr_safe).fillna(0.0).astype(np.float32)
+    )
+    features["htf_tf_alignment"] = (
+        np.sign(features["htf_1h_ret"]) * np.sign(features["htf_4h_ret"])
+    ).astype(np.float32)
+
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
     features["tmp_hour"] = df["datetime"].dt.hour
@@ -309,6 +337,32 @@ def _classify_structure(swing_highs, swing_lows, length):
     structure[hh & hl] = 1
     structure[lh & ll] = -1
     return structure
+
+
+def _compute_htf_context(
+    df: pd.DataFrame,
+    minutes: int,
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    For each base bar, return the open, cumulative-high, and cumulative-low of
+    the *ongoing* HTF candle that contains that bar.
+
+    Uses dt.ceil(rule) to group base bars into HTF periods, matching the
+    closed="right", label="right" convention used by _resample_ohlcv.
+    The first bar of each period sets the HTF open; subsequent bars expand
+    the running high/low — no lookahead into the future of that candle.
+
+    Returns (htf_open, htf_high_so_far, htf_low_so_far), all pandas Series
+    aligned to df.index.
+    """
+    rule = f"{minutes}min"
+    period = df["datetime"].dt.ceil(rule)
+
+    htf_open = df.groupby(period)["open"].transform("first")
+    htf_high = df.groupby(period)["high"].cummax()
+    htf_low = df.groupby(period)["low"].cummin()
+
+    return htf_open, htf_high, htf_low
 
 
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -427,4 +481,8 @@ def get_model_feature_columns() -> list:
         # Group 8: Candle Psychology (candle_type excluded — uses its own model embedding)
         "engulf_count", "momentum_speed_ratio",
         "wick_rejection", "dir_consistency", "bar_size_vs_session",
+        # Group 9: HTF Price Context
+        "htf_1h_close_pos", "htf_1h_ret",
+        "htf_4h_close_pos", "htf_4h_ret",
+        "htf_tf_alignment",
     ]
