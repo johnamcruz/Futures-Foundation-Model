@@ -124,6 +124,7 @@ class FFMBackbone(PreTrainedModel):
             nn.GELU(),
             nn.Linear(config.hidden_size, config.hidden_size),
         )
+        self.input_dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # Learnable CLS token
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -195,7 +196,7 @@ class FFMBackbone(PreTrainedModel):
         batch_size, seq_len, _ = features.shape
 
         # Project input features
-        hidden_states = self.input_projection(features)
+        hidden_states = self.input_dropout(self.input_projection(features))
 
         # Prepend CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
@@ -352,7 +353,7 @@ class FFMForPretraining(PreTrainedModel):
             (range_labels, range_logits),
         ]
 
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing)
         total_loss = torch.tensor(0.0, device=features.device)
         num_tasks = 0
 

@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .features import get_model_feature_columns
 
@@ -103,6 +103,42 @@ def temporal_train_val_split(features_df, labels_df, val_ratio=0.15, seq_len=64,
     train_ds = FFMDataset(features_df.iloc[:split_idx].copy(), labels_df.iloc[:split_idx].copy(), seq_len=seq_len, stride=stride_train)
     val_ds = FFMDataset(features_df.iloc[split_idx:].copy(), labels_df.iloc[split_idx:].copy(), seq_len=seq_len, stride=stride_val)
     return train_ds, val_ds
+
+
+def interleaved_train_val_split(
+    features_df, labels_df, val_ratio=0.20, seq_len=64, n_blocks=20
+) -> Tuple[List[FFMDataset], List[FFMDataset]]:
+    """
+    Distributes val uniformly across time rather than concentrating it at the end.
+
+    Divides the series into n_blocks equal blocks; every (1/val_ratio)-th block → val.
+    With val_ratio=0.20, n_blocks=20: blocks 5,10,15,20 are val — covering the full
+    time range instead of just the most recent 20%.
+
+    Returns:
+        train_datasets: List[FFMDataset] — one dataset per training block
+        val_datasets:   List[FFMDataset] — one dataset per val block
+
+    Caller should wrap each list in FFMMultiInstrumentDataset or extend a shared list.
+    """
+    n_bars = len(features_df)
+    val_every = max(2, round(1.0 / val_ratio))  # 0.20 → 5
+    block_size = n_bars // n_blocks
+
+    train_datasets: List[FFMDataset] = []
+    val_datasets: List[FFMDataset] = []
+
+    for i in range(n_blocks):
+        start = i * block_size
+        end = (i + 1) * block_size if i < n_blocks - 1 else n_bars
+        f_blk = features_df.iloc[start:end].reset_index(drop=True)
+        l_blk = labels_df.iloc[start:end].reset_index(drop=True)
+        if len(f_blk) < seq_len + 1:
+            continue
+        ds = FFMDataset(f_blk, l_blk, seq_len=seq_len)
+        (val_datasets if (i + 1) % val_every == 0 else train_datasets).append(ds)
+
+    return train_datasets, val_datasets
 
 
 def create_dataloaders(train_dataset, val_dataset, batch_size=256, num_workers=4):
