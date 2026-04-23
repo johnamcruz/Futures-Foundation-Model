@@ -18,6 +18,13 @@ import pytest
 _REPO_ROOT = Path(__file__).parent.parent
 _FEATURES_PATH = _REPO_ROOT / "futures_foundation" / "features.py"
 
+# Pre-register candle_psychology so features.py relative import resolves
+_CP_PATH = _REPO_ROOT / "futures_foundation" / "candle_psychology.py"
+_cp_spec = importlib.util.spec_from_file_location("futures_foundation.candle_psychology", _CP_PATH)
+_cp_mod = importlib.util.module_from_spec(_cp_spec)
+sys.modules["futures_foundation.candle_psychology"] = _cp_mod
+_cp_spec.loader.exec_module(_cp_mod)
+
 def _load():
     spec = importlib.util.spec_from_file_location("ffm_features", _FEATURES_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -68,7 +75,7 @@ def make_ohlcv(n=600, freq="5min", seed=0):
 # ---------------------------------------------------------------------------
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 52
+    assert len(get_model_feature_columns()) == 58
 
 
 def test_sweep_column_names_in_list():

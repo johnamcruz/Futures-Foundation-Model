@@ -36,7 +36,7 @@ class FFMConfig(PretrainedConfig):
     def __init__(
         self,
         # --- Input dimensions ---
-        num_features: int = 52,
+        num_features: int = 58,
         # --- Transformer backbone ---
         hidden_size: int = 256,
         num_hidden_layers: int = 6,
