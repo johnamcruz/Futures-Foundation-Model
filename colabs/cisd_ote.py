@@ -14,7 +14,14 @@
 #            Zone geometry features (zone_height_vs_atr) now use the same ATR
 #            the backbone was trained on, ensuring consistent normalisation
 #   [Cell 3] Timestamp alignment: dict loop O(n) → pd.reindex O(n log n)
-#   [Cell 2] Cache dir v6 → v7; v6 outputs are preserved for baseline comparison
+#   [Cell 2] Cache dir v6 → v7; v6 outputs preserved for baseline comparison
+#   [Cell 4] Dual checkpoint: saves best val_loss AND best signal_f1 separately;
+#            loads best signal_f1 for test evaluation (matches v5.1 behaviour)
+#   [Cell 4] Warm start: each fold inherits weights from the previous fold
+#            (F1→F2→F3→F4), matching v5.1's progressive training
+#   [Cell 4] ONNX device fix: model moved to CPU before export (v5.1 had this bug)
+#   [Cell 5] Full evaluation: AvgRR, PF, per-fold breakdown, learning verification
+#            vs mechanical baselines — matches v5.1 output format for comparison
 # Changes from v5.1 (carried forward from v6.0):
 #   BACKBONE_PATH / PREPARED_DIR: 5min_ prefix fix
 #   SEQ_LEN: 64 → 96 (matches pretraining context window)
@@ -979,7 +986,7 @@ def evaluate(model, loader, loss_fn, device):
     total_loss = 0.0; n_batches = 0
     correct = total = 0
     tp = fp = fn = 0
-    all_conf = []; all_labels = []; all_preds = []
+    all_conf = []; all_labels = []; all_preds = []; all_max_rr = []
 
     for batch in loader:
         feats    = batch['features'].to(device)
@@ -1009,6 +1016,7 @@ def evaluate(model, loader, loss_fn, device):
         all_conf.extend(out['confidence'].cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
         all_preds.extend(preds.cpu().tolist())
+        all_max_rr.extend(batch['max_rr'].tolist())
 
     precision = tp / max(tp + fp, 1)
     recall    = tp / max(tp + fn, 1)
@@ -1018,7 +1026,8 @@ def evaluate(model, loader, loss_fn, device):
         'acc':       correct / max(total, 1),
         'precision': precision, 'recall': recall, 'f1': f1,
         'tp': tp, 'fp': fp, 'fn': fn,
-        'all_conf': all_conf, 'all_labels': all_labels, 'all_preds': all_preds,
+        'all_conf': all_conf, 'all_labels': all_labels,
+        'all_preds': all_preds, 'all_max_rr': all_max_rr,
     }
 
 
@@ -1074,12 +1083,14 @@ def load_fold_data(fold, tickers, ffm_dir, cisd_dir, seq_len):
     return train_dsets, val_dsets, test_dsets
 
 
-def train_fold(fold, config):
+def train_fold(fold, config, warm_start_state=None):
     fold_name = fold['name']
-    ckpt_path = os.path.join(OUTPUT_DIR, f'{fold_name}_{CONFIG_HASH}_best.pt')
+    ckpt_path    = os.path.join(OUTPUT_DIR, f'{fold_name}_{CONFIG_HASH}_loss.pt')
+    ckpt_f1_path = os.path.join(OUTPUT_DIR, f'{fold_name}_{CONFIG_HASH}_f1.pt')
 
     print(f"\n{'='*60}")
     print(f'  FOLD {fold_name} | train<{fold["train_end"]} val<{fold["val_end"]}')
+    print(f'  {"Warm start from prev fold" if warm_start_state is not None else "Cold start"}')
     print(f"{'='*60}")
 
     # ── Build datasets ──
@@ -1094,7 +1105,6 @@ def train_fold(fold, config):
     val_ds   = ConcatDataset(val_dsets)
     test_ds  = ConcatDataset(test_dsets) if test_dsets else None
 
-    # Build signal index list across ConcatDataset for balanced sampling
     train_ds.signal_indices = []
     train_ds.seq_len = SEQ_LEN
     train_ds._labels = np.concatenate([
@@ -1117,15 +1127,18 @@ def train_fold(fold, config):
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=2, pin_memory=True)
 
-    # ── Model ──
+    # ── Model — warm start from prev fold or fresh backbone ──
     model = HybridCISDModel(config, NUM_CISD_FEATURES, NUM_LABELS,
                             risk_weight=RISK_WEIGHT).to(device)
 
-    if os.path.exists(BACKBONE_PATH):
+    if warm_start_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in warm_start_state.items()})
+        print(f'  ✅ Warm start from prev fold')
+    elif os.path.exists(BACKBONE_PATH):
         print(f'  Loading backbone: {BACKBONE_PATH}')
         model.load_backbone(BACKBONE_PATH)
     else:
-        print(f'  ⚠ Backbone not found at {BACKBONE_PATH} — training from scratch')
+        print(f'  ⚠ Backbone not found — training from scratch')
 
     model.freeze_backbone(FREEZE_RATIO)
 
@@ -1142,19 +1155,26 @@ def train_fold(fold, config):
     )
 
     # ── Resume check ──
-    start_epoch = 0
-    best_val_loss = float('inf')
-    patience_ctr  = 0
-    ratio_bad_ctr = 0
+    start_epoch     = 0
+    best_val_loss   = float('inf')
+    best_val_epoch  = -1
+    best_signal_f1  = 0.0
+    best_f1_epoch   = -1
+    best_f1_state   = None
+    patience_ctr    = 0
+    ratio_bad_ctr   = 0
 
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         if ckpt.get('config_hash') == CONFIG_HASH:
             model.load_state_dict(ckpt['model_state'])
             optimizer.load_state_dict(ckpt['optim_state'])
-            start_epoch   = ckpt['epoch'] + 1
-            best_val_loss = ckpt['val_loss']
-            patience_ctr  = ckpt.get('patience_ctr', 0)
+            start_epoch    = ckpt['epoch'] + 1
+            best_val_loss  = ckpt['val_loss']
+            best_val_epoch = ckpt['epoch']
+            best_signal_f1 = ckpt.get('best_signal_f1', 0.0)
+            best_f1_epoch  = ckpt.get('best_f1_epoch', -1)
+            patience_ctr   = ckpt.get('patience_ctr', 0)
             print(f'  ▶ Resumed from epoch {start_epoch} (val_loss={best_val_loss:.4f})')
         else:
             print(f'  ℹ Config changed — starting fresh')
@@ -1166,59 +1186,91 @@ def train_fold(fold, config):
 
         scheduler.step()
 
-        ratio = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
+        ratio    = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         improved = va['loss'] < best_val_loss
+        f1_improved = va['f1'] > best_signal_f1
         save_str = ''
 
         if improved:
-            best_val_loss = va['loss']
-            patience_ctr  = 0
-            ratio_bad_ctr = 0
+            best_val_loss  = va['loss']
+            best_val_epoch = epoch
+            patience_ctr   = 0
+            ratio_bad_ctr  = 0
             torch.save({
                 'config_hash': CONFIG_HASH, 'epoch': epoch,
                 'model_state': model.state_dict(),
                 'optim_state': optimizer.state_dict(),
                 'val_loss': best_val_loss, 'patience_ctr': patience_ctr,
+                'best_signal_f1': best_signal_f1, 'best_f1_epoch': best_f1_epoch,
             }, ckpt_path)
-            save_str = ' ✅ SAVE'
+            save_str += ' 💾L'
+
+        if f1_improved:
+            best_signal_f1 = va['f1']
+            best_f1_epoch  = epoch
+            best_f1_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            save_str += ' 📈F'
 
         overfitting = ratio > MAX_RATIO
         if overfitting:
             ratio_bad_ctr += 1
-            ratio_str = f'🚨 ratio={ratio:.2f} ({ratio_bad_ctr}/{RATIO_PATIENCE})'
+            ratio_str = f'🚨 {ratio:.2f} ({ratio_bad_ctr}/{RATIO_PATIENCE})'
         else:
             ratio_bad_ctr = 0
-            ratio_str = f'OK ratio={ratio:.2f}'
+            ratio_str = f'OK {ratio:.2f}'
 
         if not improved:
             patience_ctr += 1
 
-        print(f'  E{epoch+1:2d}/{EPOCHS} | '
+        print(f'  {fold_name} E{epoch+1:2d}/{EPOCHS} | '
               f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
-              f'Acc:{va["acc"]:.3f} P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
+              f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
               f'{ratio_str}{save_str}')
 
         if patience_ctr >= PATIENCE:
             print(f'  ⏹ Early stop — patience {PATIENCE} exhausted'); break
         if ratio_bad_ctr >= RATIO_PATIENCE:
-            print(f'  ⏹ Early stop — overfitting ratio exceeded {RATIO_PATIENCE}x'); break
+            print(f'  ⏹ Early stop — overfitting {RATIO_PATIENCE}x'); break
 
-    # ── Load best and evaluate on test ──
-    if os.path.exists(ckpt_path):
-        best = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(best['model_state'])
+    # ── Checkpoint summary ──
+    print(f'\n  Checkpoint summary:')
+    print(f'    val_loss   : epoch={best_val_epoch+1} score={best_val_loss:.4f}')
+    print(f'    signal_f1  : epoch={best_f1_epoch+1}  score={best_signal_f1:.4f}')
+    print(f'  ✅ Loading best signal_f1 (epoch {best_f1_epoch+1}) for test')
+
+    # Load best F1 checkpoint for test evaluation
+    if best_f1_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_f1_state.items()})
+    elif os.path.exists(ckpt_path):
+        model.load_state_dict(
+            torch.load(ckpt_path, map_location=device, weights_only=False)['model_state'])
+
+    # Capture model state for warm-starting the next fold
+    next_fold_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     test_metrics = None
     if test_ds is not None and len(test_ds) > 0:
         test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
                                  num_workers=2, pin_memory=True)
         test_metrics = evaluate(model, test_loader, loss_fn, device)
-        print(f'\n  📊 Test | Acc:{test_metrics["acc"]:.3f} '
-              f'P:{test_metrics["precision"]:.3f} R:{test_metrics["recall"]:.3f} '
-              f'F1:{test_metrics["f1"]:.3f} | '
-              f'TP:{test_metrics["tp"]} FP:{test_metrics["fp"]} FN:{test_metrics["fn"]}')
+        n_test = len(test_ds)
+        n_sig  = test_metrics['tp'] + test_metrics['fn']
+        print(f'\n  {fold_name} test: {n_test:,} bars | {n_sig} actual signals')
+        print(f'  {"Thresh":>6}  {"Predicted":>9}  {"Correct":>7}  {"Precision":>9}  {"Recall":>6}  {"Rate"}')
+        conf_arr  = np.array(test_metrics['all_conf'])
+        lab_arr   = np.array(test_metrics['all_labels'])
+        pred_arr  = np.array(test_metrics['all_preds'])
+        for thresh in [0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
+            m = conf_arr >= thresh
+            if m.sum() == 0: continue
+            htp = ((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum()
+            hfp = ((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum()
+            hfn = ((pred_arr[m] == 0) & (lab_arr[m] > 0)).sum()
+            hp  = htp / max(htp + hfp, 1); hr = htp / max(htp + hfn, 1)
+            ok  = ' ✅' if hp >= 0.40 else ''
+            print(f'  {thresh:>6.2f}  {htp+hfp:>9}  {htp:>7}  {hp:>9.3f}  {hr:>6.3f}  {(htp+hfp)/max(len(lab_arr),1)*100:.1f}%{ok}')
 
-    return model, test_metrics
+    return model, test_metrics, next_fold_state
 
 
 # ── Walk-forward ──
@@ -1237,13 +1289,14 @@ config = FFMConfig(
     label_smoothing=FOCAL_SMOOTHING,
 )
 
-fold_results = {}
-last_model   = None
+fold_results    = {}
+last_model      = None
+prev_fold_state = None   # warm-start: each fold inherits weights from the prior
 
 for fold in FOLDS:
-    result = train_fold(fold, config)
+    result = train_fold(fold, config, warm_start_state=prev_fold_state)
     if result is not None:
-        last_model, test_metrics = result
+        last_model, test_metrics, prev_fold_state = result
         fold_results[fold['name']] = test_metrics
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -1251,16 +1304,16 @@ for fold in FOLDS:
 # ── ONNX export (F4 model — production deployment) ──
 if last_model is not None:
     print(f'\n{"="*60}\n  ONNX EXPORT\n{"="*60}')
-    last_model.eval()
+    last_model.eval().cpu()   # ONNX export requires all tensors on the same device
     onnx_path = os.path.join(OUTPUT_DIR, 'cisd_ote_hybrid.onnx')
     dummy = {
-        'features':       torch.randn(1, SEQ_LEN, len(get_model_feature_columns())).to(device),
-        'cisd_features':  torch.randn(1, NUM_CISD_FEATURES).to(device),
-        'candle_types':   torch.zeros(1, SEQ_LEN, dtype=torch.long).to(device),
-        'instrument_ids': torch.zeros(1, dtype=torch.long).to(device),
-        'session_ids':    torch.zeros(1, SEQ_LEN, dtype=torch.long).to(device),
-        'time_of_day':    torch.zeros(1, SEQ_LEN).to(device),
-        'day_of_week':    torch.zeros(1, SEQ_LEN, dtype=torch.long).to(device),
+        'features':       torch.randn(1, SEQ_LEN, len(get_model_feature_columns())),
+        'cisd_features':  torch.randn(1, NUM_CISD_FEATURES),
+        'candle_types':   torch.zeros(1, SEQ_LEN, dtype=torch.long),
+        'instrument_ids': torch.zeros(1, dtype=torch.long),
+        'session_ids':    torch.zeros(1, SEQ_LEN, dtype=torch.long),
+        'time_of_day':    torch.zeros(1, SEQ_LEN),
+        'day_of_week':    torch.zeros(1, SEQ_LEN, dtype=torch.long),
     }
     try:
         torch.onnx.export(
@@ -1293,42 +1346,93 @@ if last_model is not None:
 
 
 # ==============================================================================
-# CELL 5 — EVALUATION SUMMARY
+# CELL 5 — WALK-FORWARD EVALUATION SUMMARY
 # ==============================================================================
 
-print(f'\n{"="*60}')
-print(f'  WALK-FORWARD RESULTS SUMMARY')
-print(f'{"="*60}')
+# Aggregate all fold test predictions
+all_conf_c   = []; all_labels_c = []; all_preds_c = []; all_rr_c = []
+for fname, metrics in fold_results.items():
+    if metrics is None: continue
+    all_conf_c.extend(metrics['all_conf'])
+    all_labels_c.extend(metrics['all_labels'])
+    all_preds_c.extend(metrics['all_preds'])
+    all_rr_c.extend(metrics['all_max_rr'])
 
-if not fold_results:
-    print('  No fold results available.')
+if not all_labels_c:
+    print('No fold results available.')
 else:
+    all_conf   = np.array(all_conf_c)
+    all_labels = np.array(all_labels_c)
+    all_preds  = np.array(all_preds_c)
+    all_rr     = np.array(all_rr_c)
+
+    n_sig = (all_labels > 0).sum()
+    print(f'\n📊 Combined ({len(all_labels):,} bars): {n_sig} signals | {len(all_labels)-n_sig} noise')
+    print(f'   Signal rate in test: {n_sig/len(all_labels)*100:.2f}%')
+
+    print(f'\n🎯 CONFIDENCE THRESHOLDS (signal_prob ≥ thresh → TRADE):')
+    print('='*72)
+    print(f'   {"Thresh":>6}  {"Trades":>6}  {"Correct":>7}  {"Prec":>6}  {"Recall":>6}  {"AvgRR":>6}  {"PF":>7}  Verdict')
+    print(f'  {"-"*66}')
+
+    for thresh in [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]:
+        mask = all_conf >= thresh
+        if mask.sum() == 0:
+            print(f'  {thresh:.2f}{"":>12}  — no trades'); continue
+        t_labels = all_labels[mask]; t_preds = all_preds[mask]; t_rr = all_rr[mask]
+        called   = t_preds > 0
+        if called.sum() == 0: continue
+        tp = (called & (t_labels > 0)).sum()
+        fp = (called & (t_labels == 0)).sum()
+        fn = (~called & (t_labels > 0)).sum()
+        trades   = int(tp + fp)
+        prec     = tp / max(trades, 1)
+        rec      = tp / max(tp + fn, 1)
+        wins_rr  = t_rr[called & (t_labels > 0)]
+        avg_rr   = float(wins_rr.mean()) if len(wins_rr) > 0 else 0.0
+        pf       = (wins_rr.sum() / fp) if fp > 0 else float('inf')
+        pf_str   = f'{pf:>7.2f}' if pf < 9999 else '    ∞  '
+        verdict  = '✅ EDGE' if prec >= 0.40 and trades >= 5 else ('⚠️ LOW' if trades < 5 else '❌')
+        print(f'  {thresh:.2f}  {trades:>6}  {int(tp):>7}  {prec:>6.3f}  {rec:>6.3f}  {avg_rr:>6.2f}  {pf_str}  {verdict}')
+
+    print(f'\n{"="*72}')
+    print(f'  📊 PER-FOLD BREAKDOWN (signal_prob ≥ 0.90)')
+    print(f'{"="*72}')
     for fname, metrics in fold_results.items():
-        if metrics is None:
-            print(f'  {fname}: no test data'); continue
-        conf_arr   = np.array(metrics['all_conf'])
-        label_arr  = np.array(metrics['all_labels'])
-        pred_arr   = np.array(metrics['all_preds'])
-        print(f'\n  {fname}:')
-        print(f'    Overall  — Acc:{metrics["acc"]:.3f} P:{metrics["precision"]:.3f} '
-              f'R:{metrics["recall"]:.3f} F1:{metrics["f1"]:.3f}')
-        print(f'    Signals  — TP:{metrics["tp"]} FP:{metrics["fp"]} FN:{metrics["fn"]}')
+        if metrics is None: print(f'  {fname}: no data'); continue
+        ca = np.array(metrics['all_conf']); la = np.array(metrics['all_labels'])
+        pa = np.array(metrics['all_preds']); ra = np.array(metrics['all_max_rr'])
+        m  = ca >= 0.90; called = pa[m] > 0
+        if called.sum() == 0: print(f'  {fname}: 0 trades at 0.90'); continue
+        tp = (called & (la[m] > 0)).sum(); fp = (called & (la[m] == 0)).sum()
+        wins_rr = ra[m][called & (la[m] > 0)]
+        avg_rr  = float(wins_rr.mean()) if len(wins_rr) > 0 else 0.0
+        pf      = wins_rr.sum() / fp if fp > 0 else float('inf')
+        pl_r    = wins_rr.sum() - fp
+        pf_str  = f'{pf:.2f}' if pf < 9999 else '∞'
+        print(f'  {fname}: {int(tp+fp)} trades | Prec:{tp/max(tp+fp,1):.3f} | '
+              f'AvgRR:{avg_rr:.2f} | PF:{pf_str} | {pl_r:+.1f}R')
 
-        # Confidence threshold sweep
-        print(f'    Conf threshold analysis:')
-        for thresh in [0.50, 0.60, 0.70, 0.80, 0.90]:
-            high_conf = conf_arr >= thresh
-            if high_conf.sum() == 0: continue
-            hc_labels = label_arr[high_conf]
-            hc_preds  = pred_arr[high_conf]
-            hc_tp = ((hc_preds > 0) & (hc_labels > 0)).sum()
-            hc_fp = ((hc_preds > 0) & (hc_labels == 0)).sum()
-            hc_fn = ((hc_preds == 0) & (hc_labels > 0)).sum()
-            hc_p  = hc_tp / max(hc_tp + hc_fp, 1)
-            hc_r  = hc_tp / max(hc_tp + hc_fn, 1)
-            print(f'      conf≥{thresh:.0%}: {high_conf.sum():,} windows | '
-                  f'P:{hc_p:.3f} R:{hc_r:.3f} | TP:{hc_tp} FP:{hc_fp}')
+    print(f'\n{"="*72}')
+    print(f'  🧠 LEARNING VERIFICATION (vs mechanical baseline)')
+    print(f'{"="*72}')
+    baseline_avg = np.mean(list(BASELINE_WR.values()))
+    print(f'  Mechanical baseline avg: {baseline_avg*100:.1f}% precision @ 1R')
+    print(f'  {"Thresh":>6}  {"Trades":>6}  {"Prec":>6}  {"vs Base":>8}  Verdict')
+    print(f'  {"-"*48}')
+    for thresh in [0.50, 0.60, 0.70, 0.80, 0.90]:
+        mask   = all_conf >= thresh
+        called = all_preds[mask] > 0
+        if called.sum() < 3: continue
+        tp_n   = (called & (all_labels[mask] > 0)).sum()
+        fp_n   = (called & (all_labels[mask] == 0)).sum()
+        prec   = tp_n / max(tp_n + fp_n, 1)
+        delta  = prec - baseline_avg
+        ok     = '✅ LEARNING' if delta > 0 else '❌ BELOW'
+        print(f'  {thresh:.2f}  {int(tp_n+fp_n):>6}  {prec:>6.3f}  {delta:>+8.1%}  {ok}')
 
+    print(f'\n  ✅ Good: precision should rise as threshold increases')
+    print(f'  ✅ Good: precision > baseline at ≥0.70')
     print(f'\n  ONNX model: {os.path.join(OUTPUT_DIR, "cisd_ote_hybrid.onnx")}')
     print(f'  Checkpoints: {OUTPUT_DIR}')
 
