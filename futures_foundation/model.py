@@ -186,10 +186,11 @@ class FFMBackbone(PreTrainedModel):
         session_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         output_sequence: bool = False,
+        causal: bool = False,
     ) -> torch.Tensor:
         """
         Args:
-            features: (batch, seq_len, num_features) — derived OHLCV features (57 continuous)
+            features: (batch, seq_len, num_features) — derived OHLCV features
             candle_types: (batch, seq_len) long in [0, 5] — routed through dedicated embedding
             time_of_day: (batch, seq_len) — fraction of day [0, 1]
             day_of_week: (batch, seq_len) — day index [0, 6]
@@ -197,6 +198,10 @@ class FFMBackbone(PreTrainedModel):
             session_ids: (batch, seq_len) — session type index
             attention_mask: (batch, seq_len) — 1 for valid, 0 for padding
             output_sequence: if True, return full sequence; else return CLS only
+            causal: if True, apply causal mask so bar i cannot attend to bar j > i.
+                    CLS (position 0) still attends to all bars so it can aggregate
+                    the full window into a summary embedding. Use this during
+                    fine-tuning when you need per-bar predictions without lookahead.
 
         Returns:
             If output_sequence=False: (batch, hidden_size) — CLS embedding
@@ -231,15 +236,31 @@ class FFMBackbone(PreTrainedModel):
             hidden_states, instrument_ids, session_ids, candle_types
         )
 
-        # Attention mask
+        # Padding mask
         src_key_padding_mask = None
         if attention_mask is not None:
             cls_mask = torch.ones(batch_size, 1, device=attention_mask.device)
             full_mask = torch.cat([cls_mask, attention_mask], dim=1)
             src_key_padding_mask = full_mask == 0
 
+        # Causal mask: strict lower-triangular — position i attends only to 0..i.
+        # Use this with output_sequence=True for per-bar hidden states with no
+        # lookahead. In causal mode the CLS embedding (position 0) processes only
+        # its own initialization; for a global summary use causal=False instead.
+        src_mask = None
+        if causal:
+            total_len = seq_len + 1  # +1 for prepended CLS
+            src_mask = torch.triu(
+                torch.ones(total_len, total_len, dtype=torch.bool, device=features.device),
+                diagonal=1,
+            )  # True = mask out (PyTorch convention for bool src_mask)
+
         # Transformer encoder
-        hidden_states = self.encoder(hidden_states, src_key_padding_mask=src_key_padding_mask)
+        hidden_states = self.encoder(
+            hidden_states,
+            mask=src_mask,
+            src_key_padding_mask=src_key_padding_mask,
+        )
         hidden_states = self.output_layernorm(hidden_states)
 
         if output_sequence:
@@ -324,6 +345,7 @@ class FFMForPretraining(PreTrainedModel):
         volatility_labels: Optional[torch.Tensor] = None,
         structure_labels: Optional[torch.Tensor] = None,
         range_labels: Optional[torch.Tensor] = None,
+        causal: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with optional loss computation.
@@ -342,6 +364,7 @@ class FFMForPretraining(PreTrainedModel):
             session_ids=session_ids,
             attention_mask=attention_mask,
             output_sequence=False,
+            causal=causal,
         )
 
         # Task predictions
@@ -477,6 +500,7 @@ class FFMForClassification(PreTrainedModel):
         session_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        causal: bool = False,
     ) -> Dict[str, torch.Tensor]:
         embedding = self.backbone(
             features=features,
@@ -487,6 +511,7 @@ class FFMForClassification(PreTrainedModel):
             session_ids=session_ids,
             attention_mask=attention_mask,
             output_sequence=False,
+            causal=causal,
         )
 
         logits = self.classifier(embedding)
@@ -571,10 +596,12 @@ class FFMForRegression(PreTrainedModel):
         session_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        causal: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             labels: (batch, num_targets) float — ground truth distances in ATR units
+            causal: if True, apply causal attention mask (no lookahead between bars)
 
         Returns:
             predictions: (batch, num_targets) — predicted SL/TP distances
@@ -589,6 +616,7 @@ class FFMForRegression(PreTrainedModel):
             session_ids=session_ids,
             attention_mask=attention_mask,
             output_sequence=False,
+            causal=causal,
         )
 
         predictions = self.regressor(embedding)
@@ -725,11 +753,13 @@ class FFMForStrategyWithRisk(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         signal_labels: Optional[torch.Tensor] = None,
         risk_labels: Optional[torch.Tensor] = None,
+        causal: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             signal_labels: (batch,) long — 0=HOLD, 1=BUY, 2=SELL
             risk_labels: (batch, num_risk_targets) float — SL/TP in ATR units
+            causal: if True, apply causal attention mask (no lookahead between bars)
 
         Returns:
             signal_logits: (batch, num_labels)
@@ -746,6 +776,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
             session_ids=session_ids,
             attention_mask=attention_mask,
             output_sequence=False,
+            causal=causal,
         )
 
         # Both heads read from same embedding
