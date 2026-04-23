@@ -36,7 +36,7 @@ class FFMConfig(PretrainedConfig):
     def __init__(
         self,
         # --- Input dimensions ---
-        num_features: int = 62,           # continuous features; candle_type uses its own embedding
+        num_features: int = 66,           # continuous features; candle_type uses its own embedding
         # --- Transformer backbone ---
         hidden_size: int = 256,
         num_hidden_layers: int = 6,
@@ -52,7 +52,7 @@ class FFMConfig(PretrainedConfig):
         # --- Pretraining task heads ---
         num_regime_labels: int = 4,       # Trending Up/Down, Rotational, Volatile
         num_volatility_labels: int = 4,   # Low, Normal, Elevated, Extreme
-        num_structure_labels: int = 3,    # Bullish (HH+HL), Bearish (LH+LL), Mixed
+        num_structure_labels: int = 2,    # Bullish (confirmed), Bearish (confirmed)
         num_range_labels: int = 5,        # Quintiles: 0-20%, 20-40%, ..., 80-100%
         # --- Training ---
         layer_norm_eps: float = 1e-6,

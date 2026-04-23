@@ -10,7 +10,7 @@ learn predictive representations rather than identity mappings.
 Tasks:
     1. Regime (next 20 bars): trending up/down, rotational, volatile expansion
     2. Volatility State (next 10 bars): low, normal, elevated, extreme
-    3. Market Structure (next 20 bars): bullish, bearish, mixed
+    3. Market Structure (next 20 bars): confirmed bullish/bearish via 1H structure + expansion
     4. Range Position (next 10 bars): quintile within recent range
 
 The model sees features at time T and must predict labels computed from
@@ -30,7 +30,7 @@ LABEL_CONFIDENCE_SENTINEL = -100
 
 REGIME_LABELS = {0: "trending_up", 1: "trending_down", 2: "rotational", 3: "volatile_expansion"}
 VOLATILITY_LABELS = {0: "low", 1: "normal", 2: "elevated", 3: "extreme"}
-STRUCTURE_LABELS = {0: "bullish", 1: "bearish", 2: "mixed"}
+STRUCTURE_LABELS = {0: "bullish", 1: "bearish"}
 RANGE_LABELS = {0: "q1_0_20", 1: "q2_20_40", 2: "q3_40_60", 3: "q4_60_80", 4: "q5_80_100"}
 
 
@@ -119,34 +119,51 @@ def generate_volatility_labels(features, horizon=10):
 
 def generate_structure_labels(features, horizon=20):
     """
-    Predict FUTURE market structure over the next `horizon` bars.
+    Label current market structure confirmed by future price expansion.
 
-    Bullish: upside expansion > downside from current close
-    Bearish: downside expansion > upside
-    Mixed:   neither dominates
+    Two-factor confirmation: a bar is labeled only when both signals agree:
+      1. Current 1H market structure (majority direction of last 3 completed 1H bars)
+      2. Future price expansion over the next horizon bars favors the same direction
+
+    This design keeps the forward-looking nature that drives useful pretraining
+    representations, while requiring current structure alignment so the backbone
+    learns that real structural moves have BOTH a recognizable current state AND
+    a confirming future expansion. Conflicting signals → SENTINEL (no gradient).
+
+    Classes:
+      0 = confirmed bullish: 1H structure bullish AND future expands more upward
+      1 = confirmed bearish: 1H structure bearish AND future expands more downward
+      SENTINEL: disagreement between current structure and future expansion, or
+                neutral 1H structure, or insufficient history
     """
     close = features["_close"]
 
-    # Forward price extremes
+    # Forward price extremes from current close
     fwd_max = close.shift(-1).rolling(horizon).max().shift(-(horizon - 1))
     fwd_min = close.shift(-1).rolling(horizon).min().shift(-(horizon - 1))
-
-    # How far price goes up vs down from current close
     upside = (fwd_max - close) / close
     downside = (close - fwd_min) / close
-
-    # Asymmetry ratio: >1 = bullish, <1 = bearish
     asymmetry = upside / downside.replace(0, np.nan)
 
-    # Default to ambiguous — only label when the directional bias is decisive.
-    # Thresholds of 2.5 / 0.4 (reciprocals) require upside or downside to be
-    # 2.5x the opposing move; the former 1.5 / 0.67 thresholds were too noisy
-    # at a 20-bar horizon, producing a large "mixed" class that was unlearnable.
+    # Current 1H structure state (metadata column, computed in derive_features)
+    # +1 = 1H bullish (≥2 of last 3 completed 1H bars closed higher)
+    # -1 = 1H bearish (≥2 of last 3 completed 1H bars closed lower)
+    #  0 / NaN = neutral or no history
+    struct_1h = features.get("_1h_structure", pd.Series(0, index=features.index))
+
     labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
 
-    valid = asymmetry.notna()
-    labels[valid & (asymmetry > 2.5)] = 0   # clearly bullish
-    labels[valid & (asymmetry < 0.4)] = 1   # clearly bearish
+    # Both asymmetry and 1H structure must be available
+    valid = asymmetry.notna() & struct_1h.notna()
+
+    # Confirmed bullish: current 1H is bullish AND future expansion favors upside
+    # Threshold 1.5/0.67 (reciprocal) is relaxed vs single-factor 2.5/0.4 because
+    # double confirmation compensates for the looser asymmetry requirement.
+    labels[valid & (struct_1h == 1) & (asymmetry > 1.5)] = 0
+
+    # Confirmed bearish: current 1H is bearish AND future expansion favors downside
+    labels[valid & (struct_1h == -1) & (asymmetry < 0.67)] = 1
+
     labels[~valid] = pd.NA
 
     return labels

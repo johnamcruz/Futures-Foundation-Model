@@ -45,7 +45,7 @@ def make_ohlcv(n=300, seed=42, bar_freq_min=5):
 # =============================================================================
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 62
+    assert len(get_model_feature_columns()) == 66
 
 
 def test_all_model_columns_present():
@@ -300,3 +300,104 @@ def test_3min_bars_feature_columns():
     features = derive_features(df, "NQ")
     for col in get_model_feature_columns():
         assert col in features.columns
+
+
+# =============================================================================
+# Group 10 — Volume Absorption & Order Flow
+# =============================================================================
+
+def test_vol_cum_signed_range():
+    features = derive_features(make_ohlcv(), "ES")
+    for col in ["vol_cum_signed_5", "vol_cum_signed_20"]:
+        vals = features[col]
+        assert (vals >= -0.5).all() and (vals <= 0.5).all(), f"{col} out of [-0.5, 0.5]"
+
+
+def test_vol_cum_signed_positive_for_buying_bars():
+    """All bars with close at high → cumulative signed delta is positive."""
+    df = make_ohlcv(n=200, seed=99)
+    df["open"] = df["low"]
+    df["close"] = df["high"]
+    features = derive_features(df, "ES")
+    valid = features["vol_cum_signed_5"].iloc[20:]
+    assert (valid > 0).all(), "Bars closing at their high should produce positive cum signed delta"
+
+
+def test_vol_cum_signed_negative_for_selling_bars():
+    """All bars with close at low → cumulative signed delta is negative."""
+    df = make_ohlcv(n=200, seed=99)
+    df["open"] = df["high"]
+    df["close"] = df["low"]
+    features = derive_features(df, "ES")
+    valid = features["vol_cum_signed_5"].iloc[20:]
+    assert (valid < 0).all(), "Bars closing at their low should produce negative cum signed delta"
+
+
+def test_vol_absorption_range():
+    features = derive_features(make_ohlcv(), "ES")
+    vals = features["vol_absorption"]
+    assert (vals >= 0).all() and (vals <= 5.0 + 1e-6).all(), "vol_absorption out of [0, 5]"
+
+
+def test_vol_absorption_higher_for_doji_than_marubozu():
+    """Same elevated volume: doji (small body) should have higher absorption than marubozu."""
+    df = make_ohlcv(n=100, seed=5)
+    avg_vol = df["volume"].mean()
+
+    # Bar 50: doji — open = close = midpoint of range
+    mid = (df.loc[50, "high"] + df.loc[50, "low"]) / 2
+    df.loc[50, "open"] = mid
+    df.loc[50, "close"] = mid
+    df.loc[50, "volume"] = avg_vol * 4
+
+    # Bar 60: marubozu — open = low, close = high (maximum body)
+    df.loc[60, "open"] = df.loc[60, "low"]
+    df.loc[60, "close"] = df.loc[60, "high"]
+    df.loc[60, "volume"] = avg_vol * 4
+
+    features = derive_features(df, "ES")
+    assert features["vol_absorption"].iloc[50] > features["vol_absorption"].iloc[60], \
+        "Doji bar should have higher absorption than marubozu at same volume"
+
+
+def test_vol_momentum_align_range():
+    features = derive_features(make_ohlcv(), "ES")
+    vals = features["vol_momentum_align"]
+    assert (vals >= -3.0 - 1e-6).all() and (vals <= 3.0 + 1e-6).all(), \
+        "vol_momentum_align out of [-3, 3]"
+
+
+def test_vol_momentum_align_positive_in_confirmed_uptrend():
+    """Early in a volume surge on a steady uptrend: vol_ratio > 1 before rolling mean adapts."""
+    df = make_ohlcv(n=200, seed=7)
+    base_vol = df["volume"].mean()
+
+    # Bars 30-49: steady uptrend at normal volume (builds positive momentum)
+    for i in range(30, 50):
+        c = 5000 + (i - 30) * 1.0
+        df.loc[i, ["close", "open", "high", "low"]] = [c, c - 0.5, c + 0.5, c - 1.0]
+        df.loc[i, "volume"] = base_vol
+
+    # Bars 50-80: same uptrend rate + 3x volume spike
+    for i in range(50, 80):
+        c = 5020 + (i - 50) * 1.0
+        df.loc[i, ["close", "open", "high", "low"]] = [c, c - 0.5, c + 0.5, c - 1.0]
+        df.loc[i, "volume"] = base_vol * 3
+
+    features = derive_features(df, "ES")
+    # Bar 52: vol_ratio_5 = 3x / mean(1x,1x,3x,3x,3x) ≈ 1.36 > 1.
+    # momentum_5 = sum of 5 small positive returns → positive.
+    assert features["vol_momentum_align"].iloc[52] > 0, \
+        "Uptrend + volume surge should give positive alignment before rolling mean adapts"
+
+
+def test_1h_structure_metadata_present():
+    features = derive_features(make_ohlcv(), "ES")
+    assert "_1h_structure" in features.columns, "Missing _1h_structure metadata column"
+
+
+def test_1h_structure_values_valid():
+    features = derive_features(make_ohlcv(), "ES")
+    vals = features["_1h_structure"].dropna()
+    assert set(vals.unique()).issubset({-1, 0, 1}), \
+        f"_1h_structure should only contain {{-1, 0, 1}}, got {set(vals.unique())}"

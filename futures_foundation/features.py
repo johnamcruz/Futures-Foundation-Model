@@ -4,7 +4,7 @@ Feature derivation from raw OHLCV data.
 All features are instrument-agnostic via ATR normalization or z-scores,
 ensuring the backbone learns transferable patterns across instruments.
 
-Feature Groups (63 total):
+Feature Groups (66 continuous model features; candle_type uses its own embedding):
     1. Bar anatomy (8) — body, wicks, range normalized by ATR
     2. Returns & momentum (8) — multi-horizon returns + acceleration
     3. Volume dynamics (6) — relative volume, delta proxy
@@ -12,8 +12,9 @@ Feature Groups (63 total):
     5. Session-relative context (5) — distance from session OHLC + VWAP
     6. Market structure (9) — swing distances, range position multi-lookback
     7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
-    8. Candle psychology (6) — candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session
+    8. Candle psychology (5) — engulf count, momentum speed, wick rejection, dir consistency, bar size vs session
     9. HTF price context (5) — position within ongoing 1H/4H candle, ATR-normalized return from HTF open, cross-TF alignment
+   10. Volume absorption & order flow (4) — cumulative signed volume, absorption signal, momentum alignment
 """
 
 import numpy as np
@@ -196,6 +197,20 @@ def derive_features(
     features["swp_tf_alignment"] = np.sign(sweep_dir_1h + sweep_dir_4h).astype(np.float32)
     features["swp_dominant_dir"] = features["swp_tf_alignment"].copy()
 
+    # --- 1H Structure State (metadata for label generation) ---
+    # Causal: uses only closed 1H bars. Majority direction over last 3 completed 1H bars.
+    # +1 = at least 2 of 3 recent 1H bars closed higher (bullish structure)
+    # -1 = at least 2 of 3 recent 1H bars closed lower (bearish structure)
+    # 0 / NaN = mixed or insufficient history
+    _1h_dir = np.sign(df_1h["close"].diff())
+    _1h_maj = _1h_dir.shift(1) + _1h_dir.shift(2) + _1h_dir.shift(3)
+    _1h_struct_htf = pd.Series(0, index=df_1h.index, dtype="Int64")
+    _1h_struct_htf[_1h_maj >= 2] = 1
+    _1h_struct_htf[_1h_maj <= -2] = -1
+    _1h_struct_htf[_1h_dir.shift(3).isna()] = pd.NA
+    _1h_period = df["datetime"].dt.ceil("60min")
+    features["_1h_structure"] = _1h_period.map(_1h_struct_htf).astype("Int64")
+
     # --- Group 8: Candle Psychology (6 features) ---
     df_cp = _add_candle_features(df)
     for _col in ("candle_type", "engulf_count", "momentum_speed_ratio",
@@ -234,6 +249,34 @@ def derive_features(
     features["htf_tf_alignment"] = (
         np.sign(features["htf_1h_ret"]) * np.sign(features["htf_4h_ret"])
     ).astype(np.float32)
+
+    # --- Group 10: Volume Absorption & Order Flow (4 features) ---
+    # Cumulative signed volume: rolling weighted sum of per-bar buying/selling pressure,
+    # normalized by rolling volume total → instrument-agnostic, range [-0.5, 0.5].
+    # Positive = buyers have dominated; negative = sellers have dominated.
+    _vol5_sum = df["volume"].rolling(5).sum().replace(0, np.nan)
+    _vol20_sum = df["volume"].rolling(20).sum().replace(0, np.nan)
+    features["vol_cum_signed_5"] = (
+        (features["vol_delta_proxy"].rolling(5).sum() / _vol5_sum)
+        .fillna(0.0).clip(-0.5, 0.5).astype(np.float32)
+    )
+    features["vol_cum_signed_20"] = (
+        (features["vol_delta_proxy"].rolling(20).sum() / _vol20_sum)
+        .fillna(0.0).clip(-0.5, 0.5).astype(np.float32)
+    )
+    # Absorption: elevated volume on a small-body bar = effort with no directional result.
+    # High value = buyers or sellers absorbing the opposing side; signals potential exhaustion.
+    features["vol_absorption"] = (
+        (features["vol_ratio_5"] * (1.0 - features["bar_body_pct"].abs()))
+        .clip(0.0, 5.0).fillna(1.0).astype(np.float32)
+    )
+    # Momentum alignment: is volume confirming the price trend or diverging from it?
+    # Positive = trending direction + above-average volume (conviction, likely continues).
+    # Negative = trending direction + below-average volume (weak move, likely fades).
+    features["vol_momentum_align"] = (
+        (np.sign(features["ret_momentum_5"].fillna(0)) * (features["vol_ratio_5"].fillna(1.0) - 1.0))
+        .clip(-3.0, 3.0).astype(np.float32)
+    )
 
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
@@ -485,4 +528,7 @@ def get_model_feature_columns() -> list:
         "htf_1h_close_pos", "htf_1h_ret",
         "htf_4h_close_pos", "htf_4h_ret",
         "htf_tf_alignment",
+        # Group 10: Volume Absorption & Order Flow
+        "vol_cum_signed_5", "vol_cum_signed_20",
+        "vol_absorption", "vol_momentum_align",
     ]
