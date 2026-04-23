@@ -1033,9 +1033,9 @@ def evaluate(model, loader, loss_fn, device):
 
 def load_fold_data(fold, tickers, ffm_dir, cisd_dir, seq_len):
     """Load and time-slice data for a single fold, returning train/val/test datasets."""
-    train_end = pd.Timestamp(fold['train_end'])
-    val_end   = pd.Timestamp(fold['val_end'])
-    test_end  = pd.Timestamp(fold['test_end'])
+    train_end = pd.Timestamp(fold['train_end'], tz='America/New_York')
+    val_end   = pd.Timestamp(fold['val_end'],   tz='America/New_York')
+    test_end  = pd.Timestamp(fold['test_end'],  tz='America/New_York')
 
     train_dsets = []; val_dsets = []; test_dsets = []
 
