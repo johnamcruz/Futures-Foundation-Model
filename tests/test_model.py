@@ -96,6 +96,74 @@ def test_backbone_sequence():
     assert out.shape == (4, SEQ_LEN + 1, c.hidden_size)  # +1 for CLS
 
 
+def test_backbone_causal_output_shape():
+    """causal=True produces identical output shape to causal=False."""
+    c = small_config()
+    m = FFMBackbone(c)
+    features = torch.randn(2, SEQ_LEN, c.num_features)
+    out_causal = m(features, causal=True)
+    out_normal = m(features, causal=False)
+    assert out_causal.shape == out_normal.shape == (2, c.hidden_size)
+
+
+def test_backbone_causal_isolates_earlier_bars():
+    """With causal mask, modifying bar k must not change hidden states of bars 0..k-1."""
+    c = small_config()
+    m = FFMBackbone(c)
+    m.eval()
+    torch.manual_seed(7)
+    features = torch.randn(1, SEQ_LEN, c.num_features)
+
+    pivot = SEQ_LEN // 2  # 0-indexed bar to modify
+    pivot_seq_pos = pivot + 1  # +1 for CLS prefix in output tensor
+
+    with torch.no_grad():
+        seq_out = m(features, output_sequence=True, causal=True)
+
+        features_mod = features.clone()
+        features_mod[0, pivot, :] += 100.0  # large change to bar at `pivot`
+        seq_out_mod = m(features_mod, output_sequence=True, causal=True)
+
+    # Bars BEFORE the modified bar must be unchanged (causal isolation)
+    assert torch.allclose(
+        seq_out[0, 1:pivot_seq_pos, :],
+        seq_out_mod[0, 1:pivot_seq_pos, :],
+        atol=1e-4,
+    ), "Causal mask: bars before the modified bar should not change"
+
+    # Bars AT and AFTER the modified bar must change
+    assert not torch.allclose(
+        seq_out[0, pivot_seq_pos:, :],
+        seq_out_mod[0, pivot_seq_pos:, :],
+        atol=1e-4,
+    ), "Causal mask: bars at and after the modified bar should reflect the change"
+
+
+def test_backbone_no_causal_bidirectional():
+    """Without causal mask, modifying bar k DOES change hidden states of bars before k."""
+    c = small_config()
+    m = FFMBackbone(c)
+    m.eval()
+    torch.manual_seed(7)
+    features = torch.randn(1, SEQ_LEN, c.num_features)
+
+    pivot = SEQ_LEN // 2
+    pivot_seq_pos = pivot + 1
+
+    with torch.no_grad():
+        seq_out = m(features, output_sequence=True, causal=False)
+        features_mod = features.clone()
+        features_mod[0, pivot, :] += 100.0
+        seq_out_mod = m(features_mod, output_sequence=True, causal=False)
+
+    # Without causal mask, bidirectional attention propagates changes backward
+    assert not torch.allclose(
+        seq_out[0, 1:pivot_seq_pos, :],
+        seq_out_mod[0, 1:pivot_seq_pos, :],
+        atol=1e-4,
+    ), "Without causal mask, earlier bars should be affected by changes to later bars"
+
+
 # =============================================================================
 # Pretraining Tests
 # =============================================================================
