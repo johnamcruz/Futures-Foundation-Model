@@ -72,10 +72,12 @@ class TemporalEncoding(nn.Module):
 
 class CategoricalEmbeddings(nn.Module):
     """
-    Embeddings for categorical metadata: instrument and session type.
+    Embeddings for categorical inputs: instrument, session type, and candle type.
 
-    Added to hidden states so the model learns instrument-specific and
-    session-specific patterns while sharing the core representation.
+    Added to hidden states so the model learns instrument-specific,
+    session-specific, and candle-structure patterns while sharing the core
+    representation. candle_type uses an embedding rather than a float to avoid
+    implying a false ordinal relationship between the 6 candle classes.
     """
 
     def __init__(self, config: FFMConfig):
@@ -86,13 +88,18 @@ class CategoricalEmbeddings(nn.Module):
         self.session_embeddings = nn.Embedding(
             config.num_sessions, config.hidden_size
         )
+        self.candle_type_embeddings = nn.Embedding(
+            config.num_candle_types, config.hidden_size
+        )
 
-    def forward(self, hidden_states, instrument_ids=None, session_ids=None):
+    def forward(self, hidden_states, instrument_ids=None, session_ids=None, candle_types=None):
         if instrument_ids is not None:
             inst_emb = self.instrument_embeddings(instrument_ids)
             hidden_states = hidden_states + inst_emb.unsqueeze(1)
         if session_ids is not None:
             hidden_states = hidden_states + self.session_embeddings(session_ids)
+        if candle_types is not None:
+            hidden_states = hidden_states + self.candle_type_embeddings(candle_types)
         return hidden_states
 
 
@@ -172,6 +179,7 @@ class FFMBackbone(PreTrainedModel):
     def forward(
         self,
         features: torch.Tensor,
+        candle_types: Optional[torch.Tensor] = None,
         time_of_day: Optional[torch.Tensor] = None,
         day_of_week: Optional[torch.Tensor] = None,
         instrument_ids: Optional[torch.Tensor] = None,
@@ -181,7 +189,8 @@ class FFMBackbone(PreTrainedModel):
     ) -> torch.Tensor:
         """
         Args:
-            features: (batch, seq_len, num_features) — derived OHLCV features
+            features: (batch, seq_len, num_features) — derived OHLCV features (57 continuous)
+            candle_types: (batch, seq_len) long in [0, 5] — routed through dedicated embedding
             time_of_day: (batch, seq_len) — fraction of day [0, 1]
             day_of_week: (batch, seq_len) — day index [0, 6]
             instrument_ids: (batch,) — instrument index
@@ -203,6 +212,9 @@ class FFMBackbone(PreTrainedModel):
         hidden_states = torch.cat([cls_tokens, hidden_states], dim=1)
 
         # Adjust metadata tensors for CLS prefix
+        if candle_types is not None:
+            cls_pad = torch.zeros(batch_size, 1, dtype=torch.long, device=candle_types.device)
+            candle_types = torch.cat([cls_pad, candle_types], dim=1)
         if time_of_day is not None:
             cls_pad = torch.zeros(batch_size, 1, device=time_of_day.device)
             time_of_day = torch.cat([cls_pad, time_of_day], dim=1)
@@ -215,7 +227,9 @@ class FFMBackbone(PreTrainedModel):
 
         # Add encodings
         hidden_states = self.temporal_encoding(hidden_states, time_of_day, day_of_week)
-        hidden_states = self.categorical_embeddings(hidden_states, instrument_ids, session_ids)
+        hidden_states = self.categorical_embeddings(
+            hidden_states, instrument_ids, session_ids, candle_types
+        )
 
         # Attention mask
         src_key_padding_mask = None
@@ -300,6 +314,7 @@ class FFMForPretraining(PreTrainedModel):
     def forward(
         self,
         features: torch.Tensor,
+        candle_types: Optional[torch.Tensor] = None,
         time_of_day: Optional[torch.Tensor] = None,
         day_of_week: Optional[torch.Tensor] = None,
         instrument_ids: Optional[torch.Tensor] = None,
@@ -320,6 +335,7 @@ class FFMForPretraining(PreTrainedModel):
         """
         embedding = self.backbone(
             features=features,
+            candle_types=candle_types,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
             instrument_ids=instrument_ids,
@@ -446,6 +462,7 @@ class FFMForClassification(PreTrainedModel):
     def forward(
         self,
         features: torch.Tensor,
+        candle_types: Optional[torch.Tensor] = None,
         time_of_day: Optional[torch.Tensor] = None,
         day_of_week: Optional[torch.Tensor] = None,
         instrument_ids: Optional[torch.Tensor] = None,
@@ -455,6 +472,7 @@ class FFMForClassification(PreTrainedModel):
     ) -> Dict[str, torch.Tensor]:
         embedding = self.backbone(
             features=features,
+            candle_types=candle_types,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
             instrument_ids=instrument_ids,
@@ -538,6 +556,7 @@ class FFMForRegression(PreTrainedModel):
     def forward(
         self,
         features: torch.Tensor,
+        candle_types: Optional[torch.Tensor] = None,
         time_of_day: Optional[torch.Tensor] = None,
         day_of_week: Optional[torch.Tensor] = None,
         instrument_ids: Optional[torch.Tensor] = None,
@@ -555,6 +574,7 @@ class FFMForRegression(PreTrainedModel):
         """
         embedding = self.backbone(
             features=features,
+            candle_types=candle_types,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
             instrument_ids=instrument_ids,
@@ -689,6 +709,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
     def forward(
         self,
         features: torch.Tensor,
+        candle_types: Optional[torch.Tensor] = None,
         time_of_day: Optional[torch.Tensor] = None,
         day_of_week: Optional[torch.Tensor] = None,
         instrument_ids: Optional[torch.Tensor] = None,
@@ -710,6 +731,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
         # Single backbone forward pass
         embedding = self.backbone(
             features=features,
+            candle_types=candle_types,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
             instrument_ids=instrument_ids,

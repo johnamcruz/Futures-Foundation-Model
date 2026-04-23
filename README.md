@@ -21,7 +21,7 @@ Just as BERT learns language structure before being fine-tuned for sentiment or 
 ## Architecture
 
 ```
-Input: OHLCV Bars (sequence of N bars × 58 derived features)
+Input: OHLCV Bars (sequence of N bars × 57 continuous features + candle_type embedding)
          │
     [Instrument Embedding + Session Embedding + Temporal Encoding]
          │
@@ -149,7 +149,7 @@ data/raw/
 
 Each CSV should have columns: `datetime, open, high, low, close, volume`
 
-### Feature Derivation (58 Features)
+### Feature Derivation (58 Features: 57 Continuous + 1 Embedding)
 
 Features are instrument-agnostic via ATR normalization:
 
@@ -162,7 +162,7 @@ Features are instrument-agnostic via ATR normalization:
 | Session Context | 5 | Distance from session OHLC + VWAP |
 | Market Structure | 9 | Swing distances, range position |
 | CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
-| Candle Psychology | 6 | Candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session |
+| Candle Psychology | 5 + 1 emb | engulf count, momentum speed, wick rejection, dir consistency, bar size vs session; candle_type → dedicated model embedding |
 
 #### CRT Sweep State Features
 
@@ -189,7 +189,7 @@ Strategy-agnostic price action descriptors computed from raw OHLCV. These captur
 
 | Feature | Description |
 |---------|-------------|
-| `candle_type` | Categorical candle class: 0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral |
+| `candle_type` | Categorical candle class (0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral) — routed through a dedicated `nn.Embedding(6, 256)` rather than the continuous feature matrix to avoid implying a false ordinal relationship |
 | `engulf_count` | Count of prior N bars (default 5) whose bodies are fully engulfed by the current bar |
 | `momentum_speed_ratio` | Ratio of impulse speed to retrace speed over a rolling window; >1 = impulse leg dominant, <1 = retrace dominant |
 | `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1]; positive = bullish rejection, negative = bearish rejection |
@@ -280,7 +280,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] Core transformer backbone with HuggingFace compatibility
 - [x] OHLCV feature derivation pipeline (58 ATR-normalized features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
-- [x] Candle psychology features — candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session (6 features)
+- [x] Candle psychology features — 5 continuous features + candle_type via dedicated model embedding (58 total inputs)
 - [x] Forward-looking self-supervised label generation (4 tasks)
 - [x] Pretraining with overfitting detection + collapse monitoring
 - [x] Fine-tuning framework: Classification, Regression, Strategy+Risk

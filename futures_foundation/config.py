@@ -36,7 +36,7 @@ class FFMConfig(PretrainedConfig):
     def __init__(
         self,
         # --- Input dimensions ---
-        num_features: int = 58,
+        num_features: int = 57,           # continuous features; candle_type uses its own embedding
         # --- Transformer backbone ---
         hidden_size: int = 256,
         num_hidden_layers: int = 6,
@@ -48,6 +48,7 @@ class FFMConfig(PretrainedConfig):
         # --- Categorical embeddings ---
         num_instruments: int = 8,         # ES, NQ, RTY, YM + room for expansion
         num_sessions: int = 4,            # Pre-market, London, NY AM, NY PM
+        num_candle_types: int = 6,        # doji, bull/bear strong, bull/bear pin, neutral
         # --- Pretraining task heads ---
         num_regime_labels: int = 4,       # Trending Up/Down, Rotational, Volatile
         num_volatility_labels: int = 4,   # Low, Normal, Elevated, Extreme
@@ -71,6 +72,7 @@ class FFMConfig(PretrainedConfig):
         self.max_sequence_length = max_sequence_length
         self.num_instruments = num_instruments
         self.num_sessions = num_sessions
+        self.num_candle_types = num_candle_types
         self.num_regime_labels = num_regime_labels
         self.num_volatility_labels = num_volatility_labels
         self.num_structure_labels = num_structure_labels

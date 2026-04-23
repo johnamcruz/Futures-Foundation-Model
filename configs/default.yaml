@@ -1,7 +1,7 @@
 # Futures Foundation Model — Default Configuration
 
 model:
-  num_features: 58
+  num_features: 57          # continuous features; candle_type uses its own embedding
   hidden_size: 256
   num_hidden_layers: 6
   num_attention_heads: 8
@@ -13,6 +13,7 @@ model:
 embeddings:
   num_instruments: 8      # ES, NQ, RTY, YM + expansion room
   num_sessions: 4         # Pre-market, London, NY AM, NY PM
+  num_candle_types: 6     # doji, bull/bear strong, bull/bear pin, neutral
 
 pretraining_tasks:
   num_regime_labels: 4    # Trending Up/Down, Rotational, Volatile
