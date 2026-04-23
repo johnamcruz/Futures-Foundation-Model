@@ -162,7 +162,7 @@ Features are instrument-agnostic via ATR normalization:
 | Session Context | 5 | Distance from session OHLC + VWAP |
 | Market Structure | 9 | Swing distances, range position |
 | CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
-| Candle Psychology | 6 | Body/wick ratios, candle type, engulf count, momentum speed |
+| Candle Psychology | 6 | Candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session |
 
 #### CRT Sweep State Features
 
@@ -185,16 +185,16 @@ Sweep state is forward-filled for a frequency-agnostic expiry window (1 hour = `
 
 #### Candle Psychology Features
 
-Strategy-agnostic price action descriptors computed from raw OHLCV. These capture candle structure and sequential momentum without embedding any specific setup logic:
+Strategy-agnostic price action descriptors computed from raw OHLCV. These capture candle structure, sequential momentum, and session context without embedding any specific setup logic:
 
 | Feature | Description |
 |---------|-------------|
-| `body_ratio` | Body size as a fraction of bar range [0, 1]; 0 = doji, 1 = full body |
-| `upper_wick_ratio` | Upper wick as a fraction of bar range [0, 1] |
-| `lower_wick_ratio` | Lower wick as a fraction of bar range [0, 1] |
 | `candle_type` | Categorical candle class: 0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral |
 | `engulf_count` | Count of prior N bars (default 5) whose bodies are fully engulfed by the current bar |
-| `momentum_speed_ratio` | Ratio of current bar's momentum to recent average bar range; >1 = impulse, <1 = retrace |
+| `momentum_speed_ratio` | Ratio of impulse speed to retrace speed over a rolling window; >1 = impulse leg dominant, <1 = retrace dominant |
+| `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1]; positive = bullish rejection, negative = bearish rejection |
+| `dir_consistency` | Fraction of the last N bars (default 5) whose close-open direction matches the current bar; range [0, 1] |
+| `bar_size_vs_session` | Current bar range relative to the running session average range (resets at session open); >1 = larger than session average |
 
 ---
 
@@ -280,7 +280,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] Core transformer backbone with HuggingFace compatibility
 - [x] OHLCV feature derivation pipeline (58 ATR-normalized features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
-- [x] Candle psychology features — body/wick ratios, candle type, engulf count, momentum speed (6 features)
+- [x] Candle psychology features — candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session (6 features)
 - [x] Forward-looking self-supervised label generation (4 tasks)
 - [x] Pretraining with overfitting detection + collapse monitoring
 - [x] Fine-tuning framework: Classification, Regression, Strategy+Risk

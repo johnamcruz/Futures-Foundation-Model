@@ -12,7 +12,7 @@ Feature Groups (58 total):
     5. Session-relative context (5) — distance from session OHLC + VWAP
     6. Market structure (9) — swing distances, range position multi-lookback
     7. CRT sweep state (10) — 1H/4H prior-candle liquidity sweep events
-    8. Candle psychology (6) — body/wick ratios, type, engulf, momentum speed
+    8. Candle psychology (6) — candle type, engulf count, momentum speed, wick rejection, dir consistency, bar size vs session
 """
 
 import numpy as np
@@ -197,9 +197,15 @@ def derive_features(
 
     # --- Group 8: Candle Psychology (6 features) ---
     df_cp = _add_candle_features(df)
-    for _col in ("body_ratio", "upper_wick_ratio", "lower_wick_ratio",
-                 "candle_type", "engulf_count", "momentum_speed_ratio"):
+    for _col in ("candle_type", "engulf_count", "momentum_speed_ratio",
+                 "wick_rejection", "dir_consistency"):
         features[_col] = df_cp[_col].values
+
+    # Current bar range relative to running session average (resets at session open).
+    # Captures whether this bar is unusually large or small for the current session.
+    _sess_keys = df["datetime"].dt.date.astype(str) + "_" + session_ids.astype(str)
+    _sess_avg_range = bar_range.groupby(_sess_keys).expanding().mean().reset_index(level=0, drop=True)
+    features["bar_size_vs_session"] = (bar_range / _sess_avg_range.replace(0, np.nan)).fillna(1.0).astype(np.float32)
 
     # --- Temporal (for embeddings, not model features) ---
     features["tmp_day_of_week"] = df["datetime"].dt.dayofweek
@@ -419,6 +425,6 @@ def get_model_feature_columns() -> list:
         "swp_4h_bull_active", "swp_4h_bear_active", "swp_4h_age_norm", "swp_4h_magnitude",
         "swp_tf_alignment", "swp_dominant_dir",
         # Group 8: Candle Psychology
-        "body_ratio", "upper_wick_ratio", "lower_wick_ratio",
         "candle_type", "engulf_count", "momentum_speed_ratio",
+        "wick_rejection", "dir_consistency", "bar_size_vs_session",
     ]
