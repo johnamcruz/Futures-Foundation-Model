@@ -25,6 +25,7 @@ from .labels import (
     generate_all_labels, generate_regime_labels, generate_volatility_labels,
     generate_structure_labels, generate_range_labels, print_label_distribution,
     REGIME_LABELS, VOLATILITY_LABELS, STRUCTURE_LABELS, RANGE_LABELS,
+    LABEL_CONFIDENCE_SENTINEL,
 )
 from .dataset import (
     FFMDataset, FFMMultiInstrumentDataset,
@@ -39,6 +40,7 @@ __all__ = [
     "generate_all_labels", "generate_regime_labels", "generate_volatility_labels",
     "generate_structure_labels", "generate_range_labels", "print_label_distribution",
     "REGIME_LABELS", "VOLATILITY_LABELS", "STRUCTURE_LABELS", "RANGE_LABELS",
+    "LABEL_CONFIDENCE_SENTINEL",
     "FFMDataset", "FFMMultiInstrumentDataset",
     "temporal_train_val_split", "interleaved_train_val_split", "create_dataloaders",
 ]

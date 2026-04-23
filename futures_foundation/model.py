@@ -358,29 +358,31 @@ class FFMForPretraining(PreTrainedModel):
             "range_logits": range_logits,
         }
 
-        # Compute loss — simple equal-weight cross-entropy averaging.
-        # (Kendall uncertainty weighting was removed because the learnable
-        # log-variance terms could go to -inf, making total loss negative
-        # and allowing the model to "optimize" by ignoring the actual tasks.)
+        # Regime and structure labels use confidence masking: low-confidence samples
+        # are assigned LABEL_CONFIDENCE_SENTINEL (-100) and skipped in the loss.
+        # Volatility and range labels are reliable enough to train on every sample.
+        # Per-head weights reflect relative signal quality (volatility most reliable).
+        ls = self.config.label_smoothing
+        _masked_ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=ls)
+        _full_ce = nn.CrossEntropyLoss(label_smoothing=ls)
+        cfg = self.config
         labels_and_logits = [
-            (regime_labels, regime_logits),
-            (volatility_labels, volatility_logits),
-            (structure_labels, structure_logits),
-            (range_labels, range_logits),
+            (regime_labels,     regime_logits,     _masked_ce, cfg.regime_loss_weight),
+            (volatility_labels, volatility_logits, _full_ce,   cfg.volatility_loss_weight),
+            (structure_labels,  structure_logits,  _masked_ce, cfg.structure_loss_weight),
+            (range_labels,      range_logits,      _full_ce,   cfg.range_loss_weight),
         ]
 
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing)
         total_loss = torch.tensor(0.0, device=features.device)
-        num_tasks = 0
+        weight_sum = 0.0
 
-        for labels, logits in labels_and_logits:
+        for labels, logits, loss_fn, weight in labels_and_logits:
             if labels is not None:
-                task_loss = loss_fn(logits, labels)
-                total_loss = total_loss + task_loss
-                num_tasks += 1
+                total_loss = total_loss + weight * loss_fn(logits, labels)
+                weight_sum += weight
 
-        if num_tasks > 0:
-            output["loss"] = total_loss / num_tasks
+        if weight_sum > 0:
+            output["loss"] = total_loss / weight_sum
 
         return output
 
