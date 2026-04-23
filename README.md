@@ -21,7 +21,7 @@ Just as BERT learns language structure before being fine-tuned for sentiment or 
 ## Architecture
 
 ```
-Input: OHLCV Bars (sequence of N bars × 52 derived features)
+Input: OHLCV Bars (sequence of N bars × 58 derived features)
          │
     [Instrument Embedding + Session Embedding + Temporal Encoding]
          │
@@ -149,7 +149,7 @@ data/raw/
 
 Each CSV should have columns: `datetime, open, high, low, close, volume`
 
-### Feature Derivation (52 Features)
+### Feature Derivation (58 Features)
 
 Features are instrument-agnostic via ATR normalization:
 
@@ -162,6 +162,7 @@ Features are instrument-agnostic via ATR normalization:
 | Session Context | 5 | Distance from session OHLC + VWAP |
 | Market Structure | 9 | Swing distances, range position |
 | CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
+| Candle Psychology | 6 | Body/wick ratios, candle type, engulf count, momentum speed |
 
 #### CRT Sweep State Features
 
@@ -181,6 +182,19 @@ Candle Range Theory (CRT) sweeps occur when a bar wicks beyond the prior candle'
 | `swp_dominant_dir` | Dominant sweep direction across timeframes (same as `swp_tf_alignment`) |
 
 Sweep state is forward-filled for a frequency-agnostic expiry window (1 hour = `round(60 / bar_minutes)` bars) so the features work correctly on 3-min, 5-min, or any other base timeframe.
+
+#### Candle Psychology Features
+
+Strategy-agnostic price action descriptors computed from raw OHLCV. These capture candle structure and sequential momentum without embedding any specific setup logic:
+
+| Feature | Description |
+|---------|-------------|
+| `body_ratio` | Body size as a fraction of bar range [0, 1]; 0 = doji, 1 = full body |
+| `upper_wick_ratio` | Upper wick as a fraction of bar range [0, 1] |
+| `lower_wick_ratio` | Lower wick as a fraction of bar range [0, 1] |
+| `candle_type` | Categorical candle class: 0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral |
+| `engulf_count` | Count of prior N bars (default 5) whose bodies are fully engulfed by the current bar |
+| `momentum_speed_ratio` | Ratio of current bar's momentum to recent average bar range; >1 = impulse, <1 = retrace |
 
 ---
 
@@ -223,7 +237,8 @@ Futures-Foundation-Model/
 │   ├── __init__.py
 │   ├── config.py               # FFMConfig (HuggingFace compatible)
 │   ├── model.py                # Backbone + Classification/Regression/Strategy heads
-│   ├── features.py             # OHLCV → 52 derived features (incl. CRT sweeps)
+│   ├── features.py             # OHLCV → 58 derived features (incl. CRT sweeps + candle psychology)
+│   ├── candle_psychology.py    # Candle psychology feature derivation (6 features)
 │   ├── labels.py               # Forward-looking label generation
 │   └── dataset.py              # PyTorch Dataset + DataLoader
 ├── scripts/                    # Training & data prep scripts
@@ -233,7 +248,8 @@ Futures-Foundation-Model/
 │   ├── test_model.py
 │   ├── test_features_crt.py    # CRT sweep feature tests (24 tests)
 │   ├── test_features_core.py   # Core feature group tests (30 tests)
-│   └── test_labels.py          # Label generation tests (25 tests)
+│   ├── test_labels.py          # Label generation tests (25 tests)
+│   └── test_candle_psychology.py  # Candle psychology tests (33 tests)
 ├── .githooks/                  # Git hooks (activate with: git config core.hooksPath .githooks)
 │   └── pre-commit              # Runs all unit tests before every commit
 ├── setup.py
@@ -262,14 +278,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ## Roadmap
 
 - [x] Core transformer backbone with HuggingFace compatibility
-- [x] OHLCV feature derivation pipeline (52 ATR-normalized features)
+- [x] OHLCV feature derivation pipeline (58 ATR-normalized features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
+- [x] Candle psychology features — body/wick ratios, candle type, engulf count, momentum speed (6 features)
 - [x] Forward-looking self-supervised label generation (4 tasks)
 - [x] Pretraining with overfitting detection + collapse monitoring
 - [x] Fine-tuning framework: Classification, Regression, Strategy+Risk
 - [x] Backbone freezing with differential layer groups
 - [x] 5-instrument pretraining (ES, NQ, RTY, YM, GC)
-- [x] Unit test suite (79 tests) with pre-commit hook enforcement
+- [x] Unit test suite (130 tests) with pre-commit hook enforcement
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (SI, CL, NKD)
