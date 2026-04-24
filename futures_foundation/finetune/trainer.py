@@ -647,7 +647,7 @@ def export_onnx(
             'session_ids':       {0: 'batch', 1: 'seq'},
             'signal_logits':     {0: 'batch'},
             'risk_predictions':  {0: 'batch'},
-            'confidence':        {0: 'batch'},
+            'confidence':        {0: 'batch'},  # max(softmax(signal_logits))
         },
         opset_version=17,
     )
