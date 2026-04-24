@@ -511,11 +511,37 @@ def _make_optimizer(
     return optimizer, scheduler
 
 
-# ── Fold ─────────────────────────────────────────────────────────────────────
+# ── Fold helpers ─────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
     d = {k: v for k, v in training_cfg.__dict__.items() if k != 'baseline_wr'}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def _print_test_threshold_table(test_metrics: dict, fold_name: str) -> None:
+    """Print the per-threshold precision/recall table for a fold's test results."""
+    if test_metrics is None:
+        return
+    n_test   = len(test_metrics['all_labels'])
+    n_sig    = test_metrics['tp'] + test_metrics['fn']
+    print(f'\n  {fold_name} test: {n_test:,} bars | {n_sig} actual signals')
+    print(f'  {"Thresh":>6}  {"Predicted":>9}  {"Correct":>7}  '
+          f'{"Precision":>9}  {"Recall":>6}  {"Rate"}')
+    conf_arr = np.array(test_metrics['all_conf'])
+    lab_arr  = np.array(test_metrics['all_labels'])
+    pred_arr = np.array(test_metrics['all_preds'])
+    for thresh in [0.50, 0.60, 0.70, 0.80, 0.90]:
+        m = conf_arr >= thresh
+        if m.sum() == 0:
+            continue
+        htp = ((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum()
+        hfp = ((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum()
+        hfn = ((pred_arr[m] == 0) & (lab_arr[m] > 0)).sum()
+        hp  = htp / max(htp + hfp, 1)
+        hr  = htp / max(htp + hfn, 1)
+        ok  = ' ✅' if hp >= 0.40 else ''
+        print(f'  {thresh:>6.2f}  {htp+hfp:>9}  {htp:>7}  {hp:>9.3f}  {hr:>6.3f}  '
+              f'{(htp+hfp)/max(len(lab_arr),1)*100:.1f}%{ok}')
 
 
 def _train_fold(
@@ -537,13 +563,32 @@ def _train_fold(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    fold_name    = fold['name']
-    ckpt_path    = os.path.join(output_dir, f'{fold_name}_{config_hash}_loss.pt')
+    fold_name   = fold['name']
+    # _loss.pt  — epoch-level resume checkpoint (saved on val_loss improvement)
+    # _f1.pt    — best signal-F1 checkpoint (saved whenever F1 improves, survives disconnect)
+    # _done.pt  — fold completion marker (next_fold_state + test_metrics; skip re-training)
+    ckpt_path   = os.path.join(output_dir, f'{fold_name}_{config_hash}_loss.pt')
+    ckpt_f1     = os.path.join(output_dir, f'{fold_name}_{config_hash}_f1.pt')
+    ckpt_done   = os.path.join(output_dir, f'{fold_name}_{config_hash}_done.pt')
 
     print(f"\n{'='*60}")
     print(f'  FOLD {fold_name} | train<{fold["train_end"]} val<{fold["val_end"]}')
     print(f'  {"Warm start from prev fold" if warm_start_state is not None else "Cold start"}')
     print(f"{'='*60}")
+
+    # ── Skip if already complete (Colab disconnect between folds) ──
+    if os.path.exists(ckpt_done):
+        saved = torch.load(ckpt_done, map_location='cpu', weights_only=False)
+        if saved.get('config_hash') == config_hash:
+            print(f'  ✅ {fold_name} already complete — skipping re-training')
+            model = HybridStrategyModel(
+                ffm_config, num_strategy_features,
+                training_cfg.num_labels, training_cfg.risk_weight,
+            ).to(device)
+            model.load_state_dict(
+                {k: v.to(device) for k, v in saved['next_fold_state'].items()})
+            _print_test_threshold_table(saved.get('test_metrics'), fold_name)
+            return model, saved.get('test_metrics'), saved['next_fold_state']
 
     # ── Datasets ──
     train_dsets, val_dsets, test_dsets = _load_fold_data(
@@ -614,15 +659,29 @@ def _train_fold(
             best_signal_f1 = ckpt.get('best_signal_f1', 0.0)
             best_f1_epoch  = ckpt.get('best_f1_epoch', -1)
             patience_ctr   = ckpt.get('patience_ctr', 0)
-            print(f'  ▶ Resumed from epoch {start_epoch} (val_loss={best_val_loss:.4f})')
+            ratio_bad_ctr  = ckpt.get('ratio_bad_ctr', 0)
+            print(f'  ▶ Resumed from epoch {start_epoch} '
+                  f'(val_loss={best_val_loss:.4f}, patience={patience_ctr})')
         else:
             print(f'  ℹ Config changed — starting fresh')
 
+    # Restore best_f1_state from disk so a mid-fold disconnect doesn't lose it
+    if start_epoch > 0 and os.path.exists(ckpt_f1):
+        f1_saved = torch.load(ckpt_f1, map_location='cpu', weights_only=False)
+        if f1_saved.get('config_hash') == config_hash:
+            best_f1_state  = f1_saved['model_state']
+            best_signal_f1 = f1_saved.get('score', best_signal_f1)
+            best_f1_epoch  = f1_saved.get('epoch', best_f1_epoch)
+            print(f'  ▶ Restored best F1 state '
+                  f'(epoch {best_f1_epoch+1}, F1={best_signal_f1:.4f})')
+
     # ── Training loop ──
     for epoch in range(start_epoch, training_cfg.epochs):
+        t0 = time.time()
         tr = _train_one_epoch(model, train_loader, optimizer, loss_fn, device)
         va = _evaluate(model, val_loader, loss_fn, device)
         scheduler.step()
+        elapsed = time.time() - t0
 
         ratio     = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         improved  = va['loss'] < best_val_loss
@@ -635,11 +694,15 @@ def _train_fold(
             patience_ctr   = 0
             ratio_bad_ctr  = 0
             torch.save({
-                'config_hash': config_hash, 'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optim_state': optimizer.state_dict(),
-                'val_loss': best_val_loss, 'patience_ctr': patience_ctr,
-                'best_signal_f1': best_signal_f1, 'best_f1_epoch': best_f1_epoch,
+                'config_hash':   config_hash,
+                'epoch':         epoch,
+                'model_state':   model.state_dict(),
+                'optim_state':   optimizer.state_dict(),
+                'val_loss':      best_val_loss,
+                'patience_ctr':  patience_ctr,
+                'ratio_bad_ctr': ratio_bad_ctr,
+                'best_signal_f1': best_signal_f1,
+                'best_f1_epoch': best_f1_epoch,
             }, ckpt_path)
             save_str += ' 💾L'
 
@@ -647,6 +710,13 @@ def _train_fold(
             best_signal_f1 = va['f1']
             best_f1_epoch  = epoch
             best_f1_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # Persist to disk so a disconnect doesn't lose the best F1 weights
+            torch.save({
+                'config_hash': config_hash,
+                'model_state': best_f1_state,
+                'epoch':       epoch,
+                'score':       best_signal_f1,
+            }, ckpt_f1)
             save_str += ' 📈F'
 
         if ratio > training_cfg.max_ratio:
@@ -659,7 +729,7 @@ def _train_fold(
         if not improved:
             patience_ctr += 1
 
-        print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} | '
+        print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} ({elapsed:.0f}s) | '
               f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
               f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
               f'{ratio_str}{save_str}')
@@ -686,27 +756,23 @@ def _train_fold(
     # ── Test eval ──
     test_metrics = None
     if test_ds is not None and len(test_ds) > 0:
-        test_loader = DataLoader(test_ds, batch_size=training_cfg.batch_size,
-                                 shuffle=False, num_workers=2, pin_memory=True)
+        test_loader  = DataLoader(test_ds, batch_size=training_cfg.batch_size,
+                                  shuffle=False, num_workers=2, pin_memory=True)
         test_metrics = _evaluate(model, test_loader, loss_fn, device)
-        n_test = len(test_ds)
-        n_sig  = test_metrics['tp'] + test_metrics['fn']
-        print(f'\n  {fold_name} test: {n_test:,} bars | {n_sig} actual signals')
-        print(f'  {"Thresh":>6}  {"Predicted":>9}  {"Correct":>7}  {"Precision":>9}  {"Recall":>6}  {"Rate"}')
-        conf_arr = np.array(test_metrics['all_conf'])
-        lab_arr  = np.array(test_metrics['all_labels'])
-        pred_arr = np.array(test_metrics['all_preds'])
-        for thresh in [0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
-            m = conf_arr >= thresh
-            if m.sum() == 0: continue
-            htp = ((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum()
-            hfp = ((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum()
-            hfn = ((pred_arr[m] == 0) & (lab_arr[m] > 0)).sum()
-            hp  = htp / max(htp + hfp, 1)
-            hr  = htp / max(htp + hfn, 1)
-            ok  = ' ✅' if hp >= 0.40 else ''
-            print(f'  {thresh:>6.2f}  {htp+hfp:>9}  {htp:>7}  {hp:>9.3f}  {hr:>6.3f}  '
-                  f'{(htp+hfp)/max(len(lab_arr),1)*100:.1f}%{ok}')
+    _print_test_threshold_table(test_metrics, fold_name)
+
+    # ── Save fold-complete checkpoint ──
+    # Stores next_fold_state + test_metrics so reconnecting Colab sessions can
+    # skip re-training this fold entirely and jump straight to the next one.
+    torch.save({
+        'config_hash':    config_hash,
+        'next_fold_state': next_fold_state,
+        'test_metrics':   test_metrics,
+    }, ckpt_done)
+    for p in [ckpt_path, ckpt_f1]:
+        if os.path.exists(p):
+            os.remove(p)
+    print(f'  💾 Fold {fold_name} state saved — safe to disconnect')
 
     return model, test_metrics, next_fold_state
 
