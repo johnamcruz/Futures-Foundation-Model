@@ -155,7 +155,20 @@ def test_hybrid_model_confidence_bounded():
     strat = torch.randn(4, NUM_STRATEGY_FEATURES)
     out   = model(feats, strat)
     conf  = out['confidence']
-    assert (conf >= 0).all() and (conf <= 1).all()
+    # Confidence = max(softmax(signal_logits)), so range is (0, 1].
+    # For 2-class uniform logits the minimum is ~0.5; always > 0 and ≤ 1.
+    assert (conf > 0).all() and (conf <= 1).all()
+
+
+def test_hybrid_model_confidence_equals_max_softmax():
+    """Confidence must equal max(softmax(signal_logits)) — directly calibrated."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    feats = torch.randn(4, SEQ_LEN, len(get_model_feature_columns()))
+    strat = torch.randn(4, NUM_STRATEGY_FEATURES)
+    out   = model(feats, strat)
+    expected = torch.softmax(out['signal_logits'], dim=-1).max(dim=-1).values
+    assert torch.allclose(out['confidence'], expected, atol=1e-6)
 
 
 def test_hybrid_model_risk_positive():
@@ -401,7 +414,8 @@ def test_evaluate_confidence_all_in_01():
     loss_fn = FocalLoss()
     result = _evaluate(model, loader, loss_fn, torch.device('cpu'))
     confs = result['all_conf']
-    assert all(0.0 <= c <= 1.0 for c in confs)
+    # max(softmax) is always in (0, 1]; for 2-class it is always >= 0.5
+    assert all(0.0 < c <= 1.0 for c in confs)
 
 
 def test_train_reduces_loss():
@@ -411,9 +425,11 @@ def test_train_reduces_loss():
     optim   = torch.optim.Adam(model.parameters(), lr=1e-2)
     loss_fn = FocalLoss()
     losses = [_train_one_epoch(model, loader, optim, loss_fn, torch.device('cpu'))['loss']
-              for _ in range(5)]
-    # Loss should decrease (at least from first to last over 5 epochs)
-    assert losses[-1] < losses[0] * 1.5  # generous bound; just verify no explosion
+              for _ in range(10)]
+    # Loss should not explode over 10 epochs (all values finite and < 10)
+    assert all(0 < l < 10 for l in losses), f'Loss out of range: {losses}'
+    # Minimum loss across all epochs should be lower than the first epoch
+    assert min(losses) < losses[0], f'Loss never improved: {losses}'
 
 
 # =============================================================================

@@ -74,13 +74,8 @@ class HybridStrategyModel(nn.Module):
             nn.Softplus(),
         )
 
-        self.confidence_head = nn.Sequential(
-            nn.Linear(ffm_config.hidden_size, ffm_config.hidden_size // 4),
-            nn.GELU(),
-            nn.Dropout(ffm_config.hidden_dropout_prob),
-            nn.Linear(ffm_config.hidden_size // 4, 1),
-            nn.Sigmoid(),
-        )
+        # No separate confidence head — confidence is derived from signal_logits
+        # so it is always trained by the classification loss and stays calibrated.
 
     def load_backbone(self, path: str) -> None:
         """Load pretrained backbone weights (raw backbone state_dict, no prefix)."""
@@ -105,7 +100,7 @@ class HybridStrategyModel(nn.Module):
         head_params = sum(
             p.numel()
             for m in [self.strategy_projection, self.fusion,
-                      self.signal_head, self.risk_head, self.confidence_head]
+                      self.signal_head, self.risk_head]
             for p in m.parameters()
         )
         trainable += head_params
@@ -136,10 +131,16 @@ class HybridStrategyModel(nn.Module):
             attention_mask=attention_mask,
             output_sequence=False,
         )
-        strat_embed = self.strategy_projection(strategy_features)
-        fused = self.fusion(torch.cat([embedding, strat_embed], dim=-1))
+        strat_embed  = self.strategy_projection(strategy_features)
+        fused        = self.fusion(torch.cat([embedding, strat_embed], dim=-1))
+        signal_logits = self.signal_head(fused)
+        # Confidence = probability assigned to the predicted class.
+        # Derived from signal_logits so it is trained by the classification loss —
+        # the model must earn high confidence by correctly assigning probability mass.
+        probs = torch.softmax(signal_logits, dim=-1)
+        confidence = probs.max(dim=-1).values
         return {
-            'signal_logits':    self.signal_head(fused),
+            'signal_logits':    signal_logits,
             'risk_predictions': self.risk_head(fused),
-            'confidence':       self.confidence_head(fused).squeeze(-1),
+            'confidence':       confidence,
         }
