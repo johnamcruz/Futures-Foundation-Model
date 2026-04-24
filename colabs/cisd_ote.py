@@ -53,6 +53,7 @@ print('✅ Cloned')
 
 os.chdir('/content/Futures-Foundation-Model')
 os.system('pip install -e . -q 2>&1 | tail -1')
+os.system('pip install onnxscript -q 2>&1 | tail -1')
 
 try:
     from futures_foundation import FFMConfig, FFMBackbone, get_model_feature_columns

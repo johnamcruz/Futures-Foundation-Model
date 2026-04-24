@@ -26,6 +26,7 @@ subprocess.run(['git', 'clone', '--depth=1',
                check=True)
 os.chdir('/content/Futures-Foundation-Model')
 os.system('pip install -e . -q 2>&1 | tail -1')
+os.system('pip install onnxscript -q 2>&1 | tail -1')
 
 # ── Config (must match training) ───────────────────────────────────────────────
 
