@@ -22,6 +22,16 @@ class TrainingConfig:
     lr: float = 5e-5
     freeze_ratio: float = 0.66    # fraction of backbone layers to freeze
 
+    # ── Warm start ──
+    # 'selective' (default): transfer backbone weights only, cold-start strategy heads
+    #   so heads re-calibrate to the new fold's regime from scratch.
+    # 'full': transfer entire model (original behaviour).
+    warm_start_mode: str = 'selective'
+    # LR multiplier applied to backbone params when warm-starting (option 2).
+    # Keeps backbone knowledge stable while heads adapt at full speed.
+    # Set to 1.0 to disable layerwise LR.
+    backbone_lr_multiplier: float = 0.1
+
     # ── Loss ──
     risk_weight: float = 0.1      # risk-head loss coefficient
     miss_penalty: float = 1.0     # class weight for signal class
