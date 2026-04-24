@@ -160,6 +160,16 @@ PATIENCE       = 15
 MAX_RATIO      = 2.5
 RATIO_PATIENCE = 8
 
+# ── WARM START (fold-to-fold weight transfer) ──
+# 'selective': transfer backbone only, cold-start strategy heads each fold
+#              so heads re-calibrate to the new fold's regime from scratch.
+# 'full':      transfer entire model (use to compare against selective).
+WARM_START_MODE       = 'selective'
+# LR multiplier for backbone params when warm-starting.
+# Heads train at full LR; backbone erodes slowly so prior knowledge is preserved.
+# Set to 1.0 to disable layerwise LR and use uniform LR for all params.
+BACKBONE_LR_MULTIPLIER = 0.1
+
 # ── MECHANICAL BASELINE WR ──
 BASELINE_WR = {
     'ES': 0.275, 'NQ': 0.393, 'RTY': 0.30, 'YM': 0.30, 'GC': 0.355,
@@ -196,6 +206,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\n🖥️  Device: {device}')
 print(f'🏗️  FFM 256-dim + {NUM_CISD_FEATURES} CISD features | {NUM_LABELS}-class')
 print(f'🔧  LR:{LR} | Freeze:{FREEZE_RATIO:.0%} | SEQ_LEN:{SEQ_LEN} | SIG/batch:{SIG_PER_BATCH}')
+print(f'🔁  WarmStart:{WARM_START_MODE} | BackboneLR×{BACKBONE_LR_MULTIPLIER}')
 print(f'📅  Train<{TRAIN_END} | Val<{VAL_END} | Test≥{VAL_END}')
 print(f'📊  CISD on 5min | Trend:{TREND_FILTER_TF} | Swing:{SWING_PERIOD} | Tol:{TOLERANCE}')
 print(f'🔴  Displacement: body>={DISP_BODY_RATIO_MIN} + close_str>={DISP_CLOSE_STR_MIN}')
@@ -712,22 +723,24 @@ from futures_foundation.finetune import TrainingConfig, run_walk_forward, export
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 training_cfg = TrainingConfig(
-    seq_len        = SEQ_LEN,
-    batch_size     = BATCH_SIZE,
-    sig_per_batch  = SIG_PER_BATCH,
-    epochs         = EPOCHS,
-    lr             = LR,
-    freeze_ratio   = FREEZE_RATIO,
-    risk_weight    = RISK_WEIGHT,
-    miss_penalty   = MISS_PENALTY,
-    false_penalty  = FALSE_PENALTY,
-    focal_gamma    = FOCAL_GAMMA,
-    focal_smoothing= FOCAL_SMOOTHING,
-    patience       = PATIENCE,
-    max_ratio      = MAX_RATIO,
-    ratio_patience = RATIO_PATIENCE,
-    num_labels     = NUM_LABELS,
-    baseline_wr    = BASELINE_WR,
+    seq_len               = SEQ_LEN,
+    batch_size            = BATCH_SIZE,
+    sig_per_batch         = SIG_PER_BATCH,
+    epochs                = EPOCHS,
+    lr                    = LR,
+    freeze_ratio          = FREEZE_RATIO,
+    risk_weight           = RISK_WEIGHT,
+    miss_penalty          = MISS_PENALTY,
+    false_penalty         = FALSE_PENALTY,
+    focal_gamma           = FOCAL_GAMMA,
+    focal_smoothing       = FOCAL_SMOOTHING,
+    patience              = PATIENCE,
+    max_ratio             = MAX_RATIO,
+    ratio_patience        = RATIO_PATIENCE,
+    num_labels            = NUM_LABELS,
+    warm_start_mode       = WARM_START_MODE,
+    backbone_lr_multiplier= BACKBONE_LR_MULTIPLIER,
+    baseline_wr           = BASELINE_WR,
 )
 
 ffm_config = FFMConfig(
