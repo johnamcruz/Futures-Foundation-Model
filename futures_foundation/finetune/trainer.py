@@ -910,7 +910,7 @@ def export_onnx(
             'risk_predictions':  {0: 'batch'},
             'confidence':        {0: 'batch'},  # max(softmax(signal_logits))
         },
-        opset_version=14,
+        opset_version=18,
     )
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'  ✅ ONNX exported: {output_path} ({size_mb:.1f} MB)')
