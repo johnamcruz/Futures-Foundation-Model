@@ -14,8 +14,10 @@ from futures_foundation.finetune import (
     HybridStrategyModel, HybridStrategyDataset, FocalLoss,
     run_labeling, run_walk_forward, export_onnx, print_eval_summary,
 )
+from futures_foundation.finetune import validate_setup
 from futures_foundation.finetune.trainer import (
     _make_balanced_loader, _train_one_epoch, _evaluate, _concat_with_meta,
+    _config_hash, _load_fold_data, _validate_labeler_output,
 )
 
 
@@ -716,3 +718,546 @@ def test_dataset_label_is_last_bar_of_window():
     for i in range(len(ds)):
         if i != target_window:
             assert ds[i]['signal_label'].item() == 0, f'Window {i} should be noise'
+
+
+# =============================================================================
+# 1. Config hash — resume detection correctness
+# =============================================================================
+
+def test_config_hash_is_deterministic():
+    """Same config must always produce the same hash — resume detection depends on it."""
+    cfg = TrainingConfig(seq_len=96, lr=5e-5, epochs=40)
+    assert _config_hash(cfg) == _config_hash(cfg)
+
+
+def test_config_hash_changes_with_lr():
+    """Changing any hyperparameter must produce a different hash."""
+    base = TrainingConfig(lr=5e-5)
+    changed = TrainingConfig(lr=1e-4)
+    assert _config_hash(base) != _config_hash(changed)
+
+
+def test_config_hash_changes_with_seq_len():
+    base = TrainingConfig(seq_len=96)
+    changed = TrainingConfig(seq_len=64)
+    assert _config_hash(base) != _config_hash(changed)
+
+
+def test_config_hash_changes_with_freeze_ratio():
+    base = TrainingConfig(freeze_ratio=0.66)
+    changed = TrainingConfig(freeze_ratio=0.50)
+    assert _config_hash(base) != _config_hash(changed)
+
+
+def test_config_hash_ignores_baseline_wr():
+    """baseline_wr is evaluation-only metadata — it must NOT affect the hash
+    so that adding a new ticker's baseline doesn't invalidate saved checkpoints."""
+    cfg_no_wr   = TrainingConfig(baseline_wr={})
+    cfg_with_wr = TrainingConfig(baseline_wr={'ES': 0.30, 'NQ': 0.40})
+    assert _config_hash(cfg_no_wr) == _config_hash(cfg_with_wr)
+
+
+def test_config_hash_length():
+    """Hash must be exactly 8 hex characters (as stored in checkpoint files)."""
+    h = _config_hash(TrainingConfig())
+    assert len(h) == 8
+    assert all(c in '0123456789abcdef' for c in h)
+
+
+# =============================================================================
+# 2. Frozen params — backbone freeze correctness
+# =============================================================================
+
+def test_frozen_params_have_no_gradient():
+    """After freeze_backbone(), frozen layers must not accumulate gradients."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.5)
+
+    # Run a forward + backward pass
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+    labels = torch.randint(0, 2, (2,))
+    loss_fn = FocalLoss()
+    out  = model(feats, strat)
+    loss = loss_fn(out['signal_logits'], labels)
+    loss.backward()
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            assert param.grad is None, (
+                f'Frozen param {name} has a gradient — freeze_backbone() is broken')
+
+
+def test_trainable_params_do_have_gradient():
+    """After freeze_backbone(), strategy heads and unfrozen layers must get gradients."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.5)
+
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+    labels = torch.randint(0, 2, (2,))
+    loss_fn = FocalLoss()
+    out  = model(feats, strat)
+    loss = loss_fn(out['signal_logits'], labels)
+    loss.backward()
+
+    trainable_with_grad = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and p.grad is not None and p.grad.abs().sum() > 0
+    ]
+    assert len(trainable_with_grad) > 0, (
+        'No trainable parameters received gradients after backward()')
+
+
+def test_freeze_ratio_zero_trains_all():
+    """freeze_ratio=0 must leave all backbone params trainable."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)
+    frozen = [p for p in model.backbone.parameters() if not p.requires_grad]
+    assert len(frozen) == 0, 'freeze_ratio=0 should leave all backbone params trainable'
+
+
+def test_freeze_ratio_one_freezes_all_backbone():
+    """freeze_ratio=1 must freeze the entire backbone."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=1.0)
+    trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
+    assert len(trainable_backbone) == 0, (
+        'freeze_ratio=1 should freeze the entire backbone')
+
+
+# =============================================================================
+# 3. Time splits — no data leakage between train / val / test
+# =============================================================================
+
+def _write_fold_parquets(tmp_path, ticker, n=500):
+    """Write minimal FFM + strategy parquet files for fold data loading tests."""
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        return None, None
+
+    ffm_dir      = tmp_path / 'ffm';      ffm_dir.mkdir(exist_ok=True)
+    strategy_dir = tmp_path / 'strategy'; strategy_dir.mkdir(exist_ok=True)
+
+    # Build timestamps spanning multiple years so splits are non-empty
+    dates = pd.date_range('2021-01-01', periods=n, freq='5min', tz='UTC')
+    ffm_df = make_ffm_df(n)
+    ffm_df['_datetime'] = dates.tz_convert('America/New_York')
+
+    strat_f = make_strategy_features(n)
+    strat_l = make_labels(n, signal_rate=0.05)
+
+    ffm_df.to_parquet(ffm_dir  / f'{ticker}_features.parquet', index=False)
+    strat_f.to_parquet(strategy_dir / f'{ticker}_strategy_features.parquet', index=False)
+    strat_l.to_parquet(strategy_dir / f'{ticker}_strategy_labels.parquet',   index=False)
+    return str(ffm_dir), str(strategy_dir)
+
+
+@pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
+def test_fold_time_splits_no_overlap(tmp_path):
+    """Train / val / test windows must not share any rows."""
+    ticker = 'ES'
+    ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, ticker, n=2000)
+
+    fold = {
+        'name':      'F1',
+        'train_end': '2021-01-15',
+        'val_end':   '2021-01-22',
+        'test_end':  '2021-01-29',
+    }
+    train_ds, val_ds, test_ds = _load_fold_data(
+        fold, [ticker], ffm_dir, strategy_dir,
+        STRATEGY_COLS, seq_len=SEQ_LEN)
+
+    # Collect raw row indices consumed by each split
+    def row_indices(dsets):
+        indices = set()
+        for d in dsets:
+            for ws in d.window_starts:
+                indices.update(range(ws, ws + d.seq_len))
+        return indices
+
+    if not train_ds or not val_ds or not test_ds:
+        pytest.skip('Not enough data in generated parquet to fill all splits')
+
+    train_rows = row_indices(train_ds)
+    val_rows   = row_indices(val_ds)
+    test_rows  = row_indices(test_ds)
+
+    assert len(train_rows & val_rows) == 0,  'Train and val share rows — data leakage'
+    assert len(val_rows   & test_rows) == 0, 'Val and test share rows — data leakage'
+    assert len(train_rows & test_rows) == 0, 'Train and test share rows — data leakage'
+
+
+@pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
+def test_fold_train_comes_before_val(tmp_path):
+    """Every train window must end before every val window starts."""
+    ticker = 'ES'
+    ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, ticker, n=2000)
+
+    fold = {
+        'name':      'F1',
+        'train_end': '2021-01-15',
+        'val_end':   '2021-01-22',
+        'test_end':  '2021-01-29',
+    }
+    train_ds, val_ds, _ = _load_fold_data(
+        fold, [ticker], ffm_dir, strategy_dir,
+        STRATEGY_COLS, seq_len=SEQ_LEN)
+
+    if not train_ds or not val_ds:
+        pytest.skip('Not enough data')
+
+    max_train_row = max(ws + d.seq_len - 1 for d in train_ds for ws in d.window_starts)
+    min_val_row   = min(ws             for d in val_ds   for ws in d.window_starts)
+    assert max_train_row < min_val_row, (
+        f'Train rows extend into val: max_train={max_train_row} min_val={min_val_row}')
+
+
+# =============================================================================
+# 4. Balanced loader — signal oversampling actually works
+# =============================================================================
+
+def test_balanced_loader_signal_rate_approximately_correct():
+    """Batches should contain ~sig_per_batch signals out of batch_size windows."""
+    ffm_df = make_ffm_df(2000, seed=1)
+    strat  = make_strategy_features(2000, seed=1)
+    labels = make_labels(2000, signal_rate=0.02, seed=1)   # 2% natural rate
+
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+
+    batch_size    = 32
+    sig_per_batch = 4                                       # target: 12.5% per batch
+    loader = _make_balanced_loader(concat, batch_size=batch_size,
+                                   sig_per_batch=sig_per_batch, num_workers=0)
+
+    # Sample 20 batches and count signal windows
+    signal_counts = []
+    for i, batch in enumerate(loader):
+        if i >= 20:
+            break
+        signal_counts.append((batch['signal_label'] > 0).sum().item())
+
+    avg_signals = sum(signal_counts) / len(signal_counts)
+    # Natural rate would give ~0.64 signals/batch; target is 4.
+    # Accept anywhere in [2, 8] — well above natural rate and below saturation.
+    assert avg_signals >= 2, (
+        f'Oversampling not working: avg {avg_signals:.1f} signals/batch '
+        f'(expected ~{sig_per_batch}, natural rate ~{0.02 * batch_size:.1f})')
+    assert avg_signals <= batch_size, 'More signals than batch size — impossible'
+
+
+def test_balanced_loader_signal_rate_above_natural():
+    """Signal rate in batches must be significantly higher than the natural dataset rate."""
+    ffm_df = make_ffm_df(3000, seed=2)
+    strat  = make_strategy_features(3000, seed=2)
+    labels = make_labels(3000, signal_rate=0.01, seed=2)   # 1% natural rate
+
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+
+    natural_rate = len(ds.signal_indices) / len(ds)
+
+    loader = _make_balanced_loader(concat, batch_size=64, sig_per_batch=8, num_workers=0)
+
+    seen_signals = seen_total = 0
+    for i, batch in enumerate(loader):
+        if i >= 30:
+            break
+        seen_signals += (batch['signal_label'] > 0).sum().item()
+        seen_total   += batch['signal_label'].size(0)
+
+    sampled_rate = seen_signals / max(seen_total, 1)
+    assert sampled_rate > natural_rate * 3, (
+        f'Sampled signal rate {sampled_rate:.3f} not much above '
+        f'natural rate {natural_rate:.3f} — oversampling may be broken')
+
+
+# =============================================================================
+# 5. Model save / load identity
+# =============================================================================
+
+def test_model_save_load_identical_predictions():
+    """Saving and reloading a model's state_dict must produce bit-identical outputs."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.eval()
+
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+
+    with torch.no_grad():
+        out_before = {k: v.clone() for k, v in model(feats, strat).items()}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'model.pt')
+        torch.save({'model_state': model.state_dict()}, path)
+
+        model2 = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+        ckpt   = torch.load(path, map_location='cpu', weights_only=False)
+        model2.load_state_dict(ckpt['model_state'])
+        model2.eval()
+
+    with torch.no_grad():
+        out_after = model2(feats, strat)
+
+    for key in ['signal_logits', 'risk_predictions', 'confidence']:
+        assert torch.allclose(out_before[key], out_after[key], atol=1e-6), (
+            f'{key} differs after save/load — model weights not preserved correctly')
+
+
+def test_warm_start_changes_initial_predictions():
+    """A model loaded from a warm-start state must produce different outputs than
+    a freshly initialised model with the same architecture."""
+    cfg    = small_ffm_config()
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+
+    # Train the 'previous fold' model for a few steps so its weights differ from init
+    prev_model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    optim = torch.optim.SGD(prev_model.parameters(), lr=0.1)
+    loss_fn = FocalLoss()
+    for _ in range(5):
+        out  = prev_model(feats, strat)
+        loss = loss_fn(out['signal_logits'], torch.randint(0, 2, (2,)))
+        loss.backward(); optim.step(); optim.zero_grad()
+
+    warm_state = {k: v.cpu().clone() for k, v in prev_model.state_dict().items()}
+
+    # Fresh model
+    fresh_model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    # Warm-started model
+    warm_model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    warm_model.load_state_dict({k: v for k, v in warm_state.items()})
+
+    fresh_model.eval(); warm_model.eval()
+    with torch.no_grad():
+        fresh_out = fresh_model(feats, strat)['signal_logits']
+        warm_out  = warm_model(feats,  strat)['signal_logits']
+
+    assert not torch.allclose(fresh_out, warm_out, atol=1e-4), (
+        'Warm-started model produces identical outputs to a fresh model — '
+        'warm_start_state is not being applied')
+
+
+# =============================================================================
+# 6. validate_setup — pre-flight error detection
+# =============================================================================
+
+def test_validate_setup_passes_with_valid_files(tmp_path):
+    """validate_setup must not raise when all required files exist."""
+    backbone = tmp_path / 'backbone.pt'
+    ffm_dir  = tmp_path / 'ffm';      ffm_dir.mkdir()
+    strat_dir = tmp_path / 'strat';   strat_dir.mkdir()
+
+    # Create stub files
+    backbone.write_bytes(b'stub')
+    (ffm_dir / 'ES_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_labels.parquet').write_bytes(b'stub')
+
+    validate_setup(
+        tickers=['ES'],
+        ffm_dir=str(ffm_dir),
+        strategy_dir=str(strat_dir),
+        backbone_path=str(backbone),
+        strategy_feature_cols=STRATEGY_COLS,
+        num_strategy_features=NUM_STRATEGY_FEATURES,
+    )
+
+
+def test_validate_setup_raises_missing_backbone(tmp_path):
+    """validate_setup must raise ValueError with a clear message when backbone is absent."""
+    ffm_dir  = tmp_path / 'ffm';   ffm_dir.mkdir()
+    strat_dir = tmp_path / 'strat'; strat_dir.mkdir()
+    (ffm_dir / 'ES_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_labels.parquet').write_bytes(b'stub')
+
+    with pytest.raises(ValueError, match='Backbone not found'):
+        validate_setup(
+            tickers=['ES'],
+            ffm_dir=str(ffm_dir),
+            strategy_dir=str(strat_dir),
+            backbone_path=str(tmp_path / 'missing.pt'),
+            strategy_feature_cols=STRATEGY_COLS,
+            num_strategy_features=NUM_STRATEGY_FEATURES,
+        )
+
+
+def test_validate_setup_raises_feature_count_mismatch(tmp_path):
+    """validate_setup must raise when num_strategy_features != len(strategy_feature_cols)."""
+    backbone  = tmp_path / 'backbone.pt';           backbone.write_bytes(b'stub')
+    ffm_dir   = tmp_path / 'ffm';   ffm_dir.mkdir()
+    strat_dir = tmp_path / 'strat'; strat_dir.mkdir()
+    (ffm_dir / 'ES_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_labels.parquet').write_bytes(b'stub')
+
+    with pytest.raises(ValueError, match='num_strategy_features'):
+        validate_setup(
+            tickers=['ES'],
+            ffm_dir=str(ffm_dir),
+            strategy_dir=str(strat_dir),
+            backbone_path=str(backbone),
+            strategy_feature_cols=STRATEGY_COLS,          # 4 cols
+            num_strategy_features=NUM_STRATEGY_FEATURES + 2,  # wrong count
+        )
+
+
+def test_validate_setup_raises_missing_ffm_parquet(tmp_path):
+    """validate_setup must raise when FFM prepared parquet files are missing."""
+    backbone  = tmp_path / 'backbone.pt'; backbone.write_bytes(b'stub')
+    ffm_dir   = tmp_path / 'ffm';   ffm_dir.mkdir()   # empty — no parquet
+    strat_dir = tmp_path / 'strat'; strat_dir.mkdir()
+    (strat_dir / 'ES_strategy_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'ES_strategy_labels.parquet').write_bytes(b'stub')
+
+    with pytest.raises(ValueError, match='Missing FFM parquet'):
+        validate_setup(
+            tickers=['ES'],
+            ffm_dir=str(ffm_dir),
+            strategy_dir=str(strat_dir),
+            backbone_path=str(backbone),
+            strategy_feature_cols=STRATEGY_COLS,
+            num_strategy_features=NUM_STRATEGY_FEATURES,
+        )
+
+
+def test_validate_setup_raises_missing_cache_files(tmp_path):
+    """validate_setup must raise when strategy cache parquets are missing."""
+    backbone  = tmp_path / 'backbone.pt'; backbone.write_bytes(b'stub')
+    ffm_dir   = tmp_path / 'ffm';   ffm_dir.mkdir()
+    strat_dir = tmp_path / 'strat'; strat_dir.mkdir()  # empty — no cache
+    (ffm_dir / 'ES_features.parquet').write_bytes(b'stub')
+
+    with pytest.raises(ValueError, match='Missing strategy cache'):
+        validate_setup(
+            tickers=['ES'],
+            ffm_dir=str(ffm_dir),
+            strategy_dir=str(strat_dir),
+            backbone_path=str(backbone),
+            strategy_feature_cols=STRATEGY_COLS,
+            num_strategy_features=NUM_STRATEGY_FEATURES,
+        )
+
+
+def test_validate_setup_reports_all_errors_at_once(tmp_path):
+    """validate_setup must collect all problems and raise them together,
+    not bail after the first one — so users see the full picture in one run."""
+    with pytest.raises(ValueError) as exc_info:
+        validate_setup(
+            tickers=['ES', 'NQ'],
+            ffm_dir=str(tmp_path / 'ffm'),       # does not exist
+            strategy_dir=str(tmp_path / 'strat'), # does not exist
+            backbone_path=str(tmp_path / 'missing.pt'),
+            strategy_feature_cols=STRATEGY_COLS,
+            num_strategy_features=NUM_STRATEGY_FEATURES + 1,  # mismatch
+        )
+    msg = str(exc_info.value)
+    assert 'Backbone not found' in msg
+    assert 'num_strategy_features' in msg
+
+
+def test_validate_setup_micro_to_full_mapping(tmp_path):
+    """micro_to_full must be applied when looking for FFM parquets."""
+    backbone  = tmp_path / 'backbone.pt'; backbone.write_bytes(b'stub')
+    ffm_dir   = tmp_path / 'ffm';   ffm_dir.mkdir()
+    strat_dir = tmp_path / 'strat'; strat_dir.mkdir()
+
+    # Data stored under full ticker (ES), not micro (MES)
+    (ffm_dir / 'ES_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'MES_strategy_features.parquet').write_bytes(b'stub')
+    (strat_dir / 'MES_strategy_labels.parquet').write_bytes(b'stub')
+
+    # Should pass: MES → ES mapping resolves the FFM file
+    validate_setup(
+        tickers=['MES'],
+        ffm_dir=str(ffm_dir),
+        strategy_dir=str(strat_dir),
+        backbone_path=str(backbone),
+        strategy_feature_cols=STRATEGY_COLS,
+        num_strategy_features=NUM_STRATEGY_FEATURES,
+        micro_to_full={'MES': 'ES'},
+    )
+
+
+# =============================================================================
+# 7. _validate_labeler_output — labeler contract enforcement
+# =============================================================================
+
+def test_validate_labeler_output_passes_valid():
+    """Valid labeler output must pass without raising."""
+    n = 100
+    feats  = make_strategy_features(n)
+    labels = make_labels(n, signal_rate=0.05)
+    _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_misaligned_features():
+    """Raises when strategy_features row count != ffm_df row count."""
+    n = 100
+    feats  = make_strategy_features(n - 5)   # wrong length
+    labels = make_labels(n, signal_rate=0.05)
+    with pytest.raises(ValueError, match='strategy_features'):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_misaligned_labels():
+    """Raises when labels_df row count != ffm_df row count."""
+    n = 100
+    feats  = make_strategy_features(n)
+    labels = make_labels(n - 5, signal_rate=0.05)  # wrong length
+    with pytest.raises(ValueError, match='labels_df'):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_missing_feature_col():
+    """Raises when a declared feature_col is absent from strategy_features."""
+    n = 100
+    feats  = make_strategy_features(n)[['feat_a', 'feat_b']]  # drop feat_c, feat_d
+    labels = make_labels(n, signal_rate=0.05)
+    with pytest.raises(ValueError, match='missing columns'):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_missing_signal_label_col():
+    """Raises when labels_df is missing the 'signal_label' column."""
+    n = 100
+    feats  = make_strategy_features(n)
+    labels = make_labels(n).drop(columns=['signal_label'])
+    with pytest.raises(ValueError, match="signal_label"):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_missing_max_rr_col():
+    """Raises when labels_df is missing the 'max_rr' column."""
+    n = 100
+    feats  = make_strategy_features(n)
+    labels = make_labels(n).drop(columns=['max_rr'])
+    with pytest.raises(ValueError, match="max_rr"):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_raises_zero_signals():
+    """Raises when there are no positive signal labels — training would be useless."""
+    n = 100
+    feats  = make_strategy_features(n)
+    labels = make_labels(n, signal_rate=0.0)  # all zeros
+    with pytest.raises(ValueError, match='0 signals'):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'ES')
+
+
+def test_validate_labeler_output_error_includes_ticker():
+    """Error message must include the ticker so multi-ticker logs are easy to triage."""
+    n = 100
+    feats  = make_strategy_features(n - 1)  # misaligned
+    labels = make_labels(n, signal_rate=0.05)
+    with pytest.raises(ValueError, match='NQ'):
+        _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'NQ')

@@ -37,6 +37,7 @@ from .trainer import (
     print_eval_summary,
     run_labeling,
     run_walk_forward,
+    validate_setup,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     'run_walk_forward',
     'export_onnx',
     'print_eval_summary',
+    'validate_setup',
 ]

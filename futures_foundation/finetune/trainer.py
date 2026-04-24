@@ -28,7 +28,116 @@ from .losses import FocalLoss
 from .model import HybridStrategyModel
 
 
+# ── Setup validation ─────────────────────────────────────────────────────────
+
+def validate_setup(
+    tickers: list,
+    ffm_dir: str,
+    strategy_dir: str,
+    backbone_path: str,
+    strategy_feature_cols: list,
+    num_strategy_features: int,
+    micro_to_full: dict = None,
+) -> None:
+    """
+    Pre-flight checks before training starts.  Raises ValueError / FileNotFoundError
+    with a clear message so Colab shows the exact problem instead of a cryptic
+    stack trace several cells later.
+    """
+    errors = []
+    micro_to_full = micro_to_full or {}
+
+    # Backbone
+    if not os.path.exists(backbone_path):
+        errors.append(
+            f'❌ Backbone not found: {backbone_path}\n'
+            f'   Run the pretraining script first or check BACKBONE_PATH.')
+
+    # feature_cols / num_strategy_features consistency
+    if len(strategy_feature_cols) != num_strategy_features:
+        errors.append(
+            f'❌ num_strategy_features={num_strategy_features} but '
+            f'len(strategy_feature_cols)={len(strategy_feature_cols)} — must match.')
+
+    # FFM prepared files
+    missing_ffm = []
+    for ticker in tickers:
+        data_ticker = micro_to_full.get(ticker, ticker)
+        p = os.path.join(ffm_dir, f'{data_ticker}_features.parquet')
+        if not os.path.exists(p):
+            missing_ffm.append(p)
+    if missing_ffm:
+        errors.append(
+            f'❌ Missing FFM parquet files ({len(missing_ffm)}):\n' +
+            '\n'.join(f'   {p}' for p in missing_ffm[:5]) +
+            (f'\n   … and {len(missing_ffm)-5} more' if len(missing_ffm) > 5 else '') +
+            f'\n   Run the FFM data preparation step first.')
+
+    # Strategy cache files
+    missing_cache = []
+    for ticker in tickers:
+        for suffix in ('strategy_features', 'strategy_labels'):
+            p = os.path.join(strategy_dir, f'{ticker}_{suffix}.parquet')
+            if not os.path.exists(p):
+                missing_cache.append(p)
+    if missing_cache:
+        errors.append(
+            f'❌ Missing strategy cache files ({len(missing_cache)}):\n' +
+            '\n'.join(f'   {p}' for p in missing_cache[:6]) +
+            (f'\n   … and {len(missing_cache)-6} more' if len(missing_cache) > 6 else '') +
+            f'\n   Run run_labeling() (Cell 3) before run_walk_forward() (Cell 4).')
+
+    if errors:
+        raise ValueError(
+            '\n\nSetup validation failed — fix these issues before training:\n\n' +
+            '\n\n'.join(errors))
+
+    print(f'  ✅ Setup validation passed ({len(tickers)} tickers, backbone found)')
+
+
 # ── Labeling ─────────────────────────────────────────────────────────────────
+
+def _validate_labeler_output(
+    strategy_feats: 'pd.DataFrame',
+    labels_df: 'pd.DataFrame',
+    feature_cols: list,
+    expected_len: int,
+    ticker: str,
+) -> None:
+    """Sanity-check labeler.run() output before writing to parquet cache."""
+    problems = []
+
+    if len(strategy_feats) != expected_len:
+        problems.append(
+            f'strategy_features has {len(strategy_feats)} rows but '
+            f'ffm_df has {expected_len} rows — must be aligned to ffm_df.index')
+
+    if len(labels_df) != expected_len:
+        problems.append(
+            f'labels_df has {len(labels_df)} rows but '
+            f'ffm_df has {expected_len} rows — must be aligned to ffm_df.index')
+
+    missing_feat_cols = [c for c in feature_cols if c not in strategy_feats.columns]
+    if missing_feat_cols:
+        problems.append(
+            f'strategy_features is missing columns: {missing_feat_cols}\n'
+            f'   feature_cols declares {feature_cols}')
+
+    for col in ('signal_label', 'max_rr'):
+        if col not in labels_df.columns:
+            problems.append(f"labels_df is missing required column '{col}'")
+
+    if 'signal_label' in labels_df.columns:
+        n_signals = (labels_df['signal_label'] > 0).sum()
+        if n_signals == 0:
+            problems.append(
+                f'labels_df has 0 signals — check strategy logic or data range')
+
+    if problems:
+        raise ValueError(
+            f'\n\n❌ Labeler output validation failed for {ticker}:\n' +
+            '\n'.join(f'  • {p}' for p in problems))
+
 
 def run_labeling(
     labeler: StrategyLabeler,
@@ -98,6 +207,10 @@ def run_labeling(
         print(f'  Loaded {len(df_raw):,} 5m bars')
 
         strategy_feats, labels_df = labeler.run(df_raw, ffm_df, ticker)
+
+        # Validate labeler output before saving to avoid corrupted cache files
+        _validate_labeler_output(strategy_feats, labels_df, labeler.feature_cols,
+                                 len(ffm_df), ticker)
 
         strategy_feats.to_parquet(feat_path,  index=False)
         labels_df.to_parquet(label_path, index=False)
@@ -565,8 +678,15 @@ def run_walk_forward(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    if not os.path.exists(backbone_path):
-        raise FileNotFoundError(f'Backbone not found: {backbone_path}')
+    validate_setup(
+        tickers=tickers,
+        ffm_dir=ffm_dir,
+        strategy_dir=strategy_dir,
+        backbone_path=backbone_path,
+        strategy_feature_cols=strategy_feature_cols,
+        num_strategy_features=num_strategy_features,
+        micro_to_full=micro_to_full,
+    )
 
     config_hash = _config_hash(training_cfg)
     print(f'\n{"="*60}')
