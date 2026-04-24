@@ -912,6 +912,14 @@ def export_onnx(
         },
         opset_version=18,
     )
+    # Inline any external weight data back into the single .onnx file
+    import onnx as _onnx
+    _proto = _onnx.load(output_path, load_external_data=True)
+    _onnx.save(_proto, output_path, save_as_external_data=False)
+    # Remove the companion .data file if it was left behind
+    data_path = output_path + '.data'
+    if os.path.exists(data_path):
+        os.remove(data_path)
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'  ✅ ONNX exported: {output_path} ({size_mb:.1f} MB)')
 
