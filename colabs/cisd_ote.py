@@ -707,7 +707,7 @@ import gc, importlib
 import futures_foundation
 importlib.reload(futures_foundation)
 from futures_foundation import FFMConfig, get_model_feature_columns
-from futures_foundation.finetune import TrainingConfig, run_walk_forward, export_onnx
+from futures_foundation.finetune import TrainingConfig, run_walk_forward, export_onnx, validate_setup
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -733,6 +733,16 @@ training_cfg = TrainingConfig(
 ffm_config = FFMConfig(
     num_features  = len(get_model_feature_columns()),
     label_smoothing = FOCAL_SMOOTHING,
+)
+
+validate_setup(
+    tickers               = TICKERS,
+    ffm_dir               = PREPARED_DIR,
+    strategy_dir          = CISD_CACHE_DIR,
+    backbone_path         = BACKBONE_PATH,
+    strategy_feature_cols = CISD_FEATURE_COLS,
+    num_strategy_features = NUM_CISD_FEATURES,
+    micro_to_full         = MICRO_TO_FULL,
 )
 
 fold_results = run_walk_forward(
