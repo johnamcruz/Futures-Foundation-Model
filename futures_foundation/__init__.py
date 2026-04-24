@@ -31,8 +31,13 @@ from .dataset import (
     FFMDataset, FFMMultiInstrumentDataset,
     temporal_train_val_split, interleaved_train_val_split, create_dataloaders,
 )
+from .finetune import (
+    StrategyLabeler, TrainingConfig,
+    HybridStrategyModel, HybridStrategyDataset, FocalLoss,
+    run_labeling, run_walk_forward, export_onnx, print_eval_summary,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "FFMConfig", "FFMBackbone", "FFMForPretraining", "FFMForClassification",
     "FFMForRegression", "FFMForStrategyWithRisk",
@@ -43,4 +48,7 @@ __all__ = [
     "LABEL_CONFIDENCE_SENTINEL",
     "FFMDataset", "FFMMultiInstrumentDataset",
     "temporal_train_val_split", "interleaved_train_val_split", "create_dataloaders",
+    "StrategyLabeler", "TrainingConfig",
+    "HybridStrategyModel", "HybridStrategyDataset", "FocalLoss",
+    "run_labeling", "run_walk_forward", "export_onnx", "print_eval_summary",
 ]
