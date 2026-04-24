@@ -910,7 +910,7 @@ def export_onnx(
             'risk_predictions':  {0: 'batch'},
             'confidence':        {0: 'batch'},  # max(softmax(signal_logits))
         },
-        opset_version=17,
+        opset_version=14,
     )
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'  ✅ ONNX exported: {output_path} ({size_mb:.1f} MB)')
@@ -1017,6 +1017,6 @@ def print_eval_summary(
             print(f'  {thresh:.2f}  {int(tp_n+fp_n):>6}  {prec:>6.3f}  {delta:>+8.1%}  {ok}')
 
     if output_dir:
-        onnx_path = os.path.join(output_dir, 'strategy_hybrid.onnx')
+        onnx_path = os.path.join(output_dir, 'cisd_ote_hybrid.onnx')
         print(f'\n  ONNX model: {onnx_path}')
         print(f'  Checkpoints: {output_dir}')
