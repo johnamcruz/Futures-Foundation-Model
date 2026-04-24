@@ -2,7 +2,7 @@
 
 ![Python Unit Tests](https://github.com/johnamcruz/Futures-Foundation-Model/actions/workflows/main.yml/badge.svg)
 
-**A pretrained transformer backbone for futures market structure and regime classification.**
+**A pretrained transformer backbone for futures market structure and regime classification — with a plug-and-play fine-tuning framework for any trading strategy.**
 
 ---
 
@@ -14,7 +14,99 @@ Futures Foundation Model (FFM) is an open-source pretrained transformer designed
 
 > Separate **"understanding market context"** from **"making strategy-specific decisions."**
 
-Just as BERT learns language structure before being fine-tuned for sentiment or Q&A, FFM learns market structure before being fine-tuned for ORB entries, ICT setups, mean reversion signals, or any other strategy.
+Just as BERT learns language structure before being fine-tuned for sentiment or Q&A, FFM learns market structure before being fine-tuned for ORB entries, ICT setups, mean reversion signals, or any other strategy. The backbone handles all market context — trend, volatility, session, HTF structure, order flow. Your strategy adds only the setup-specific features it uniquely knows.
+
+---
+
+## Fine-Tuning Framework
+
+**v0.3 introduced `futures_foundation.finetune` — a reusable, fully-tested walk-forward training framework.**
+
+Adding a new strategy now requires implementing one class. Everything else — training loop, walk-forward splits, warm start between folds, dual checkpointing, evaluation tables, ONNX export — is handled by the framework.
+
+### Add a new strategy in ~30 lines
+
+```python
+from futures_foundation.finetune import StrategyLabeler, TrainingConfig, run_labeling, run_walk_forward
+
+class MyStrategyLabeler(StrategyLabeler):
+    @property
+    def name(self): return 'my_strategy'
+
+    @property
+    def feature_cols(self): return ['zone_height', 'entry_depth', 'risk_norm']
+
+    def run(self, df_raw, ffm_df, ticker):
+        # df_raw:  raw 5-min OHLCV (tz-aware NY index)
+        # ffm_df:  FFM-prepared features — use htf_1h_structure, vty_atr_raw, etc.
+        #          directly rather than recomputing from raw bars
+        features_df, labels_df = my_signal_logic(df_raw, ffm_df)
+        return features_df, labels_df  # both aligned to ffm_df.index
+```
+
+```python
+# Cell 3 — Label all tickers (cached to parquet on first run)
+labeler = MyStrategyLabeler()
+run_labeling(labeler, TICKERS, RAW_DATA_DIR, PREPARED_DIR, CACHE_DIR)
+
+# Cell 4 — Walk-forward fine-tuning (4 folds, warm start, dual checkpoint)
+fold_results = run_walk_forward(
+    folds=FOLDS, tickers=TICKERS, ffm_dir=PREPARED_DIR,
+    strategy_dir=CACHE_DIR, output_dir=OUTPUT_DIR,
+    backbone_path=BACKBONE_PATH, ffm_config=ffm_config,
+    training_cfg=TrainingConfig(), num_strategy_features=3,
+    strategy_feature_cols=labeler.feature_cols,
+)
+
+# Cell 5 — Evaluation (confidence thresholds, per-fold, vs baseline)
+from futures_foundation.finetune import print_eval_summary
+print_eval_summary(fold_results, baseline_wr=BASELINE_WR)
+```
+
+### What the framework provides
+
+| Component | Description |
+|---|---|
+| `StrategyLabeler` | ABC — implement `name`, `feature_cols`, `run()` to define any strategy |
+| `TrainingConfig` | Dataclass holding all training hyperparameters |
+| `HybridStrategyModel` | FFM backbone + strategy feature projection + signal/risk/confidence heads |
+| `HybridStrategyDataset` | Sliding-window dataset parameterised by your strategy feature columns |
+| `run_labeling()` | CSV I/O, timezone normalization, parquet caching per ticker |
+| `run_walk_forward()` | 4-fold walk-forward, warm start F1→F2→F3→F4, dual checkpoint (val_loss + signal_F1) |
+| `print_eval_summary()` | Confidence threshold table, per-fold breakdown, vs-baseline comparison |
+| `export_onnx()` | Production ONNX export of the final fold model |
+
+### Model architecture
+
+```
+FFM Backbone (frozen lower layers)
+     │  → CLS embedding (256-dim)
+     │
+┌────┴─────────────────────────────────────┐
+│                                           │
+│   Strategy features (N strategy-specific) │
+│        → Linear(64) → GELU → Linear(64)  │
+│                           │               │
+└────── cat ────────────────┘               │
+          │ (256 + 64)                       │
+      fusion: Linear → GELU → LayerNorm     │
+          │ (256)                            │
+   ┌──────┼──────────┬───────────┐
+   │      │          │           │
+signal   risk   confidence
+ head    head     head
+```
+
+The backbone handles **all market context** — HTF trend, volatility regime, session structure, CRT sweeps, order flow. Strategy features cover only what the backbone cannot derive: setup geometry, zone age, entry distance, risk sizing.
+
+### CISD+OTE: first concrete implementation
+
+`colabs/cisd_ote.py` implements the Change in State of Delivery + Optimal Trade Entry strategy using the framework. It reduces to a `CISDOTELabeler(StrategyLabeler)` subclass with 10 strategy-specific features (zone geometry and trade mechanics). The 400-line training cell is replaced by a single `run_walk_forward()` call.
+
+Baseline performance (v5.1 reference, 5 instruments):
+- 2,729 signals across ES, NQ, RTY, YM, GC
+- 68.2% precision @ 0.90 confidence threshold
+- Profit factor 8.71 · +35.7pp above mechanical baseline
 
 ---
 
@@ -38,17 +130,8 @@ Input: OHLCV Bars (sequence of N bars × 66 continuous features + candle_type em
     ┌────┴────────┴──────────┴────────┴───┐
  [Regime]  [Volatility]  [Structure]  [Range]    ← Pretraining heads
     │
-    └──→ Fine-tune: [Classification] [Regression] [Strategy+Risk]
+    └──→ Fine-tune: [Classification] [Regression] [Strategy+Risk] [HybridStrategy]
 ```
-
-### Model Variants
-
-| Model | Purpose | Output |
-|-------|---------|--------|
-| `FFMForPretraining` | Multi-task self-supervised pretraining | 4 classification heads |
-| `FFMForClassification` | Strategy signal prediction (e.g., BUY/SELL/HOLD) | N-class logits |
-| `FFMForRegression` | Continuous value prediction (e.g., dynamic SL/TP) | N positive targets |
-| `FFMForStrategyWithRisk` | Combined signal + risk management | Logits + SL/TP distances |
 
 ### Pretraining Objectives (Forward-Looking, Self-Supervised)
 
@@ -80,43 +163,23 @@ pip install -e .
 ```python
 from futures_foundation import FFMConfig, FFMBackbone
 
-# Load pretrained backbone
-config = FFMConfig()
+config   = FFMConfig()
 backbone = FFMBackbone(config)
 backbone.load_pretrained("path/to/checkpoint")
 
-# Get market context embeddings
 embeddings = backbone(features_tensor)  # (batch, 256)
 ```
 
-### Fine-Tuning for a Strategy
+### Fine-Tuning with the Framework
 
 ```python
-from futures_foundation import FFMForClassification
-
-# ORB strategy: BUY / SELL / HOLD
-model = FFMForClassification(config, num_labels=3)
-model.load_backbone("path/to/pretrained/backbone")
-model.freeze_backbone(freeze_ratio=0.66)  # Freeze bottom 2/3
-
-# Train only the top layers + classification head
-optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=1e-4)
+from futures_foundation.finetune import (
+    StrategyLabeler, TrainingConfig,
+    run_labeling, run_walk_forward, print_eval_summary,
+)
 ```
 
-### Combined Strategy + Risk Management
-
-```python
-from futures_foundation import FFMForStrategyWithRisk
-
-# Signal head (BUY/SELL/HOLD) + Risk head (SL/TP in ATR units)
-model = FFMForStrategyWithRisk(config, num_labels=3, num_risk_targets=2)
-model.load_backbone("path/to/pretrained/backbone")
-model.freeze_backbone(freeze_ratio=0.66)
-
-outputs = model(features)
-# outputs["signal_logits"]    → (batch, 3)  BUY/SELL/HOLD
-# outputs["risk_predictions"] → (batch, 2)  [sl_atr, tp_atr]
-```
+See the [Fine-Tuning Framework](#fine-tuning-framework) section above and `colabs/cisd_ote.py` for a complete working example.
 
 ### Causal Attention Mask (Per-Bar Predictions)
 
@@ -125,13 +188,10 @@ All model classes support a `causal=True` parameter that applies a strict lower-
 ```python
 # Per-bar volatility prediction — no lookahead allowed
 logits = model(features, output_sequence=True, causal=True)
-# logits → (batch, seq_len, num_labels); each position only sees its own history
 
 # Global summary inference — use full bidirectional attention (default)
-embedding = backbone(features, causal=False)  # default; CLS aggregates all bars
+embedding = backbone(features, causal=False)
 ```
-
-> In causal mode the CLS token (position 0) is also restricted — it processes only itself, not the full sequence. For global sequence summary use `causal=False` (default).
 
 ---
 
@@ -152,8 +212,6 @@ Currently pretrained on 5 instruments (~1.7M bars total):
 Extensible to: SI (Silver), CL (Crude Oil), NKD (Nikkei), and more.
 
 ### Input Format
-
-Place your OHLCV CSV files in your data directory:
 
 ```
 data/raw/
@@ -204,70 +262,35 @@ Sweep state is forward-filled for a frequency-agnostic expiry window (1 hour = `
 
 #### Candle Psychology Features
 
-Strategy-agnostic price action descriptors computed from raw OHLCV. These capture candle structure, sequential momentum, and session context without embedding any specific setup logic:
+Strategy-agnostic price action descriptors computed from raw OHLCV:
 
 | Feature | Description |
 |---------|-------------|
-| `candle_type` | Categorical candle class (0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral) — routed through a dedicated `nn.Embedding(6, 256)` rather than the continuous feature matrix to avoid implying a false ordinal relationship |
-| `engulf_count` | Count of prior N bars (default 5) whose bodies are fully engulfed by the current bar |
-| `momentum_speed_ratio` | Ratio of impulse speed to retrace speed over a rolling window; >1 = impulse leg dominant, <1 = retrace dominant |
-| `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1]; positive = bullish rejection, negative = bearish rejection |
-| `dir_consistency` | Fraction of the last N bars (default 5) whose close-open direction matches the current bar; range [0, 1] |
-| `bar_size_vs_session` | Current bar range relative to the running session average range (resets at session open); >1 = larger than session average |
+| `candle_type` | Categorical candle class (0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral) — routed through a dedicated `nn.Embedding(6, 256)` |
+| `engulf_count` | Count of prior N bars whose bodies are fully engulfed by the current bar |
+| `momentum_speed_ratio` | Ratio of impulse speed to retrace speed; >1 = impulse dominant |
+| `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1] |
+| `dir_consistency` | Fraction of last N bars whose direction matches the current bar |
+| `bar_size_vs_session` | Current bar range relative to running session average |
 
 #### HTF Price Context Features (Group 9)
 
-Where the current bar sits relative to the broader daily and weekly reference frames:
-
 | Feature | Description |
 |---------|-------------|
-| `htf_dist_daily_high` | `(close − daily_high) / daily_high`, range ≤ 0 |
-| `htf_dist_daily_low` | `(close − daily_low) / daily_low`, range ≥ 0 |
-| `htf_dist_weekly_high` | `(close − weekly_high) / weekly_high`, range ≤ 0 |
-| `htf_dist_weekly_low` | `(close − weekly_low) / weekly_low`, range ≥ 0 |
-| `htf_range_position` | `(close − weekly_low) / (weekly_high − weekly_low)`, range [0, 1]; where in the week's range is price right now? |
+| `htf_dist_daily_high` | `(close − daily_high) / daily_high` |
+| `htf_dist_daily_low` | `(close − daily_low) / daily_low` |
+| `htf_dist_weekly_high` | `(close − weekly_high) / weekly_high` |
+| `htf_dist_weekly_low` | `(close − weekly_low) / weekly_low` |
+| `htf_range_position` | `(close − weekly_low) / (weekly_high − weekly_low)` |
 
 #### Volume Absorption & Order Flow Features (Group 10)
 
-Order-flow proxies that reveal whether volume is confirming or absorbing price movement:
-
 | Feature | Description |
 |---------|-------------|
-| `vol_cum_signed_5` | Rolling 5-bar net buying/selling pressure: `Σ(vol_delta_proxy) / Σ(volume)`, range [−0.5, 0.5]; positive = buyers dominant |
-| `vol_cum_signed_20` | Same as above over 20 bars |
-| `vol_absorption` | `vol_ratio_5 × (1 − |body_pct|)`, range [0, 5]; high volume + small body = price being absorbed by opposing interest |
-| `vol_momentum_align` | `sign(momentum_5) × (vol_ratio_5 − 1)`, range [−3, 3]; positive = elevated volume confirming the trend direction |
-
----
-
-## Training
-
-### Two-Stage Pipeline
-
-**Stage 1: Pretrain** the backbone on all instruments with self-supervised tasks:
-
-```bash
-python scripts/pretrain.py \
-    --data-dir data/raw/ \
-    --output-dir checkpoints/pretrained/ \
-    --epochs 50 \
-    --batch-size 256 \
-    --lr 1e-3 \
-    --seq-len 64
-```
-
-**Stage 2: Fine-tune** for a specific strategy:
-
-```bash
-python scripts/finetune.py \
-    --backbone checkpoints/pretrained/best_backbone.pt \
-    --strategy orb \
-    --data-dir data/orb_labeled/ \
-    --output-dir checkpoints/orb/ \
-    --freeze-ratio 0.66 \
-    --epochs 30 \
-    --lr 1e-4
-```
+| `vol_cum_signed_5` | Rolling 5-bar net buying/selling pressure |
+| `vol_cum_signed_20` | Same over 20 bars |
+| `vol_absorption` | High volume + small body = price being absorbed |
+| `vol_momentum_align` | Elevated volume confirming or diverging from trend direction |
 
 ---
 
@@ -279,27 +302,44 @@ Futures-Foundation-Model/
 │   ├── __init__.py
 │   ├── config.py               # FFMConfig (HuggingFace compatible)
 │   ├── model.py                # Backbone + Classification/Regression/Strategy heads
-│   ├── features.py             # OHLCV → 66 derived features (10 groups incl. HTF context + volume absorption)
-│   ├── candle_psychology.py    # Candle psychology feature derivation (6 features)
+│   ├── features.py             # OHLCV → 66 derived features (10 groups)
+│   ├── candle_psychology.py    # Candle psychology features
 │   ├── labels.py               # Forward-looking label generation
-│   └── dataset.py              # PyTorch Dataset + DataLoader
-├── scripts/                    # Training & data prep scripts
-│   ├── pretrain.py
-│   └── finetune.py
-├── tests/                      # Unit tests
-│   ├── test_model.py
-│   ├── test_features_crt.py    # CRT sweep feature tests (24 tests)
-│   ├── test_features_core.py   # Core feature group tests (30 tests)
-│   ├── test_labels.py          # Label generation tests (25 tests)
-│   └── test_candle_psychology.py  # Candle psychology tests (33 tests)
-├── .githooks/                  # Git hooks (activate with: git config core.hooksPath .githooks)
+│   ├── dataset.py              # PyTorch Dataset + DataLoader
+│   └── finetune/               # ★ Strategy fine-tuning framework
+│       ├── __init__.py
+│       ├── base.py             # StrategyLabeler ABC
+│       ├── config.py           # TrainingConfig dataclass
+│       ├── model.py            # HybridStrategyModel
+│       ├── dataset.py          # HybridStrategyDataset
+│       ├── losses.py           # FocalLoss
+│       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
+├── colabs/
+│   ├── ffm_pretrain_5min.py    # Colab pretraining script
+│   └── cisd_ote.py             # CISD+OTE strategy (example fine-tune implementation)
+├── tests/                      # Unit tests (217 total)
+│   ├── test_model.py           # Backbone + heads (32 tests)
+│   ├── test_finetune.py        # Fine-tuning framework (42 tests, incl. FFM field coverage)
+│   ├── test_features_crt.py    # CRT sweep features (24 tests)
+│   ├── test_features_core.py   # Core feature groups (30 tests)
+│   ├── test_labels.py          # Label generation (25 tests)
+│   └── test_candle_psychology.py  # Candle psychology (33 tests)
+├── .githooks/
 │   └── pre-commit              # Runs all unit tests before every commit
 ├── setup.py
 ├── requirements.txt
-├── CONTRIBUTING.md
-├── LICENSE
 └── README.md
 ```
+
+---
+
+## Releases
+
+| Version | Description |
+|---------|-------------|
+| **v0.3** | `futures_foundation.finetune` framework — plug-and-play walk-forward fine-tuning; CISD+OTE migrated as first concrete strategy |
+| **v0.2** | FFM backbone + CISD+OTE fine-tuning pipeline (v7); 58 backbone features |
+| **v0.1** | Last stable backbone checkpoint reference |
 
 ---
 
@@ -307,11 +347,10 @@ Futures-Foundation-Model/
 
 We welcome contributions! Key areas:
 
+- **New strategy implementations**: Add a `StrategyLabeler` subclass for ORB, ICT breaker blocks, mean reversion, etc.
 - **New instruments**: Add support for crypto, forex, additional commodities
 - **Additional pretraining tasks**: Order flow proxies, session pattern recognition
-- **Fine-tuning recipes**: Share configs for specific strategies (ORB, ICT, mean reversion)
 - **Feature engineering**: Novel OHLCV-derived features
-- **Evaluation benchmarks**: Standardized regime classification benchmarks
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -322,21 +361,21 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] Core transformer backbone with HuggingFace compatibility
 - [x] OHLCV feature derivation pipeline (66 ATR-normalized continuous features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
-- [x] Candle psychology features — 5 continuous features + candle_type via dedicated model embedding
-- [x] HTF price context features — daily/weekly OHLC distances + range position (5 features, Group 9)
-- [x] Volume absorption & order flow features — cumulative signed delta, absorption ratio, vol-momentum alignment (4 features, Group 10)
+- [x] Candle psychology features — 5 continuous + candle_type embedding
+- [x] HTF price context features — daily/weekly OHLC distances + range position
+- [x] Volume absorption & order flow features
 - [x] Forward-looking self-supervised label generation (4 tasks)
-- [x] Two-factor structure labels — 1H causal structure + forward expansion asymmetry must agree
-- [x] Causal attention mask — `causal=True` on all forward() for per-bar lookahead-free predictions
-- [x] Pretraining with overfitting detection + collapse monitoring
-- [x] Fine-tuning framework: Classification, Regression, Strategy+Risk
-- [x] Backbone freezing with differential layer groups
+- [x] Two-factor structure labels with confidence sentinel
+- [x] Causal attention mask for per-bar predictions
 - [x] 5-instrument pretraining (ES, NQ, RTY, YM, GC)
-- [x] Unit test suite (172 tests) with pre-commit hook enforcement
+- [x] **`futures_foundation.finetune` — reusable walk-forward fine-tuning framework**
+- [x] **`StrategyLabeler` ABC — implement one class, get everything else for free**
+- [x] **CISD+OTE strategy as first concrete fine-tune implementation**
+- [x] Unit test suite (217 tests) with per-column FFM field coverage checks
 - [ ] Pretrained weights release on HuggingFace Hub
+- [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (SI, CL, NKD)
-- [ ] Evaluation suite and benchmarks
 - [ ] ONNX export for production inference
 
 ---
