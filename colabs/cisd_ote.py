@@ -714,7 +714,7 @@ print(f"{'='*60}")
 # CELL 4 — WALK-FORWARD HYBRID FINE-TUNING
 # ==============================================================================
 
-import gc, importlib
+import gc, importlib, json
 import futures_foundation
 importlib.reload(futures_foundation)
 from futures_foundation import FFMConfig, get_model_feature_columns
@@ -777,11 +777,49 @@ last_model = fold_results.get('_model')
 if last_model is not None:
     print(f'\n{"="*60}\n  ONNX EXPORT\n{"="*60}')
     onnx_path = os.path.join(OUTPUT_DIR, 'cisd_ote_hybrid.onnx')
+    meta_path = onnx_path.replace('.onnx', '_metadata.json')
     try:
         export_onnx(last_model, onnx_path,
                     seq_len=SEQ_LEN,
                     num_ffm_features=len(get_model_feature_columns()),
                     num_strategy_features=NUM_CISD_FEATURES)
+
+        # ── Build per-fold precision from saved test_metrics ──
+        import torch as _torch
+        wf_results = {}
+        for fname, metrics in fold_results.items():
+            if fname == '_model' or metrics is None:
+                continue
+            confs  = _torch.tensor(metrics['all_conf'])
+            labels = _torch.tensor(metrics['all_labels'])
+            entry  = {'signals': int((labels > 0).sum())}
+            for key, thr in [('prec_at_70', 0.70), ('prec_at_80', 0.80), ('prec_at_90', 0.90)]:
+                mask = confs >= thr
+                entry[key] = round(float((labels[mask] > 0).float().mean()), 3) if mask.sum() > 0 else None
+            wf_results[fname] = entry
+
+        metadata = {
+            'version':           'cisd_ote_v7_0',
+            'seq_len':           SEQ_LEN,
+            'num_labels':        NUM_LABELS,
+            'num_features':      len(get_model_feature_columns()),
+            'num_cisd_features': NUM_CISD_FEATURES,
+            'feature_cols':      get_model_feature_columns(),
+            'cisd_feature_cols': CISD_FEATURE_COLS,
+            'tickers':           TICKERS,
+            'inference': {
+                'output_0': '[B,2] signal_logits — apply softmax, index 1 = signal prob',
+                'output_1': '[B]   confidence   — max(softmax), 0.5 to 1.0',
+                'output_2': '[B,1] risk         — predicted R:R',
+                'direction': 'cisd_feature_cols index 4 (zone_is_bullish): >0=BUY, <=0=SELL',
+                'entry_rule': 'softmax(signal_logits)[:,1] >= threshold',
+                'thresholds': {'conservative': 0.90, 'moderate': 0.80, 'aggressive': 0.70},
+            },
+            'walk_forward_results': wf_results,
+        }
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f'  ✅ Metadata:    {meta_path}')
     except Exception as e:
         print(f'  ❌ ONNX export failed: {e}')
 
