@@ -431,6 +431,86 @@ def _evaluate(model, loader, loss_fn, device):
     }
 
 
+# ── Warm start helpers ────────────────────────────────────────────────────────
+
+def _apply_warm_start(
+    model: 'HybridStrategyModel',
+    warm_start_state: dict,
+    mode: str,
+    device,
+) -> None:
+    """
+    Load weights from the previous fold according to warm_start_mode.
+
+    'selective' (default): transfer backbone weights only; strategy heads keep
+        their random initialisation so they re-calibrate to the new fold's
+        market regime from scratch.
+    'full': transfer the entire model state (original behaviour).
+    """
+    if mode == 'selective':
+        prefix = 'backbone.'
+        backbone_state = {
+            k[len(prefix):]: v.to(device)
+            for k, v in warm_start_state.items()
+            if k.startswith(prefix)
+        }
+        model.backbone.load_state_dict(backbone_state, strict=True)
+        print('  ✅ Selective warm start — backbone transferred, heads re-initialised')
+    elif mode == 'full':
+        model.load_state_dict({k: v.to(device) for k, v in warm_start_state.items()})
+        print('  ✅ Full warm start — entire model transferred from prev fold')
+    else:
+        raise ValueError(
+            f"Unknown warm_start_mode '{mode}'. "
+            f"Choose 'selective' (backbone only) or 'full' (entire model).")
+
+
+def _make_optimizer(
+    model: 'HybridStrategyModel',
+    training_cfg: 'TrainingConfig',
+    is_warm_started: bool,
+    train_loader_len: int,
+):
+    """
+    Build AdamW + OneCycleLR scheduler.
+
+    When warm-starting and backbone_lr_multiplier != 1.0, the backbone gets a
+    lower LR so its pretrained/transferred knowledge erodes slowly while the
+    strategy heads adapt at full speed (layerwise LR, option 2).
+    """
+    use_layerwise = is_warm_started and training_cfg.backbone_lr_multiplier != 1.0
+
+    if use_layerwise:
+        backbone_ids = {id(p) for p in model.backbone.parameters()}
+        head_params = [
+            p for p in model.trainable_parameters()
+            if id(p) not in backbone_ids
+        ]
+        backbone_trainable = [
+            p for p in model.backbone.parameters() if p.requires_grad
+        ]
+        param_groups = [
+            {'params': head_params,       'lr': training_cfg.lr},
+            {'params': backbone_trainable, 'lr': training_cfg.lr * training_cfg.backbone_lr_multiplier},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+        max_lrs   = [training_cfg.lr, training_cfg.lr * training_cfg.backbone_lr_multiplier]
+        print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
+              f'backbone: {training_cfg.lr * training_cfg.backbone_lr_multiplier:.2e}')
+    else:
+        optimizer = torch.optim.AdamW(
+            model.trainable_parameters(), lr=training_cfg.lr, weight_decay=0.01)
+        max_lrs = training_cfg.lr
+
+    total_steps = training_cfg.epochs * train_loader_len
+    warmup      = min(500, total_steps // 10)
+    scheduler   = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=max_lrs, total_steps=total_steps,
+        pct_start=warmup / total_steps, anneal_strategy='cos')
+
+    return optimizer, scheduler
+
+
 # ── Fold ─────────────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
@@ -493,9 +573,9 @@ def _train_fold(
                                 training_cfg.num_labels,
                                 training_cfg.risk_weight).to(device)
 
-    if warm_start_state is not None:
-        model.load_state_dict({k: v.to(device) for k, v in warm_start_state.items()})
-        print(f'  ✅ Warm start from prev fold')
+    is_warm_started = warm_start_state is not None
+    if is_warm_started:
+        _apply_warm_start(model, warm_start_state, training_cfg.warm_start_mode, device)
     elif os.path.exists(backbone_path):
         print(f'  Loading backbone: {backbone_path}')
         model.load_backbone(backbone_path)
@@ -508,15 +588,10 @@ def _train_fold(
     class_weights = torch.tensor(
         [training_cfg.false_penalty, training_cfg.miss_penalty],
         dtype=torch.float32).to(device)
-    loss_fn   = FocalLoss(gamma=training_cfg.focal_gamma, weight=class_weights,
-                          label_smoothing=training_cfg.focal_smoothing)
-    optimizer = torch.optim.AdamW(model.trainable_parameters(),
-                                  lr=training_cfg.lr, weight_decay=0.01)
-    total_steps = training_cfg.epochs * len(train_loader)
-    warmup      = min(500, total_steps // 10)
-    scheduler   = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=training_cfg.lr, total_steps=total_steps,
-        pct_start=warmup / total_steps, anneal_strategy='cos')
+    loss_fn = FocalLoss(gamma=training_cfg.focal_gamma, weight=class_weights,
+                        label_smoothing=training_cfg.focal_smoothing)
+    optimizer, scheduler = _make_optimizer(
+        model, training_cfg, is_warm_started, len(train_loader))
 
     # ── Resume ──
     start_epoch    = 0

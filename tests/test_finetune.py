@@ -18,6 +18,7 @@ from futures_foundation.finetune import validate_setup
 from futures_foundation.finetune.trainer import (
     _make_balanced_loader, _train_one_epoch, _evaluate, _concat_with_meta,
     _config_hash, _load_fold_data, _validate_labeler_output,
+    _apply_warm_start, _make_optimizer,
 )
 
 
@@ -1261,3 +1262,203 @@ def test_validate_labeler_output_error_includes_ticker():
     labels = make_labels(n, signal_rate=0.05)
     with pytest.raises(ValueError, match='NQ'):
         _validate_labeler_output(feats, labels, STRATEGY_COLS, n, 'NQ')
+
+
+# =============================================================================
+# 8. Warm start modes — _apply_warm_start
+# =============================================================================
+
+def _make_trained_state(cfg, seed=42):
+    """Return a state_dict with weights that differ from a fresh model init."""
+    torch.manual_seed(seed)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    optim = torch.optim.SGD(model.parameters(), lr=0.1)
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+    for _ in range(3):
+        out  = model(feats, strat)
+        loss = FocalLoss()(out['signal_logits'], torch.randint(0, 2, (2,)))
+        loss.backward(); optim.step(); optim.zero_grad()
+    return {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+
+def test_selective_warm_start_backbone_transferred():
+    """Selective mode: backbone weights must exactly match the warm-start state."""
+    cfg   = small_ffm_config()
+    state = _make_trained_state(cfg)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    _apply_warm_start(model, state, mode='selective', device=torch.device('cpu'))
+
+    for key, val in model.backbone.state_dict().items():
+        expected = state[f'backbone.{key}']
+        assert torch.allclose(val, expected), (
+            f'backbone.{key} not transferred by selective warm start')
+
+
+def test_selective_warm_start_heads_reinitialised():
+    """Selective mode: strategy heads must NOT carry over the previous fold's weights."""
+    cfg   = small_ffm_config()
+    state = _make_trained_state(cfg)
+
+    # Capture fresh random init for comparison
+    torch.manual_seed(99)
+    fresh = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    fresh_head_state = {k: v.clone() for k, v in fresh.signal_head.state_dict().items()}
+
+    torch.manual_seed(99)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    _apply_warm_start(model, state, mode='selective', device=torch.device('cpu'))
+
+    for key, fresh_val in fresh_head_state.items():
+        warm_val  = model.signal_head.state_dict()[key]
+        prev_val  = state[f'signal_head.{key}']
+        # Head must equal the fresh init (not the warm-start state)
+        assert torch.allclose(warm_val, fresh_val), (
+            f'signal_head.{key} was overwritten by selective warm start — heads should stay cold')
+        assert not torch.allclose(warm_val, prev_val, atol=1e-4), (
+            f'signal_head.{key} accidentally matches prev fold state')
+
+
+def test_full_warm_start_entire_model_transferred():
+    """Full mode: every key in the state dict must match the warm-start state."""
+    cfg   = small_ffm_config()
+    state = _make_trained_state(cfg)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    _apply_warm_start(model, state, mode='full', device=torch.device('cpu'))
+
+    for key, val in model.state_dict().items():
+        assert torch.allclose(val, state[key].cpu()), (
+            f'{key} not transferred by full warm start')
+
+
+def test_warm_start_invalid_mode_raises():
+    """Unknown warm_start_mode must raise ValueError with the mode name in the message."""
+    cfg   = small_ffm_config()
+    state = _make_trained_state(cfg)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    with pytest.raises(ValueError, match='bogus_mode'):
+        _apply_warm_start(model, state, mode='bogus_mode', device=torch.device('cpu'))
+
+
+def test_selective_warm_start_all_head_modules_stay_cold():
+    """All non-backbone modules (strategy_projection, fusion, risk_head) must stay cold."""
+    cfg   = small_ffm_config()
+    state = _make_trained_state(cfg)
+
+    torch.manual_seed(77)
+    fresh = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    torch.manual_seed(77)
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    _apply_warm_start(model, state, mode='selective', device=torch.device('cpu'))
+
+    for module_name in ('strategy_projection', 'fusion', 'risk_head'):
+        fresh_sd = dict(getattr(fresh, module_name).named_parameters())
+        model_sd = dict(getattr(model, module_name).named_parameters())
+        for key in fresh_sd:
+            assert torch.allclose(model_sd[key], fresh_sd[key]), (
+                f'{module_name}.{key} was overwritten by selective warm start')
+
+
+# =============================================================================
+# 9. Layer-wise LR — _make_optimizer
+# =============================================================================
+
+def _make_small_train_loader():
+    return _make_small_loader(n=200)
+
+
+def test_layerwise_lr_backbone_gets_lower_lr():
+    """When warm-starting with multiplier < 1, backbone max_lr must be lr * multiplier.
+    OneCycleLR stores max_lr per param_group so we check param_groups[i]['max_lr']."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)   # all backbone params trainable
+
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=True, train_loader_len=10)
+
+    assert len(optimizer.param_groups) == 2, (
+        f'Expected 2 param groups, got {len(optimizer.param_groups)}')
+    head_max_lr     = optimizer.param_groups[0]['max_lr']
+    backbone_max_lr = optimizer.param_groups[1]['max_lr']
+    assert abs(head_max_lr     - 1e-4) < 1e-9, f'Head max LR should be 1e-4, got {head_max_lr}'
+    assert abs(backbone_max_lr - 1e-5) < 1e-9, f'Backbone max LR should be 1e-5, got {backbone_max_lr}'
+
+
+def test_layerwise_lr_heads_get_full_lr():
+    """Strategy head params must always receive the full configured max LR."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)
+
+    training_cfg = TrainingConfig(lr=5e-5, backbone_lr_multiplier=0.1)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=True, train_loader_len=10)
+
+    head_max_lr = optimizer.param_groups[0]['max_lr']
+    assert abs(head_max_lr - 5e-5) < 1e-12, f'Head max LR should be 5e-5, got {head_max_lr}'
+
+
+def test_layerwise_lr_not_applied_on_cold_start():
+    """A cold start (is_warm_started=False) must use a single param group at full LR."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=False, train_loader_len=10)
+
+    assert len(optimizer.param_groups) == 1, (
+        'Cold start should produce a single param group')
+    assert abs(optimizer.param_groups[0]['max_lr'] - 1e-4) < 1e-12
+
+
+def test_layerwise_lr_multiplier_one_gives_single_group():
+    """backbone_lr_multiplier=1.0 disables splitting even when warm-starting."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=1.0)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=True, train_loader_len=10)
+
+    assert len(optimizer.param_groups) == 1, (
+        'multiplier=1.0 should not split param groups')
+
+
+def test_make_optimizer_returns_scheduler():
+    """_make_optimizer must always return a scheduler alongside the optimizer."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    training_cfg = TrainingConfig()
+    optimizer, scheduler = _make_optimizer(model, training_cfg,
+                                           is_warm_started=False, train_loader_len=20)
+    assert optimizer  is not None
+    assert scheduler  is not None
+    # Scheduler step should not raise
+    optimizer.zero_grad()
+    feats  = torch.randn(2, SEQ_LEN, len(get_model_feature_columns()))
+    strat  = torch.randn(2, NUM_STRATEGY_FEATURES)
+    out    = model(feats, strat)
+    loss   = FocalLoss()(out['signal_logits'], torch.randint(0, 2, (2,)))
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+
+def test_warm_start_mode_in_config_hash():
+    """warm_start_mode must be included in the config hash — changing it invalidates checkpoints."""
+    cfg_selective = TrainingConfig(warm_start_mode='selective')
+    cfg_full      = TrainingConfig(warm_start_mode='full')
+    assert _config_hash(cfg_selective) != _config_hash(cfg_full)
+
+
+def test_backbone_lr_multiplier_in_config_hash():
+    """backbone_lr_multiplier must be included in the config hash."""
+    cfg_low  = TrainingConfig(backbone_lr_multiplier=0.1)
+    cfg_high = TrainingConfig(backbone_lr_multiplier=1.0)
+    assert _config_hash(cfg_low) != _config_hash(cfg_high)
