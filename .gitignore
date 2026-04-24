@@ -207,3 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 .DS_Store
+
+# Local outputs (model files, exports, results)
+output/
+
+# Claude Code memory
+memory/
