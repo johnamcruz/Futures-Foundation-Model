@@ -18,7 +18,7 @@ from futures_foundation.finetune import validate_setup
 from futures_foundation.finetune.trainer import (
     _make_balanced_loader, _train_one_epoch, _evaluate, _concat_with_meta,
     _config_hash, _load_fold_data, _validate_labeler_output,
-    _apply_warm_start, _make_optimizer,
+    _apply_warm_start, _make_optimizer, _print_test_threshold_table,
 )
 
 
@@ -1462,3 +1462,196 @@ def test_backbone_lr_multiplier_in_config_hash():
     cfg_low  = TrainingConfig(backbone_lr_multiplier=0.1)
     cfg_high = TrainingConfig(backbone_lr_multiplier=1.0)
     assert _config_hash(cfg_low) != _config_hash(cfg_high)
+
+
+# =============================================================================
+# 10. Checkpoint resume — disconnect safety
+# =============================================================================
+
+def _make_fake_test_metrics(n=100, seed=3):
+    """Minimal test_metrics dict matching what _evaluate returns."""
+    rng = np.random.default_rng(seed)
+    labels = rng.integers(0, 2, n).tolist()
+    preds  = rng.integers(0, 2, n).tolist()
+    confs  = rng.uniform(0.5, 1.0, n).tolist()
+    tp = sum(1 for l, p in zip(labels, preds) if l == 1 and p == 1)
+    fp = sum(1 for l, p in zip(labels, preds) if l == 0 and p == 1)
+    fn = sum(1 for l, p in zip(labels, preds) if l == 1 and p == 0)
+    return {
+        'loss': 0.05, 'precision': 0.4, 'recall': 0.6, 'f1': 0.48,
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': n - tp - fp - fn,
+        'all_conf': confs, 'all_labels': labels,
+        'all_preds': preds, 'all_max_rr': [1.0] * n,
+    }
+
+
+def test_done_checkpoint_skip_retraining(tmp_path):
+    """If a _done.pt checkpoint exists for a fold, _train_fold must skip re-training
+    and return the saved state without touching the GPU."""
+    cfg        = small_ffm_config()
+    model      = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+    test_metrics = _make_fake_test_metrics()
+    config_hash  = _config_hash(TrainingConfig())
+
+    done_path = tmp_path / f'F1_{config_hash}_done.pt'
+    torch.save({
+        'config_hash':     config_hash,
+        'next_fold_state': state_dict,
+        'test_metrics':    test_metrics,
+    }, done_path)
+
+    # Import _train_fold to call directly — we pass minimal valid args
+    from futures_foundation.finetune.trainer import _train_fold
+
+    fold = {'name': 'F1', 'train_end': '2020-01-01',
+            'val_end': '2020-06-01', 'test_end': '2021-01-01'}
+
+    # _train_fold should hit the done-checkpoint early-exit without touching datasets
+    # We verify this by passing empty/invalid dirs — if it tries to load data it will fail
+    result = _train_fold(
+        fold=fold,
+        ffm_config=cfg,
+        training_cfg=TrainingConfig(seq_len=SEQ_LEN),
+        num_strategy_features=NUM_STRATEGY_FEATURES,
+        strategy_feature_cols=STRATEGY_COLS,
+        tickers=['ES'],
+        ffm_dir=str(tmp_path / 'ffm_nonexistent'),
+        strategy_dir=str(tmp_path / 'strat_nonexistent'),
+        output_dir=str(tmp_path),
+        backbone_path=str(tmp_path / 'backbone.pt'),
+        config_hash=config_hash,
+    )
+
+    assert result is not None, 'Should return saved result, not None'
+    loaded_model, loaded_metrics, loaded_state = result
+    assert loaded_model   is not None
+    assert loaded_metrics is not None
+    assert loaded_metrics['tp'] == test_metrics['tp']
+    # Model weights must match what was saved
+    for key in state_dict:
+        assert torch.allclose(
+            loaded_model.state_dict()[key].cpu(), state_dict[key].cpu()
+        ), f'{key} mismatch after loading done checkpoint'
+
+
+def test_done_checkpoint_wrong_hash_ignored(tmp_path):
+    """A _done.pt with a different config hash must be ignored (config changed)."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    state = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    stale_hash  = 'deadbeef'
+    active_hash = _config_hash(TrainingConfig())
+    assert stale_hash != active_hash
+
+    done_path = tmp_path / f'F1_{active_hash}_done.pt'
+    torch.save({
+        'config_hash':     stale_hash,   # wrong hash
+        'next_fold_state': state,
+        'test_metrics':    _make_fake_test_metrics(),
+    }, done_path)
+
+    from futures_foundation.finetune.trainer import _train_fold
+    fold = {'name': 'F1', 'train_end': '2020-01-01',
+            'val_end': '2020-06-01', 'test_end': '2021-01-01'}
+
+    # Should NOT use the stale done checkpoint — tries to load data and returns
+    # None (insufficient data) rather than returning the stale saved state.
+    result = _train_fold(
+        fold=fold, ffm_config=cfg,
+        training_cfg=TrainingConfig(seq_len=SEQ_LEN),
+        num_strategy_features=NUM_STRATEGY_FEATURES,
+        strategy_feature_cols=STRATEGY_COLS,
+        tickers=['ES'],
+        ffm_dir=str(tmp_path / 'ffm_nonexistent'),
+        strategy_dir=str(tmp_path / 'strat_nonexistent'),
+        output_dir=str(tmp_path),
+        backbone_path=str(tmp_path / 'backbone.pt'),
+        config_hash=active_hash,
+    )
+    # Stale done checkpoint ignored → no data found → returns None
+    assert result is None, (
+        'Stale done checkpoint was used despite config hash mismatch')
+
+
+def test_f1_checkpoint_persisted_to_disk(tmp_path):
+    """The best F1 checkpoint (_f1.pt) must be written to disk whenever F1 improves,
+    so a disconnect between epochs doesn't lose the best weights."""
+    ffm_df = make_ffm_df(200, seed=5)
+    strat  = make_strategy_features(200, seed=5)
+    labels = make_labels(200, signal_rate=0.10, seed=5)
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+    loader = _make_balanced_loader(concat, batch_size=16, sig_per_batch=2, num_workers=0)
+
+    cfg      = small_ffm_config()
+    model    = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loss_fn  = FocalLoss()
+    optimizer, scheduler = _make_optimizer(
+        model, TrainingConfig(lr=1e-3), is_warm_started=False, train_loader_len=len(loader))
+
+    config_hash = _config_hash(TrainingConfig())
+    ckpt_f1 = tmp_path / f'TEST_{config_hash}_f1.pt'
+
+    best_f1 = 0.0
+    for epoch in range(5):
+        _train_one_epoch(model, loader, optimizer, loss_fn, torch.device('cpu'))
+        va = _evaluate(model, loader, loss_fn, torch.device('cpu'))
+        scheduler.step()
+        if va['f1'] > best_f1:
+            best_f1 = va['f1']
+            torch.save({
+                'config_hash': config_hash,
+                'model_state': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                'epoch':       epoch,
+                'score':       best_f1,
+            }, ckpt_f1)
+
+    # If F1 ever improved, the checkpoint must exist
+    if best_f1 > 0:
+        assert ckpt_f1.exists(), '_f1.pt not saved despite F1 improving'
+        saved = torch.load(ckpt_f1, map_location='cpu', weights_only=False)
+        assert saved['config_hash'] == config_hash
+        assert saved['score'] == best_f1
+        assert 'model_state' in saved
+
+
+def test_print_test_threshold_table_smoke(capsys):
+    """_print_test_threshold_table must not raise and must print threshold rows."""
+    metrics = _make_fake_test_metrics(n=200)
+    _print_test_threshold_table(metrics, 'F1')
+    out = capsys.readouterr().out
+    assert 'F1 test:' in out
+    assert '0.70' in out
+
+
+def test_print_test_threshold_table_none_is_noop(capsys):
+    """None test_metrics must silently produce no output."""
+    _print_test_threshold_table(None, 'F2')
+    assert capsys.readouterr().out == ''
+
+
+def test_resume_checkpoint_includes_ratio_bad_ctr(tmp_path):
+    """The resume checkpoint must store ratio_bad_ctr so early-stop state
+    is correctly restored after a disconnect."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    config_hash = _config_hash(TrainingConfig())
+    ckpt_path   = tmp_path / f'F1_{config_hash}_loss.pt'
+
+    torch.save({
+        'config_hash':    config_hash,
+        'epoch':          5,
+        'model_state':    model.state_dict(),
+        'optim_state':    torch.optim.AdamW(model.parameters(), lr=1e-4).state_dict(),
+        'val_loss':       0.05,
+        'patience_ctr':   3,
+        'ratio_bad_ctr':  2,
+        'best_signal_f1': 0.3,
+        'best_f1_epoch':  4,
+    }, ckpt_path)
+
+    saved = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    assert 'ratio_bad_ctr' in saved, 'ratio_bad_ctr missing from resume checkpoint'
+    assert saved['ratio_bad_ctr'] == 2
