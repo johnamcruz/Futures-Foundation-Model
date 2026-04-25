@@ -125,8 +125,7 @@ Each strategy is a `StrategyLabeler` subclass with a two-phase Colab script — 
 | Strategy | Script | Features | Edge |
 |---|---|---|---|
 | **CISD+OTE** | `cisd_ote.py` + `cisd_ote_v71_riskhead.py` | 10 (zone geometry, entry mechanics) | ICT institutional order flow — mean reversion at swept zones |
-| **EMA Trend Follow** | `ema_trend_v1.py` + `ema_trend_v11_riskhead.py` | 8 (EMA spread, alignment, compression state) | Compression→expansion transitions — trend follow with chop filter |
-| **AMD** | `amd_v1.py` | 8 (session ranges, sweep depth, time) | Asian range → London sweep → NY reversal — session-based fade |
+| **SuperTrend Trend Follow** | `st_trend_v1.py` | 8 (ST distance, prior trend stats, HTF alignment) | 5min ST flip confirmed by 1h ST — trend-following entries avoiding counter-trend chop |
 
 CISD+OTE baseline (v5.1 reference, 5 instruments):
 - 2,729 signals across ES, NQ, RTY, YM, GC
@@ -344,9 +343,7 @@ Futures-Foundation-Model/
 │   ├── cisd_ote.py                    # CISD+OTE — Phase 1 (signal classifier)
 │   ├── cisd_ote_v71_riskhead.py       # CISD+OTE — Phase 2 (risk head calibration)
 │   ├── export_cisd_ote_v7.py          # CISD+OTE ONNX export utility
-│   ├── ema_trend_v1.py                # EMA Trend Follow — Phase 1 (signal classifier)
-│   ├── ema_trend_v11_riskhead.py      # EMA Trend Follow — Phase 2 (risk head calibration)
-│   └── amd_v1.py                      # AMD — Phase 1 (signal classifier)
+│   └── st_trend_v1.py                 # SuperTrend Trend Follow — Phase 1 (signal classifier)
 ├── tests/                      # Unit tests (217 total)
 │   ├── test_model.py           # Backbone + heads (32 tests)
 │   ├── test_finetune.py        # Fine-tuning framework (42 tests, incl. FFM field coverage)
@@ -403,10 +400,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **CISD+OTE strategy as first concrete fine-tune implementation**
 - [x] Unit test suite with per-column FFM field coverage checks
 - [x] ONNX export for production inference
-- [x] **EMA Trend Follow strategy — compression→expansion labeler with hysteresis state machine**
-- [x] **AMD strategy — Accumulation/Manipulation/Distribution session-based reversal**
+- [x] **SuperTrend Trend Follow — 5min ST flip + 1h HTF alignment filter; 8 discriminative features; 9,323 signals across 5 tickers**
 - [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry (CISD+OTE v7.1)**
-- [ ] Phase 2 risk head calibration for EMA Trend and AMD (in progress)
+- [ ] Phase 2 risk head calibration for SuperTrend Trend Follow
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
