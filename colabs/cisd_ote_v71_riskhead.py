@@ -122,7 +122,6 @@ rr_done_paths = run_risk_head_calibration(
     ffm_config            = ffm_config,
     num_labels            = NUM_LABELS,
     risk_weight           = RISK_WEIGHT,
-    focal_smoothing       = FOCAL_SMOOTHING,
     micro_to_full         = MICRO_TO_FULL,
     seq_len               = SEQ_LEN,
     rr_lr                 = RR_LR,
