@@ -1836,6 +1836,7 @@ def test_run_risk_head_calibration_skips_existing_rr_checkpoint(tmp_path):
     model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
     config_hash = 'abcd1234'
 
+    # n=2000 5-min bars from 2021-01-01 spans ~7 days; splits must stay within that window
     ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
     output_dir = tmp_path / 'output'; output_dir.mkdir()
 
@@ -1851,15 +1852,10 @@ def test_run_risk_head_calibration_skips_existing_rr_checkpoint(tmp_path):
     rr_path = output_dir / f'F1_{config_hash}_rr_done.pt'
     rr_path.write_bytes(b'existing')
 
-    ffm_config = FFMConfig(
-        num_features=len(get_model_feature_columns()),
-        hidden_size=32, num_hidden_layers=2,
-        num_attention_heads=4, intermediate_size=64,
-        max_sequence_length=SEQ_LEN,
-    )
+    ffm_config = small_ffm_config()   # must match checkpoint architecture
 
-    folds = [{'name': 'F1', 'train_end': '2021-01-15',
-              'val_end': '2021-01-22', 'test_end': '2021-01-29'}]
+    folds = [{'name': 'F1', 'train_end': '2021-01-03',
+              'val_end': '2021-01-05', 'test_end': '2021-01-08'}]
 
     result = run_risk_head_calibration(
         folds=folds, tickers=['ES'],
@@ -1882,22 +1878,15 @@ def test_run_risk_head_calibration_skips_missing_phase1_checkpoint(tmp_path):
     ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
     output_dir = tmp_path / 'output'; output_dir.mkdir()
 
-    ffm_config = FFMConfig(
-        num_features=len(get_model_feature_columns()),
-        hidden_size=32, num_hidden_layers=2,
-        num_attention_heads=4, intermediate_size=64,
-        max_sequence_length=SEQ_LEN,
-    )
-
-    folds = [{'name': 'F1', 'train_end': '2021-01-15',
-              'val_end': '2021-01-22', 'test_end': '2021-01-29'}]
+    folds = [{'name': 'F1', 'train_end': '2021-01-03',
+              'val_end': '2021-01-05', 'test_end': '2021-01-08'}]
 
     result = run_risk_head_calibration(
         folds=folds, tickers=['ES'],
         ffm_dir=ffm_dir, strategy_dir=strategy_dir,
         output_dir=str(output_dir),
         strategy_feature_cols=STRATEGY_COLS,
-        ffm_config=ffm_config,
+        ffm_config=small_ffm_config(),
         seq_len=SEQ_LEN,
         rr_lr=1e-3, rr_epochs=1, rr_patience=1, rr_batch=8,
     )
@@ -1912,6 +1901,7 @@ def test_run_risk_head_calibration_saves_rr_checkpoint(tmp_path):
     model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
     config_hash = _config_hash(TrainingConfig())
 
+    # n=2000 5-min bars from 2021-01-01 spans ~7 days; splits must stay within that window
     ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
     output_dir = tmp_path / 'output'; output_dir.mkdir()
 
@@ -1922,15 +1912,10 @@ def test_run_risk_head_calibration_saves_rr_checkpoint(tmp_path):
         'test_metrics':    _make_fake_test_metrics(),
     }, p1_path)
 
-    ffm_config = FFMConfig(
-        num_features=len(get_model_feature_columns()),
-        hidden_size=32, num_hidden_layers=2,
-        num_attention_heads=4, intermediate_size=64,
-        max_sequence_length=SEQ_LEN,
-    )
+    ffm_config = small_ffm_config()   # must match checkpoint architecture
 
-    folds = [{'name': 'F1', 'train_end': '2021-01-04',
-              'val_end': '2021-01-11', 'test_end': '2021-01-18'}]
+    folds = [{'name': 'F1', 'train_end': '2021-01-03',
+              'val_end': '2021-01-05', 'test_end': '2021-01-08'}]
 
     result = run_risk_head_calibration(
         folds=folds, tickers=['ES'],

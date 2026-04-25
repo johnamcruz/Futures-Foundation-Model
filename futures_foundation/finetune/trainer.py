@@ -989,7 +989,6 @@ def run_risk_head_calibration(
     ffm_config: FFMConfig,
     num_labels: int = 2,
     risk_weight: float = 0.1,
-    focal_smoothing: float = 0.10,
     micro_to_full: dict = None,
     seq_len: int = 96,
     rr_lr: float = 1e-5,
@@ -1010,10 +1009,9 @@ def run_risk_head_calibration(
         folds:                 Same fold list used in run_walk_forward().
         tickers / ffm_dir / strategy_dir / output_dir: same as run_walk_forward().
         strategy_feature_cols: Same feature cols used in Phase 1.
-        ffm_config:            Same FFMConfig used in Phase 1.
+        ffm_config:            Same FFMConfig used in Phase 1 — architecture must match.
         num_labels:            Must match Phase 1 (default 2).
         risk_weight:           Must match Phase 1 (default 0.1).
-        focal_smoothing:       Must match Phase 1 (default 0.10).
         micro_to_full:         Optional ticker → data_ticker mapping.
         seq_len:               Must match Phase 1 (default 96).
         rr_lr / rr_epochs / rr_patience / rr_batch / huber_delta: Phase 2 hyperparams.
@@ -1027,9 +1025,7 @@ def run_risk_head_calibration(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    num_ffm_features  = len(get_model_feature_columns())
     num_strat_features = len(strategy_feature_cols)
-    focal_cfg = FFMConfig(num_features=num_ffm_features, label_smoothing=focal_smoothing)
 
     # ── Load all fold datasets from Phase 1 cache ──
     print(f'\n{"="*60}')
@@ -1101,7 +1097,7 @@ def run_risk_head_calibration(
             continue
 
         model = HybridStrategyModel(
-            ffm_config=focal_cfg,
+            ffm_config=ffm_config,
             num_strategy_features=num_strat_features,
             num_labels=num_labels,
             risk_weight=risk_weight,
