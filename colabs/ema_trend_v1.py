@@ -79,12 +79,13 @@ MED_PERIODS     = [20, 50, 100, 150]
 MIN_WARMUP_BARS = 200   # skip detection until EMAs stabilise (~12h of 5min bars)
 MIN_COMP_BARS   = 3     # minimum consecutive bars in compression before signal fires
 
-# ── COMPRESSION / EXPANSION THRESHOLDS (ATR-normalised) ──
-# Spread = (EMA_fast - EMA_slow) / ATR. Tune if signal count is outside 500–5000/ticker.
-COMPRESSION_THR_FAST = 0.5   # |spread_fast| < thr → compressed
-EXPANSION_THR_FAST   = 1.5   # |spread_fast| > thr → expanding
-COMPRESSION_THR_MED  = 0.6
-EXPANSION_THR_MED    = 1.8
+# ── ADAPTIVE THRESHOLD PERCENTILES ──
+# Thresholds are computed per-ticker from the spread distribution of the full dataset.
+# compression = COMP_PCT percentile of |spread|  (bottom of distribution = tight EMAs)
+# expansion   = EXP_PCT  percentile of |spread|  (top of distribution = wide EMAs)
+# Target signal density: 500–3000 per ticker. Raise EXP_PCT to reduce signals.
+COMP_PCT = 25   # percentile for compression threshold
+EXP_PCT  = 75   # percentile for expansion threshold
 
 # ── RISK / LABELING ──
 SL_ATR_MULT   = 1.5    # stop = entry ± SL_ATR_MULT × ATR
@@ -158,14 +159,27 @@ def _ema(close_arr: np.ndarray, period: int) -> np.ndarray:
     return pd.Series(close_arr).ewm(span=period, adjust=False).mean().values
 
 
+def _adaptive_thresholds(abs_spread: np.ndarray) -> tuple:
+    """Return (compression_thr, expansion_thr) from the spread distribution."""
+    valid = abs_spread[MIN_WARMUP_BARS:]
+    valid = valid[valid > 0]
+    if len(valid) == 0:
+        return 0.3, 0.7
+    return float(np.percentile(valid, COMP_PCT)), float(np.percentile(valid, EXP_PCT))
+
+
 def label_ema_trend_signals(df_5m, atr_arr):
     """
     Detect compression→expansion transitions on 5-min bars.
 
+    Compression and expansion thresholds are computed adaptively from the
+    ATR-normalised spread distribution of this ticker (COMP_PCT / EXP_PCT
+    percentiles), so thresholds self-calibrate across instruments and regimes.
+
     Signal fires when:
       - Both fast and medium EMAs were compressed for >= MIN_COMP_BARS bars
       - Both cross into expansion simultaneously
-      - Fast and medium EMA ordering agree on direction (both fully bull or both fully bear)
+      - Fast and medium EMA ordering agree on direction
 
     Returns:
       signal_labels  int8[n]     0=noise, 1=BUY, 2=SELL
@@ -201,6 +215,12 @@ def label_ema_trend_signals(df_5m, atr_arr):
     med_bear   = (e20 < e50) & (e50 < e100) & (e100 < e150)
     med_align  = np.where(med_bull, 1.0, np.where(med_bear, -1.0, 0.0)).astype(np.float32)
 
+    # Adaptive thresholds from this ticker's spread distribution
+    comp_thr_fast, exp_thr_fast = _adaptive_thresholds(abs_fast)
+    comp_thr_med,  exp_thr_med  = _adaptive_thresholds(abs_med)
+    print(f'    thresholds fast: comp={comp_thr_fast:.3f} exp={exp_thr_fast:.3f} | '
+          f'med: comp={comp_thr_med:.3f} exp={exp_thr_med:.3f}')
+
     # Per-bar feature arrays (populated for all bars, not just signals)
     compression_bars_norm = np.zeros(n, dtype=np.float32)
     expansion_delta       = np.zeros(n, dtype=np.float32)
@@ -214,8 +234,8 @@ def label_ema_trend_signals(df_5m, atr_arr):
 
     for i in range(1, n):
         # Update compression counters from previous bar
-        comp_fast = (comp_fast + 1) if abs_fast[i-1] < COMPRESSION_THR_FAST else 0
-        comp_med  = (comp_med  + 1) if abs_med[i-1]  < COMPRESSION_THR_MED  else 0
+        comp_fast = (comp_fast + 1) if abs_fast[i-1] < comp_thr_fast else 0
+        comp_med  = (comp_med  + 1) if abs_med[i-1]  < comp_thr_med  else 0
 
         compression_bars_norm[i] = float(np.clip(min(comp_fast, comp_med) / 50.0, 0.0, 5.0))
 
@@ -229,7 +249,7 @@ def label_ema_trend_signals(df_5m, atr_arr):
             continue
 
         was_compressed  = comp_fast >= MIN_COMP_BARS and comp_med >= MIN_COMP_BARS
-        now_expanding   = abs_fast[i] > EXPANSION_THR_FAST and abs_med[i] > EXPANSION_THR_MED
+        now_expanding   = abs_fast[i] > exp_thr_fast and abs_med[i] > exp_thr_med
         direction       = int(fa)
         direction_agree = direction != 0 and direction == int(ma)
 
@@ -333,8 +353,7 @@ run_labeling(labeler, TICKERS, RAW_DATA_DIR, PREPARED_DIR, EMA_CACHE_DIR,
 
 # ── Label diagnostic ──
 print(f"\n{'='*60}\n  📊 LABEL DIAGNOSTIC\n{'='*60}")
-print(f"  Thresholds — Compression fast:{COMPRESSION_THR_FAST} med:{COMPRESSION_THR_MED} "
-      f"| Expansion fast:{EXPANSION_THR_FAST} med:{EXPANSION_THR_MED}")
+print(f"  Adaptive thresholds — COMP_PCT:{COMP_PCT}th EXP_PCT:{EXP_PCT}th (see per-ticker above)")
 for ticker in TICKERS:
     label_path = os.path.join(EMA_CACHE_DIR, f'{ticker}_strategy_labels.parquet')
     feat_path  = os.path.join(EMA_CACHE_DIR, f'{ticker}_strategy_features.parquet')
@@ -360,8 +379,9 @@ for ticker in TICKERS:
           f'WR@2R:{wr_2r*100:.1f}% WR@3R:{wr_3r*100:.1f}% | baseline:{baseline*100:.0f}%')
 print(f"{'='*60}")
 print("  ⚙️  Threshold tuning guide:")
-print("  Too few signals  → lower EXPANSION_THR (e.g. 1.5→1.2) or lower COMPRESSION_THR")
-print("  WR@2R near 100%  → raise EXPANSION_THR (signals fire too early / in noise)")
+print("  Too few signals  (<500/ticker) → lower EXP_PCT  (e.g. 75→65)")
+print("  WR@2R near 100%  (signals too easy) → raise EXP_PCT (e.g. 75→85)")
+print("  Too many signals (>5000/ticker) → raise EXP_PCT or raise COMP_PCT")
 print(f"{'='*60}")
 
 
@@ -462,14 +482,12 @@ if last_model is not None:
             'ema_feature_cols':   EMA_FEATURE_COLS,
             'tickers':            TICKERS,
             'ema_params': {
-                'fast_periods':        FAST_PERIODS,
-                'med_periods':         MED_PERIODS,
-                'compression_thr_fast': COMPRESSION_THR_FAST,
-                'expansion_thr_fast':   EXPANSION_THR_FAST,
-                'compression_thr_med':  COMPRESSION_THR_MED,
-                'expansion_thr_med':    EXPANSION_THR_MED,
-                'sl_atr_mult':          SL_ATR_MULT,
-                'horizon_bars':         HORIZON_BARS,
+                'fast_periods':  FAST_PERIODS,
+                'med_periods':   MED_PERIODS,
+                'comp_pct':      COMP_PCT,
+                'exp_pct':       EXP_PCT,
+                'sl_atr_mult':   SL_ATR_MULT,
+                'horizon_bars':  HORIZON_BARS,
             },
             'inference': {
                 'output_0': '[B,2] signal_logits — softmax; index 1 = signal probability',
