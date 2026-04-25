@@ -867,6 +867,273 @@ def run_walk_forward(
     return fold_results
 
 
+# ── Risk head calibration (Phase 2) ──────────────────────────────────────────
+
+def _run_rr_epoch(model, loader, optimizer, training, device, huber_delta=1.0):
+    model.train() if training else model.eval()
+    total_loss = 0.0; n = 0
+    all_pred = []; all_true = []
+
+    ctx = torch.enable_grad() if training else torch.no_grad()
+    with ctx:
+        for batch in loader:
+            feats   = batch['features'].to(device)
+            strat   = batch['strategy_features'].to(device)
+            candles = batch['candle_types'].to(device)
+            inst    = batch['instrument_ids'].to(device)
+            sess    = batch['session_ids'].to(device)
+            tod     = batch['time_of_day'].to(device)
+            dow     = batch['day_of_week'].to(device)
+            max_rr  = batch['max_rr'].to(device)
+
+            out  = model(features=feats, strategy_features=strat,
+                         candle_types=candles, time_of_day=tod,
+                         day_of_week=dow, instrument_ids=inst,
+                         session_ids=sess)
+            pred = out['risk_predictions'].squeeze(-1)
+            loss = F.huber_loss(pred, max_rr, delta=huber_delta)
+
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.risk_head.parameters(), 1.0)
+                optimizer.step()
+
+            total_loss += loss.item(); n += 1
+            all_pred.extend(pred.detach().cpu().tolist())
+            all_true.extend(max_rr.cpu().tolist())
+
+    mae = float(np.mean(np.abs(np.array(all_pred) - np.array(all_true))))
+    return total_loss / max(n, 1), mae, all_pred, all_true
+
+
+def _train_risk_head_fold(fold_name, model, train_sig, val_sig,
+                          rr_lr, rr_epochs, rr_patience, rr_batch,
+                          huber_delta, device):
+    """Freeze everything except risk_head and train with Huber loss + early stopping."""
+    import copy
+    for name, param in model.named_parameters():
+        param.requires_grad = 'risk_head' in name
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'  Trainable params: {trainable:,} (risk_head only)')
+
+    optimizer = torch.optim.Adam(model.risk_head.parameters(), lr=rr_lr)
+
+    train_loader = DataLoader(train_sig, batch_size=rr_batch, shuffle=True,
+                              num_workers=2, pin_memory=True, drop_last=False)
+    val_loader   = DataLoader(val_sig,   batch_size=rr_batch, shuffle=False,
+                              num_workers=2, pin_memory=True)
+
+    best_val_loss = float('inf')
+    best_state    = None
+    patience_left = rr_patience
+
+    for epoch in range(1, rr_epochs + 1):
+        tr_loss, tr_mae, _, _ = _run_rr_epoch(
+            model, train_loader, optimizer, True,  device, huber_delta)
+        vl_loss, vl_mae, _, _ = _run_rr_epoch(
+            model, val_loader,   optimizer, False, device, huber_delta)
+
+        marker = ''
+        if vl_loss < best_val_loss:
+            best_val_loss = vl_loss
+            best_state    = copy.deepcopy(model.state_dict())
+            patience_left = rr_patience
+            marker = ' ✅'
+        else:
+            patience_left -= 1
+            if patience_left == 0:
+                print(f'  Early stop at epoch {epoch}')
+                break
+
+        print(f'  E{epoch:02d}  train_huber={tr_loss:.4f} mae={tr_mae:.3f}R  '
+              f'val_huber={vl_loss:.4f} mae={vl_mae:.3f}R{marker}')
+
+    model.load_state_dict(best_state)
+    _, _, val_pred, val_true = _run_rr_epoch(
+        model, val_loader, optimizer, False, device, huber_delta)
+    return model, np.array(val_pred), np.array(val_true)
+
+
+def print_rr_calibration(fold_name: str, pred: np.ndarray, true: np.ndarray) -> None:
+    """Print predicted R:R calibration table — how well predicted_rr tracks actual max_rr."""
+    print(f'\n  Calibration — {fold_name} val signals ({len(pred)} total)')
+    print(f'  {"Predict ≥":>10}  {"Signals":>8}  {"Pct":>6}  {"2R hit":>8}  {"3R hit":>8}  {"4R hit":>8}')
+    print(f'  {"-"*58}')
+    for thr in [1.0, 1.5, 2.0, 3.0, 4.0]:
+        mask = pred >= thr
+        n = mask.sum()
+        if n == 0:
+            continue
+        pct    = n / len(pred) * 100
+        hit_2r = (true[mask] >= 2.0).mean() * 100
+        hit_3r = (true[mask] >= 3.0).mean() * 100
+        hit_4r = (true[mask] >= 4.0).mean() * 100
+        print(f'  {thr:>10.1f}  {n:>8}  {pct:>5.1f}%  {hit_2r:>7.1f}%  {hit_3r:>7.1f}%  {hit_4r:>7.1f}%')
+
+    print(f'\n  Actual max_rr distribution:')
+    for pct, label in [(25, 'p25'), (50, 'p50'), (75, 'p75'), (90, 'p90')]:
+        print(f'    {label}: {np.percentile(true, pct):.2f}R')
+    print(f'  Predicted max_rr distribution:')
+    for pct, label in [(25, 'p25'), (50, 'p50'), (75, 'p75'), (90, 'p90')]:
+        print(f'    {label}: {np.percentile(pred, pct):.2f}R')
+
+
+def run_risk_head_calibration(
+    folds: list,
+    tickers: list,
+    ffm_dir: str,
+    strategy_dir: str,
+    output_dir: str,
+    strategy_feature_cols: list,
+    ffm_config: FFMConfig,
+    num_labels: int = 2,
+    risk_weight: float = 0.1,
+    focal_smoothing: float = 0.10,
+    micro_to_full: dict = None,
+    seq_len: int = 96,
+    rr_lr: float = 1e-5,
+    rr_epochs: int = 20,
+    rr_patience: int = 5,
+    rr_batch: int = 64,
+    huber_delta: float = 1.0,
+    device=None,
+) -> dict:
+    """
+    Phase 2: fine-tune risk_head on confirmed signal windows from the Phase 1
+    walk-forward checkpoints.  Call this after run_walk_forward() completes.
+
+    Loads the Phase 1 _done.pt for each fold, freezes backbone + signal_head,
+    and trains risk_head with Huber loss until early stopping.
+
+    Args:
+        folds:                 Same fold list used in run_walk_forward().
+        tickers / ffm_dir / strategy_dir / output_dir: same as run_walk_forward().
+        strategy_feature_cols: Same feature cols used in Phase 1.
+        ffm_config:            Same FFMConfig used in Phase 1.
+        num_labels:            Must match Phase 1 (default 2).
+        risk_weight:           Must match Phase 1 (default 0.1).
+        focal_smoothing:       Must match Phase 1 (default 0.10).
+        micro_to_full:         Optional ticker → data_ticker mapping.
+        seq_len:               Must match Phase 1 (default 96).
+        rr_lr / rr_epochs / rr_patience / rr_batch / huber_delta: Phase 2 hyperparams.
+        device:                torch.device (auto-detected if None).
+
+    Returns:
+        dict: fold_name → path of the saved _rr_done.pt checkpoint.
+              Use the F4 entry for ONNX export.
+    """
+    import glob as _glob
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    num_ffm_features  = len(get_model_feature_columns())
+    num_strat_features = len(strategy_feature_cols)
+    focal_cfg = FFMConfig(num_features=num_ffm_features, label_smoothing=focal_smoothing)
+
+    # ── Load all fold datasets from Phase 1 cache ──
+    print(f'\n{"="*60}')
+    print('  Loading fold datasets from cache...')
+    print(f'{"="*60}')
+
+    fold_data = {}
+    for fold in folds:
+        fold_cfg = {
+            'train_end': fold['train_end'],
+            'val_end':   fold['val_end'],
+            'test_end':  fold['test_end'],
+        }
+        train_dsets, val_dsets, _ = _load_fold_data(
+            fold_cfg, tickers, ffm_dir, strategy_dir,
+            strategy_feature_cols, seq_len, micro_to_full,
+        )
+        if not train_dsets or not val_dsets:
+            print(f'  ⚠ {fold["name"]}: insufficient data — will skip')
+            fold_data[fold['name']] = None
+            continue
+
+        train_ds = _concat_with_meta(train_dsets, seq_len)
+        val_ds   = ConcatDataset(val_dsets)
+
+        train_sig = torch.utils.data.Subset(train_ds, train_ds.signal_indices)
+        val_sig_indices = []
+        for i, d in enumerate(val_dsets):
+            offset = sum(len(val_dsets[j]) for j in range(i))
+            val_sig_indices.extend(offset + s for s in d.signal_indices)
+        val_sig = torch.utils.data.Subset(val_ds, val_sig_indices)
+
+        print(f'  {fold["name"]}: {len(train_sig)} train signals, {len(val_sig)} val signals')
+        fold_data[fold['name']] = {'train_sig': train_sig, 'val_sig': val_sig}
+
+    print('\n✅ Data loaded')
+
+    # ── Phase 2 fine-tuning per fold ──
+    print(f'\n{"="*60}')
+    print('  PHASE 2 — RISK HEAD FINE-TUNING')
+    print(f'{"="*60}')
+
+    rr_done_paths = {}
+
+    for fold in folds:
+        fold_name = fold['name']
+        if fold_data.get(fold_name) is None:
+            print(f'\n  ⚠ {fold_name}: no data — skipping')
+            continue
+
+        done_files = sorted(_glob.glob(os.path.join(output_dir, f'{fold_name}_*_done.pt')))
+        done_files = [f for f in done_files if '_rr_done' not in f]
+        if not done_files:
+            print(f'\n  ⚠ {fold_name}: no Phase 1 _done.pt found — skipping')
+            continue
+        p1_path = done_files[-1]
+        p1_ckpt = torch.load(p1_path, map_location='cpu', weights_only=False)
+        config_hash = p1_ckpt.get('config_hash', 'unknown')
+
+        rr_ckpt_path = os.path.join(output_dir, f'{fold_name}_{config_hash}_rr_done.pt')
+
+        print(f'\n{"="*60}')
+        print(f'  {fold_name} | hash={config_hash} | from {os.path.basename(p1_path)}')
+        print(f'{"="*60}')
+
+        if os.path.exists(rr_ckpt_path):
+            print(f'  ✅ Phase 2 checkpoint already exists — skipping re-training')
+            rr_done_paths[fold_name] = rr_ckpt_path
+            continue
+
+        model = HybridStrategyModel(
+            ffm_config=focal_cfg,
+            num_strategy_features=num_strat_features,
+            num_labels=num_labels,
+            risk_weight=risk_weight,
+        ).to(device)
+        model.load_state_dict(
+            {k: v.to(device) for k, v in p1_ckpt['next_fold_state'].items()}
+        )
+
+        data = fold_data[fold_name]
+        model, val_pred, val_true = _train_risk_head_fold(
+            fold_name, model, data['train_sig'], data['val_sig'],
+            rr_lr, rr_epochs, rr_patience, rr_batch, huber_delta, device,
+        )
+        print_rr_calibration(fold_name, val_pred, val_true)
+
+        torch.save({
+            'config_hash':     config_hash,
+            'phase':           'phase2_risk_head',
+            'next_fold_state': {k: v.cpu() for k, v in model.state_dict().items()},
+            'rr_metrics': {
+                'val_pred': val_pred.tolist(),
+                'val_true': val_true.tolist(),
+                'val_mae':  float(np.mean(np.abs(val_pred - val_true))),
+            },
+        }, rr_ckpt_path)
+        print(f'\n  💾 Saved: {rr_ckpt_path}')
+        rr_done_paths[fold_name] = rr_ckpt_path
+
+    print(f'\n✅ Phase 2 complete')
+    return rr_done_paths
+
+
 # ── ONNX export ───────────────────────────────────────────────────────────────
 
 def export_onnx(

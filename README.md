@@ -63,6 +63,23 @@ from futures_foundation.finetune import print_eval_summary
 print_eval_summary(fold_results, baseline_wr=BASELINE_WR)
 ```
 
+**Phase 2: risk head calibration** (separate script, run after Phase 1 completes)
+
+```python
+from futures_foundation.finetune import run_risk_head_calibration
+
+# Loads Phase 1 checkpoints, freezes signal head + backbone, trains risk_head
+# with Huber loss on confirmed signal windows only. Prints calibration table
+# showing how well predicted_rr tracks actual max_rr at each R threshold.
+rr_done_paths = run_risk_head_calibration(
+    folds=FOLDS, tickers=TICKERS,
+    ffm_dir=PREPARED_DIR, strategy_dir=CACHE_DIR, output_dir=OUTPUT_DIR,
+    strategy_feature_cols=labeler.feature_cols, ffm_config=ffm_config,
+    rr_lr=1e-5, rr_epochs=20, rr_patience=5,
+)
+# rr_done_paths['F4'] → path to the F4 _rr_done.pt used for ONNX export
+```
+
 ### What the framework provides
 
 | Component | Description |
@@ -73,7 +90,9 @@ print_eval_summary(fold_results, baseline_wr=BASELINE_WR)
 | `HybridStrategyDataset` | Sliding-window dataset parameterised by your strategy feature columns |
 | `run_labeling()` | CSV I/O, timezone normalization, parquet caching per ticker |
 | `run_walk_forward()` | 4-fold walk-forward, warm start F1→F2→F3→F4, dual checkpoint (val_loss + signal_F1) |
+| `run_risk_head_calibration()` | Phase 2: freeze signal head, fine-tune risk_head with Huber loss on signal-only subsets |
 | `print_eval_summary()` | Confidence threshold table, per-fold breakdown, vs-baseline comparison |
+| `print_rr_calibration()` | Phase 2 calibration table: predicted R:R vs actual max_rr at each threshold |
 | `export_onnx()` | Production ONNX export of the final fold model |
 
 ### Model architecture
