@@ -99,11 +99,17 @@ signal   risk   confidence
 
 The backbone handles **all market context** — HTF trend, volatility regime, session structure, CRT sweeps, order flow. Strategy features cover only what the backbone cannot derive: setup geometry, zone age, entry distance, risk sizing.
 
-### CISD+OTE: first concrete implementation
+### Strategy implementations
 
-`colabs/cisd_ote.py` implements the Change in State of Delivery + Optimal Trade Entry strategy using the framework. It reduces to a `CISDOTELabeler(StrategyLabeler)` subclass with 10 strategy-specific features (zone geometry and trade mechanics). The 400-line training cell is replaced by a single `run_walk_forward()` call.
+Each strategy is a `StrategyLabeler` subclass with a two-phase Colab script — Phase 1 trains the signal classifier, Phase 2 fine-tunes the risk head (Huber loss on confirmed signals only) to produce a calibrated predicted R:R at trade entry.
 
-Baseline performance (v5.1 reference, 5 instruments):
+| Strategy | Script | Features | Edge |
+|---|---|---|---|
+| **CISD+OTE** | `cisd_ote.py` + `cisd_ote_v71_riskhead.py` | 10 (zone geometry, entry mechanics) | ICT institutional order flow — mean reversion at swept zones |
+| **EMA Trend Follow** | `ema_trend_v1.py` + `ema_trend_v11_riskhead.py` | 8 (EMA spread, alignment, compression state) | Compression→expansion transitions — trend follow with chop filter |
+| **AMD** | `amd_v1.py` | 8 (session ranges, sweep depth, time) | Asian range → London sweep → NY reversal — session-based fade |
+
+CISD+OTE baseline (v5.1 reference, 5 instruments):
 - 2,729 signals across ES, NQ, RTY, YM, GC
 - 68.2% precision @ 0.90 confidence threshold
 - Profit factor 8.71 · +35.7pp above mechanical baseline
@@ -315,8 +321,13 @@ Futures-Foundation-Model/
 │       ├── losses.py           # FocalLoss
 │       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
 ├── colabs/
-│   ├── ffm_pretrain_5min.py    # Colab pretraining script
-│   └── cisd_ote.py             # CISD+OTE strategy (example fine-tune implementation)
+│   ├── ffm_pretrain_5min.py           # Colab pretraining script
+│   ├── cisd_ote.py                    # CISD+OTE — Phase 1 (signal classifier)
+│   ├── cisd_ote_v71_riskhead.py       # CISD+OTE — Phase 2 (risk head calibration)
+│   ├── export_cisd_ote_v7.py          # CISD+OTE ONNX export utility
+│   ├── ema_trend_v1.py                # EMA Trend Follow — Phase 1 (signal classifier)
+│   ├── ema_trend_v11_riskhead.py      # EMA Trend Follow — Phase 2 (risk head calibration)
+│   └── amd_v1.py                      # AMD — Phase 1 (signal classifier)
 ├── tests/                      # Unit tests (217 total)
 │   ├── test_model.py           # Backbone + heads (32 tests)
 │   ├── test_finetune.py        # Fine-tuning framework (42 tests, incl. FFM field coverage)
@@ -371,12 +382,16 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **`futures_foundation.finetune` — reusable walk-forward fine-tuning framework**
 - [x] **`StrategyLabeler` ABC — implement one class, get everything else for free**
 - [x] **CISD+OTE strategy as first concrete fine-tune implementation**
-- [x] Unit test suite (217 tests) with per-column FFM field coverage checks
+- [x] Unit test suite with per-column FFM field coverage checks
+- [x] ONNX export for production inference
+- [x] **EMA Trend Follow strategy — compression→expansion labeler with hysteresis state machine**
+- [x] **AMD strategy — Accumulation/Manipulation/Distribution session-based reversal**
+- [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry (CISD+OTE v7.1)**
+- [ ] Phase 2 risk head calibration for EMA Trend and AMD (in progress)
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (SI, CL, NKD)
-- [ ] ONNX export for production inference
 
 ---
 
