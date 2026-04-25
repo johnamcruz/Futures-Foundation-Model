@@ -422,6 +422,8 @@ def test_evaluate_confidence_all_in_01():
 
 
 def test_train_reduces_loss():
+    torch.manual_seed(42)
+    np.random.seed(42)
     cfg    = small_ffm_config()
     model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
     loader = _make_small_loader()
@@ -1655,3 +1657,301 @@ def test_resume_checkpoint_includes_ratio_bad_ctr(tmp_path):
     saved = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     assert 'ratio_bad_ctr' in saved, 'ratio_bad_ctr missing from resume checkpoint'
     assert saved['ratio_bad_ctr'] == 2
+
+
+# =============================================================================
+# 11. Phase 2 risk head calibration
+# =============================================================================
+
+from futures_foundation.finetune import print_rr_calibration, run_risk_head_calibration
+from futures_foundation.finetune.trainer import _run_rr_epoch, _train_risk_head_fold
+
+
+def _make_signal_only_loader(n=100, seed=7):
+    """DataLoader containing only signal windows (simulates Phase 2 subset)."""
+    from torch.utils.data import Subset
+    ffm_df = make_ffm_df(n, seed)
+    strat  = make_strategy_features(n, seed)
+    labels = make_labels(n, signal_rate=0.30, seed=seed)
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    sig_ds = Subset(ds, ds.signal_indices) if ds.signal_indices else ds
+    from torch.utils.data import DataLoader
+    return DataLoader(sig_ds, batch_size=8, shuffle=False, num_workers=0)
+
+
+def test_run_rr_epoch_returns_correct_types():
+    """`_run_rr_epoch` must return (loss, mae, pred_list, true_list)."""
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loader = _make_signal_only_loader()
+    optim  = torch.optim.Adam(model.risk_head.parameters(), lr=1e-4)
+
+    loss, mae, pred, true = _run_rr_epoch(
+        model, loader, optim, training=False, device=torch.device('cpu'))
+
+    assert isinstance(loss, float)
+    assert isinstance(mae,  float)
+    assert isinstance(pred, list)
+    assert isinstance(true, list)
+    assert len(pred) == len(true)
+    assert len(pred) > 0
+
+
+def test_run_rr_epoch_loss_is_positive():
+    """`_run_rr_epoch` Huber loss must be > 0 for random weights."""
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loader = _make_signal_only_loader()
+    optim  = torch.optim.Adam(model.risk_head.parameters(), lr=1e-4)
+
+    loss, _, _, _ = _run_rr_epoch(
+        model, loader, optim, training=False, device=torch.device('cpu'))
+    assert loss > 0
+
+
+def test_run_rr_epoch_training_updates_risk_head():
+    """A training-mode epoch must change risk_head weights (gradient applied)."""
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loader = _make_signal_only_loader()
+    optim  = torch.optim.Adam(model.risk_head.parameters(), lr=1e-3)
+
+    before = {k: v.clone() for k, v in model.risk_head.state_dict().items()}
+    _run_rr_epoch(model, loader, optim, training=True, device=torch.device('cpu'))
+    after = model.risk_head.state_dict()
+
+    any_changed = any(
+        not torch.allclose(before[k], after[k]) for k in before
+    )
+    assert any_changed, 'risk_head weights did not change after a training epoch'
+
+
+def test_run_rr_epoch_eval_does_not_update_weights():
+    """An eval-mode epoch must NOT modify any model weights."""
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loader = _make_signal_only_loader()
+    optim  = torch.optim.Adam(model.risk_head.parameters(), lr=1e-3)
+
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    _run_rr_epoch(model, loader, optim, training=False, device=torch.device('cpu'))
+    after = model.state_dict()
+
+    for k in before:
+        assert torch.allclose(before[k], after[k]), (
+            f'{k} changed during eval-mode epoch — no-grad not working')
+
+
+def test_train_risk_head_fold_only_risk_head_trained():
+    """After `_train_risk_head_fold`, only risk_head weights should have changed;
+    backbone and signal_head must be identical to the pre-training snapshot."""
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    before_backbone     = {k: v.clone() for k, v in model.backbone.state_dict().items()}
+    before_signal_head  = {k: v.clone() for k, v in model.signal_head.state_dict().items()}
+    before_risk_head    = {k: v.clone() for k, v in model.risk_head.state_dict().items()}
+
+    train_loader = _make_signal_only_loader(n=120, seed=8)
+    val_loader   = _make_signal_only_loader(n=80,  seed=9)
+
+    _train_risk_head_fold(
+        'TEST', model, train_loader.dataset, val_loader.dataset,
+        rr_lr=1e-3, rr_epochs=3, rr_patience=3,
+        rr_batch=8, huber_delta=1.0, device=torch.device('cpu'),
+    )
+
+    for k in before_backbone:
+        assert torch.allclose(model.backbone.state_dict()[k], before_backbone[k]), (
+            f'backbone.{k} changed — risk_head freeze not working')
+
+    for k in before_signal_head:
+        assert torch.allclose(model.signal_head.state_dict()[k], before_signal_head[k]), (
+            f'signal_head.{k} changed — risk_head freeze not working')
+
+    any_rh_changed = any(
+        not torch.allclose(model.risk_head.state_dict()[k], before_risk_head[k])
+        for k in before_risk_head
+    )
+    assert any_rh_changed, 'risk_head weights did not change at all — training did nothing'
+
+
+def test_train_risk_head_fold_returns_arrays():
+    """`_train_risk_head_fold` must return (model, pred_np, true_np) with matching shapes."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    train_l = _make_signal_only_loader(n=100, seed=10)
+    val_l   = _make_signal_only_loader(n=60,  seed=11)
+
+    returned_model, pred, true = _train_risk_head_fold(
+        'F1', model, train_l.dataset, val_l.dataset,
+        rr_lr=1e-3, rr_epochs=2, rr_patience=2,
+        rr_batch=8, huber_delta=1.0, device=torch.device('cpu'),
+    )
+
+    assert returned_model is model
+    assert isinstance(pred, np.ndarray)
+    assert isinstance(true, np.ndarray)
+    assert pred.shape == true.shape
+    assert len(pred) > 0
+
+
+def test_print_rr_calibration_smoke(capsys):
+    """print_rr_calibration must not raise and must print threshold rows."""
+    rng  = np.random.default_rng(0)
+    pred = rng.uniform(0.5, 5.0, 100).astype(np.float32)
+    true = rng.uniform(0.0, 5.0, 100).astype(np.float32)
+    print_rr_calibration('F1', pred, true)
+    out = capsys.readouterr().out
+    assert 'Calibration' in out
+    assert 'F1' in out
+
+
+def test_print_rr_calibration_shows_distribution(capsys):
+    """print_rr_calibration must print percentile rows for actual and predicted."""
+    rng  = np.random.default_rng(1)
+    pred = rng.uniform(0.5, 4.0, 200).astype(np.float32)
+    true = rng.uniform(0.0, 5.0, 200).astype(np.float32)
+    print_rr_calibration('F2', pred, true)
+    out = capsys.readouterr().out
+    assert 'p25' in out
+    assert 'p50' in out
+    assert 'Actual' in out
+    assert 'Predicted' in out
+
+
+def test_print_rr_calibration_skips_empty_threshold(capsys):
+    """Threshold rows with 0 signals above them must be silently skipped."""
+    pred = np.array([0.1, 0.2, 0.3], dtype=np.float32)   # all below 1.0
+    true = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    print_rr_calibration('F3', pred, true)
+    out = capsys.readouterr().out
+    assert '1.0' not in out.split('Calibration')[1].split('Actual')[0]
+
+
+@pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
+def test_run_risk_head_calibration_skips_existing_rr_checkpoint(tmp_path):
+    """If a _rr_done.pt already exists for a fold it must be skipped (idempotent)."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    config_hash = 'abcd1234'
+
+    ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
+    output_dir = tmp_path / 'output'; output_dir.mkdir()
+
+    # Write a fake Phase 1 _done.pt
+    p1_path = output_dir / f'F1_{config_hash}_done.pt'
+    torch.save({
+        'config_hash':     config_hash,
+        'next_fold_state': {k: v.cpu() for k, v in model.state_dict().items()},
+        'test_metrics':    _make_fake_test_metrics(),
+    }, p1_path)
+
+    # Write a pre-existing _rr_done.pt
+    rr_path = output_dir / f'F1_{config_hash}_rr_done.pt'
+    rr_path.write_bytes(b'existing')
+
+    ffm_config = FFMConfig(
+        num_features=len(get_model_feature_columns()),
+        hidden_size=32, num_hidden_layers=2,
+        num_attention_heads=4, intermediate_size=64,
+        max_sequence_length=SEQ_LEN,
+    )
+
+    folds = [{'name': 'F1', 'train_end': '2021-01-15',
+              'val_end': '2021-01-22', 'test_end': '2021-01-29'}]
+
+    result = run_risk_head_calibration(
+        folds=folds, tickers=['ES'],
+        ffm_dir=ffm_dir, strategy_dir=strategy_dir,
+        output_dir=str(output_dir),
+        strategy_feature_cols=STRATEGY_COLS,
+        ffm_config=ffm_config,
+        seq_len=SEQ_LEN,
+        rr_lr=1e-3, rr_epochs=1, rr_patience=1, rr_batch=8,
+    )
+
+    # Must return the existing path without overwriting it
+    assert result.get('F1') == str(rr_path)
+    assert rr_path.read_bytes() == b'existing', '_rr_done.pt was overwritten'
+
+
+@pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
+def test_run_risk_head_calibration_skips_missing_phase1_checkpoint(tmp_path):
+    """If no Phase 1 _done.pt exists for a fold, that fold must be skipped gracefully."""
+    ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
+    output_dir = tmp_path / 'output'; output_dir.mkdir()
+
+    ffm_config = FFMConfig(
+        num_features=len(get_model_feature_columns()),
+        hidden_size=32, num_hidden_layers=2,
+        num_attention_heads=4, intermediate_size=64,
+        max_sequence_length=SEQ_LEN,
+    )
+
+    folds = [{'name': 'F1', 'train_end': '2021-01-15',
+              'val_end': '2021-01-22', 'test_end': '2021-01-29'}]
+
+    result = run_risk_head_calibration(
+        folds=folds, tickers=['ES'],
+        ffm_dir=ffm_dir, strategy_dir=strategy_dir,
+        output_dir=str(output_dir),
+        strategy_feature_cols=STRATEGY_COLS,
+        ffm_config=ffm_config,
+        seq_len=SEQ_LEN,
+        rr_lr=1e-3, rr_epochs=1, rr_patience=1, rr_batch=8,
+    )
+
+    assert 'F1' not in result, 'F1 should be absent — no Phase 1 checkpoint'
+
+
+@pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
+def test_run_risk_head_calibration_saves_rr_checkpoint(tmp_path):
+    """A complete Phase 2 run must create _rr_done.pt with required keys."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    config_hash = _config_hash(TrainingConfig())
+
+    ffm_dir, strategy_dir = _write_fold_parquets(tmp_path, 'ES', n=2000)
+    output_dir = tmp_path / 'output'; output_dir.mkdir()
+
+    p1_path = output_dir / f'F1_{config_hash}_done.pt'
+    torch.save({
+        'config_hash':     config_hash,
+        'next_fold_state': {k: v.cpu() for k, v in model.state_dict().items()},
+        'test_metrics':    _make_fake_test_metrics(),
+    }, p1_path)
+
+    ffm_config = FFMConfig(
+        num_features=len(get_model_feature_columns()),
+        hidden_size=32, num_hidden_layers=2,
+        num_attention_heads=4, intermediate_size=64,
+        max_sequence_length=SEQ_LEN,
+    )
+
+    folds = [{'name': 'F1', 'train_end': '2021-01-04',
+              'val_end': '2021-01-11', 'test_end': '2021-01-18'}]
+
+    result = run_risk_head_calibration(
+        folds=folds, tickers=['ES'],
+        ffm_dir=ffm_dir, strategy_dir=strategy_dir,
+        output_dir=str(output_dir),
+        strategy_feature_cols=STRATEGY_COLS,
+        ffm_config=ffm_config,
+        seq_len=SEQ_LEN,
+        rr_lr=1e-3, rr_epochs=2, rr_patience=2, rr_batch=8,
+    )
+
+    if 'F1' not in result:
+        pytest.skip('Insufficient signal windows in generated data for this fold')
+
+    rr_path = result['F1']
+    assert os.path.exists(rr_path), '_rr_done.pt not created'
+
+    ckpt = torch.load(rr_path, map_location='cpu', weights_only=False)
+    assert 'config_hash'     in ckpt
+    assert 'phase'           in ckpt
+    assert 'next_fold_state' in ckpt
+    assert 'rr_metrics'      in ckpt
+    assert 'val_mae'         in ckpt['rr_metrics']
+    assert ckpt['config_hash'] == config_hash

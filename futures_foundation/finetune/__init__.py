@@ -35,7 +35,9 @@ from .model import HybridStrategyModel
 from .trainer import (
     export_onnx,
     print_eval_summary,
+    print_rr_calibration,
     run_labeling,
+    run_risk_head_calibration,
     run_walk_forward,
     validate_setup,
 )
@@ -48,6 +50,8 @@ __all__ = [
     'HybridStrategyModel',
     'run_labeling',
     'run_walk_forward',
+    'run_risk_head_calibration',
+    'print_rr_calibration',
     'export_onnx',
     'print_eval_summary',
     'validate_setup',
