@@ -120,17 +120,12 @@ The backbone handles **all market context** — HTF trend, volatility regime, se
 
 ### Strategy implementations
 
-Each strategy is a `StrategyLabeler` subclass with a two-phase Colab script — Phase 1 trains the signal classifier, Phase 2 fine-tunes the risk head (Huber loss on confirmed signals only) to produce a calibrated predicted R:R at trade entry.
+Each strategy is a `StrategyLabeler` subclass with a two-phase training pipeline — Phase 1 trains the signal classifier, Phase 2 fine-tunes the risk head (Huber loss on confirmed signals only) to produce a calibrated predicted R:R at trade entry.
 
-| Strategy | Script | Features | Edge |
-|---|---|---|---|
-| **CISD+OTE** | `cisd_ote.py` + `cisd_ote_v71_riskhead.py` | 10 (zone geometry, entry mechanics) | ICT institutional order flow — mean reversion at swept zones |
-| **SuperTrend Trend Follow** | `st_trend_v1.py` | 8 (ST distance, prior trend stats, HTF alignment) | 5min ST flip confirmed by 1h ST — trend-following entries avoiding counter-trend chop |
-
-CISD+OTE baseline (v5.1 reference, 5 instruments):
-- 2,729 signals across ES, NQ, RTY, YM, GC
-- 68.2% precision @ 0.90 confidence threshold
-- Profit factor 8.71 · +35.7pp above mechanical baseline
+| Strategy | Features | Edge |
+|---|---|---|
+| **CISD+OTE** | 10 (zone geometry, entry mechanics) | ICT institutional order flow — mean reversion at swept zones |
+| **SuperTrend Trend Follow** | 8 (ST distance, prior trend stats, HTF alignment) | Trend-following entries with HTF alignment filter |
 
 ---
 
@@ -203,7 +198,7 @@ from futures_foundation.finetune import (
 )
 ```
 
-See the [Fine-Tuning Framework](#fine-tuning-framework) section above and `colabs/cisd_ote.py` for a complete working example.
+See the [Fine-Tuning Framework](#fine-tuning-framework) section above for a complete working example.
 
 ### Causal Attention Mask (Per-Bar Predictions)
 
@@ -338,19 +333,13 @@ Futures-Foundation-Model/
 │       ├── dataset.py          # HybridStrategyDataset
 │       ├── losses.py           # FocalLoss
 │       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
-├── colabs/
-│   ├── ffm_pretrain_5min.py           # Colab pretraining script
-│   ├── cisd_ote.py                    # CISD+OTE — Phase 1 (signal classifier)
-│   ├── cisd_ote_v71_riskhead.py       # CISD+OTE — Phase 2 (risk head calibration)
-│   ├── export_cisd_ote_v7.py          # CISD+OTE ONNX export utility
-│   └── st_trend_v1.py                 # SuperTrend Trend Follow — Phase 1 (signal classifier)
-├── tests/                      # Unit tests (217 total)
-│   ├── test_model.py           # Backbone + heads (32 tests)
-│   ├── test_finetune.py        # Fine-tuning framework (42 tests, incl. FFM field coverage)
-│   ├── test_features_crt.py    # CRT sweep features (24 tests)
-│   ├── test_features_core.py   # Core feature groups (30 tests)
-│   ├── test_labels.py          # Label generation (25 tests)
-│   └── test_candle_psychology.py  # Candle psychology (33 tests)
+├── tests/                      # Unit tests (274 total)
+│   ├── test_model.py           # Backbone + heads
+│   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage)
+│   ├── test_features_crt.py    # CRT sweep features
+│   ├── test_features_core.py   # Core feature groups
+│   ├── test_labels.py          # Label generation
+│   └── test_candle_psychology.py  # Candle psychology
 ├── .githooks/
 │   └── pre-commit              # Runs all unit tests before every commit
 ├── setup.py
@@ -400,9 +389,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **CISD+OTE strategy as first concrete fine-tune implementation**
 - [x] Unit test suite with per-column FFM field coverage checks
 - [x] ONNX export for production inference
-- [x] **SuperTrend Trend Follow — 5min ST flip + 1h HTF alignment filter; 8 discriminative features; 9,323 signals across 5 tickers**
-- [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry (CISD+OTE v7.1)**
-- [ ] Phase 2 risk head calibration for SuperTrend Trend Follow
+- [x] **SuperTrend Trend Follow strategy**
+- [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry**
+- [x] **Phase 2 risk head calibration for SuperTrend Trend Follow**
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
