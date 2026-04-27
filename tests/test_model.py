@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import pandas as pd
 import torch.nn as nn
+from transformers import AutoConfig, AutoModel
 from futures_foundation import (
     FFMConfig, FFMBackbone, FFMForPretraining, FFMForClassification,
     FFMForRegression, FFMForStrategyWithRisk,
@@ -63,6 +64,66 @@ def test_config_save_load():
         c.save_pretrained(d)
         loaded = FFMConfig.from_pretrained(d)
         assert loaded.hidden_size == 128
+
+
+def test_config_auto_map_present():
+    c = FFMConfig()
+    assert "AutoConfig" in c.auto_map
+    assert "AutoModel" in c.auto_map
+    assert "FFMConfig" in c.auto_map["AutoConfig"]
+    assert "FFMBackbone" in c.auto_map["AutoModel"]
+
+
+def test_config_auto_map_survives_roundtrip():
+    c = FFMConfig(hidden_size=64)
+    with tempfile.TemporaryDirectory() as d:
+        c.save_pretrained(d)
+        loaded = FFMConfig.from_pretrained(d)
+        assert loaded.auto_map == c.auto_map
+
+
+def test_autoconfig_from_pretrained():
+    c = FFMConfig(hidden_size=64)
+    with tempfile.TemporaryDirectory() as d:
+        c.save_pretrained(d)
+        loaded = AutoConfig.from_pretrained(d)
+        assert isinstance(loaded, FFMConfig)
+        assert loaded.hidden_size == 64
+
+
+def test_automodel_from_pretrained():
+    c = small_config()
+    m = FFMBackbone(c)
+    with tempfile.TemporaryDirectory() as d:
+        m.save_pretrained(d)
+        loaded = AutoModel.from_pretrained(d)
+        assert isinstance(loaded, FFMBackbone)
+
+
+def test_backbone_save_pretrained_load_pretrained():
+    c = small_config()
+    m = FFMBackbone(c)
+    with tempfile.TemporaryDirectory() as d:
+        m.save_pretrained(d)
+        loaded = FFMBackbone.from_pretrained(d)
+        assert isinstance(loaded, FFMBackbone)
+        assert loaded.config.hidden_size == c.hidden_size
+
+
+def test_backbone_weights_preserved_after_roundtrip():
+    c = small_config()
+    m = FFMBackbone(c)
+    m.eval()
+    x = torch.randn(2, SEQ_LEN, c.num_features)
+    with torch.no_grad():
+        out_before = m(x)
+    with tempfile.TemporaryDirectory() as d:
+        m.save_pretrained(d)
+        loaded = FFMBackbone.from_pretrained(d)
+        loaded.eval()
+        with torch.no_grad():
+            out_after = loaded(x)
+    assert torch.allclose(out_before, out_after, atol=1e-6)
 
 
 # =============================================================================

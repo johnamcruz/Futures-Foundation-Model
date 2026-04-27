@@ -164,6 +164,7 @@ class FFMBackbone(PreTrainedModel):
         # Initialize weights
         self.apply(self._init_weights)
         nn.init.normal_(self.cls_token, std=config.initializer_range)
+        self.post_init()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -322,6 +323,7 @@ class FFMForPretraining(PreTrainedModel):
         self.volatility_head = self._make_head(config, config.num_volatility_labels)
         self.structure_head = self._make_head(config, config.num_structure_labels)
         self.range_head = self._make_head(config, config.num_range_labels)
+        self.post_init()
 
     @staticmethod
     def _make_head(config: FFMConfig, num_labels: int) -> nn.Sequential:
@@ -445,6 +447,7 @@ class FFMForClassification(PreTrainedModel):
             nn.Dropout(config.hidden_dropout_prob),
             nn.Linear(config.hidden_size // 2, num_labels),
         )
+        self.post_init()
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""
@@ -557,6 +560,7 @@ class FFMForRegression(PreTrainedModel):
             nn.Linear(config.hidden_size // 2, num_targets),
             nn.Softplus(),  # Forces positive outputs
         )
+        self.post_init()
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""
@@ -695,6 +699,7 @@ class FFMForStrategyWithRisk(PreTrainedModel):
             nn.Linear(config.hidden_size // 2, num_risk_targets),
             nn.Softplus(),  # Forces positive outputs
         )
+        self.post_init()
 
     def load_backbone(self, path: str):
         """Load pretrained backbone weights from file."""

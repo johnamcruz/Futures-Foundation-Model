@@ -91,6 +91,11 @@ class FFMConfig(PretrainedConfig):
         self.structure_loss_weight = structure_loss_weight
         self.range_loss_weight = range_loss_weight
 
+        self.auto_map = {
+            "AutoConfig": "futures_foundation.config.FFMConfig",
+            "AutoModel": "futures_foundation.model.FFMBackbone",
+        }
+
         assert hidden_size % num_attention_heads == 0, (
             f"hidden_size ({hidden_size}) must be divisible by "
             f"num_attention_heads ({num_attention_heads})"

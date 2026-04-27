@@ -15,11 +15,16 @@ Strategy fine-tuning (e.g. ORB):
 """
 
 
+from transformers import AutoConfig, AutoModel
+
 from .config import FFMConfig
 from .model import (
     FFMBackbone, FFMForPretraining, FFMForClassification,
     FFMForRegression, FFMForStrategyWithRisk,
 )
+
+AutoConfig.register("futures_foundation_model", FFMConfig)
+AutoModel.register(FFMConfig, FFMBackbone)
 from .features import derive_features, get_model_feature_columns, INSTRUMENT_MAP
 from .labels import (
     generate_all_labels, generate_regime_labels, generate_volatility_labels,
