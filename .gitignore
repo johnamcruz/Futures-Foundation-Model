@@ -220,3 +220,6 @@ colabs/
 
 # Temporary diagnostic/scratch scripts
 temp/
+
+# DataBento raw compressed data (large binary files — not for git)
+databento/*.zst
