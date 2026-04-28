@@ -223,3 +223,7 @@ temp/
 
 # DataBento raw compressed data (large binary files — not for git)
 databento/*.zst
+
+# Live trade log and monitor (local only — not for git)
+logs/trades.csv
+scripts/trade_monitor.py
