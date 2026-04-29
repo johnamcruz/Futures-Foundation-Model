@@ -213,6 +213,20 @@ def derive_features(
     # Also expose as a continuous model feature (-1 / 0 / +1 → float32)
     features["htf_1h_structure"] = features["_1h_structure"].astype(float).fillna(0.0).astype(np.float32)
 
+    # --- Daily Structure State (feature 68) ---
+    # Causal: majority close direction over last 3 completed daily bars.
+    # +1 = bullish daily structure, -1 = bearish, 0 = choppy/mixed.
+    df_1d = _resample_ohlcv(df, "1D")
+    _1d_dir = np.sign(df_1d["close"].diff())
+    _1d_maj = _1d_dir.shift(1) + _1d_dir.shift(2) + _1d_dir.shift(3)
+    _1d_struct_htf = pd.Series(0, index=df_1d.index, dtype="Int64")
+    _1d_struct_htf[_1d_maj >= 2] = 1
+    _1d_struct_htf[_1d_maj <= -2] = -1
+    _1d_struct_htf[_1d_dir.shift(3).isna()] = pd.NA
+    _1d_period = df["datetime"].dt.ceil("1D")
+    features["_daily_structure"] = _1d_period.map(_1d_struct_htf).astype("Int64")
+    features["htf_daily_structure"] = features["_daily_structure"].astype(float).fillna(0.0).astype(np.float32)
+
     # --- Group 8: Candle Psychology (6 features) ---
     df_cp = _add_candle_features(df)
     for _col in ("candle_type", "engulf_count", "momentum_speed_ratio",
@@ -531,6 +545,7 @@ def get_model_feature_columns() -> list:
         "htf_4h_close_pos", "htf_4h_ret",
         "htf_tf_alignment",
         "htf_1h_structure",
+        "htf_daily_structure",
         # Group 10: Volume Absorption & Order Flow
         "vol_cum_signed_5", "vol_cum_signed_20",
         "vol_absorption", "vol_momentum_align",

@@ -90,7 +90,7 @@ def make_controlled_uptrend(n=600, start=5000, end=5100, freq="5min"):
 # ---------------------------------------------------------------------------
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 67
+    assert len(get_model_feature_columns()) == 68
 
 
 def test_sweep_column_names_in_list():

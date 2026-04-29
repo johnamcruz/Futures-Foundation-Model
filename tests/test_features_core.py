@@ -45,7 +45,7 @@ def make_ohlcv(n=300, seed=42, bar_freq_min=5):
 # =============================================================================
 
 def test_feature_count():
-    assert len(get_model_feature_columns()) == 67
+    assert len(get_model_feature_columns()) == 68
 
 
 def test_htf_1h_structure_feature():
