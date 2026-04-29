@@ -214,6 +214,8 @@ output/
 # Claude Code memory
 memory/
 data/
+data-old/
+data-combined/
 
 # Strategy training scripts (private IP — kept local only)
 colabs/
