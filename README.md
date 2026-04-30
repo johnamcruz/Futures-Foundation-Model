@@ -16,6 +16,32 @@ Futures Foundation Model (FFM) is an open-source pretrained transformer designed
 
 Just as BERT learns language structure before being fine-tuned for sentiment or Q&A, FFM learns market structure before being fine-tuned for ORB entries, ICT setups, mean reversion signals, or any other strategy. The backbone handles all market context — trend, volatility, session, HTF structure, order flow. Your strategy adds only the setup-specific features it uniquely knows.
 
+### Why This Architecture
+
+**1. Regime changes don't require retraining.**
+
+The four frozen context heads produce live regime/volatility/structure/range probabilities at every inference bar. When the market shifts — say a high-volatility trending selloff — the regime head's softmax output changes from `[0.1, 0.7, 0.1, 0.1]` (ranging) to `[0.1, 0.1, 0.7, 0.1]` (trending). The signal head already trained against this context, so it adjusts confidence automatically. The backbone was pretrained on 2020–2026 data spanning multiple distinct regimes (COVID crash, 2021 melt-up, 2022 bear, 2023 recovery, 2025 tariff selloff) — a new market phase maps to the same embedding space without any code changes.
+
+**2. Adding new data is just a re-run.**
+
+When new bars arrive (monthly or quarterly), you only re-run strategy fine-tuning. The backbone representations are stable. Walk-forward folds shift forward automatically, so your test set becomes more recent and training signals increase — making the model progressively better with no architectural changes.
+
+| Event | Action required |
+|-------|----------------|
+| New bars added to existing tickers | Re-run fine-tuning only |
+| New strategy to trade | Implement one `StrategyLabeler` class |
+| New market regime (within seen volatility) | Nothing — context heads adapt at inference |
+| New input features added to backbone | Retrain backbone, then re-run fine-tuning |
+| Genuinely unprecedented market structure | Retrain backbone (rare — 5+ year training window covers most regimes) |
+
+**3. One backbone, unlimited strategies.**
+
+The pretrained backbone is a shared market context layer. CISD+OTE, SuperTrend, ORB, breaker blocks — each is a thin fine-tuned head on top of the same backbone. Each strategy adds only what the backbone cannot derive: its own setup geometry, zone age, entry distance. Market structure knowledge is never duplicated.
+
+**4. Context heads give the signal head named market handles.**
+
+Prior to context heads, regime information was implicit in the 256-dim CLS embedding — present but unaddressable. The four frozen context heads expose regime, volatility, structure, and range as an explicit 15-dim probability vector. The signal head can learn "when structure head says bearish + volatility head says elevated → tighten confidence threshold" rather than reverse-engineering that from the embedding.
+
 ---
 
 ## Fine-Tuning Framework
