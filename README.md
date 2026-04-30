@@ -439,7 +439,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry**
 - [x] **`HybridStrategyModel` context heads — 4 frozen pretrained heads give signal head explicit market context (regime/vol/structure/range)**
 - [x] **CISD+OTE v9 — backbone v2 + context heads**
-- [ ] Pretrained weights release on HuggingFace Hub
+- [x] **Pretrained weights released on HuggingFace Hub** — [johnamcruz/futures-foundation-model](https://huggingface.co/johnamcruz/futures-foundation-model)
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (CL, NKD)
