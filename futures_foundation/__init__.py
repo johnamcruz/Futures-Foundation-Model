@@ -41,8 +41,18 @@ from .finetune import (
     HybridStrategyModel, HybridStrategyDataset, FocalLoss,
     run_labeling, run_walk_forward, export_onnx, print_eval_summary,
 )
+from .primitives import (
+    compute_atr, compute_supertrend, compute_supertrend_htf,
+    compute_ema, compute_rsi,
+    rolling_mean, rolling_atr_percentile,
+    detect_pivots,
+    apply_rr_barriers, best_rr_hit,
+    session_mask, session_end_mask,
+    compute_vwap,
+    detect_cisd_signals, compute_ote_zones,
+)
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "FFMConfig", "FFMBackbone", "FFMForPretraining", "FFMForClassification",
     "FFMForRegression", "FFMForStrategyWithRisk",
@@ -56,4 +66,12 @@ __all__ = [
     "StrategyLabeler", "TrainingConfig",
     "HybridStrategyModel", "HybridStrategyDataset", "FocalLoss",
     "run_labeling", "run_walk_forward", "export_onnx", "print_eval_summary",
+    "compute_atr", "compute_supertrend", "compute_supertrend_htf",
+    "compute_ema", "compute_rsi",
+    "rolling_mean", "rolling_atr_percentile",
+    "detect_pivots",
+    "apply_rr_barriers", "best_rr_hit",
+    "session_mask", "session_end_mask",
+    "compute_vwap",
+    "detect_cisd_signals", "compute_ote_zones",
 ]
