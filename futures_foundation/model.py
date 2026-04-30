@@ -388,14 +388,25 @@ class FFMForPretraining(PreTrainedModel):
         # Volatility and range labels are reliable enough to train on every sample.
         # Per-head weights reflect relative signal quality (volatility most reliable).
         ls = self.config.label_smoothing
+        cfg = self.config
         _masked_ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=ls)
         _full_ce = nn.CrossEntropyLoss(label_smoothing=ls)
-        cfg = self.config
+
+        # Structure head uses class weights to prevent collapse on bearish-dominant data.
+        _struct_weight = None
+        if getattr(cfg, "structure_class_weights", None) is not None:
+            _struct_weight = torch.tensor(
+                cfg.structure_class_weights, device=features.device, dtype=torch.float32
+            )
+        _structure_ce = nn.CrossEntropyLoss(
+            ignore_index=-100, label_smoothing=ls, weight=_struct_weight
+        )
+
         labels_and_logits = [
-            ("regime",     regime_labels,     regime_logits,     _masked_ce, cfg.regime_loss_weight),
-            ("volatility", volatility_labels, volatility_logits, _full_ce,   cfg.volatility_loss_weight),
-            ("structure",  structure_labels,  structure_logits,  _masked_ce, cfg.structure_loss_weight),
-            ("range",      range_labels,      range_logits,      _full_ce,   cfg.range_loss_weight),
+            ("regime",     regime_labels,     regime_logits,     _masked_ce,    cfg.regime_loss_weight),
+            ("volatility", volatility_labels, volatility_logits, _full_ce,      cfg.volatility_loss_weight),
+            ("structure",  structure_labels,  structure_logits,  _structure_ce, cfg.structure_loss_weight),
+            ("range",      range_labels,      range_logits,      _full_ce,      cfg.range_loss_weight),
         ]
 
         total_loss = torch.tensor(0.0, device=features.device)

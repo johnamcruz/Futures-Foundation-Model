@@ -5,6 +5,8 @@ Defines all hyperparameters for the Futures Foundation Model backbone
 and pretraining heads. Fully compatible with save_pretrained / from_pretrained.
 """
 
+from typing import List, Optional
+
 from transformers import PretrainedConfig
 
 
@@ -64,6 +66,9 @@ class FFMConfig(PretrainedConfig):
         volatility_loss_weight: float = 2.0,
         structure_loss_weight: float = 0.75,
         range_loss_weight: float = 1.5,
+        # Class weights for structure head to prevent bearish-collapse on imbalanced data.
+        # Set to [bullish_weight, bearish_weight] e.g. [2.0, 1.0] when bullish is ~30% of labels.
+        structure_class_weights: Optional[List[float]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -90,6 +95,7 @@ class FFMConfig(PretrainedConfig):
         self.volatility_loss_weight = volatility_loss_weight
         self.structure_loss_weight = structure_loss_weight
         self.range_loss_weight = range_loss_weight
+        self.structure_class_weights = structure_class_weights
 
         self.auto_map = {
             "AutoConfig": "futures_foundation.config.FFMConfig",
