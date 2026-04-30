@@ -101,22 +101,36 @@ rr_done_paths = run_risk_head_calibration(
 FFM Backbone (frozen lower layers)
      │  → CLS embedding (256-dim)
      │
-┌────┴─────────────────────────────────────┐
-│                                           │
-│   Strategy features (N strategy-specific) │
-│        → Linear(64) → GELU → Linear(64)  │
-│                           │               │
-└────── cat ────────────────┘               │
-          │ (256 + 64)                       │
-      fusion: Linear → GELU → LayerNorm     │
-          │ (256)                            │
-   ┌──────┼──────────┬───────────┐
-   │      │          │           │
-signal   risk   confidence
- head    head     head
+     ├── Context Heads (frozen, loaded from best_pretrained.pt)
+     │   regime(4) + volatility(4) + structure(2) + range(5)
+     │   → softmax → 15-dim explicit context vector
+     │
+┌────┴──────────────────────────────────────────────┐
+│                                                    │
+│   Strategy features (N strategy-specific)          │
+│        → Linear(64) → GELU → Linear(64)           │
+│                                        │           │
+└─────── cat ────────────────────────────┘
+              │ (256 + 15 + 64 = 335)
+          fusion: Linear → GELU → LayerNorm
+              │ (256)
+       ┌──────┼──────────┐
+       │      │          │
+   signal    risk   confidence
+    head     head     head
 ```
 
-The backbone handles **all market context** — HTF trend, volatility regime, session structure, CRT sweeps, order flow. Strategy features cover only what the backbone cannot derive: setup geometry, zone age, entry distance, risk sizing.
+The backbone handles **all market context** — HTF trend, volatility regime, session structure, CRT sweeps, order flow. The four frozen context heads expose regime, volatility, structure, and range as an explicit 15-dim probability vector so the signal head has named handles on market state rather than relying on implicit encoding. Strategy features cover only what the backbone cannot derive: setup geometry, zone age, entry distance, risk sizing.
+
+Pass `pretrained_path` (not just `backbone_path`) to load context head weights:
+
+```python
+fold_results = run_walk_forward(
+    ...,
+    backbone_path=BACKBONE_PATH,      # fallback if pretrained not found
+    pretrained_path=PRETRAINED_PATH,  # loads backbone + 4 context heads
+)
+```
 
 ### Strategy implementations
 
@@ -132,7 +146,7 @@ Each strategy is a `StrategyLabeler` subclass with a two-phase training pipeline
 ## Architecture
 
 ```
-Input: OHLCV Bars (sequence of N bars × 66 continuous features + candle_type embedding)
+Input: OHLCV Bars (sequence of N bars × 68 continuous features + candle_type embedding)
          │
     [Instrument Embedding + Session Embedding + Temporal Encoding]
          │
@@ -160,10 +174,10 @@ All labels are **forward-looking** — the model must predict what happens in th
 |------|---------|---------|-------------|
 | **Regime** | Trending Up, Trending Down, Rotational, Volatile | 20 bars | Future return direction + volatility expansion |
 | **Volatility State** | Low, Normal, Elevated, Extreme | 10 bars | Forward realized vol ranked vs recent history |
-| **Market Structure** | Bullish, Bearish | 20 bars | Two-factor confirmation: 1H causal structure AND forward expansion asymmetry must agree; conflicting signals → sentinel (skipped in loss) |
+| **Market Structure** | Bullish, Bearish | 20 bars | Predicts forward `htf_1h_structure` — majority close direction of the 3 completed 1H bars at T+horizon. Learnable because the 8-hour context window contains the 1H price action that drives 1H direction. Choppy/mixed bars → sentinel (skipped in loss) |
 | **Range Position** | 5 quintiles (0-20%, ..., 80-100%) | 10 bars | Where future close lands in current range |
 
-> **Structure labels use two-factor confirmation.** A bar is labeled bullish only when the 1H higher-timeframe structure is already bullish (majority of last 3 completed 1H closes moving higher) AND forward price shows upside > 1.5× downside over the next 20 bars. Both factors must agree — ambiguous bars are skipped via `ignore_index=-100`. This prevents the model from confusing counter-trend bounces with genuine structural trends.
+> **Structure labels are forward-looking 1H structure.** A bar is labeled bullish (0) when `htf_1h_structure` at T+20 bars equals +1 (all 3 completed 1H bars at that point closed higher), bearish (1) when it equals -1. Choppy/mixed bars (0) and data unavailability are masked via `ignore_index=-100`. This label is learnable — the 8-hour context window (96 bars × 5min) contains the full price action that determines 1H direction, so the model can genuinely predict it rather than memorize noise.
 
 ---
 
@@ -218,7 +232,7 @@ embedding = backbone(features, causal=False)
 
 ### Supported Instruments
 
-Currently pretrained on 5 instruments (~1.7M bars total):
+Currently pretrained on 6 instruments (~2.3M bars, Oct 2020 – Apr 2026):
 
 | Instrument | Symbol | Description |
 |-----------|--------|-------------|
@@ -227,8 +241,9 @@ Currently pretrained on 5 instruments (~1.7M bars total):
 | **RTY** | E-mini Russell 2000 | US small cap index |
 | **YM** | E-mini Dow | US blue chip index |
 | **GC** | Gold Futures | Precious metals |
+| **SI** | Silver Futures | Precious metals |
 
-Extensible to: SI (Silver), CL (Crude Oil), NKD (Nikkei), and more.
+Extensible to: CL (Crude Oil), NKD (Nikkei), and more.
 
 ### Input Format
 
@@ -243,7 +258,7 @@ data/raw/
 
 Each CSV should have columns: `datetime, open, high, low, close, volume`
 
-### Feature Derivation (67 Inputs: 66 Continuous + 1 Embedding)
+### Feature Derivation (69 Inputs: 68 Continuous + 1 Embedding)
 
 Features are instrument-agnostic via ATR normalization:
 
@@ -257,7 +272,7 @@ Features are instrument-agnostic via ATR normalization:
 | 6 — Market Structure | 9 | Swing distances, range position |
 | 7 — CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
 | 8 — Candle Psychology | 5 + 1 emb | engulf count, momentum speed, wick rejection, dir consistency, bar size vs session; candle_type → dedicated model embedding |
-| 9 — HTF Price Context | 5 | Daily + weekly OHLC distances, higher-timeframe range position |
+| 9 — HTF Timeframe Context | 7 | 1H/4H close position, returns, TF alignment, 1H structure, daily structure |
 | 10 — Volume Absorption & Order Flow | 4 | Cumulative signed delta, absorption ratio, volume-momentum alignment |
 
 #### CRT Sweep State Features
@@ -292,15 +307,17 @@ Strategy-agnostic price action descriptors computed from raw OHLCV:
 | `dir_consistency` | Fraction of last N bars whose direction matches the current bar |
 | `bar_size_vs_session` | Current bar range relative to running session average |
 
-#### HTF Price Context Features (Group 9)
+#### HTF Timeframe Context Features (Group 9)
 
 | Feature | Description |
 |---------|-------------|
-| `htf_dist_daily_high` | `(close − daily_high) / daily_high` |
-| `htf_dist_daily_low` | `(close − daily_low) / daily_low` |
-| `htf_dist_weekly_high` | `(close − weekly_high) / weekly_high` |
-| `htf_dist_weekly_low` | `(close − weekly_low) / weekly_low` |
-| `htf_range_position` | `(close − weekly_low) / (weekly_high − weekly_low)` |
+| `htf_1h_close_pos` | Close position within the current 1H bar's range |
+| `htf_1h_ret` | Return of the current 1H bar so far |
+| `htf_4h_close_pos` | Close position within the current 4H bar's range |
+| `htf_4h_ret` | Return of the current 4H bar so far |
+| `htf_tf_alignment` | 1H/4H trend agreement: +1 both bullish, -1 both bearish, 0 mixed |
+| `htf_1h_structure` | Majority close direction of last 3 completed 1H bars (+1=bullish, -1=bearish, 0=mixed) |
+| `htf_daily_structure` | Majority close direction of last 3 completed daily bars (+1=bullish, -1=bearish, 0=mixed) — macro regime context |
 
 #### Volume Absorption & Order Flow Features (Group 10)
 
@@ -333,7 +350,7 @@ Futures-Foundation-Model/
 │       ├── dataset.py          # HybridStrategyDataset
 │       ├── losses.py           # FocalLoss
 │       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
-├── tests/                      # Unit tests (274 total)
+├── tests/                      # Unit tests (281 total)
 │   ├── test_model.py           # Backbone + heads
 │   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage)
 │   ├── test_features_crt.py    # CRT sweep features
@@ -353,6 +370,7 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
+| **v0.4** | Backbone v2 (68 features, 6 instruments, 2.3M bars); structure label redesigned to predict forward 1H structure; `HybridStrategyModel` context heads — 4 frozen pretrained heads expose 15-dim regime/vol/structure/range context at fine-tuning; `pretrained_path` API in `run_walk_forward`; CISD+OTE v9 |
 | **v0.3** | `futures_foundation.finetune` framework — plug-and-play walk-forward fine-tuning; CISD+OTE migrated as first concrete strategy |
 | **v0.2** | FFM backbone + CISD+OTE fine-tuning pipeline (v7); 58 backbone features |
 | **v0.1** | Last stable backbone checkpoint reference |
@@ -375,15 +393,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ## Roadmap
 
 - [x] Core transformer backbone with HuggingFace compatibility
-- [x] OHLCV feature derivation pipeline (66 ATR-normalized continuous features)
+- [x] OHLCV feature derivation pipeline (68 ATR-normalized continuous features)
 - [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
 - [x] Candle psychology features — 5 continuous + candle_type embedding
-- [x] HTF price context features — daily/weekly OHLC distances + range position
+- [x] HTF timeframe context features — 1H/4H position, returns, alignment, structure (7 features)
+- [x] Daily macro structure feature — `htf_daily_structure` for regime blindness fix
 - [x] Volume absorption & order flow features
 - [x] Forward-looking self-supervised label generation (4 tasks)
-- [x] Two-factor structure labels with confidence sentinel
+- [x] Structure label — predicts forward 1H structure (learnable from 8h context window)
+- [x] Confidence sentinel masking for regime + structure heads
 - [x] Causal attention mask for per-bar predictions
-- [x] 5-instrument pretraining (ES, NQ, RTY, YM, GC)
+- [x] **6-instrument pretraining — ES, NQ, RTY, YM, GC, SI (~2.3M bars)**
 - [x] **`futures_foundation.finetune` — reusable walk-forward fine-tuning framework**
 - [x] **`StrategyLabeler` ABC — implement one class, get everything else for free**
 - [x] **CISD+OTE strategy as first concrete fine-tune implementation**
@@ -391,11 +411,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] ONNX export for production inference
 - [x] **SuperTrend Trend Follow strategy**
 - [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry**
-- [x] **Phase 2 risk head calibration for SuperTrend Trend Follow**
+- [x] **`HybridStrategyModel` context heads — 4 frozen pretrained heads give signal head explicit market context (regime/vol/structure/range)**
+- [x] **CISD+OTE v9 — backbone v2 + context heads**
 - [ ] Pretrained weights release on HuggingFace Hub
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
-- [ ] Additional instruments (SI, CL, NKD)
+- [ ] Additional instruments (CL, NKD)
 
 ---
 
