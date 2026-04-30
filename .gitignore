@@ -221,6 +221,7 @@ data-combined/
 # Strategy training scripts (private IP — kept local only)
 colabs/
 !colabs/ffm_pretrain_5min.py
+!colabs/strategy_template.py
 
 # Temporary diagnostic/scratch scripts
 temp/
