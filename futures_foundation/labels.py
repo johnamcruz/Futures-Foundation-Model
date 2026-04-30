@@ -119,35 +119,27 @@ def generate_volatility_labels(features, horizon=10):
 
 def generate_structure_labels(features, horizon=20):
     """
-    Label current market structure confirmed by future price expansion.
+    Predict the 1H market structure state N bars forward.
 
-    A bar is labeled when future price expansion clearly favors one direction:
-      0 = bullish: upside / downside > 1.5  (upside is 1.5× the downside)
-      1 = bearish: upside / downside < 0.67 (downside is 1.5× the upside)
-      SENTINEL: asymmetry near 1.0 (ambiguous expansion), or forward data unavailable
+    Uses htf_1h_structure computed in derive_features: majority close direction
+    of the last 3 completed 1H bars (+1=bullish, -1=bearish, 0=choppy/mixed).
+    Predicting future 1H structure is learnable from the 96-bar 5min context
+    because the window contains the price action that drives 1H direction.
 
-    The 1H structure direction is NOT a gate here — it is provided to the model
-    as a soft input feature (htf_1h_structure) so the backbone can learn when
-    structure alignment matters without hard-filtering the label set.
+      0 = bullish: all 3 completed 1H bars at T+horizon closed higher
+      1 = bearish: all 3 completed 1H bars at T+horizon closed lower
+      SENTINEL: mixed/choppy (0) or forward data unavailable — masked in training
     """
-    close = features["_close"]
+    raw = features["_1h_structure"]  # Int64: +1, -1, 0, or pd.NA
 
-    # Forward price extremes from current close
-    fwd_max = close.shift(-1).rolling(horizon).max().shift(-(horizon - 1))
-    fwd_min = close.shift(-1).rolling(horizon).min().shift(-(horizon - 1))
-    upside = (fwd_max - close) / close
-    downside = (close - fwd_min) / close
-    asymmetry = upside / downside.replace(0, np.nan)
+    fwd = raw.shift(-horizon)
 
     labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
 
-    valid = asymmetry.notna()
-
-    # Bullish: upside clearly dominates (upside > 1.5× downside)
-    labels[valid & (asymmetry > 1.5)] = 0
-
-    # Bearish: downside clearly dominates (downside > 1.5× upside)
-    labels[valid & (asymmetry < 0.67)] = 1
+    valid = fwd.notna()
+    labels[valid & (fwd == 1)]  = 0   # bullish
+    labels[valid & (fwd == -1)] = 1   # bearish
+    # fwd == 0 (choppy) stays at SENTINEL — ambiguous, skip in training
 
     labels[~valid] = pd.NA
 
