@@ -150,13 +150,14 @@ def run_labeling(
     cache_dir: str,
     micro_to_full: dict = None,
     force: bool = False,
+    timeframe: str = '5min',
 ) -> None:
     """
     For each ticker: load raw CSV + FFM parquet, call labeler.run(),
     save strategy_features and labels to cache_dir.
 
     Skips a ticker if cached files already exist (unless force=True).
-    Raw data is expected at {raw_dir}/{data_ticker}_5min.csv.
+    Raw data is expected at {raw_dir}/{data_ticker}_{timeframe}.csv.
     FFM features at {ffm_dir}/{data_ticker}_features.parquet.
     """
     os.makedirs(cache_dir, exist_ok=True)
@@ -174,13 +175,13 @@ def run_labeling(
         if not force and os.path.exists(feat_path) and os.path.exists(label_path):
             cached = pd.read_parquet(label_path)
             sigs   = (cached['signal_label'] > 0).sum()
-            print(f'  {ticker}: ⚡ cached — {len(cached):,} bars, {sigs} signals')
+            print(f'  {ticker}: cached — {len(cached):,} bars, {sigs} signals')
             total_signals += sigs
             total_bars    += len(cached)
             continue
 
         data_ticker   = micro_to_full.get(ticker, ticker)
-        csv_path      = os.path.join(raw_dir, f'{data_ticker}_5min.csv')
+        csv_path      = os.path.join(raw_dir, f'{data_ticker}_{timeframe}.csv')
         ffm_feat_path = os.path.join(ffm_dir,  f'{data_ticker}_features.parquet')
 
         if not os.path.exists(csv_path) or not os.path.exists(ffm_feat_path):
@@ -207,7 +208,7 @@ def run_labeling(
         except TypeError:
             if df_raw.index.tz is not None:
                 df_raw.index = df_raw.index.tz_convert('America/New_York')
-        print(f'  Loaded {len(df_raw):,} 5m bars')
+        print(f'  Loaded {len(df_raw):,} {timeframe} bars')
 
         strategy_feats, labels_df = labeler.run(df_raw, ffm_df, ticker)
 
