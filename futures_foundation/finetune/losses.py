@@ -20,9 +20,10 @@ class FocalLoss(nn.Module):
             smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
         log_probs    = F.log_softmax(logits, dim=-1)
         ce           = -(smooth_targets * log_probs).sum(dim=-1)
-        pt           = torch.exp(-F.cross_entropy(logits, targets, weight=self.weight, reduction='none'))
+        w = self.weight.to(logits.dtype) if self.weight is not None else None
+        pt           = torch.exp(-F.cross_entropy(logits, targets, weight=w, reduction='none'))
         focal_weight = (1 - pt) ** self.gamma
         loss         = focal_weight * ce
-        if self.weight is not None:
-            loss = loss * self.weight[targets]
+        if w is not None:
+            loss = loss * w[targets]
         return loss.mean()
