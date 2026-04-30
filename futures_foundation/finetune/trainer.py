@@ -408,10 +408,9 @@ def _evaluate(model, loader, loss_fn, device):
                 out = model(features=feats, strategy_features=strat, candle_types=candles,
                             time_of_day=tod, day_of_week=dow,
                             instrument_ids=inst, session_ids=sess)
-
-            cls_loss  = loss_fn(out['signal_logits'], labels)
-            risk_loss = F.mse_loss(out['risk_predictions'].squeeze(-1), max_rr)
-            loss = cls_loss + model.risk_weight * risk_loss
+                cls_loss  = loss_fn(out['signal_logits'], labels)
+                risk_loss = F.mse_loss(out['risk_predictions'].squeeze(-1), max_rr)
+                loss      = cls_loss + model.risk_weight * risk_loss
             total_loss += loss.item(); n_batches += 1
 
             preds = out['signal_logits'].argmax(dim=-1)

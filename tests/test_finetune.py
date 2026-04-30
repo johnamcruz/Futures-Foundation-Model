@@ -261,6 +261,16 @@ def test_focal_loss_gamma_zero_matches_ce():
     assert abs(loss.item() - ce_loss.item()) / ce_loss.item() < 0.5
 
 
+def test_focal_loss_bfloat16_with_float_weight():
+    # BF16 logits (simulate A100 autocast) must not crash with Float class weights
+    w       = torch.tensor([1.0, 5.0])  # Float weight as in production
+    loss_fn = FocalLoss(weight=w)
+    logits  = torch.randn(8, 2).to(torch.bfloat16)
+    targets = torch.randint(0, 2, (8,))
+    loss    = loss_fn(logits, targets)
+    assert loss.item() > 0
+
+
 # =============================================================================
 # HybridStrategyDataset
 # =============================================================================
