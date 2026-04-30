@@ -230,3 +230,4 @@ databento/*.zst
 # Live trade log and monitor (local only — not for git)
 logs/trades.csv
 scripts/trade_monitor.py
+.claude/
