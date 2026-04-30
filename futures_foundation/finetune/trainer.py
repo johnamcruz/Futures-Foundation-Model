@@ -346,6 +346,7 @@ def _train_one_epoch(model, loader, optimizer, loss_fn, device):
     model.train()
     total_loss = 0.0; n_batches = 0
     correct = total = sig_correct = sig_total = 0
+    use_amp = device.type == 'cuda'
 
     for batch in loader:
         feats   = batch['features'].to(device)
@@ -359,13 +360,13 @@ def _train_one_epoch(model, loader, optimizer, loss_fn, device):
         max_rr  = batch['max_rr'].to(device)
 
         optimizer.zero_grad()
-        out = model(features=feats, strategy_features=strat, candle_types=candles,
-                    time_of_day=tod, day_of_week=dow,
-                    instrument_ids=inst, session_ids=sess)
-
-        cls_loss  = loss_fn(out['signal_logits'], labels)
-        risk_loss = F.mse_loss(out['risk_predictions'].squeeze(-1), max_rr)
-        loss      = cls_loss + model.risk_weight * risk_loss
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            out = model(features=feats, strategy_features=strat, candle_types=candles,
+                        time_of_day=tod, day_of_week=dow,
+                        instrument_ids=inst, session_ids=sess)
+            cls_loss  = loss_fn(out['signal_logits'], labels)
+            risk_loss = F.mse_loss(out['risk_predictions'].squeeze(-1), max_rr)
+            loss      = cls_loss + model.risk_weight * risk_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -389,6 +390,7 @@ def _evaluate(model, loader, loss_fn, device):
     total_loss = 0.0; n_batches = 0
     correct = total = tp = fp = fn = 0
     all_conf = []; all_labels = []; all_preds = []; all_max_rr = []
+    use_amp = device.type == 'cuda'
 
     with torch.no_grad():
         for batch in loader:
@@ -402,9 +404,10 @@ def _evaluate(model, loader, loss_fn, device):
             labels  = batch['signal_label'].to(device)
             max_rr  = batch['max_rr'].to(device)
 
-            out = model(features=feats, strategy_features=strat, candle_types=candles,
-                        time_of_day=tod, day_of_week=dow,
-                        instrument_ids=inst, session_ids=sess)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                out = model(features=feats, strategy_features=strat, candle_types=candles,
+                            time_of_day=tod, day_of_week=dow,
+                            instrument_ids=inst, session_ids=sess)
 
             cls_loss  = loss_fn(out['signal_logits'], labels)
             risk_loss = F.mse_loss(out['risk_predictions'].squeeze(-1), max_rr)
@@ -885,6 +888,7 @@ def _run_rr_epoch(model, loader, optimizer, training, device, huber_delta=1.0):
     model.train() if training else model.eval()
     total_loss = 0.0; n = 0
     all_pred = []; all_true = []
+    use_amp = device.type == 'cuda'
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
@@ -898,12 +902,13 @@ def _run_rr_epoch(model, loader, optimizer, training, device, huber_delta=1.0):
             dow     = batch['day_of_week'].to(device)
             max_rr  = batch['max_rr'].to(device)
 
-            out  = model(features=feats, strategy_features=strat,
-                         candle_types=candles, time_of_day=tod,
-                         day_of_week=dow, instrument_ids=inst,
-                         session_ids=sess)
-            pred = out['risk_predictions'].squeeze(-1)
-            loss = F.huber_loss(pred, max_rr, delta=huber_delta)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                out  = model(features=feats, strategy_features=strat,
+                             candle_types=candles, time_of_day=tod,
+                             day_of_week=dow, instrument_ids=inst,
+                             session_ids=sess)
+                pred = out['risk_predictions'].squeeze(-1)
+                loss = F.huber_loss(pred, max_rr, delta=huber_delta)
 
             if training:
                 optimizer.zero_grad()
