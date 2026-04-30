@@ -205,14 +205,14 @@ def test_structure_dtype_and_range():
 
 def test_structure_trailing_nans():
     features = make_features(np.linspace(100, 400, 300), struct_1h=1)
-    labels = generate_structure_labels(features, horizon=20)
-    assert labels.iloc[-20:].isna().all()
+    labels = generate_structure_labels(features, horizon=48)
+    assert labels.iloc[-48:].isna().all()
 
 
 def test_structure_bullish_when_1h_bullish():
     """When _1h_structure is +1 throughout, all valid labels are bullish (0)."""
     features = make_features(np.linspace(100, 400, 200), struct_1h=1)
-    labels = generate_structure_labels(features, horizon=20)
+    labels = generate_structure_labels(features, horizon=48)
     valid = labels.dropna()
     labeled = valid[valid != LABEL_CONFIDENCE_SENTINEL]
     assert len(labeled) > 0
@@ -223,7 +223,7 @@ def test_structure_bullish_when_1h_bullish():
 def test_structure_bearish_when_1h_bearish():
     """When _1h_structure is -1 throughout, all valid labels are bearish (1)."""
     features = make_features(np.linspace(400, 100, 200), struct_1h=-1)
-    labels = generate_structure_labels(features, horizon=20)
+    labels = generate_structure_labels(features, horizon=48)
     valid = labels.dropna()
     labeled = valid[valid != LABEL_CONFIDENCE_SENTINEL]
     assert len(labeled) > 0
@@ -234,7 +234,7 @@ def test_structure_bearish_when_1h_bearish():
 def test_structure_sentinel_when_choppy():
     """When _1h_structure is 0 (choppy), all valid labels are SENTINEL."""
     features = make_features(np.linspace(100, 200, 200), struct_1h=0)
-    labels = generate_structure_labels(features, horizon=20)
+    labels = generate_structure_labels(features, horizon=48)
     non_nan = labels.dropna()
     assert (non_nan == LABEL_CONFIDENCE_SENTINEL).all(), \
         "All valid labels should be SENTINEL (-100) when 1H structure is 0 (choppy)"
@@ -242,10 +242,10 @@ def test_structure_sentinel_when_choppy():
 
 def test_structure_confident_labels_appear():
     """Mixed +1/-1 1H structure produces both bullish and bearish labels."""
-    n = 300
-    vals = [1] * 100 + [-1] * 100 + [1] * 100
+    n = 400
+    vals = [1] * 150 + [-1] * 100 + [1] * 150
     features = make_features(np.linspace(100, 400, n), struct_1h=vals)
-    labels = generate_structure_labels(features, horizon=20)
+    labels = generate_structure_labels(features, horizon=48)
     valid = labels.dropna()
     confident = valid[valid != LABEL_CONFIDENCE_SENTINEL]
     assert {0, 1}.issubset(set(confident.unique())), \

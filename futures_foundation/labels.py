@@ -117,17 +117,22 @@ def generate_volatility_labels(features, horizon=10):
     return labels
 
 
-def generate_structure_labels(features, horizon=20):
+def generate_structure_labels(features, horizon=48):
     """
     Predict the 1H market structure state N bars forward.
 
     Uses htf_1h_structure computed in derive_features: majority close direction
     of the last 3 completed 1H bars (+1=bullish, -1=bearish, 0=choppy/mixed).
-    Predicting future 1H structure is learnable from the 96-bar 5min context
-    because the window contains the price action that drives 1H direction.
 
-      0 = bullish: all 3 completed 1H bars at T+horizon closed higher
-      1 = bearish: all 3 completed 1H bars at T+horizon closed lower
+    horizon must be >= 36 (3 × 12 bars/hour) so that ALL 3 contributing 1H bars
+    at T+horizon are bars that completed AFTER T. horizon=20 caused label leakage:
+    2 of the 3 contributing bars were identical to the current htf_1h_structure
+    feature, making the task trivially easy (95%+ accuracy, no useful gradient).
+    horizon=48 (4 hours) ensures 4 complete new 1H bars have passed — no overlap
+    with the model's visible context at T.
+
+      0 = bullish: majority of 3 completed 1H bars at T+horizon closed higher
+      1 = bearish: majority of 3 completed 1H bars at T+horizon closed lower
       SENTINEL: mixed/choppy (0) or forward data unavailable — masked in training
     """
     raw = features["_1h_structure"]  # Int64: +1, -1, 0, or pd.NA
