@@ -7,7 +7,6 @@ Accepts two formats in the databento/ folder:
 
 Deduplicates roll-overlap bars, resamples to RESAMPLE_PERIOD, writes to data/.
 
-To change timeframe: edit RESAMPLE_PERIOD below — that's the only line you need.
 Valid values: '1min', '3min', '5min', '15min', '30min', '1h', '4h', '1D'
 
 DataBento roll handling:
@@ -21,7 +20,9 @@ Output format: datetime, open, high, low, close, volume
 
 Usage:
     pip install zstandard databento   # one-time
-    python databento/build_continuous.py
+    python databento/build_continuous.py 1min
+    python databento/build_continuous.py 5min
+    python databento/build_continuous.py        # defaults to 5min
 """
 
 import re
@@ -30,9 +31,10 @@ from pathlib import Path
 
 import pandas as pd
 
-# ── Configuration — only edit this section ─────────────────────────────────────
+# ── Configuration ───────────────────────────────────────────────────────────────
 
-RESAMPLE_PERIOD = '5min'   # ← change this to switch timeframe
+_DEFAULT_PERIOD = '5min'
+RESAMPLE_PERIOD = sys.argv[1] if len(sys.argv) > 1 else _DEFAULT_PERIOD
 
 DATABENTO_DIR = Path(__file__).parent
 OUTPUT_DIR    = Path(__file__).parent.parent / 'data'
