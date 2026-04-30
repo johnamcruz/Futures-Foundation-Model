@@ -38,6 +38,7 @@ def validate_setup(
     strategy_feature_cols: list,
     num_strategy_features: int,
     micro_to_full: dict = None,
+    pretrained_path: str = None,
 ) -> None:
     """
     Pre-flight checks before training starts.  Raises ValueError / FileNotFoundError
@@ -47,11 +48,13 @@ def validate_setup(
     errors = []
     micro_to_full = micro_to_full or {}
 
-    # Backbone
-    if not os.path.exists(backbone_path):
+    # Backbone / pretrained
+    check_path = pretrained_path if pretrained_path else backbone_path
+    if not os.path.exists(check_path):
+        label = 'Pretrained model' if pretrained_path else 'Backbone'
         errors.append(
-            f'❌ Backbone not found: {backbone_path}\n'
-            f'   Run the pretraining script first or check BACKBONE_PATH.')
+            f'❌ {label} not found: {check_path}\n'
+            f'   Run the pretraining script first or check the path.')
 
     # feature_cols / num_strategy_features consistency
     if len(strategy_feature_cols) != num_strategy_features:
@@ -559,6 +562,7 @@ def _train_fold(
     micro_to_full: dict = None,
     warm_start_state: dict = None,
     device=None,
+    pretrained_path: str = None,
 ):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -621,6 +625,9 @@ def _train_fold(
     is_warm_started = warm_start_state is not None
     if is_warm_started:
         _apply_warm_start(model, warm_start_state, training_cfg.warm_start_mode, device)
+    elif pretrained_path and os.path.exists(pretrained_path):
+        print(f'  Loading pretrained: {pretrained_path}')
+        model.load_pretrained(pretrained_path)
     elif os.path.exists(backbone_path):
         print(f'  Loading backbone: {backbone_path}')
         model.load_backbone(backbone_path)
@@ -792,6 +799,7 @@ def run_walk_forward(
     strategy_feature_cols: list,
     micro_to_full: dict = None,
     device=None,
+    pretrained_path: str = None,
 ):
     """
     Train all walk-forward folds and return per-fold test metrics.
@@ -802,7 +810,8 @@ def run_walk_forward(
         ffm_dir:               Directory with {ticker}_features.parquet (FFM prepared).
         strategy_dir:          Directory with {ticker}_strategy_*.parquet (labeler output).
         output_dir:            Where to save checkpoints and ONNX model.
-        backbone_path:         Path to best_backbone.pt.
+        backbone_path:         Path to best_backbone.pt (used when pretrained_path is None).
+        pretrained_path:       Path to best_pretrained.pt — enables context heads (recommended).
         ffm_config:            FFMConfig used for the backbone.
         training_cfg:          TrainingConfig with all hyperparameters.
         num_strategy_features: Size of the strategy feature vector.
@@ -827,12 +836,14 @@ def run_walk_forward(
         strategy_feature_cols=strategy_feature_cols,
         num_strategy_features=num_strategy_features,
         micro_to_full=micro_to_full,
+        pretrained_path=pretrained_path,
     )
 
     config_hash = _config_hash(training_cfg)
+    weights_label = pretrained_path or backbone_path
     print(f'\n{"="*60}')
     print(f'  WALK-FORWARD — {len(folds)} folds | config hash: {config_hash}')
-    print(f'  Backbone: {backbone_path}')
+    print(f'  Weights: {weights_label}')
     print(f'{"="*60}')
 
     fold_results    = {}
@@ -855,6 +866,7 @@ def run_walk_forward(
             micro_to_full=micro_to_full,
             warm_start_state=prev_fold_state,
             device=device,
+            pretrained_path=pretrained_path,
         )
         if result is not None:
             last_model, test_metrics, prev_fold_state = result
