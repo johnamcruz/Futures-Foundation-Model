@@ -47,5 +47,11 @@ class TrainingConfig:
     # ── Output ──
     num_labels: int = 2           # 2 = noise/signal; 3 = sell/hold/buy
 
+    # ── Checkpoint selection ──
+    # Max val/train loss ratio allowed when updating the signal_f1 checkpoint.
+    # Prevents late-epoch saturated checkpoints from winning on a marginal F1 gain.
+    # Excluded from config hash so it can be tuned without breaking fold resumption.
+    f1_ok_ceiling: float = 0.50
+
     # ── Evaluation ──
     baseline_wr: Dict[str, float] = field(default_factory=dict)

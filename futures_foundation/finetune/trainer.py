@@ -520,7 +520,8 @@ def _make_optimizer(
 # ── Fold helpers ─────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
-    d = {k: v for k, v in training_cfg.__dict__.items() if k != 'baseline_wr'}
+    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling'}
+    d = {k: v for k, v in training_cfg.__dict__.items() if k not in _hash_exclude}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 
 
@@ -695,7 +696,7 @@ def _train_fold(
 
         ratio     = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         improved  = va['loss'] < best_val_loss
-        f1_better = va['f1'] > best_signal_f1
+        f1_better = va['f1'] > best_signal_f1 and ratio <= training_cfg.f1_ok_ceiling
         save_str  = ''
 
         if improved:
