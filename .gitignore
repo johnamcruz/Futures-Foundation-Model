@@ -226,6 +226,7 @@ colabs/
 !colabs/st_trend_v5.py
 !colabs/cisd_ote_v11_phase2.py
 !colabs/cisd_ote_v12.py
+!colabs/cisd_ote_v13.py
 
 # Temporary diagnostic/scratch scripts
 temp/
