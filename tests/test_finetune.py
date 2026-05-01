@@ -1476,6 +1476,91 @@ def test_backbone_lr_multiplier_in_config_hash():
     assert _config_hash(cfg_low) != _config_hash(cfg_high)
 
 
+def test_f1_ok_ceiling_excluded_from_config_hash():
+    """f1_ok_ceiling must NOT change the config hash — excluded so fold resumption works
+    after tuning the ceiling mid-run without triggering a fresh start."""
+    cfg_default = TrainingConfig()
+    cfg_tight   = TrainingConfig(f1_ok_ceiling=0.30)
+    cfg_loose   = TrainingConfig(f1_ok_ceiling=0.99)
+    assert _config_hash(cfg_default) == _config_hash(cfg_tight)
+    assert _config_hash(cfg_default) == _config_hash(cfg_loose)
+
+
+def test_f1_ok_ceiling_default_is_0_50():
+    """Default ceiling must be 0.50 — the value chosen to block late-epoch saturation."""
+    assert TrainingConfig().f1_ok_ceiling == 0.50
+
+
+def test_f1_ok_ceiling_blocks_checkpoint_above_ceiling(tmp_path):
+    """When ratio > f1_ok_ceiling, the signal_f1 checkpoint must NOT update even if F1 improves.
+    Uses a ceiling of 0.0 so every epoch is above the limit."""
+    ffm_df = make_ffm_df(200, seed=7)
+    strat  = make_strategy_features(200, seed=7)
+    labels = make_labels(200, signal_rate=0.10, seed=7)
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+    loader = _make_balanced_loader(concat, batch_size=16, sig_per_batch=2, num_workers=0)
+
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loss_fn = FocalLoss()
+    training_cfg = TrainingConfig(lr=1e-3, f1_ok_ceiling=0.0)  # ceiling=0 → nothing ever passes
+    optimizer, scheduler = _make_optimizer(
+        model, training_cfg, is_warm_started=False, train_loader_len=len(loader))
+
+    config_hash = _config_hash(training_cfg)
+    ckpt_f1 = tmp_path / f'TEST_{config_hash}_f1.pt'
+
+    best_signal_f1 = 0.0
+    for epoch in range(5):
+        tr = _train_one_epoch(model, loader, optimizer, loss_fn, torch.device('cpu'))
+        va = _evaluate(model, loader, loss_fn, torch.device('cpu'))
+        scheduler.step()
+        ratio    = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
+        f1_better = va['f1'] > best_signal_f1 and ratio <= training_cfg.f1_ok_ceiling
+        if f1_better:
+            best_signal_f1 = va['f1']
+            torch.save({'score': best_signal_f1}, ckpt_f1)
+
+    assert not ckpt_f1.exists(), 'F1 checkpoint saved despite ratio always > ceiling=0'
+
+
+def test_f1_ok_ceiling_allows_checkpoint_below_ceiling(tmp_path):
+    """When ratio <= f1_ok_ceiling, F1 checkpoints save as normal."""
+    ffm_df = make_ffm_df(200, seed=8)
+    strat  = make_strategy_features(200, seed=8)
+    labels = make_labels(200, signal_rate=0.10, seed=8)
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+    loader = _make_balanced_loader(concat, batch_size=16, sig_per_batch=2, num_workers=0)
+
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loss_fn = FocalLoss()
+    training_cfg = TrainingConfig(lr=1e-3, f1_ok_ceiling=2.0)  # ceiling=2.0 → always passes
+    optimizer, scheduler = _make_optimizer(
+        model, training_cfg, is_warm_started=False, train_loader_len=len(loader))
+
+    config_hash = _config_hash(training_cfg)
+    ckpt_f1 = tmp_path / f'TEST_{config_hash}_f1.pt'
+
+    best_signal_f1 = 0.0
+    for epoch in range(5):
+        tr = _train_one_epoch(model, loader, optimizer, loss_fn, torch.device('cpu'))
+        va = _evaluate(model, loader, loss_fn, torch.device('cpu'))
+        scheduler.step()
+        ratio     = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
+        f1_better = va['f1'] > best_signal_f1 and ratio <= training_cfg.f1_ok_ceiling
+        if f1_better:
+            best_signal_f1 = va['f1']
+            torch.save({'score': best_signal_f1}, ckpt_f1)
+
+    if best_signal_f1 > 0:
+        assert ckpt_f1.exists(), 'F1 checkpoint not saved despite ceiling=2.0'
+        saved = torch.load(ckpt_f1, map_location='cpu', weights_only=False)
+        assert saved['score'] == best_signal_f1
+
+
 # =============================================================================
 # 10. Checkpoint resume — disconnect safety
 # =============================================================================
