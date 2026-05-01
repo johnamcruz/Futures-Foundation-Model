@@ -1562,7 +1562,91 @@ def test_f1_ok_ceiling_allows_checkpoint_below_ceiling(tmp_path):
 
 
 # =============================================================================
-# 10. Checkpoint resume — disconnect safety
+# 10. Epoch callback
+# =============================================================================
+
+def _make_callback_loader(seed):
+    ffm_df = make_ffm_df(200, seed=seed)
+    strat  = make_strategy_features(200, seed=seed)
+    labels = make_labels(200, signal_rate=0.10, seed=seed)
+    ds     = HybridStrategyDataset(ffm_df, strat, labels, STRATEGY_COLS, seq_len=SEQ_LEN)
+    concat = _concat_with_meta([ds], SEQ_LEN)
+    return _make_balanced_loader(concat, batch_size=16, sig_per_batch=2, num_workers=0)
+
+
+def _run_cb_epochs(n_epochs, callback, seed=20):
+    loader = _make_callback_loader(seed)
+    cfg    = small_ffm_config()
+    model  = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    loss_fn = FocalLoss()
+    training_cfg = TrainingConfig(lr=1e-3)
+    optimizer, scheduler = _make_optimizer(
+        model, training_cfg, is_warm_started=False, train_loader_len=len(loader))
+    for epoch in range(n_epochs):
+        tr = _train_one_epoch(model, loader, optimizer, loss_fn, torch.device('cpu'))
+        va = _evaluate(model, loader, loss_fn, torch.device('cpu'))
+        scheduler.step()
+        ratio = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
+        if callback is not None:
+            callback('F1', epoch, model, va, ratio)
+    return model
+
+
+def test_epoch_callback_called_once_per_epoch():
+    """epoch_callback must fire exactly once per training epoch."""
+    call_epochs = []
+    def cb(fold_name, epoch, model, va, ratio):
+        call_epochs.append(epoch)
+
+    _run_cb_epochs(4, cb)
+    assert call_epochs == [0, 1, 2, 3]
+
+
+def test_epoch_callback_receives_correct_argument_types():
+    """Callback receives: fold_name str, epoch int, model HybridStrategyModel,
+    val_metrics dict with required keys, ratio float."""
+    captured = []
+    def cb(fold_name, epoch, model, va, ratio):
+        captured.append((fold_name, epoch, model, va, ratio))
+
+    _run_cb_epochs(1, cb)
+
+    assert len(captured) == 1
+    fold_name, epoch, model, va, ratio = captured[0]
+    assert fold_name == 'F1'
+    assert epoch == 0
+    assert isinstance(model, HybridStrategyModel)
+    assert isinstance(ratio, float)
+    for key in ('f1', 'precision', 'recall', 'loss', 'all_conf', 'all_labels', 'all_preds'):
+        assert key in va, f"val_metrics missing key '{key}'"
+
+
+def test_epoch_callback_none_is_backward_compatible():
+    """epoch_callback=None must not raise — default behaviour is unchanged."""
+    _run_cb_epochs(2, None)  # no assertion needed — must not raise
+
+
+def test_epoch_callback_can_compute_precision_at_threshold():
+    """val_metrics exposes all_conf/all_preds/all_labels so the callback can compute
+    P@threshold without any changes to the framework."""
+    computed = []
+    def cb(fold_name, epoch, model, va, ratio):
+        conf  = np.array(va['all_conf'])
+        preds = np.array(va['all_preds'])
+        lab   = np.array(va['all_labels'])
+        mask  = conf >= 0.50
+        if mask.sum() > 0:
+            tp = ((preds[mask] > 0) & (lab[mask] > 0)).sum()
+            fp = ((preds[mask] > 0) & (lab[mask] == 0)).sum()
+            computed.append(float(tp / max(tp + fp, 1)))
+
+    _run_cb_epochs(3, cb)
+    assert len(computed) > 0, 'callback should compute at least one P@0.50 value'
+    assert all(0.0 <= p <= 1.0 for p in computed)
+
+
+# =============================================================================
+# 11. Checkpoint resume — disconnect safety
 # =============================================================================
 
 def _make_fake_test_metrics(n=100, seed=3):

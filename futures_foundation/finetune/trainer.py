@@ -567,6 +567,7 @@ def _train_fold(
     warm_start_state: dict = None,
     device=None,
     pretrained_path: str = None,
+    epoch_callback=None,
 ):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -745,6 +746,9 @@ def _train_fold(
               f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
               f'{ratio_str}{save_str}')
 
+        if epoch_callback is not None:
+            epoch_callback(fold_name, epoch, model, va, ratio)
+
         if patience_ctr >= training_cfg.patience:
             print(f'  ⏹ Early stop — patience exhausted'); break
         if ratio_bad_ctr >= training_cfg.ratio_patience:
@@ -804,6 +808,7 @@ def run_walk_forward(
     micro_to_full: dict = None,
     device=None,
     pretrained_path: str = None,
+    epoch_callback=None,
 ):
     """
     Train all walk-forward folds and return per-fold test metrics.
@@ -871,6 +876,7 @@ def run_walk_forward(
             warm_start_state=prev_fold_state,
             device=device,
             pretrained_path=pretrained_path,
+            epoch_callback=epoch_callback,
         )
         if result is not None:
             last_model, test_metrics, prev_fold_state = result
