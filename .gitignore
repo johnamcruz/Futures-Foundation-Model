@@ -223,7 +223,6 @@ colabs/
 !colabs/ffm_pretrain_5min.py
 !colabs/prepare_data_3min.py
 !colabs/strategy_template.py
-!colabs/st_trend_v4.py
 
 # Temporary diagnostic/scratch scripts
 temp/
