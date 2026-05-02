@@ -536,6 +536,39 @@ def _config_hash(training_cfg: TrainingConfig) -> str:
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 
 
+def _print_model_diagnostic(model, feature_names: list = None) -> None:
+    """Print feature weight spread and fusion input split after each fold."""
+    try:
+        strat_w = model.strategy_projection[0].weight.detach().cpu().numpy()
+        importance = np.abs(strat_w).mean(axis=0)
+        fi_min, fi_max = importance.min(), importance.max()
+        spread = fi_max / fi_min if fi_min > 0 else 0.0
+        n_feats = len(importance)
+        names = list(feature_names or []) + [f'feature_{i}' for i in range(len(feature_names or []), n_feats)]
+
+        status = '✅' if spread >= 1.3 else '❌'
+        print(f'\n  Model diagnostic:')
+        print(f'  Feature spread: {fi_min:.4f}–{fi_max:.4f}  ratio={spread:.2f}x  {status} '
+              f'({"differentiated" if spread >= 1.3 else "undifferentiated — consider increasing LR"})')
+
+        ranked = sorted(zip(importance, names[:n_feats]), reverse=True)
+        top3   = ', '.join(f'{n}({v:.3f})' for v, n in ranked[:3])
+        bot3   = ', '.join(f'{n}({v:.3f})' for v, n in ranked[-3:])
+        print(f'  Top 3:  {top3}')
+        print(f'  Bot 3:  {bot3}')
+
+        fusion_w = model.fusion[0].weight.detach().cpu().numpy()
+        b_imp = np.abs(fusion_w[:, :256]).mean()
+        c_imp = np.abs(fusion_w[:, 256:271]).mean()
+        s_imp = np.abs(fusion_w[:, 271:]).mean()
+        total = b_imp + c_imp + s_imp
+        bp, cp, sp = b_imp / total, c_imp / total, s_imp / total
+        bb_status = '✅' if bp > 0.35 else '⚠️ '
+        print(f'  Fusion: {bb_status} Backbone:{bp:.1%}  Context:{cp:.1%}  Strategy:{sp:.1%}')
+    except Exception:
+        pass
+
+
 def _print_test_threshold_table(test_metrics: dict, fold_name: str) -> None:
     """Print the per-threshold precision/recall table for a fold's test results."""
     if test_metrics is None:
@@ -887,6 +920,7 @@ def _train_fold(
                                   shuffle=False, num_workers=2, pin_memory=True)
         test_metrics = _evaluate(model, test_loader, loss_fn, device)
     _print_test_threshold_table(test_metrics, fold_name)
+    _print_model_diagnostic(model, feature_names=strategy_feature_cols)
 
     # ── Save fold-complete checkpoint ──
     # Stores next_fold_state + test_metrics so reconnecting Colab sessions can
