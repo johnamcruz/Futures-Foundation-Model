@@ -1873,12 +1873,14 @@ def test_print_test_threshold_table_recall_uses_total_signals(capsys):
     out = capsys.readouterr().out
 
     # At thresh=0.80: only the 6 high-conf TPs are in the mask
-    # Correct recall = 6 / 10 = 0.600 (not 1.000)
-    lines = [l for l in out.splitlines() if '0.80' in l]
+    # Correct recall = 6 / 10 = 60.0% (not 100.0%)
+    # Row format: Thresh  N  Correct  Prec  EV@2R  Recall  Rate  Status
+    lines = [l for l in out.splitlines() if '0.80' in l and 'Thresh' not in l]
     assert lines, 'No 0.80 threshold row printed'
-    recall_val = float(lines[0].split()[4])
+    recall_str = lines[0].split()[5]  # index 5 is Recall (printed as XX.X%)
+    recall_val = float(recall_str.rstrip('%')) / 100.0
     assert abs(recall_val - 0.600) < 0.001, (
-        f'Recall at 0.80 should be 0.600 (6/10 total signals), got {recall_val:.3f}. '
+        f'Recall at 0.80 should be 60.0% (6/10 total signals), got {recall_str}. '
         'Check that denominator uses n_sig not (htp + hfn_in_mask).'
     )
 
@@ -1887,6 +1889,53 @@ def test_print_test_threshold_table_none_is_noop(capsys):
     """None test_metrics must silently produce no output."""
     _print_test_threshold_table(None, 'F2')
     assert capsys.readouterr().out == ''
+
+
+def test_print_test_threshold_table_ev_and_status(capsys):
+    """EV@2R and status flag must be printed and reflect precision correctly.
+
+    At P=50% and rr_target=2: EV = 0.50*3 - 1 = +0.50R → VIABLE.
+    At P=10% and rr_target=2: EV = 0.10*3 - 1 = -0.70R → NOT VIABLE.
+    """
+    n = 500
+    rng = np.random.default_rng(0)
+
+    # Scenario A: 50% precision at 0.80 threshold (10 TP, 10 FP, 10 correct)
+    confs  = np.full(n, 0.40)
+    labels = np.zeros(n, dtype=int)
+    preds  = np.zeros(n, dtype=int)
+
+    sig_idx = rng.choice(n, 20, replace=False)
+    labels[sig_idx] = 1
+    # 10 TP at high confidence
+    for i in sig_idx[:10]:
+        preds[i] = 1; confs[i] = 0.90
+    # 10 FP at high confidence
+    fp_idx = rng.choice([i for i in range(n) if i not in sig_idx], 10, replace=False)
+    for i in fp_idx:
+        preds[i] = 1; confs[i] = 0.85
+
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+    metrics = {
+        'loss': 0.1, 'precision': 0.5, 'recall': 0.5, 'f1': 0.5,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'all_conf': confs.tolist(), 'all_labels': labels.tolist(),
+        'all_preds': preds.tolist(), 'all_max_rr': [1.0] * n,
+    }
+    _print_test_threshold_table(metrics, 'FX', rr_target=2.0)
+    out = capsys.readouterr().out
+
+    # EV breakeven note must appear
+    assert 'Breakeven' in out, 'Breakeven note missing from output'
+    assert 'EV@2R' in out or 'EV@2' in out, 'EV column header missing'
+
+    # At 0.80 threshold with 50% precision: EV = +0.50R → VIABLE
+    rows_80 = [l for l in out.splitlines() if '0.80' in l and 'Thresh' not in l]
+    assert rows_80, 'No 0.80 threshold row printed'
+    assert 'VIABLE' in rows_80[0], f'Expected VIABLE status at 50% prec, got: {rows_80[0]}'
+    assert '+' in rows_80[0], f'Expected positive EV at 50% prec, got: {rows_80[0]}'
 
 
 def test_evaluate_prec_at_80_computed_correctly():

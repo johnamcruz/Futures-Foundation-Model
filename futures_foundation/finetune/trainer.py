@@ -570,29 +570,50 @@ def _print_model_diagnostic(model, feature_names: list = None) -> None:
         pass
 
 
-def _print_test_threshold_table(test_metrics: dict, fold_name: str) -> None:
-    """Print the per-threshold precision/recall table for a fold's test results."""
+def _print_test_threshold_table(test_metrics: dict, fold_name: str, rr_target: float = 2.0) -> None:
+    """Print per-threshold precision/recall/EV table for a fold's test results."""
     if test_metrics is None:
         return
-    n_test   = len(test_metrics['all_labels'])
-    n_sig    = test_metrics['tp'] + test_metrics['fn']
-    print(f'\n  {fold_name} test: {n_test:,} bars | {n_sig} actual signals')
-    print(f'  {"Thresh":>6}  {"Predicted":>9}  {"Correct":>7}  '
-          f'{"Precision":>9}  {"Recall":>6}  {"Rate"}')
+    n_test  = len(test_metrics['all_labels'])
+    n_sig   = test_metrics['tp'] + test_metrics['fn']
+    breakeven = 1.0 / (rr_target + 1.0)
+
     conf_arr = np.array(test_metrics['all_conf'])
     lab_arr  = np.array(test_metrics['all_labels'])
     pred_arr = np.array(test_metrics['all_preds'])
+
+    print(f'\n  {fold_name} test: {n_test:,} bars | {n_sig} actual signals')
+    print(f'  {"Thresh":>6}  {"N":>6}  {"Correct":>7}  {"Prec":>6}  '
+          f'{"EV@{:.0f}R".format(rr_target):>7}  {"Recall":>6}  {"Rate":>5}  Status')
+
+    rows = []
     for thresh in [0.50, 0.60, 0.70, 0.80, 0.90]:
-        m = conf_arr >= thresh
-        if m.sum() == 0:
+        m    = conf_arr >= thresh
+        htp  = int(((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum())
+        hfp  = int(((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum())
+        n    = htp + hfp
+        if n == 0:
             continue
-        htp = ((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum()
-        hfp = ((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum()
-        hp  = htp / max(htp + hfp, 1)
-        hr  = htp / max(n_sig, 1)  # recall vs ALL actual signals, not just those in mask
-        ok  = ' ✅' if hp >= 0.40 else ''
-        print(f'  {thresh:>6.2f}  {htp+hfp:>9}  {htp:>7}  {hp:>9.3f}  {hr:>6.3f}  '
-              f'{(htp+hfp)/max(len(lab_arr),1)*100:.1f}%{ok}')
+        prec = htp / n
+        ev   = prec * (rr_target + 1.0) - 1.0
+        rec  = htp / max(n_sig, 1)
+        rate = n / max(len(lab_arr), 1) * 100
+
+        if ev > 0 and n >= 10:
+            status = '✅ VIABLE'
+        elif ev > 0 or (prec >= breakeven * 0.75 and n >= 5):
+            status = '⚠️  MARGINAL'
+        else:
+            status = '❌'
+
+        ev_str = f'{ev:+.2f}R'
+        print(f'  {thresh:>6.2f}  {n:>6}  {htp:>7}  {prec:>5.1%}  '
+              f'{ev_str:>7}  {rec:>5.1%}  {rate:>4.1f}%  {status}')
+        rows.append((thresh, n, prec, ev))
+
+    print(f'\n  EV@{rr_target:.0f}R = P×{rr_target+1:.0f} − 1  |  '
+          f'Breakeven: P≥{breakeven:.1%}  |  '
+          f'✅ EV>0 & N≥10  ⚠️  EV>0 or approaching  ❌ not viable')
 
 
 def _train_fold(
