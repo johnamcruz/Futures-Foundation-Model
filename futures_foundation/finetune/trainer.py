@@ -240,9 +240,10 @@ def _make_balanced_loader(
     num_workers: int = 2,
 ) -> DataLoader:
     """WeightedRandomSampler that delivers ~sig_per_batch signals per batch."""
+    pin = torch.cuda.is_available()
     if not dataset.signal_indices or len(dataset.signal_indices) < sig_per_batch:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                         num_workers=num_workers, pin_memory=True, drop_last=True)
+                         num_workers=num_workers, pin_memory=pin, drop_last=True)
     n_total  = len(dataset)
     n_signal = len(dataset.signal_indices)
     n_noise  = n_total - n_signal
@@ -256,7 +257,7 @@ def _make_balanced_loader(
     weights = [w_signal if l > 0 else w_noise for l in labels]
     sampler = WeightedRandomSampler(weights, num_samples=n_total, replacement=True)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                     num_workers=num_workers, pin_memory=True, drop_last=True)
+                     num_workers=num_workers, pin_memory=pin, drop_last=True)
 
 
 def _load_fold_data(
@@ -361,7 +362,7 @@ def _train_one_epoch(model, loader, optimizer, loss_fn, device):
         max_rr  = batch['max_rr'].to(device)
 
         optimizer.zero_grad()
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
             out = model(features=feats, strategy_features=strat, candle_types=candles,
                         time_of_day=tod, day_of_week=dow,
                         instrument_ids=inst, session_ids=sess)
@@ -405,7 +406,7 @@ def _evaluate(model, loader, loss_fn, device):
             labels  = batch['signal_label'].to(device)
             max_rr  = batch['max_rr'].to(device)
 
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
                 out = model(features=feats, strategy_features=strat, candle_types=candles,
                             time_of_day=tod, day_of_week=dow,
                             instrument_ids=inst, session_ids=sess)
@@ -669,7 +670,7 @@ def _train_fold(
     train_loader = _make_balanced_loader(train_ds, training_cfg.batch_size,
                                          training_cfg.sig_per_batch)
     val_loader   = DataLoader(val_ds, batch_size=training_cfg.batch_size,
-                              shuffle=False, num_workers=2, pin_memory=True)
+                              shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
 
     # ── Model ──
     model = HybridStrategyModel(ffm_config, num_strategy_features,
@@ -917,7 +918,7 @@ def _train_fold(
     test_metrics = None
     if test_ds is not None and len(test_ds) > 0:
         test_loader  = DataLoader(test_ds, batch_size=training_cfg.batch_size,
-                                  shuffle=False, num_workers=2, pin_memory=True)
+                                  shuffle=False, num_workers=2, pin_memory=torch.cuda.is_available())
         test_metrics = _evaluate(model, test_loader, loss_fn, device)
     _print_test_threshold_table(test_metrics, fold_name)
     _print_model_diagnostic(model, feature_names=strategy_feature_cols)
@@ -1057,7 +1058,7 @@ def _run_rr_epoch(model, loader, optimizer, training, device, huber_delta=1.0):
             dow     = batch['day_of_week'].to(device)
             max_rr  = batch['max_rr'].to(device)
 
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
                 out  = model(features=feats, strategy_features=strat,
                              candle_types=candles, time_of_day=tod,
                              day_of_week=dow, instrument_ids=inst,
