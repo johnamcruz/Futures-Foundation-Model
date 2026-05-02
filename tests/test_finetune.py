@@ -2451,12 +2451,11 @@ def test_extract_backbone_roundtrip(tmp_path):
     assert out_path.exists()
 
     saved = torch.load(out_path, map_location='cpu', weights_only=False)
-    assert 'model_state' in saved
-    assert saved['config_hash'] == 'abc12345'
-    assert saved['source'] == 'F5_abc12345_done.pt'
+    assert isinstance(saved, dict), 'Saved file must be a state dict'
+    assert 'model_state' not in saved, 'Must be flat state dict, not wrapped'
 
     backbone_keys = {k for k in state if k.startswith('backbone.')}
-    extracted_keys = {f'backbone.{k}' for k in saved['model_state']}
+    extracted_keys = {f'backbone.{k}' for k in saved}
     assert extracted_keys == backbone_keys, 'Extracted keys must match backbone.* keys'
 
 
@@ -2475,7 +2474,7 @@ def test_extract_backbone_no_signal_head_keys(tmp_path):
     extract_backbone(str(done_path), str(out_path))
 
     saved = torch.load(out_path, map_location='cpu', weights_only=False)
-    for key in saved['model_state']:
+    for key in saved:
         assert not key.startswith('signal_head'), f'signal_head key leaked: {key}'
         assert not key.startswith('risk_head'),   f'risk_head key leaked: {key}'
 

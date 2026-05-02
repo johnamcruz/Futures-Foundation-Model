@@ -145,7 +145,9 @@ class HybridStrategyModel(nn.Module):
 
     def load_backbone(self, path: str) -> None:
         """Load backbone-only weights (raw backbone state_dict, no prefix)."""
-        state_dict = torch.load(path, map_location='cpu', weights_only=True)
+        state_dict = torch.load(path, map_location='cpu', weights_only=False)
+        if 'model_state' in state_dict:
+            state_dict = state_dict['model_state']
         missing, unexpected = self.backbone.load_state_dict(state_dict, strict=False)
         if unexpected:
             print(f'  ⚠ Backbone unexpected keys: {len(unexpected)}')

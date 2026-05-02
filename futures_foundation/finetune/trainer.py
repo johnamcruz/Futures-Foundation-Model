@@ -1355,17 +1355,11 @@ def extract_backbone(
     if not backbone_state:
         raise ValueError(f'No backbone.* keys found in {done_path}')
 
-    config_hash = ckpt.get('config_hash', 'unknown')
-    torch.save({
-        'model_state':  backbone_state,
-        'config_hash':  config_hash,
-        'source':       os.path.basename(done_path),
-    }, output_path)
+    torch.save(backbone_state, output_path)
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'  ✅ Backbone extracted: {output_path} ({size_mb:.1f} MB)')
     print(f'     Source : {os.path.basename(done_path)}')
-    print(f'     Hash   : {config_hash}')
     print(f'     Keys   : {len(backbone_state)} backbone layers')
     return output_path
 
