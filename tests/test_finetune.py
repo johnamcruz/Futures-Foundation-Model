@@ -1807,6 +1807,56 @@ def test_print_test_threshold_table_smoke(capsys):
     assert '0.70' in out
 
 
+def test_print_test_threshold_table_recall_uses_total_signals(capsys):
+    """Recall must equal htp / n_total_actual_signals, not htp / (htp + hfn_in_mask).
+
+    Bug: hfn was computed only within conf>=thresh mask, so FN bars with low
+    confidence were excluded, producing recall=1.0 at every threshold.  Fix:
+    denominator is always n_sig = tp + fn from the full test set.
+    """
+    n = 1000
+    rng = np.random.default_rng(42)
+    labels = np.zeros(n, dtype=int)
+    preds  = np.zeros(n, dtype=int)
+    confs  = np.full(n, 0.55)  # just above 0.50 threshold
+
+    # 10 actual signals
+    sig_idx = rng.choice(n, 10, replace=False)
+    labels[sig_idx] = 1
+
+    # Model correctly predicts 6 of them with HIGH confidence
+    tp_idx = sig_idx[:6]
+    preds[tp_idx]  = 1
+    confs[tp_idx]  = 0.90  # above 0.80 thresh
+
+    # Model misses 4 signals with LOW confidence (pred=0, conf just above 0.50)
+    fn_idx = sig_idx[6:]
+    preds[fn_idx]  = 0
+    confs[fn_idx]  = 0.52  # above 0.50 but below 0.80 → excluded from 0.80 mask
+
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+    metrics = {
+        'loss': 0.1, 'precision': 0.5, 'recall': 0.6, 'f1': 0.55,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'all_conf': confs.tolist(), 'all_labels': labels.tolist(),
+        'all_preds': preds.tolist(), 'all_max_rr': [1.0] * n,
+    }
+    _print_test_threshold_table(metrics, 'FX')
+    out = capsys.readouterr().out
+
+    # At thresh=0.80: only the 6 high-conf TPs are in the mask
+    # Correct recall = 6 / 10 = 0.600 (not 1.000)
+    lines = [l for l in out.splitlines() if '0.80' in l]
+    assert lines, 'No 0.80 threshold row printed'
+    recall_val = float(lines[0].split()[4])
+    assert abs(recall_val - 0.600) < 0.001, (
+        f'Recall at 0.80 should be 0.600 (6/10 total signals), got {recall_val:.3f}. '
+        'Check that denominator uses n_sig not (htp + hfn_in_mask).'
+    )
+
+
 def test_print_test_threshold_table_none_is_noop(capsys):
     """None test_metrics must silently produce no output."""
     _print_test_threshold_table(None, 'F2')

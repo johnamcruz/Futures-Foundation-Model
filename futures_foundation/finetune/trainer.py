@@ -543,9 +543,8 @@ def _print_test_threshold_table(test_metrics: dict, fold_name: str) -> None:
             continue
         htp = ((pred_arr[m] > 0) & (lab_arr[m] > 0)).sum()
         hfp = ((pred_arr[m] > 0) & (lab_arr[m] == 0)).sum()
-        hfn = ((pred_arr[m] == 0) & (lab_arr[m] > 0)).sum()
         hp  = htp / max(htp + hfp, 1)
-        hr  = htp / max(htp + hfn, 1)
+        hr  = htp / max(n_sig, 1)  # recall vs ALL actual signals, not just those in mask
         ok  = ' ✅' if hp >= 0.40 else ''
         print(f'  {thresh:>6.2f}  {htp+hfp:>9}  {htp:>7}  {hp:>9.3f}  {hr:>6.3f}  '
               f'{(htp+hfp)/max(len(lab_arr),1)*100:.1f}%{ok}')

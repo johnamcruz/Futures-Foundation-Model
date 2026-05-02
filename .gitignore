@@ -218,16 +218,6 @@ data/
 data-old/
 data-combined/
 
-# Strategy training scripts (private IP — kept local only)
-colabs/
-!colabs/ffm_pretrain_5min.py
-!colabs/prepare_data_3min.py
-!colabs/strategy_template.py
-!colabs/st_trend_v5.py
-!colabs/cisd_ote_v11_phase2.py
-!colabs/cisd_ote_v12.py
-!colabs/cisd_ote_v13.py
-
 # Temporary diagnostic/scratch scripts
 temp/
 
