@@ -1956,6 +1956,44 @@ def test_p80_checkpoint_requires_min_n():
     assert p80_better, 'N=68 should qualify for P@80 checkpoint'
 
 
+def test_p80_resume_discards_stale_checkpoint_with_low_n(tmp_path):
+    """Restoring _p80.pt saved with N<15 (pre-fix noise) must be discarded — not
+    loaded as best_prec_at_80 — so subsequent epochs can overwrite it correctly."""
+    cfg         = small_ffm_config()
+    model       = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    training_cfg = TrainingConfig()
+    config_hash = _config_hash(training_cfg)
+
+    # Write a stale checkpoint: P@80=0.333 but N=3 (saved by old code before min-N fix)
+    ckpt_p80 = tmp_path / f'F1_{config_hash}_p80.pt'
+    torch.save({
+        'config_hash': config_hash,
+        'model_state': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+        'epoch':       5,
+        'score':       0.333,
+        'n_at_80':     3,   # old code allowed N=3
+    }, ckpt_p80)
+
+    # The restore block should discard this checkpoint
+    p80_saved = torch.load(ckpt_p80, map_location='cpu', weights_only=False)
+    assert p80_saved.get('config_hash') == config_hash
+    saved_n = p80_saved.get('n_at_80', 0)
+    assert saved_n < 15, 'test setup: checkpoint must have N<15'
+
+    # Simulate the restore logic from trainer
+    best_prec_at_80 = 0.0
+    best_p80_state  = None
+    if saved_n >= 15:
+        best_prec_at_80 = p80_saved.get('score', 0.0)
+        best_p80_state  = p80_saved['model_state']
+
+    # Stale checkpoint must NOT update best_prec_at_80
+    assert best_prec_at_80 == 0.0, \
+        f'Stale N={saved_n} checkpoint should be discarded, got best_prec_at_80={best_prec_at_80}'
+    assert best_p80_state is None, \
+        'Stale checkpoint should not set best_p80_state'
+
+
 def test_resume_checkpoint_includes_ratio_bad_ctr(tmp_path):
     """The resume checkpoint must store ratio_bad_ctr so early-stop state
     is correctly restored after a disconnect."""

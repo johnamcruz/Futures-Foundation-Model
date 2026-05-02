@@ -703,15 +703,19 @@ def _train_fold(
             print(f'  ▶ Restored best F1 state '
                   f'(epoch {best_f1_epoch+1}, F1={best_signal_f1:.4f})')
 
-    # Restore best_p80_state from disk
+    # Restore best_p80_state from disk — reject if saved with N<15 (pre-fix noise guard)
     if start_epoch > 0 and os.path.exists(ckpt_p80):
         p80_saved = torch.load(ckpt_p80, map_location='cpu', weights_only=False)
         if p80_saved.get('config_hash') == config_hash:
-            best_p80_state  = p80_saved['model_state']
-            best_prec_at_80 = p80_saved.get('score', best_prec_at_80)
-            best_p80_epoch  = p80_saved.get('epoch', best_p80_epoch)
-            print(f'  ▶ Restored best P@0.80 state '
-                  f'(epoch {best_p80_epoch+1}, P@80={best_prec_at_80:.3f})')
+            saved_n = p80_saved.get('n_at_80', 0)
+            if saved_n >= 15:
+                best_p80_state  = p80_saved['model_state']
+                best_prec_at_80 = p80_saved.get('score', best_prec_at_80)
+                best_p80_epoch  = p80_saved.get('epoch', best_p80_epoch)
+                print(f'  ▶ Restored best P@0.80 state '
+                      f'(epoch {best_p80_epoch+1}, P@80={best_prec_at_80:.3f}, N={saved_n})')
+            else:
+                print(f'  ⚠ Discarding stale P@0.80 checkpoint (N={saved_n} < 15) — will rescore')
 
     # ── Training loop ──
     for epoch in range(start_epoch, training_cfg.epochs):
