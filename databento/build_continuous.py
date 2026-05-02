@@ -43,6 +43,7 @@ OUTPUT_DIR    = Path(__file__).parent.parent / 'data'
 # Add any other mismatches here.
 TICKER_REMAP = {
     'SIL': 'SI',
+    'MCL': 'CL',
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
