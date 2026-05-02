@@ -428,9 +428,10 @@ def _evaluate(model, loader, loss_fn, device):
     recall    = tp / max(tp + fn, 1)
     f1        = 2 * precision * recall / max(precision + recall, 1e-8)
 
+    pred_arr = np.array(all_preds)
     conf_arr = np.array(all_conf)
     lab_arr  = np.array(all_labels)
-    mask_80  = conf_arr >= 0.80
+    mask_80  = (conf_arr >= 0.80) & (pred_arr > 0)
     n_at_80  = int(mask_80.sum())
     tp_80    = int((lab_arr[mask_80] > 0).sum()) if n_at_80 > 0 else 0
     fp_80    = int((lab_arr[mask_80] == 0).sum()) if n_at_80 > 0 else 0

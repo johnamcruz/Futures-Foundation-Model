@@ -1868,33 +1868,43 @@ def test_print_test_threshold_table_none_is_noop(capsys):
 
 
 def test_evaluate_prec_at_80_computed_correctly():
-    """_evaluate must return prec_at_80 and n_at_80 matching manual computation."""
+    """P@0.80 counts only bars where model PREDICTED SIGNAL with conf>=0.80.
+    Non-signal predictions at high confidence must be excluded."""
     import numpy as np
 
     n = 200
     labels = np.zeros(n, dtype=int)
+    preds  = np.zeros(n, dtype=int)
     confs  = np.full(n, 0.55)
 
-    # 5 signals: 3 at high confidence (TP at 0.80), 2 at low confidence
+    # 3 TP: model predicts signal at high conf, label=1
     labels[[10, 20, 30]] = 1
-    confs[[10, 20, 30]]  = 0.90  # TP at 0.80 threshold
+    preds[[10, 20, 30]]  = 1
+    confs[[10, 20, 30]]  = 0.90
 
+    # 2 FP: model predicts signal at high conf, label=0
+    preds[[100, 110]] = 1
+    confs[[100, 110]] = 0.85
+
+    # 2 high-conf non-signal predictions: pred=0, conf=0.95 — must NOT count in P@0.80
+    confs[[150, 160]] = 0.95  # pred stays 0
+
+    # 2 low-conf signal predictions: below 0.80, not counted
     labels[[50, 60]] = 1
-    confs[[50, 60]]  = 0.55   # below 0.80 — not counted
+    preds[[50, 60]]  = 1
+    confs[[50, 60]]  = 0.55
 
-    # 2 FPs above 0.80
-    confs[[100, 110]] = 0.85  # FP at 0.80
-
-    # expected: tp_80=3, fp_80=2 → prec_at_80 = 3/5 = 0.60, n_at_80 = 5
+    # expected: n_at_80=5 (3 TP + 2 FP), not 7 (excludes high-conf non-signal)
+    pred_arr = np.array(preds)
     conf_arr = np.array(confs)
     lab_arr  = np.array(labels)
-    mask_80  = conf_arr >= 0.80
+    mask_80  = (conf_arr >= 0.80) & (pred_arr > 0)
     n_at_80  = int(mask_80.sum())
     tp_80    = int((lab_arr[mask_80] > 0).sum())
     fp_80    = int((lab_arr[mask_80] == 0).sum())
     prec_80  = tp_80 / max(tp_80 + fp_80, 1)
 
-    assert n_at_80 == 5, f'Expected 5 predictions at conf>=0.80, got {n_at_80}'
+    assert n_at_80 == 5, f'Expected 5 signal predictions at conf>=0.80, got {n_at_80}'
     assert tp_80 == 3,   f'Expected 3 TPs at conf>=0.80, got {tp_80}'
     assert fp_80 == 2,   f'Expected 2 FPs at conf>=0.80, got {fp_80}'
     assert abs(prec_80 - 0.60) < 0.001, f'Expected P@80=0.60, got {prec_80:.3f}'
