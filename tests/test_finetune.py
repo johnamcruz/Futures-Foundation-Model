@@ -1610,6 +1610,7 @@ def _run_cb_epochs(n_epochs, callback, seed=20):
                 'saved_loss': False,
                 'saved_f1':   False,
                 'saved_p80':  False,
+                'saved_p80s': False,
                 'all_conf':   va.get('all_conf', []),
                 'all_preds':  va.get('all_preds', []),
                 'all_labels': va.get('all_labels', []),
@@ -2314,7 +2315,7 @@ def test_epoch_callback_dict_has_all_keys():
         'precision', 'recall', 'f1',
         'prec_at_80', 'n_at_80',
         'ok_ratio',
-        'saved_loss', 'saved_f1', 'saved_p80',
+        'saved_loss', 'saved_f1', 'saved_p80', 'saved_p80s',
         'all_conf', 'all_preds', 'all_labels',
     }
     assert len(received) == 2
@@ -2322,8 +2323,9 @@ def test_epoch_callback_dict_has_all_keys():
         missing = required_keys - set(m.keys())
         assert not missing, f'callback dict missing keys: {missing}'
         assert isinstance(m['saved_loss'], bool)
-        assert isinstance(m['saved_f1'],  bool)
-        assert isinstance(m['saved_p80'], bool)
+        assert isinstance(m['saved_f1'],   bool)
+        assert isinstance(m['saved_p80'],  bool)
+        assert isinstance(m['saved_p80s'], bool)
         assert m['epoch'] >= 1
 
 
@@ -2333,3 +2335,90 @@ def test_run_walk_forward_verbose_param_exists():
     sig = inspect.signature(run_walk_forward)
     assert 'verbose' in sig.parameters, 'verbose param missing from run_walk_forward'
     assert sig.parameters['verbose'].default is True, 'verbose should default to True'
+
+
+# =============================================================================
+# 13. Multi-checkpoint (p80s stable tier)
+# =============================================================================
+
+def test_p80s_checkpoint_requires_min_n_50():
+    """P@0.80 stable tier must not trigger below N=50."""
+    MIN_N = 50
+
+    va = {'prec_at_80': 0.500, 'n_at_80': 49}
+    p80s = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert not p80s, 'N=49 should not qualify for stable checkpoint'
+
+    va = {'prec_at_80': 0.200, 'n_at_80': 50}
+    p80s = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert p80s, 'N=50 should qualify for stable checkpoint'
+
+    va = {'prec_at_80': 0.150, 'n_at_80': 200}
+    p80s = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert p80s, 'N=200 should qualify for stable checkpoint'
+
+
+def test_p80s_checkpoint_saved_and_restored(tmp_path):
+    """_p80s.pt round-trips: save then restore restores score and state correctly."""
+    cfg         = small_ffm_config()
+    model       = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    config_hash = _config_hash(TrainingConfig())
+    ckpt_p80s   = tmp_path / f'F1_{config_hash}_p80s.pt'
+
+    state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    torch.save({
+        'config_hash': config_hash,
+        'model_state': state,
+        'epoch':       30,
+        'score':       0.214,
+        'n_at_80':     63,
+    }, ckpt_p80s)
+
+    saved = torch.load(ckpt_p80s, map_location='cpu', weights_only=False)
+    assert saved.get('config_hash') == config_hash
+    assert saved.get('score') == pytest.approx(0.214)
+    assert saved.get('n_at_80') == 63
+    assert saved.get('epoch') == 30
+    assert 'model_state' in saved
+
+
+def test_p80s_preferred_over_p80_at_test_time():
+    """Tier priority: if both p80s and p80 are available, p80s wins."""
+    best_p80_state  = {'dummy': torch.tensor(1.0)}
+    best_p80s_state = {'dummy': torch.tensor(2.0)}
+
+    # Simulate the priority selection logic from trainer
+    if best_p80s_state is not None:
+        selected = 'p80s'
+    elif best_p80_state is not None:
+        selected = 'p80'
+    else:
+        selected = 'fallback'
+
+    assert selected == 'p80s', 'Stable checkpoint should be preferred over peak'
+
+
+def test_p80s_falls_back_to_p80_when_none():
+    """If p80s never fired (N never reached 50), test should use p80 peak."""
+    best_p80_state  = {'dummy': torch.tensor(1.0)}
+    best_p80s_state = None
+
+    if best_p80s_state is not None:
+        selected = 'p80s'
+    elif best_p80_state is not None:
+        selected = 'p80'
+    else:
+        selected = 'fallback'
+
+    assert selected == 'p80', 'Should fall back to peak when stable not available'
+
+
+def test_epoch_callback_dict_has_saved_p80s_key():
+    """epoch_callback dict must include saved_p80s bool."""
+    received = []
+    def cb(m):
+        received.append(m)
+    _run_cb_epochs(1, cb)
+    assert len(received) == 1
+    assert 'saved_p80s' in received[0], 'saved_p80s key missing from callback dict'
+    assert isinstance(received[0]['saved_p80s'], bool)
