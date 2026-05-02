@@ -221,6 +221,9 @@ data-combined/
 # Temporary diagnostic/scratch scripts
 temp/
 
+# Strategy scripts — tracked in private ffm-strategies repo
+colabs/
+
 # DataBento raw compressed data (large binary files — not for git)
 databento/*.zst
 
