@@ -427,11 +427,21 @@ def _evaluate(model, loader, loss_fn, device):
     precision = tp / max(tp + fp, 1)
     recall    = tp / max(tp + fn, 1)
     f1        = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    conf_arr = np.array(all_conf)
+    lab_arr  = np.array(all_labels)
+    mask_80  = conf_arr >= 0.80
+    n_at_80  = int(mask_80.sum())
+    tp_80    = int((lab_arr[mask_80] > 0).sum()) if n_at_80 > 0 else 0
+    fp_80    = int((lab_arr[mask_80] == 0).sum()) if n_at_80 > 0 else 0
+    prec_80  = tp_80 / max(tp_80 + fp_80, 1)
+
     return {
         'loss':      total_loss / max(n_batches, 1),
         'acc':       correct / max(total, 1),
         'precision': precision, 'recall': recall, 'f1': f1,
         'tp': tp, 'fp': fp, 'fn': fn,
+        'prec_at_80': prec_80, 'n_at_80': n_at_80,
         'all_conf': all_conf, 'all_labels': all_labels,
         'all_preds': all_preds, 'all_max_rr': all_max_rr,
     }
@@ -574,9 +584,11 @@ def _train_fold(
     fold_name   = fold['name']
     # _loss.pt  — epoch-level resume checkpoint (saved on val_loss improvement)
     # _f1.pt    — best signal-F1 checkpoint (saved whenever F1 improves, survives disconnect)
+    # _p80.pt   — best val P@0.80 checkpoint (primary checkpoint for test evaluation)
     # _done.pt  — fold completion marker (next_fold_state + test_metrics; skip re-training)
     ckpt_path   = os.path.join(output_dir, f'{fold_name}_{config_hash}_loss.pt')
     ckpt_f1     = os.path.join(output_dir, f'{fold_name}_{config_hash}_f1.pt')
+    ckpt_p80    = os.path.join(output_dir, f'{fold_name}_{config_hash}_p80.pt')
     ckpt_done   = os.path.join(output_dir, f'{fold_name}_{config_hash}_done.pt')
 
     print(f"\n{'='*60}")
@@ -656,6 +668,9 @@ def _train_fold(
     best_signal_f1 = 0.0
     best_f1_epoch  = -1
     best_f1_state  = None
+    best_prec_at_80 = 0.0
+    best_p80_epoch  = -1
+    best_p80_state  = None
     patience_ctr   = 0
     ratio_bad_ctr  = 0
 
@@ -686,6 +701,16 @@ def _train_fold(
             print(f'  ▶ Restored best F1 state '
                   f'(epoch {best_f1_epoch+1}, F1={best_signal_f1:.4f})')
 
+    # Restore best_p80_state from disk
+    if start_epoch > 0 and os.path.exists(ckpt_p80):
+        p80_saved = torch.load(ckpt_p80, map_location='cpu', weights_only=False)
+        if p80_saved.get('config_hash') == config_hash:
+            best_p80_state  = p80_saved['model_state']
+            best_prec_at_80 = p80_saved.get('score', best_prec_at_80)
+            best_p80_epoch  = p80_saved.get('epoch', best_p80_epoch)
+            print(f'  ▶ Restored best P@0.80 state '
+                  f'(epoch {best_p80_epoch+1}, P@80={best_prec_at_80:.3f})')
+
     # ── Training loop ──
     for epoch in range(start_epoch, training_cfg.epochs):
         t0 = time.time()
@@ -697,6 +722,8 @@ def _train_fold(
         ratio     = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         improved  = va['loss'] < best_val_loss
         f1_better = va['f1'] > best_signal_f1 and ratio <= training_cfg.f1_ok_ceiling
+        # P@0.80 checkpoint: require ≥3 predictions at conf≥0.80 to avoid noise
+        p80_better = (va['prec_at_80'] > best_prec_at_80 and va['n_at_80'] >= 3)
         save_str  = ''
 
         if improved:
@@ -705,15 +732,17 @@ def _train_fold(
             patience_ctr   = 0
             ratio_bad_ctr  = 0
             torch.save({
-                'config_hash':   config_hash,
-                'epoch':         epoch,
-                'model_state':   model.state_dict(),
-                'optim_state':   optimizer.state_dict(),
-                'val_loss':      best_val_loss,
-                'patience_ctr':  patience_ctr,
-                'ratio_bad_ctr': ratio_bad_ctr,
+                'config_hash':    config_hash,
+                'epoch':          epoch,
+                'model_state':    model.state_dict(),
+                'optim_state':    optimizer.state_dict(),
+                'val_loss':       best_val_loss,
+                'patience_ctr':   patience_ctr,
+                'ratio_bad_ctr':  ratio_bad_ctr,
                 'best_signal_f1': best_signal_f1,
-                'best_f1_epoch': best_f1_epoch,
+                'best_f1_epoch':  best_f1_epoch,
+                'best_prec_at_80': best_prec_at_80,
+                'best_p80_epoch': best_p80_epoch,
             }, ckpt_path)
             save_str += ' 💾L'
 
@@ -721,7 +750,6 @@ def _train_fold(
             best_signal_f1 = va['f1']
             best_f1_epoch  = epoch
             best_f1_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            # Persist to disk so a disconnect doesn't lose the best F1 weights
             torch.save({
                 'config_hash': config_hash,
                 'model_state': best_f1_state,
@@ -729,6 +757,19 @@ def _train_fold(
                 'score':       best_signal_f1,
             }, ckpt_f1)
             save_str += ' 📈F'
+
+        if p80_better:
+            best_prec_at_80 = va['prec_at_80']
+            best_p80_epoch  = epoch
+            best_p80_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            torch.save({
+                'config_hash': config_hash,
+                'model_state': best_p80_state,
+                'epoch':       epoch,
+                'score':       best_prec_at_80,
+                'n_at_80':     va['n_at_80'],
+            }, ckpt_p80)
+            save_str += ' 📈8'
 
         if ratio > training_cfg.max_ratio:
             ratio_bad_ctr += 1
@@ -740,10 +781,11 @@ def _train_fold(
         if not improved:
             patience_ctr += 1
 
+        p80_str = f'P@80:{va["prec_at_80"]:.3f}({va["n_at_80"]})'
         print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} ({elapsed:.0f}s) | '
               f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
               f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
-              f'{ratio_str}{save_str}')
+              f'{p80_str} | {ratio_str}{save_str}')
 
         if epoch_callback is not None:
             epoch_callback(fold_name, epoch, model, va, ratio)
@@ -753,15 +795,20 @@ def _train_fold(
         if ratio_bad_ctr >= training_cfg.ratio_patience:
             print(f'  ⏹ Early stop — overfitting'); break
 
-    # ── Load best F1 for test eval ──
+    # ── Load best P@0.80 for test eval (fall back to F1 if P@0.80 never improved) ──
     print(f'\n  Checkpoint summary:')
     print(f'    val_loss  : epoch={best_val_epoch+1} score={best_val_loss:.4f}')
     print(f'    signal_f1 : epoch={best_f1_epoch+1}  score={best_signal_f1:.4f}')
-    print(f'  ✅ Loading best signal_f1 (epoch {best_f1_epoch+1}) for test')
+    print(f'    prec_at_80: epoch={best_p80_epoch+1} score={best_prec_at_80:.3f}')
 
-    if best_f1_state is not None:
+    if best_p80_state is not None:
+        print(f'  ✅ Loading best P@0.80 (epoch {best_p80_epoch+1}) for test')
+        model.load_state_dict({k: v.to(device) for k, v in best_p80_state.items()})
+    elif best_f1_state is not None:
+        print(f'  ⚠ No P@0.80 checkpoint — loading best signal_f1 (epoch {best_f1_epoch+1})')
         model.load_state_dict({k: v.to(device) for k, v in best_f1_state.items()})
     elif os.path.exists(ckpt_path):
+        print(f'  ⚠ No F1 checkpoint — loading val_loss checkpoint')
         model.load_state_dict(
             torch.load(ckpt_path, map_location=device, weights_only=False)['model_state'])
 
@@ -783,7 +830,7 @@ def _train_fold(
         'next_fold_state': next_fold_state,
         'test_metrics':   test_metrics,
     }, ckpt_done)
-    for p in [ckpt_path, ckpt_f1]:
+    for p in [ckpt_path, ckpt_f1, ckpt_p80]:
         if os.path.exists(p):
             os.remove(p)
     print(f'  💾 Fold {fold_name} state saved — safe to disconnect')

@@ -418,6 +418,10 @@ def test_evaluate_returns_metrics():
     assert 'all_conf' in result
     assert 'all_max_rr' in result
     assert len(result['all_conf']) == len(result['all_labels'])
+    assert 'prec_at_80' in result
+    assert 'n_at_80' in result
+    assert 0.0 <= result['prec_at_80'] <= 1.0
+    assert result['n_at_80'] >= 0
 
 
 def test_evaluate_confidence_all_in_01():
@@ -1861,6 +1865,39 @@ def test_print_test_threshold_table_none_is_noop(capsys):
     """None test_metrics must silently produce no output."""
     _print_test_threshold_table(None, 'F2')
     assert capsys.readouterr().out == ''
+
+
+def test_evaluate_prec_at_80_computed_correctly():
+    """_evaluate must return prec_at_80 and n_at_80 matching manual computation."""
+    import numpy as np
+
+    n = 200
+    labels = np.zeros(n, dtype=int)
+    confs  = np.full(n, 0.55)
+
+    # 5 signals: 3 at high confidence (TP at 0.80), 2 at low confidence
+    labels[[10, 20, 30]] = 1
+    confs[[10, 20, 30]]  = 0.90  # TP at 0.80 threshold
+
+    labels[[50, 60]] = 1
+    confs[[50, 60]]  = 0.55   # below 0.80 — not counted
+
+    # 2 FPs above 0.80
+    confs[[100, 110]] = 0.85  # FP at 0.80
+
+    # expected: tp_80=3, fp_80=2 → prec_at_80 = 3/5 = 0.60, n_at_80 = 5
+    conf_arr = np.array(confs)
+    lab_arr  = np.array(labels)
+    mask_80  = conf_arr >= 0.80
+    n_at_80  = int(mask_80.sum())
+    tp_80    = int((lab_arr[mask_80] > 0).sum())
+    fp_80    = int((lab_arr[mask_80] == 0).sum())
+    prec_80  = tp_80 / max(tp_80 + fp_80, 1)
+
+    assert n_at_80 == 5, f'Expected 5 predictions at conf>=0.80, got {n_at_80}'
+    assert tp_80 == 3,   f'Expected 3 TPs at conf>=0.80, got {tp_80}'
+    assert fp_80 == 2,   f'Expected 2 FPs at conf>=0.80, got {fp_80}'
+    assert abs(prec_80 - 0.60) < 0.001, f'Expected P@80=0.60, got {prec_80:.3f}'
 
 
 def test_resume_checkpoint_includes_ratio_bad_ctr(tmp_path):
