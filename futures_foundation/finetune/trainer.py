@@ -578,6 +578,7 @@ def _train_fold(
     device=None,
     pretrained_path: str = None,
     epoch_callback=None,
+    verbose=True,
 ):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -783,13 +784,33 @@ def _train_fold(
             patience_ctr += 1
 
         p80_str = f'P@80:{va["prec_at_80"]:.3f}({va["n_at_80"]})'
-        print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} ({elapsed:.0f}s) | '
-              f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
-              f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
-              f'{p80_str} | {ratio_str}{save_str}')
+        if verbose:
+            print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} ({elapsed:.0f}s) | '
+                  f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
+                  f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
+                  f'{p80_str} | {ratio_str}{save_str}')
 
         if epoch_callback is not None:
-            epoch_callback(fold_name, epoch, model, va, ratio)
+            epoch_callback({
+                'fold':       fold_name,
+                'epoch':      epoch + 1,
+                'epochs':     training_cfg.epochs,
+                'elapsed':    elapsed,
+                'train_loss': tr['loss'],
+                'val_loss':   va['loss'],
+                'precision':  va['precision'],
+                'recall':     va['recall'],
+                'f1':         va['f1'],
+                'prec_at_80': va['prec_at_80'],
+                'n_at_80':    va['n_at_80'],
+                'ok_ratio':   ratio,
+                'saved_loss': '💾L' in save_str,
+                'saved_f1':   '📈F' in save_str,
+                'saved_p80':  '📈8' in save_str,
+                'all_conf':   va.get('all_conf', []),
+                'all_preds':  va.get('all_preds', []),
+                'all_labels': va.get('all_labels', []),
+            })
 
         if patience_ctr >= training_cfg.patience:
             print(f'  ⏹ Early stop — patience exhausted'); break
@@ -856,6 +877,7 @@ def run_walk_forward(
     device=None,
     pretrained_path: str = None,
     epoch_callback=None,
+    verbose=True,
 ):
     """
     Train all walk-forward folds and return per-fold test metrics.
@@ -924,6 +946,7 @@ def run_walk_forward(
             device=device,
             pretrained_path=pretrained_path,
             epoch_callback=epoch_callback,
+            verbose=verbose,
         )
         if result is not None:
             last_model, test_metrics, prev_fold_state = result

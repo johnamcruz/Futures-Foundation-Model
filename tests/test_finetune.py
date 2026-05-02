@@ -1587,42 +1587,63 @@ def _run_cb_epochs(n_epochs, callback, seed=20):
     optimizer, scheduler = _make_optimizer(
         model, training_cfg, is_warm_started=False, train_loader_len=len(loader))
     for epoch in range(n_epochs):
+        import time
+        t0 = time.time()
         tr = _train_one_epoch(model, loader, optimizer, loss_fn, torch.device('cpu'))
         va = _evaluate(model, loader, loss_fn, torch.device('cpu'))
         scheduler.step()
         ratio = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         if callback is not None:
-            callback('F1', epoch, model, va, ratio)
+            callback({
+                'fold':       'F1',
+                'epoch':      epoch + 1,
+                'epochs':     training_cfg.epochs,
+                'elapsed':    time.time() - t0,
+                'train_loss': tr['loss'],
+                'val_loss':   va['loss'],
+                'precision':  va['precision'],
+                'recall':     va['recall'],
+                'f1':         va['f1'],
+                'prec_at_80': va['prec_at_80'],
+                'n_at_80':    va['n_at_80'],
+                'ok_ratio':   ratio,
+                'saved_loss': False,
+                'saved_f1':   False,
+                'saved_p80':  False,
+                'all_conf':   va.get('all_conf', []),
+                'all_preds':  va.get('all_preds', []),
+                'all_labels': va.get('all_labels', []),
+            })
     return model
 
 
 def test_epoch_callback_called_once_per_epoch():
     """epoch_callback must fire exactly once per training epoch."""
     call_epochs = []
-    def cb(fold_name, epoch, model, va, ratio):
-        call_epochs.append(epoch)
+    def cb(m):
+        call_epochs.append(m['epoch'])
 
     _run_cb_epochs(4, cb)
-    assert call_epochs == [0, 1, 2, 3]
+    assert call_epochs == [1, 2, 3, 4]
 
 
 def test_epoch_callback_receives_correct_argument_types():
-    """Callback receives: fold_name str, epoch int, model HybridStrategyModel,
-    val_metrics dict with required keys, ratio float."""
+    """Callback receives a dict with all required metric keys."""
     captured = []
-    def cb(fold_name, epoch, model, va, ratio):
-        captured.append((fold_name, epoch, model, va, ratio))
+    def cb(m):
+        captured.append(m)
 
     _run_cb_epochs(1, cb)
 
     assert len(captured) == 1
-    fold_name, epoch, model, va, ratio = captured[0]
-    assert fold_name == 'F1'
-    assert epoch == 0
-    assert isinstance(model, HybridStrategyModel)
-    assert isinstance(ratio, float)
-    for key in ('f1', 'precision', 'recall', 'loss', 'all_conf', 'all_labels', 'all_preds'):
-        assert key in va, f"val_metrics missing key '{key}'"
+    m = captured[0]
+    assert m['fold'] == 'F1'
+    assert m['epoch'] == 1
+    assert isinstance(m['ok_ratio'], float)
+    for key in ('fold', 'epoch', 'epochs', 'elapsed', 'train_loss', 'val_loss',
+                'precision', 'recall', 'f1', 'prec_at_80', 'n_at_80', 'ok_ratio',
+                'saved_loss', 'saved_f1', 'saved_p80', 'all_conf', 'all_preds', 'all_labels'):
+        assert key in m, f"callback dict missing key '{key}'"
 
 
 def test_epoch_callback_none_is_backward_compatible():
@@ -1631,13 +1652,13 @@ def test_epoch_callback_none_is_backward_compatible():
 
 
 def test_epoch_callback_can_compute_precision_at_threshold():
-    """val_metrics exposes all_conf/all_preds/all_labels so the callback can compute
-    P@threshold without any changes to the framework."""
+    """all_conf/all_preds/all_labels in the callback dict let the script compute
+    custom P@threshold without any changes to the framework."""
     computed = []
-    def cb(fold_name, epoch, model, va, ratio):
-        conf  = np.array(va['all_conf'])
-        preds = np.array(va['all_preds'])
-        lab   = np.array(va['all_labels'])
+    def cb(m):
+        conf  = np.array(m['all_conf'])
+        preds = np.array(m['all_preds'])
+        lab   = np.array(m['all_labels'])
         mask  = conf >= 0.50
         if mask.sum() > 0:
             tp = ((preds[mask] > 0) & (lab[mask] > 0)).sum()
@@ -2241,3 +2262,36 @@ def test_run_risk_head_calibration_saves_rr_checkpoint(tmp_path):
     assert 'rr_metrics'      in ckpt
     assert 'val_mae'         in ckpt['rr_metrics']
     assert ckpt['config_hash'] == config_hash
+
+
+def test_epoch_callback_dict_has_all_keys():
+    """epoch_callback dict must contain every documented key including checkpoint flags and raw arrays."""
+    received = []
+    def cb(m):
+        received.append(m)
+    _run_cb_epochs(2, cb)
+    required_keys = {
+        'fold', 'epoch', 'epochs', 'elapsed',
+        'train_loss', 'val_loss',
+        'precision', 'recall', 'f1',
+        'prec_at_80', 'n_at_80',
+        'ok_ratio',
+        'saved_loss', 'saved_f1', 'saved_p80',
+        'all_conf', 'all_preds', 'all_labels',
+    }
+    assert len(received) == 2
+    for m in received:
+        missing = required_keys - set(m.keys())
+        assert not missing, f'callback dict missing keys: {missing}'
+        assert isinstance(m['saved_loss'], bool)
+        assert isinstance(m['saved_f1'],  bool)
+        assert isinstance(m['saved_p80'], bool)
+        assert m['epoch'] >= 1
+
+
+def test_run_walk_forward_verbose_param_exists():
+    """run_walk_forward must accept verbose=True/False without raising."""
+    import inspect
+    sig = inspect.signature(run_walk_forward)
+    assert 'verbose' in sig.parameters, 'verbose param missing from run_walk_forward'
+    assert sig.parameters['verbose'].default is True, 'verbose should default to True'
