@@ -75,18 +75,32 @@ class MyStrategyLabeler(StrategyLabeler):
 labeler = MyStrategyLabeler()
 run_labeling(labeler, TICKERS, RAW_DATA_DIR, PREPARED_DIR, CACHE_DIR)
 
-# Cell 4 — Walk-forward fine-tuning (4 folds, warm start, dual checkpoint)
+# Cell 4 — Walk-forward fine-tuning (N folds, selective warm start, tiered checkpoint)
 fold_results = run_walk_forward(
     folds=FOLDS, tickers=TICKERS, ffm_dir=PREPARED_DIR,
     strategy_dir=CACHE_DIR, output_dir=OUTPUT_DIR,
     backbone_path=BACKBONE_PATH, ffm_config=ffm_config,
     training_cfg=TrainingConfig(), num_strategy_features=3,
     strategy_feature_cols=labeler.feature_cols,
+    epoch_callback=lambda m: print(f"  {m['fold']} E{m['epoch']} P@80:{m['prec_at_80']:.3f}(N={m['n_at_80']})"),
 )
 
 # Cell 5 — Evaluation (confidence thresholds, per-fold, vs baseline)
 from futures_foundation.finetune import print_eval_summary
 print_eval_summary(fold_results, baseline_wr=BASELINE_WR)
+```
+
+**Backbone reuse across runs** — after a walk-forward completes, extract the trained backbone to use as the starting point for the next run. The backbone accumulates domain knowledge across runs; the signal head always cold-starts to stay honest to each fold's regime:
+
+```python
+from futures_foundation.finetune import extract_backbone
+
+# After F5 completes — pull backbone weights from final fold's checkpoint
+extract_backbone(
+    done_path='F5_68cdfded_done.pt',
+    output_path='backbone_strategy_run2.pt',
+)
+# Use backbone_strategy_run2.pt as backbone_path in the next run
 ```
 
 **Phase 2: risk head calibration** (separate script, run after Phase 1 completes)
@@ -115,11 +129,12 @@ rr_done_paths = run_risk_head_calibration(
 | `HybridStrategyModel` | FFM backbone + strategy feature projection + signal/risk/confidence heads |
 | `HybridStrategyDataset` | Sliding-window dataset parameterised by your strategy feature columns |
 | `run_labeling()` | CSV I/O, timezone normalization, parquet caching per ticker |
-| `run_walk_forward()` | 4-fold walk-forward, warm start F1→F2→F3→F4, dual checkpoint (val_loss + signal_F1) |
+| `run_walk_forward()` | N-fold walk-forward, selective warm start, tiered checkpoint selection, disconnect recovery |
 | `run_risk_head_calibration()` | Phase 2: freeze signal head, fine-tune risk_head with Huber loss on signal-only subsets |
 | `print_eval_summary()` | Confidence threshold table, per-fold breakdown, vs-baseline comparison |
 | `print_rr_calibration()` | Phase 2 calibration table: predicted R:R vs actual max_rr at each threshold |
 | `export_onnx()` | Production ONNX export of the final fold model |
+| `extract_backbone()` | Extract backbone weights from a completed fold for use as the starting point of the next training run |
 
 ### Model architecture
 
@@ -376,7 +391,7 @@ Futures-Foundation-Model/
 │       ├── dataset.py          # HybridStrategyDataset
 │       ├── losses.py           # FocalLoss
 │       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
-├── tests/                      # Unit tests (281 total)
+├── tests/                      # Unit tests (370 total)
 │   ├── test_model.py           # Backbone + heads
 │   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage)
 │   ├── test_features_crt.py    # CRT sweep features
@@ -396,6 +411,7 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
+| **v0.5** | Tiered checkpoint selection (`_p80s` stable N≥50 > `_p80` peak N≥15 > `_f1` > `_loss`); selective warm start (backbone transfers fold-to-fold, signal head cold-starts); layerwise LR (backbone at lower LR to preserve pretrained knowledge); `epoch_callback` full metrics dict; `extract_backbone()` utility for backbone reuse across runs; stale checkpoint guard on resume; `verbose` param |
 | **v0.4** | Backbone v2 (68 features, 6 instruments, 2.3M bars); structure label redesigned to predict forward 1H structure; `HybridStrategyModel` context heads — 4 frozen pretrained heads expose 15-dim regime/vol/structure/range context at fine-tuning; `pretrained_path` API in `run_walk_forward`; CISD+OTE v9 |
 | **v0.3** | `futures_foundation.finetune` framework — plug-and-play walk-forward fine-tuning; CISD+OTE migrated as first concrete strategy |
 | **v0.2** | FFM backbone + CISD+OTE fine-tuning pipeline (v7); 58 backbone features |
@@ -440,6 +456,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **`HybridStrategyModel` context heads — 4 frozen pretrained heads give signal head explicit market context (regime/vol/structure/range)**
 - [x] **CISD+OTE v9 — backbone v2 + context heads**
 - [x] **Pretrained weights released on HuggingFace Hub** — [johnamcruz/futures-foundation-model](https://huggingface.co/johnamcruz/futures-foundation-model)
+- [x] **Tiered checkpoint selection** — stable (N≥50) > peak (N≥15) > F1 > val_loss; eliminates noise-driven early epoch selection
+- [x] **Selective warm start** — backbone transfers fold-to-fold; signal head cold-starts each fold for honest regime calibration
+- [x] **Layerwise LR** — backbone trained at lower LR to preserve pretrained knowledge while signal head adapts at full speed
+- [x] **`extract_backbone()` utility** — pull backbone weights from any completed fold for warm re-runs and cross-strategy transfer
+- [x] **`epoch_callback` API** — full per-epoch metrics dict for custom logging, early-stop hooks, or external monitoring
+- [x] **Stale checkpoint guard** — rejects low-N checkpoints saved by older code versions on resume
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
 - [ ] Additional instruments (CL, NKD)
