@@ -723,8 +723,8 @@ def _train_fold(
         ratio     = va['loss'] / tr['loss'] if tr['loss'] > 0 else 1.0
         improved  = va['loss'] < best_val_loss
         f1_better = va['f1'] > best_signal_f1 and ratio <= training_cfg.f1_ok_ceiling
-        # P@0.80 checkpoint: require ≥3 predictions at conf≥0.80 to avoid noise
-        p80_better = (va['prec_at_80'] > best_prec_at_80 and va['n_at_80'] >= 3)
+        # P@0.80 checkpoint: require ≥15 predictions at conf≥0.80 — blocks 1-in-4 lucky shots
+        p80_better = (va['prec_at_80'] > best_prec_at_80 and va['n_at_80'] >= 15)
         save_str  = ''
 
         if improved:

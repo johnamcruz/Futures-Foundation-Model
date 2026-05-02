@@ -1910,6 +1910,31 @@ def test_evaluate_prec_at_80_computed_correctly():
     assert abs(prec_80 - 0.60) < 0.001, f'Expected P@80=0.60, got {prec_80:.3f}'
 
 
+def test_p80_checkpoint_requires_min_n():
+    """P@0.80 checkpoint must not be saved if N < 15 — blocks lucky 1-in-4 shots."""
+    MIN_N = 15
+
+    # N=4 with good P@80 — should NOT trigger (was the F1 noise bug)
+    va = {'prec_at_80': 0.250, 'n_at_80': 4}
+    p80_better = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert not p80_better, 'N=4 should not qualify for P@80 checkpoint'
+
+    # N=14 with excellent P@80 — still below threshold
+    va = {'prec_at_80': 0.500, 'n_at_80': 14}
+    p80_better = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert not p80_better, 'N=14 should not qualify for P@80 checkpoint'
+
+    # N=15 with P@80=0.25 — exactly at threshold, should trigger
+    va = {'prec_at_80': 0.250, 'n_at_80': 15}
+    p80_better = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert p80_better, 'N=15 should qualify for P@80 checkpoint'
+
+    # N=68 with P@80=0.103 — meaningful result, should trigger
+    va = {'prec_at_80': 0.103, 'n_at_80': 68}
+    p80_better = va['prec_at_80'] > 0.0 and va['n_at_80'] >= MIN_N
+    assert p80_better, 'N=68 should qualify for P@80 checkpoint'
+
+
 def test_resume_checkpoint_includes_ratio_bad_ctr(tmp_path):
     """The resume checkpoint must store ratio_bad_ctr so early-stop state
     is correctly restored after a disconnect."""
