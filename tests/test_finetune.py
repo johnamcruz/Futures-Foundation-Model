@@ -2422,3 +2422,68 @@ def test_epoch_callback_dict_has_saved_p80s_key():
     assert len(received) == 1
     assert 'saved_p80s' in received[0], 'saved_p80s key missing from callback dict'
     assert isinstance(received[0]['saved_p80s'], bool)
+
+
+# =============================================================================
+# 14. Backbone extraction
+# =============================================================================
+
+from futures_foundation.finetune import extract_backbone
+
+
+def test_extract_backbone_roundtrip(tmp_path):
+    """extract_backbone saves only backbone.* keys, loadable as backbone weights."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    state = model.state_dict()
+
+    done_path = tmp_path / 'F5_abc12345_done.pt'
+    torch.save({
+        'config_hash':     'abc12345',
+        'next_fold_state': state,
+        'test_metrics':    None,
+    }, done_path)
+
+    out_path = tmp_path / 'backbone_extracted.pt'
+    result   = extract_backbone(str(done_path), str(out_path))
+
+    assert result == str(out_path)
+    assert out_path.exists()
+
+    saved = torch.load(out_path, map_location='cpu', weights_only=False)
+    assert 'model_state' in saved
+    assert saved['config_hash'] == 'abc12345'
+    assert saved['source'] == 'F5_abc12345_done.pt'
+
+    backbone_keys = {k for k in state if k.startswith('backbone.')}
+    extracted_keys = {f'backbone.{k}' for k in saved['model_state']}
+    assert extracted_keys == backbone_keys, 'Extracted keys must match backbone.* keys'
+
+
+def test_extract_backbone_no_signal_head_keys(tmp_path):
+    """Extracted backbone must not contain signal_head or risk_head weights."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+
+    done_path = tmp_path / 'F5_test_done.pt'
+    torch.save({
+        'config_hash':     'test',
+        'next_fold_state': model.state_dict(),
+    }, done_path)
+
+    out_path = tmp_path / 'backbone.pt'
+    extract_backbone(str(done_path), str(out_path))
+
+    saved = torch.load(out_path, map_location='cpu', weights_only=False)
+    for key in saved['model_state']:
+        assert not key.startswith('signal_head'), f'signal_head key leaked: {key}'
+        assert not key.startswith('risk_head'),   f'risk_head key leaked: {key}'
+
+
+def test_extract_backbone_missing_state_raises(tmp_path):
+    """extract_backbone raises ValueError if _done.pt has no model state."""
+    done_path = tmp_path / 'bad_done.pt'
+    torch.save({'config_hash': 'x'}, done_path)
+
+    with pytest.raises(ValueError, match='No model state'):
+        extract_backbone(str(done_path), str(tmp_path / 'out.pt'))

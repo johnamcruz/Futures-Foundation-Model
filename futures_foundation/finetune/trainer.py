@@ -1325,6 +1325,51 @@ def export_onnx(
     print(f'  ✅ ONNX exported: {output_path} ({size_mb:.1f} MB)')
 
 
+# ── Backbone extraction ───────────────────────────────────────────────────────
+
+def extract_backbone(
+    done_path: str,
+    output_path: str,
+) -> str:
+    """
+    Extract backbone weights from a completed fold's _done.pt and save as a
+    standalone backbone file usable as backbone_path in the next training run.
+
+    Args:
+        done_path:   Path to a {fold}_{hash}_done.pt checkpoint.
+        output_path: Where to save the extracted backbone weights.
+
+    Returns:
+        output_path (for chaining / logging).
+    """
+    ckpt = torch.load(done_path, map_location='cpu', weights_only=False)
+    state = ckpt.get('next_fold_state') or ckpt.get('model_state')
+    if state is None:
+        raise ValueError(f'No model state found in {done_path}')
+
+    backbone_state = {
+        k[len('backbone.'):]: v
+        for k, v in state.items()
+        if k.startswith('backbone.')
+    }
+    if not backbone_state:
+        raise ValueError(f'No backbone.* keys found in {done_path}')
+
+    config_hash = ckpt.get('config_hash', 'unknown')
+    torch.save({
+        'model_state':  backbone_state,
+        'config_hash':  config_hash,
+        'source':       os.path.basename(done_path),
+    }, output_path)
+
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f'  ✅ Backbone extracted: {output_path} ({size_mb:.1f} MB)')
+    print(f'     Source : {os.path.basename(done_path)}')
+    print(f'     Hash   : {config_hash}')
+    print(f'     Keys   : {len(backbone_state)} backbone layers')
+    return output_path
+
+
 # ── Evaluation summary ────────────────────────────────────────────────────────
 
 def print_eval_summary(

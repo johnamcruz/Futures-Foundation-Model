@@ -34,6 +34,7 @@ from .losses import FocalLoss
 from .model import HybridStrategyModel
 from .trainer import (
     export_onnx,
+    extract_backbone,
     print_eval_summary,
     print_rr_calibration,
     run_labeling,
@@ -53,6 +54,7 @@ __all__ = [
     'run_risk_head_calibration',
     'print_rr_calibration',
     'export_onnx',
+    'extract_backbone',
     'print_eval_summary',
     'validate_setup',
 ]
