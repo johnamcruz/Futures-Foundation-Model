@@ -19,6 +19,7 @@ from futures_foundation.finetune.trainer import (
     _make_balanced_loader, _train_one_epoch, _evaluate, _concat_with_meta,
     _config_hash, _load_fold_data, _validate_labeler_output,
     _apply_warm_start, _make_optimizer, _print_test_threshold_table,
+    _print_confidence_calibration,
 )
 
 
@@ -2623,3 +2624,174 @@ def test_full_warm_start_skips_shape_mismatched_keys():
     # Mismatched strategy_projection.0.weight must NOT have been overwritten
     assert new_sd['strategy_projection.0.weight'].shape == init_strat_w.shape, (
         'strategy_projection.0.weight shape must remain unchanged after partial load')
+
+
+# =============================================================================
+# _print_test_threshold_table — AvgMaxRR column
+# =============================================================================
+
+def test_threshold_table_includes_avg_rr(capsys):
+    """AvgMaxRR column must appear in threshold table output when all_max_rr provided."""
+    n = 500
+    rng = np.random.default_rng(7)
+    labels = np.zeros(n, dtype=int)
+    preds  = np.zeros(n, dtype=int)
+    confs  = np.full(n, 0.40)
+    # 20 TPs at 0.85 confidence with max_rr=3.0
+    tp_idx = rng.choice(n, 20, replace=False)
+    labels[tp_idx] = 1
+    preds[tp_idx]  = 1
+    confs[tp_idx]  = 0.85
+    max_rr = np.zeros(n)
+    max_rr[tp_idx] = 3.0
+
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+    metrics = {
+        'loss': 0.1, 'precision': 1.0, 'recall': 1.0, 'f1': 1.0,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'all_conf': confs.tolist(), 'all_labels': labels.tolist(),
+        'all_preds': preds.tolist(), 'all_max_rr': max_rr.tolist(),
+    }
+    _print_test_threshold_table(metrics, 'F1')
+    out = capsys.readouterr().out
+
+    assert 'AvgRR' in out, 'AvgRR column header must appear'
+    rows_80 = [l for l in out.splitlines() if '0.80' in l and 'Thresh' not in l]
+    assert rows_80, 'No 0.80 threshold row printed'
+    assert '3.00R' in rows_80[0], (
+        f'Expected 3.00R avg max RR at 0.80 threshold, got: {rows_80[0]}')
+
+
+def test_threshold_table_avg_rr_dash_when_no_max_rr(capsys):
+    """AvgRR column shows dash when all_max_rr is absent from metrics."""
+    metrics = _make_fake_test_metrics(n=200)
+    metrics_no_rr = {k: v for k, v in metrics.items() if k != 'all_max_rr'}
+    _print_test_threshold_table(metrics_no_rr, 'F1')
+    out = capsys.readouterr().out
+    assert 'AvgRR' in out
+    assert '—' in out
+
+
+# =============================================================================
+# _print_confidence_calibration
+# =============================================================================
+
+def _make_calibration_metrics(win_rates_by_band, n_per_band=50, seed=0):
+    """Build test_metrics where predicted positives have specified win rates per band.
+
+    win_rates_by_band: list of (lo, mid_conf, win_rate) — one entry per band.
+    """
+    rng = np.random.default_rng(seed)
+    all_conf = []; all_labels = []; all_preds = []
+
+    for lo, mid_conf, wr in win_rates_by_band:
+        n_wins   = int(n_per_band * wr)
+        n_losses = n_per_band - n_wins
+        # wins: label=1, pred=1
+        all_conf.extend([mid_conf] * n_wins)
+        all_labels.extend([1] * n_wins)
+        all_preds.extend([1] * n_wins)
+        # losses: label=0, pred=1
+        all_conf.extend([mid_conf] * n_losses)
+        all_labels.extend([0] * n_losses)
+        all_preds.extend([1] * n_losses)
+
+    n = len(all_labels)
+    tp = sum(1 for l, p in zip(all_labels, all_preds) if l == 1 and p == 1)
+    fp = sum(1 for l, p in zip(all_labels, all_preds) if l == 0 and p == 1)
+    fn = 0
+    return {
+        'loss': 0.1, 'precision': 0.5, 'recall': 0.5, 'f1': 0.5,
+        'tp': tp, 'fp': fp, 'fn': fn,
+        'all_conf': all_conf, 'all_labels': all_labels,
+        'all_preds': all_preds, 'all_max_rr': [1.0] * n,
+    }
+
+
+def test_confidence_calibration_monotonic_flagged(capsys):
+    """Monotonically rising win rates must print '✅ monotonic'."""
+    metrics = _make_calibration_metrics([
+        (0.50, 0.55, 0.10),
+        (0.60, 0.65, 0.20),
+        (0.70, 0.75, 0.35),
+        (0.80, 0.85, 0.55),
+        (0.90, 0.95, 0.75),
+    ])
+    _print_confidence_calibration(metrics)
+    out = capsys.readouterr().out
+    assert '✅ monotonic' in out, f'Expected monotonic flag, got:\n{out}'
+    assert 'Confidence calibration' in out
+
+
+def test_confidence_calibration_non_monotonic_flagged(capsys):
+    """Win rate dropping between bands must print non-monotonic warning."""
+    metrics = _make_calibration_metrics([
+        (0.50, 0.55, 0.10),
+        (0.60, 0.65, 0.50),   # high
+        (0.70, 0.75, 0.15),   # drops sharply — non-monotonic
+        (0.80, 0.85, 0.55),
+    ])
+    _print_confidence_calibration(metrics)
+    out = capsys.readouterr().out
+    assert 'non-monotonic' in out, f'Expected non-monotonic warning, got:\n{out}'
+
+
+def test_confidence_calibration_filters_predicted_positives(capsys):
+    """Only predicted positives (pred > 0) must count — noise predictions excluded."""
+    n = 200
+    rng = np.random.default_rng(5)
+    # Half the bars are predicted noise (pred=0) with high conf — must be ignored
+    labels = np.zeros(n, dtype=int)
+    preds  = np.zeros(n, dtype=int)
+    confs  = np.full(n, 0.85)
+
+    # 20 true positives predicted as signal
+    tp_idx = rng.choice(n, 20, replace=False)
+    labels[tp_idx] = 1
+    preds[tp_idx]  = 1
+
+    # 80 noise bars predicted as signal (FP) — win rate ~20%
+    fp_idx = rng.choice([i for i in range(n) if i not in tp_idx], 80, replace=False)
+    preds[fp_idx] = 1
+
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    fp_c = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+    metrics = {
+        'loss': 0.1, 'precision': 0.5, 'recall': 0.5, 'f1': 0.5,
+        'tp': tp, 'fp': fp_c, 'fn': fn,
+        'all_conf': confs.tolist(), 'all_labels': labels.tolist(),
+        'all_preds': preds.tolist(), 'all_max_rr': [1.0] * n,
+    }
+    _print_confidence_calibration(metrics)
+    out = capsys.readouterr().out
+
+    # Win rate at 0.8-0.9 band: 20 wins / (20+80) = 20%
+    # If noise bars (pred=0) were wrongly included, win rate would be lower
+    lines = [l for l in out.splitlines() if '0.8' in l and '–' in l]
+    assert lines, 'Expected 0.8–0.9 band row'
+    assert '20.0%' in lines[0], (
+        f'Win rate must reflect predicted positives only (20/100=20%), got: {lines[0]}')
+
+
+def test_confidence_calibration_none_is_noop(capsys):
+    """None test_metrics must produce no output."""
+    _print_confidence_calibration(None)
+    assert capsys.readouterr().out == ''
+
+
+def test_confidence_calibration_deploy_marker(capsys):
+    """Bands at 0.80+ must include the ◄ deploy marker."""
+    metrics = _make_calibration_metrics([
+        (0.70, 0.75, 0.20),
+        (0.80, 0.85, 0.55),
+        (0.90, 0.95, 0.75),
+    ])
+    _print_confidence_calibration(metrics)
+    out = capsys.readouterr().out
+    deploy_lines = [l for l in out.splitlines() if '◄' in l]
+    assert len(deploy_lines) >= 1, 'Deploy marker ◄ must appear for 0.80+ bands'
+    assert all('0.8' in l or '0.9' in l for l in deploy_lines), (
+        'Deploy marker must only appear on 0.80+ bands')
