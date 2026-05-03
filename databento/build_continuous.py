@@ -54,15 +54,18 @@ def ticker_from_path(path: Path) -> str:
     return TICKER_REMAP.get(raw, raw)
 
 
-def root_from_symbol(symbol: str) -> str:
-    """Extract root ticker from a futures symbol, e.g. 'RTYM1' → 'RTY', 'YMM1' → 'YM'."""
+def root_from_symbol(symbol: str) -> str | None:
+    """Extract root ticker from a futures symbol, e.g. 'RTYM1' → 'RTY', 'YMM1' → 'YM'.
+    Returns None for OTC/strategy instruments like 'UD:ZB: TL ...'."""
+    if ':' in symbol:  # OTC/inter-commodity spread instruments — not outright futures
+        return None
     # Strip trailing month-code (single letter) + year digit(s)
     match = re.match(r'^([A-Z]+)(?=[FGHJKMNQUVXZ]\d)', symbol)
     root = match.group(1) if match else symbol
     return TICKER_REMAP.get(root, root)
 
 
-def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
     """Drop spreads, bad prices, deduplicate, return indexed 1-min DataFrame."""
     spread_mask = df['symbol'].str.contains('-', na=False)
     if spread_mask.sum():
@@ -73,6 +76,10 @@ def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if bad_price.sum():
         print(f'    Dropped {bad_price.sum():,} non-positive price rows')
     df = df[~bad_price].copy()
+
+    if df.empty:
+        print(f'    No valid bars remaining — skipping')
+        return None
 
     before = len(df)
     df = df.sort_values('volume', ascending=False)
@@ -129,7 +136,8 @@ def load_dbn_zst(path: Path) -> dict[str, pd.DataFrame]:
         sub = df[df['_root'] == root].copy()
         print(f'  Processing {root} ({len(sub):,} raw rows) ...')
         clean = _clean_ohlcv(sub, root)
-        result[root] = clean
+        if clean is not None:
+            result[root] = clean
 
     return result
 
