@@ -103,6 +103,20 @@ extract_backbone(
 # Use backbone_strategy_run2.pt as backbone_path in the next run
 ```
 
+**Iterative fine-tuning (multi-pass)** — run successive refinement passes by setting `continue_from` to the prior run's final `_done.pt`. F1 of the new run warm-starts (full transfer) from that checkpoint, carrying over both backbone and strategy heads. F2-F5 then continue fold-to-fold using `warm_start_mode` as configured. Each pass bypasses cold-start waste and spends every epoch on refinement:
+
+```python
+training_cfg = TrainingConfig(
+    warm_start_mode='full',
+    continue_from='runs/v15/F5_68cdfded_done.pt',  # prior run's final fold
+    lr=2e-5,       # lower LR for refinement pass
+    epochs=60,
+)
+fold_results = run_walk_forward(..., training_cfg=training_cfg)
+```
+
+`continue_from` is excluded from the config hash so changing the path does not bust fold-resume cache.
+
 **Phase 2: risk head calibration** (separate script, run after Phase 1 completes)
 
 ```python
@@ -135,6 +149,7 @@ rr_done_paths = run_risk_head_calibration(
 | `print_rr_calibration()` | Phase 2 calibration table: predicted R:R vs actual max_rr at each threshold |
 | `export_onnx()` | Production ONNX export of the final fold model |
 | `extract_backbone()` | Extract backbone weights from a completed fold for use as the starting point of the next training run |
+| `continue_from` (TrainingConfig) | Path to a prior run's `_done.pt` — F1 warm-starts (full) from that checkpoint for iterative multi-pass refinement |
 
 ### Model architecture
 
@@ -273,7 +288,7 @@ embedding = backbone(features, causal=False)
 
 ### Supported Instruments
 
-Currently pretrained on 6 instruments (~2.3M bars, Oct 2020 – Apr 2026):
+9 instruments registered in the library (v8 backbone pretraining adds ZB/ZN for rate regime coverage):
 
 | Instrument | Symbol | Description |
 |-----------|--------|-------------|
@@ -283,8 +298,11 @@ Currently pretrained on 6 instruments (~2.3M bars, Oct 2020 – Apr 2026):
 | **YM** | E-mini Dow | US blue chip index |
 | **GC** | Gold Futures | Precious metals |
 | **SI** | Silver Futures | Precious metals |
+| **CL** | Crude Oil Futures | Energy |
+| **ZB** | 30-Year Treasury Bond | Interest rates |
+| **ZN** | 10-Year Treasury Note | Interest rates |
 
-Extensible to: CL (Crude Oil), NKD (Nikkei), and more.
+ZB and ZN add rate/macro regime context genuinely uncorrelated from equities, metals, and energy — the backbone learns how rate market structure interacts with equity volatility regimes.
 
 ### Input Format
 
@@ -391,7 +409,7 @@ Futures-Foundation-Model/
 │       ├── dataset.py          # HybridStrategyDataset
 │       ├── losses.py           # FocalLoss
 │       └── trainer.py          # run_labeling, run_walk_forward, print_eval_summary
-├── tests/                      # Unit tests (370 total)
+├── tests/                      # Unit tests (385+ total)
 │   ├── test_model.py           # Backbone + heads
 │   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage)
 │   ├── test_features_crt.py    # CRT sweep features
@@ -411,6 +429,7 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
+| **v0.6** | 9-instrument library support (added CL, ZB, ZN); `continue_from` in `TrainingConfig` for iterative multi-pass fine-tuning (F1 warm-starts full from prior run's `_done.pt`, F2-F5 use `warm_start_mode`); `continue_from` excluded from config hash to preserve fold-resume cache |
 | **v0.5** | Tiered checkpoint selection (`_p80s` stable N≥50 > `_p80` peak N≥15 > `_f1` > `_loss`); selective warm start (backbone transfers fold-to-fold, signal head cold-starts); layerwise LR (backbone at lower LR to preserve pretrained knowledge); `epoch_callback` full metrics dict; `extract_backbone()` utility for backbone reuse across runs; stale checkpoint guard on resume; `verbose` param |
 | **v0.4** | Backbone v2 (68 features, 6 instruments, 2.3M bars); structure label redesigned to predict forward 1H structure; `HybridStrategyModel` context heads — 4 frozen pretrained heads expose 15-dim regime/vol/structure/range context at fine-tuning; `pretrained_path` API in `run_walk_forward`; CISD+OTE v9 |
 | **v0.3** | `futures_foundation.finetune` framework — plug-and-play walk-forward fine-tuning; CISD+OTE migrated as first concrete strategy |
@@ -462,9 +481,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **`extract_backbone()` utility** — pull backbone weights from any completed fold for warm re-runs and cross-strategy transfer
 - [x] **`epoch_callback` API** — full per-epoch metrics dict for custom logging, early-stop hooks, or external monitoring
 - [x] **Stale checkpoint guard** — rejects low-N checkpoints saved by older code versions on resume
+- [x] **CL (Crude Oil) instrument support** — energy/macro regime context
+- [x] **ZB/ZN (Treasury Bond/Note) instrument support** — rate regime context for v8 backbone
+- [x] **`continue_from` in `TrainingConfig`** — iterative multi-pass fine-tuning; full checkpoint transfer from prior run into F1
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support
-- [ ] Additional instruments (CL, NKD)
+- [ ] v8 backbone pretraining (9 instruments: ES, NQ, RTY, YM, GC, SI, CL, ZB, ZN)
 
 ---
 
