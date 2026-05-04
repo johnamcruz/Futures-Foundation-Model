@@ -117,37 +117,47 @@ def generate_volatility_labels(features, horizon=10):
     return labels
 
 
-def generate_structure_labels(features, horizon=48):
+def generate_structure_labels(features, horizon=20, lookback=12):
     """
-    Predict the 1H market structure state N bars forward.
+    Predict whether price establishes higher-high + higher-low (bullish) or
+    lower-high + lower-low (bearish) structure over the next `horizon` bars,
+    relative to the most recent `lookback` bars.
 
-    Uses htf_1h_structure computed in derive_features: majority close direction
-    of the last 3 completed 1H bars (+1=bullish, -1=bearish, 0=choppy/mixed).
+    Labels:
+        0 = bullish: future max high > ref max high AND future min low > ref min low
+        1 = bearish: future max high < ref max high AND future min low < ref min low
+        SENTINEL: ambiguous (only one leg extends) or forward data unavailable
 
-    horizon must be >= 36 (3 × 12 bars/hour) so that ALL 3 contributing 1H bars
-    at T+horizon are bars that completed AFTER T. horizon=20 caused label leakage:
-    2 of the 3 contributing bars were identical to the current htf_1h_structure
-    feature, making the task trivially easy (95%+ accuracy, no useful gradient).
-    horizon=48 (4 hours) ensures 4 complete new 1H bars have passed — no overlap
-    with the model's visible context at T.
+    lookback=12 bars = 1 hour of 5min bars (reference window visible at T)
+    horizon=20 bars = ~1.7 hours forward (fully outside model context at T)
 
-      0 = bullish: majority of 3 completed 1H bars at T+horizon closed higher
-      1 = bearish: majority of 3 completed 1H bars at T+horizon closed lower
-      SENTINEL: mixed/choppy (0) or forward data unavailable — masked in training
+    No autocorrelation leak: the old label predicted htf_1h_structure at T+48,
+    which the model could solve by copying the same feature visible in its context
+    (1H structure is slow-changing → high autocorrelation). This label requires
+    the model to predict raw price action it cannot see.
     """
-    raw = features["_1h_structure"]  # Int64: +1, -1, 0, or pd.NA
+    h = features["_high"]
+    l = features["_low"]
 
-    fwd = raw.shift(-horizon)
+    ref_high = h.rolling(lookback).max()
+    ref_low  = l.rolling(lookback).min()
+
+    # Forward window: max/min of bars T+1 through T+horizon (no current bar)
+    # Reverse → rolling → reverse → shift(-1) gives next-horizon-bar window
+    fwd_high = h.iloc[::-1].rolling(horizon).max().iloc[::-1].shift(-1)
+    fwd_low  = l.iloc[::-1].rolling(horizon).min().iloc[::-1].shift(-1)
 
     labels = pd.Series(LABEL_CONFIDENCE_SENTINEL, index=features.index, dtype="Int64")
+    valid   = ref_high.notna() & ref_low.notna() & fwd_high.notna() & fwd_low.notna()
 
-    valid = fwd.notna()
-    labels[valid & (fwd == 1)]  = 0   # bullish
-    labels[valid & (fwd == -1)] = 1   # bearish
-    # fwd == 0 (choppy) stays at SENTINEL — ambiguous, skip in training
+    bullish = (fwd_high > ref_high) & (fwd_low > ref_low) & valid
+    bearish = (fwd_high < ref_high) & (fwd_low < ref_low) & valid
+
+    labels[bullish] = 0
+    labels[bearish] = 1
+    # Mixed (one leg extends, other contracts) stays SENTINEL
 
     labels[~valid] = pd.NA
-
     return labels
 
 

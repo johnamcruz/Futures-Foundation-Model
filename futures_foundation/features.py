@@ -304,6 +304,8 @@ def derive_features(
     features["_instrument"] = instrument
     features["_instrument_id"] = INSTRUMENT_MAP.get(instrument, 0)
     features["_close"] = df["close"]
+    features["_high"] = df["high"]
+    features["_low"] = df["low"]
     features["_volume"] = df["volume"]
 
     return features

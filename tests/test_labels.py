@@ -21,25 +21,27 @@ RANGE_LABELS = _mod.RANGE_LABELS
 LABEL_CONFIDENCE_SENTINEL = _mod.LABEL_CONFIDENCE_SENTINEL
 
 
-def make_features(close_array, struct_1h=None):
-    df = pd.DataFrame({"_close": np.asarray(close_array, dtype=float)})
-    n = len(df)
-    # _1h_structure is always required by generate_structure_labels.
-    # Default to 0 (choppy/mixed) so generate_all_labels never raises KeyError.
-    if struct_1h is not None:
-        val = struct_1h if not np.isscalar(struct_1h) else [struct_1h] * n
-    else:
-        val = [0] * n
+def make_features(close_array, high_array=None, low_array=None, struct_1h=None):
+    close = np.asarray(close_array, dtype=float)
+    n = len(close)
+    df = pd.DataFrame({"_close": close})
+    df["_high"] = np.asarray(high_array, dtype=float) if high_array is not None else close + 0.5
+    df["_low"]  = np.asarray(low_array,  dtype=float) if low_array  is not None else close - 0.5
+    # _1h_structure retained for regime/vol test helpers that set struct_1h
+    val = struct_1h if struct_1h is not None else [0] * n
+    val = val if not np.isscalar(val) else [val] * n
     df["_1h_structure"] = pd.array(val, dtype="Int64")
     return df
 
 
 def make_trend(n=400, start=100.0, end=400.0):
-    return make_features(np.linspace(start, end, n), struct_1h=1)
+    close = np.linspace(start, end, n)
+    return make_features(close, high_array=close + 0.5, low_array=close - 0.5, struct_1h=1)
 
 
 def make_downtrend(n=400, start=400.0, end=100.0):
-    return make_features(np.linspace(start, end, n), struct_1h=-1)
+    close = np.linspace(start, end, n)
+    return make_features(close, high_array=close + 0.5, low_array=close - 0.5, struct_1h=-1)
 
 
 # =============================================================================
@@ -194,112 +196,139 @@ def test_volatility_output_length():
 # =============================================================================
 
 def test_structure_dtype_and_range():
-    n = 400
-    vals = [1] * 100 + [-1] * 100 + [0] * 100 + [1] * 100
-    features = make_features(np.linspace(100, 400, n), struct_1h=vals)
+    """Output is Int64 and only contains valid values (-100, 0, 1)."""
+    close = np.linspace(100, 400, 400)
+    features = make_features(close)
     labels = generate_structure_labels(features)
     valid = labels.dropna()
     assert str(valid.dtype) == "Int64"
     assert set(valid.unique()).issubset({LABEL_CONFIDENCE_SENTINEL, 0, 1})
 
 
-def test_structure_trailing_nans():
-    features = make_features(np.linspace(100, 400, 300), struct_1h=1)
-    labels = generate_structure_labels(features, horizon=48)
-    assert labels.iloc[-48:].isna().all()
-
-
-def test_structure_bullish_when_1h_bullish():
-    """When _1h_structure is +1 throughout, all valid labels are bullish (0)."""
-    features = make_features(np.linspace(100, 400, 200), struct_1h=1)
-    labels = generate_structure_labels(features, horizon=48)
-    valid = labels.dropna()
-    labeled = valid[valid != LABEL_CONFIDENCE_SENTINEL]
-    assert len(labeled) > 0
-    assert (labeled == 0).all(), \
-        "All non-sentinel labels should be bullish (0) when 1H structure is +1"
-
-
-def test_structure_bearish_when_1h_bearish():
-    """When _1h_structure is -1 throughout, all valid labels are bearish (1)."""
-    features = make_features(np.linspace(400, 100, 200), struct_1h=-1)
-    labels = generate_structure_labels(features, horizon=48)
-    valid = labels.dropna()
-    labeled = valid[valid != LABEL_CONFIDENCE_SENTINEL]
-    assert len(labeled) > 0
-    assert (labeled == 1).all(), \
-        "All non-sentinel labels should be bearish (1) when 1H structure is -1"
-
-
-def test_structure_sentinel_when_choppy():
-    """When _1h_structure is 0 (choppy), all valid labels are SENTINEL."""
-    features = make_features(np.linspace(100, 200, 200), struct_1h=0)
-    labels = generate_structure_labels(features, horizon=48)
-    non_nan = labels.dropna()
-    assert (non_nan == LABEL_CONFIDENCE_SENTINEL).all(), \
-        "All valid labels should be SENTINEL (-100) when 1H structure is 0 (choppy)"
-
-
-def test_structure_confident_labels_appear():
-    """Mixed +1/-1 1H structure produces both bullish and bearish labels."""
-    n = 400
-    vals = [1] * 150 + [-1] * 100 + [1] * 150
-    features = make_features(np.linspace(100, 400, n), struct_1h=vals)
-    labels = generate_structure_labels(features, horizon=48)
-    valid = labels.dropna()
-    confident = valid[valid != LABEL_CONFIDENCE_SENTINEL]
-    assert {0, 1}.issubset(set(confident.unique())), \
-        f"Expected both bullish (0) and bearish (1), got {sorted(confident.unique())}"
-
-
 def test_structure_output_length():
-    features = make_features(np.linspace(100, 400, 250), struct_1h=1)
+    """Output length always matches input length."""
+    features = make_features(np.linspace(100, 400, 250))
     labels = generate_structure_labels(features)
     assert len(labels) == 250
 
 
-def test_structure_sentinel_fires_when_choppy_values_present():
-    """Mixed 1H structure including 0 values produces SENTINEL for those bars."""
-    np.random.seed(42)
-    n = 600
-    vals = ([1, -1, 0] * (n // 3 + 1))[:n]
-    close = 100 + np.cumsum(np.random.randn(n) * 2)
-    features = make_features(close, struct_1h=vals)
-    labels = generate_structure_labels(features)
-    non_nan = labels.dropna()
-    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
-    assert sentinel_frac > 0.10, (
-        f"Expected >10% SENTINEL when 1H structure includes 0 (choppy) bars, "
-        f"got {sentinel_frac:.1%}."
-    )
+def test_structure_trailing_nans():
+    """Last `horizon` bars must be NaN — no forward data available."""
+    features = make_features(np.linspace(100, 400, 300))
+    horizon = 20
+    labels = generate_structure_labels(features, horizon=horizon)
+    assert labels.iloc[-horizon:].isna().all(), \
+        f"Last {horizon} bars must be NaN (no forward data)"
 
 
-def test_structure_sentinel_low_in_strong_downtrend():
-    """All-bearish 1H structure → mostly bearish labels, low SENTINEL."""
-    features = make_features(np.linspace(800, 100, 400), struct_1h=-1)
-    labels = generate_structure_labels(features)
+def test_structure_bullish_in_uptrend():
+    """Strict monotone uptrend → every valid labeled bar is bullish (0)."""
+    n = 200
+    close = np.linspace(100.0, 400.0, n)
+    features = make_features(close, high_array=close + 1.0, low_array=close - 1.0)
+    labels = generate_structure_labels(features, horizon=20, lookback=12)
     non_nan = labels.dropna()
-    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
-    bearish_frac = (non_nan == 1).sum() / len(non_nan)
-    assert sentinel_frac < 0.30, \
-        f"Expected <30% sentinel with uniform bearish 1H structure, got {sentinel_frac:.1%}."
-    assert bearish_frac > 0.50, \
-        f"Expected >50% bearish labels with bearish 1H structure, got {bearish_frac:.1%}."
+    labeled = non_nan[non_nan != LABEL_CONFIDENCE_SENTINEL]
+    assert len(labeled) > 0, "Expected some bullish labels in uptrend"
+    assert (labeled == 0).all(), \
+        f"All labeled bars should be bullish (0) in a strict uptrend, got: {labeled.value_counts().to_dict()}"
+
+
+def test_structure_bearish_in_downtrend():
+    """Strict monotone downtrend → every valid labeled bar is bearish (1)."""
+    n = 200
+    close = np.linspace(400.0, 100.0, n)
+    features = make_features(close, high_array=close + 1.0, low_array=close - 1.0)
+    labels = generate_structure_labels(features, horizon=20, lookback=12)
+    non_nan = labels.dropna()
+    labeled = non_nan[non_nan != LABEL_CONFIDENCE_SENTINEL]
+    assert len(labeled) > 0, "Expected some bearish labels in downtrend"
+    assert (labeled == 1).all(), \
+        f"All labeled bars should be bearish (1) in a strict downtrend, got: {labeled.value_counts().to_dict()}"
+
+
+def test_structure_sentinel_in_flat_market():
+    """Perfectly flat price → no new HH or LL → all valid bars are SENTINEL."""
+    n = 200
+    close = np.full(n, 100.0)
+    features = make_features(close, high_array=close + 1.0, low_array=close - 1.0)
+    labels = generate_structure_labels(features, horizon=20, lookback=12)
+    non_nan = labels.dropna()
+    assert (non_nan == LABEL_CONFIDENCE_SENTINEL).all(), \
+        "Flat price produces no new swing → all valid bars must be SENTINEL"
+
+
+def test_structure_both_labels_appear_in_mixed_market():
+    """Price trends up then down → both bullish and bearish labels appear."""
+    n = 400
+    close = np.concatenate([np.linspace(100, 300, 200), np.linspace(300, 100, 200)])
+    features = make_features(close, high_array=close + 1.0, low_array=close - 1.0)
+    labels = generate_structure_labels(features, horizon=20, lookback=12)
+    non_nan = labels.dropna()
+    confident = non_nan[non_nan != LABEL_CONFIDENCE_SENTINEL]
+    assert {0, 1}.issubset(set(confident.unique())), \
+        f"Expected both labels in mixed market, got: {sorted(confident.unique())}"
 
 
 def test_structure_no_class_2_produced():
-    """Class 2 (old 'mixed' class) must never appear — ambiguous bars get SENTINEL."""
+    """Class 2 must never appear — ambiguous bars get SENTINEL."""
     np.random.seed(42)
-    n = 500
-    vals = ([1] * 150 + [-1] * 150 + [0] * 200)
-    close = 100 + np.cumsum(np.random.randn(n) * 2)
-    features = make_features(close, struct_1h=vals)
+    close = 100 + np.cumsum(np.random.randn(500) * 2)
+    features = make_features(close)
     labels = generate_structure_labels(features)
     non_nan = labels.dropna()
-    assert 2 not in set(non_nan.unique()), (
-        "Structure label class 2 must not appear. "
-        "Ambiguous/choppy bars should be LABEL_CONFIDENCE_SENTINEL, not class 2."
+    assert 2 not in set(non_nan.unique()), \
+        "Structure label class 2 must not appear; ambiguous bars get SENTINEL"
+
+
+def test_structure_lookback_affects_labels():
+    """Different lookback values on the same data produce different label counts.
+
+    A slow uptrend followed by a sharp reversal: with a short lookback the
+    ref window adapts quickly so the reversal zone shows more SENTINEL;
+    with a long lookback the old highs are still in scope so the reversal
+    produces more bearish labels.  We only assert the counts differ — the
+    exact direction is data-dependent.
+    """
+    np.random.seed(7)
+    n = 400
+    # Slow uptrend then sharp reversal
+    close = np.concatenate([np.linspace(100, 300, 250), np.linspace(300, 50, 150)])
+    close += np.random.randn(n) * 0.1
+    high = close + 1.0
+    low  = close - 1.0
+    features = make_features(close, high_array=high, low_array=low)
+
+    labels_short = generate_structure_labels(features, horizon=20, lookback=6)
+    labels_long  = generate_structure_labels(features, horizon=20, lookback=48)
+
+    def confident(labels):
+        non_nan = labels.dropna()
+        return non_nan[non_nan != LABEL_CONFIDENCE_SENTINEL]
+
+    conf_short = confident(labels_short)
+    conf_long  = confident(labels_long)
+
+    # With different lookbacks the distributions must differ
+    short_bearish = (conf_short == 1).sum()
+    long_bearish  = (conf_long  == 1).sum()
+    assert short_bearish != long_bearish, (
+        "Different lookback windows should yield different bearish counts on the same data"
     )
+
+
+def test_structure_sentinel_frac_in_uptrend_is_low():
+    """Strong uptrend should produce mostly bullish labels, low SENTINEL fraction."""
+    close = np.linspace(100, 800, 400)
+    features = make_features(close, high_array=close + 1.0, low_array=close - 1.0)
+    labels = generate_structure_labels(features)
+    non_nan = labels.dropna()
+    sentinel_frac = (non_nan == LABEL_CONFIDENCE_SENTINEL).sum() / len(non_nan)
+    bullish_frac  = (non_nan == 0).sum() / len(non_nan)
+    assert sentinel_frac < 0.30, \
+        f"Expected <30% SENTINEL in strong uptrend, got {sentinel_frac:.1%}"
+    assert bullish_frac > 0.50, \
+        f"Expected >50% bullish labels in strong uptrend, got {bullish_frac:.1%}"
 
 
 # =============================================================================
