@@ -545,7 +545,7 @@ def _make_optimizer(
 # ── Fold helpers ─────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
-    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min'}
+    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start'}
     d = {k: v for k, v in training_cfg.__dict__.items() if k not in _hash_exclude}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 
@@ -877,7 +877,12 @@ def _train_fold(
                   f'(epoch {best_p80s_epoch+1}, P@80={best_prec_at_80_stable:.3f}, N={saved_n})')
 
     # ── Training loop ──
+    _gamma_schedule = training_cfg.focal_gamma_end is not None
     for epoch in range(start_epoch, training_cfg.epochs):
+        if _gamma_schedule:
+            _decay_len    = max(1, training_cfg.epochs - training_cfg.focal_gamma_decay_start - 1)
+            _progress     = min(1.0, max(0.0, (epoch - training_cfg.focal_gamma_decay_start) / _decay_len))
+            loss_fn.gamma = training_cfg.focal_gamma + (training_cfg.focal_gamma_end - training_cfg.focal_gamma) * _progress
         t0 = time.time()
         tr = _train_one_epoch(model, train_loader, optimizer, loss_fn, device)
         va = _evaluate(model, val_loader, loss_fn, device)
@@ -967,11 +972,15 @@ def _train_fold(
         p80_str = f'P@80:{va["prec_at_80"]:.3f}({va["n_at_80"]})'
         if best_p80s_state is not None and p80s_patience_ctr > 0:
             p80_str += f' p80p:{p80s_patience_ctr}/{training_cfg.p80_patience}'
+        gamma_str = ''
+        if _gamma_schedule:
+            g = loss_fn.gamma
+            gamma_str = f' γ:{"BCE" if g < 0.01 else f"{g:.2f}"}'
         if verbose:
             print(f'  {fold_name} E{epoch+1:2d}/{training_cfg.epochs} ({elapsed:.0f}s) | '
                   f'TrL:{tr["loss"]:.4f} VL:{va["loss"]:.4f} | '
                   f'P:{va["precision"]:.3f} R:{va["recall"]:.3f} F1:{va["f1"]:.3f} | '
-                  f'{p80_str} | {ratio_str}{save_str}')
+                  f'{p80_str} | {ratio_str}{gamma_str}{save_str}')
 
         if epoch_callback is not None:
             epoch_callback({

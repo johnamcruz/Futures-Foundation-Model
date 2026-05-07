@@ -3055,3 +3055,72 @@ def test_n_stable_min_gates_stable_checkpoint():
         va = {'prec_at_80': 0.500, 'n_at_80': n_at_80}
         fires = va['prec_at_80'] > 0.0 and va['n_at_80'] >= cfg.n_stable_min
         assert fires == expect, f'n_stable_min={min_n}, n_at_80={n_at_80}: expected {expect}'
+
+
+# =============================================================================
+# Focal gamma decay schedule
+# =============================================================================
+
+def test_focal_gamma_end_default_is_none():
+    cfg = TrainingConfig()
+    assert cfg.focal_gamma_end is None
+    assert cfg.focal_gamma_decay_start == 0
+
+
+def test_focal_gamma_schedule_excluded_from_config_hash():
+    base = _config_hash(TrainingConfig())
+    with_end   = _config_hash(TrainingConfig(focal_gamma_end=1.0))
+    with_start = _config_hash(TrainingConfig(focal_gamma_decay_start=10))
+    assert base == with_end,   'focal_gamma_end must not affect config hash'
+    assert base == with_start, 'focal_gamma_decay_start must not affect config hash'
+
+
+def _compute_scheduled_gamma(cfg: TrainingConfig, epoch: int) -> float:
+    """Mirror of the trainer loop schedule logic."""
+    if cfg.focal_gamma_end is None:
+        return cfg.focal_gamma
+    decay_len = max(1, cfg.epochs - cfg.focal_gamma_decay_start - 1)
+    progress  = min(1.0, max(0.0, (epoch - cfg.focal_gamma_decay_start) / decay_len))
+    return cfg.focal_gamma + (cfg.focal_gamma_end - cfg.focal_gamma) * progress
+
+
+def test_focal_gamma_schedule_no_schedule_returns_fixed():
+    cfg = TrainingConfig(focal_gamma=2.0, epochs=30)
+    assert _compute_scheduled_gamma(cfg, 0)  == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 15) == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 29) == pytest.approx(2.0)
+
+
+def test_focal_gamma_schedule_linear_decay():
+    cfg = TrainingConfig(focal_gamma=2.0, focal_gamma_end=1.0, epochs=30,
+                         focal_gamma_decay_start=0)
+    assert _compute_scheduled_gamma(cfg, 0)  == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 15) == pytest.approx(1.5, abs=0.1)
+    assert _compute_scheduled_gamma(cfg, 29) == pytest.approx(1.0, abs=0.1)
+
+
+def test_focal_gamma_schedule_delayed_decay():
+    """Decay starts at epoch 15; before that gamma stays at start value."""
+    cfg = TrainingConfig(focal_gamma=2.0, focal_gamma_end=1.0, epochs=30,
+                         focal_gamma_decay_start=15)
+    assert _compute_scheduled_gamma(cfg, 0)  == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 14) == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 29) == pytest.approx(1.0, abs=0.1)
+
+
+def test_focal_gamma_schedule_decay_to_bce():
+    """focal_gamma_end=0.0 decays to BCE equivalent."""
+    cfg = TrainingConfig(focal_gamma=2.0, focal_gamma_end=0.0, epochs=20,
+                         focal_gamma_decay_start=0)
+    assert _compute_scheduled_gamma(cfg, 0)  == pytest.approx(2.0)
+    assert _compute_scheduled_gamma(cfg, 19) == pytest.approx(0.0, abs=0.1)
+
+
+def test_focal_gamma_schedule_never_overshoots():
+    """Gamma is clamped so progress never goes below 0 or above 1."""
+    cfg = TrainingConfig(focal_gamma=2.0, focal_gamma_end=1.0, epochs=10,
+                         focal_gamma_decay_start=0)
+    # epoch before range
+    assert _compute_scheduled_gamma(cfg, -5) == pytest.approx(2.0)
+    # epoch past end
+    assert _compute_scheduled_gamma(cfg, 100) == pytest.approx(1.0)

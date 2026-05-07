@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass
@@ -53,8 +53,18 @@ class TrainingConfig:
     risk_weight: float = 0.1      # risk-head loss coefficient
     miss_penalty: float = 1.0     # class weight for signal class
     false_penalty: float = 1.0    # class weight for noise class
-    focal_gamma: float = 1.0
+    focal_gamma: float = 1.0      # 0.0 = BCE equivalent (focal_weight=(1-pt)^0=1)
     focal_smoothing: float = 0.10
+
+    # ── Focal gamma decay schedule ──
+    # If set, linearly decays focal_gamma → focal_gamma_end over training,
+    # starting at focal_gamma_decay_start epoch. Eliminates the need for a
+    # separate phase2b script: early epochs sharpen calibration (high gamma),
+    # late epochs recover N@0.80 (low gamma).
+    # focal_gamma_end=0.0 decays to BCE equivalent.
+    # Excluded from config hash — schedule changes won't bust in-progress folds.
+    focal_gamma_end: Optional[float] = None
+    focal_gamma_decay_start: int = 0
 
     # ── Early stopping ──
     patience: int = 15            # epochs without val_loss improvement
