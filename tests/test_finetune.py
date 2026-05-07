@@ -1647,6 +1647,7 @@ def _run_cb_epochs(n_epochs, callback, seed=20):
                 'all_conf':   va.get('all_conf', []),
                 'all_preds':  va.get('all_preds', []),
                 'all_labels': va.get('all_labels', []),
+                'gamma':      None,
             })
     return model
 
@@ -2399,6 +2400,7 @@ def test_epoch_callback_dict_has_all_keys():
         'ok_ratio',
         'saved_loss', 'saved_f1', 'saved_p80', 'saved_p80s',
         'all_conf', 'all_preds', 'all_labels',
+        'gamma',
     }
     assert len(received) == 2
     for m in received:
@@ -3124,3 +3126,97 @@ def test_focal_gamma_schedule_never_overshoots():
     assert _compute_scheduled_gamma(cfg, -5) == pytest.approx(2.0)
     # epoch past end
     assert _compute_scheduled_gamma(cfg, 100) == pytest.approx(1.0)
+
+
+def test_p80_patience_frozen_when_n_below_stable_min():
+    """p80_patience counter must not increment when N < n_stable_min — low N makes P@80 unreliable."""
+    n_stable_min = 25
+    best_p80s_state = None
+    best_prec_at_80_stable = 0.0
+    p80s_patience_ctr = 0
+
+    events = [
+        # (prec_at_80, n_at_80)
+        (0.55, 30),   # first stable checkpoint (N≥25)
+        (0.50, 10),   # N < n_stable_min — counter must NOT increment
+        (0.48, 8),    # N < n_stable_min — counter must NOT increment
+        (0.49, 5),    # N < n_stable_min — counter must NOT increment
+        (0.52, 28),   # N≥25, no improvement — counter increments to 1
+    ]
+    for prec, n in events:
+        p80s_better = prec > best_prec_at_80_stable and n >= n_stable_min
+        if p80s_better:
+            best_prec_at_80_stable = prec
+            best_p80s_state = {'dummy': True}
+            p80s_patience_ctr = 0
+        elif best_p80s_state is not None:
+            if n >= n_stable_min:
+                p80s_patience_ctr += 1
+            # else: counter frozen — N too low to be meaningful
+
+    assert p80s_patience_ctr == 1, (
+        f'Counter should be 1 (only the last event qualifies); got {p80s_patience_ctr}. '
+        'Low-N epochs must not advance the counter.'
+    )
+
+
+def test_n_triggered_gamma_acceleration():
+    """After 3 consecutive N-collapse epochs, _decay_start must advance to the current epoch."""
+    n_stable_min = 25
+    focal_gamma_decay_start = 15
+    focal_gamma = 2.0
+    focal_gamma_end = 1.0
+    total_epochs = 30
+
+    _decay_start    = focal_gamma_decay_start
+    _n_collapse_ctr = 0
+    acceleration_epoch = None  # 0-indexed epoch where acceleration fired
+
+    # Simulate epochs 0-9: N collapses from E2 onward (epoch index 1 onward)
+    n_values = [80, 10, 8, 5, 6, 9, 7, 5, 8, 10]
+    for epoch, n_at_80 in enumerate(n_values):
+        # only accelerate before the configured decay_start
+        if epoch < _decay_start:
+            if n_at_80 < n_stable_min:
+                _n_collapse_ctr += 1
+                if _n_collapse_ctr >= 3:
+                    _decay_start    = epoch
+                    acceleration_epoch = epoch
+                    _n_collapse_ctr = 0
+            else:
+                _n_collapse_ctr = 0
+
+    # Acceleration should have fired at epoch index 3 (4th epoch: N=5, 3rd consecutive collapse)
+    assert acceleration_epoch == 3, f'Expected acceleration at epoch 3, got {acceleration_epoch}'
+    assert _decay_start == 3
+
+    # Verify gamma at epoch 4 (first epoch after acceleration) is already decaying
+    decay_len = max(1, total_epochs - _decay_start - 1)
+    progress_e4 = min(1.0, max(0.0, (4 - _decay_start) / decay_len))
+    gamma_e4 = focal_gamma + (focal_gamma_end - focal_gamma) * progress_e4
+    assert gamma_e4 < focal_gamma, 'Gamma at E5 should be below focal_gamma start after acceleration'
+    assert gamma_e4 > focal_gamma_end, 'Gamma at E5 should not yet reach focal_gamma_end'
+
+
+def test_n_triggered_acceleration_does_not_fire_after_decay_already_started():
+    """Acceleration must be a no-op once we are past the (possibly advanced) decay_start."""
+    n_stable_min = 25
+    focal_gamma_decay_start = 5
+
+    _decay_start    = focal_gamma_decay_start
+    _n_collapse_ctr = 0
+
+    # All epochs have N=0, but decay already started at epoch 5
+    for epoch in range(10):
+        if epoch < _decay_start:
+            if 0 < n_stable_min:
+                _n_collapse_ctr += 1
+                if _n_collapse_ctr >= 3:
+                    _decay_start    = epoch
+                    _n_collapse_ctr = 0
+        # epoch >= _decay_start: no acceleration check
+
+    # Acceleration fires at epoch 2 (N=0 < 25 for 3 epochs: 0,1,2)
+    assert _decay_start == 2
+    # After epoch 2, _n_collapse_ctr is reset and no further advancement happens
+    assert _n_collapse_ctr == 0

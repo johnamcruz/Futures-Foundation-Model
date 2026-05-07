@@ -877,11 +877,13 @@ def _train_fold(
                   f'(epoch {best_p80s_epoch+1}, P@80={best_prec_at_80_stable:.3f}, N={saved_n})')
 
     # ── Training loop ──
-    _gamma_schedule = training_cfg.focal_gamma_end is not None
+    _gamma_schedule  = training_cfg.focal_gamma_end is not None
+    _decay_start     = training_cfg.focal_gamma_decay_start  # mutable: N-triggered acceleration can advance this
+    _n_collapse_ctr  = 0                                      # consecutive epochs with N < n_stable_min before decay start
     for epoch in range(start_epoch, training_cfg.epochs):
         if _gamma_schedule:
-            _decay_len    = max(1, training_cfg.epochs - training_cfg.focal_gamma_decay_start - 1)
-            _progress     = min(1.0, max(0.0, (epoch - training_cfg.focal_gamma_decay_start) / _decay_len))
+            _decay_len    = max(1, training_cfg.epochs - _decay_start - 1)
+            _progress     = min(1.0, max(0.0, (epoch - _decay_start) / _decay_len))
             loss_fn.gamma = training_cfg.focal_gamma + (training_cfg.focal_gamma_end - training_cfg.focal_gamma) * _progress
         t0 = time.time()
         tr = _train_one_epoch(model, train_loader, optimizer, loss_fn, device)
@@ -957,7 +959,21 @@ def _train_fold(
             save_str += ' 📈S'
             p80s_patience_ctr = 0
         elif best_p80s_state is not None:
-            p80s_patience_ctr += 1
+            if va['n_at_80'] >= training_cfg.n_stable_min:
+                p80s_patience_ctr += 1
+            # N below stable threshold — counter frozen; low N makes P@80 unreliable
+
+        # ── N-triggered gamma acceleration ──
+        if _gamma_schedule and epoch < _decay_start:
+            if va['n_at_80'] < training_cfg.n_stable_min:
+                _n_collapse_ctr += 1
+                if _n_collapse_ctr >= 3:
+                    _decay_start    = epoch
+                    _n_collapse_ctr = 0
+                    if verbose:
+                        print(f'  ⚡ N={va["n_at_80"]} collapsed 3 epochs — gamma decay accelerated, starts E{epoch + 2}')
+            else:
+                _n_collapse_ctr = 0
 
         if ratio > training_cfg.max_ratio:
             ratio_bad_ctr += 1
@@ -991,6 +1007,7 @@ def _train_fold(
                 'train_loss': tr['loss'],
                 'val_loss':   va['loss'],
                 'precision':  va['precision'],
+                'gamma':      loss_fn.gamma if _gamma_schedule else None,
                 'recall':     va['recall'],
                 'f1':         va['f1'],
                 'prec_at_80': va['prec_at_80'],
