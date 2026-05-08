@@ -39,12 +39,20 @@ _TASK_LOSS_WEIGHT_ATTR = {
 # prepare_data
 # ─────────────────────────────────────────────────────────────────────────────
 
-def prepare_data(raw_dir: str, output_dir: str, force: bool = False) -> Dict:
+def prepare_data(
+    raw_dir: str,
+    output_dir: str,
+    force: bool = False,
+    atr_period: int = 14,
+) -> Dict:
     """Derive 68 features + 4 pretraining labels from raw OHLCV files.
 
     Scans raw_dir for *.csv and *.parquet files. For each instrument, derives
     features and labels and saves them as parquet pairs to output_dir.
     Skips instruments already prepared unless force=True.
+
+    atr_period: ATR lookback period. Default 14 (5min baseline). Use 20 for 3min
+        data to match the same ~60-min lookback (20 × 3min = 60min ≈ 14 × 5min).
 
     Returns a summary dict keyed by instrument name.
     """
@@ -99,7 +107,7 @@ def prepare_data(raw_dir: str, output_dir: str, force: bool = False) -> Dict:
 
         print(f'  Loaded {len(df):,} bars  {df["datetime"].iloc[0]} → {df["datetime"].iloc[-1]}')
 
-        features_df = derive_features(df, instrument=instrument)
+        features_df = derive_features(df, instrument=instrument, atr_period=atr_period)
         labels_df   = generate_all_labels(features_df)
         print_label_distribution(labels_df)
 
@@ -124,6 +132,7 @@ def prepare_data(raw_dir: str, output_dir: str, force: bool = False) -> Dict:
         json.dump({
             'num_features':    len(get_model_feature_columns()),
             'feature_columns': get_model_feature_columns(),
+            'atr_period':      atr_period,
             'instruments':     summary,
         }, f, indent=2)
 

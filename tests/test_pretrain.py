@@ -244,6 +244,28 @@ class TestPrepareData:
         assert cfg['num_features'] == 68
         assert 'feature_columns' in cfg
 
+    def test_atr_period_stored_in_config(self, tmp_path):
+        raw_dir = tmp_path / 'raw'
+        out_dir = tmp_path / 'prepared'
+        _make_raw_csv(raw_dir, n=500)
+
+        prepare_data(str(raw_dir), str(out_dir), atr_period=20)
+
+        with open(out_dir / 'prep_config.json') as f:
+            cfg = json.load(f)
+        assert cfg['atr_period'] == 20
+
+    def test_default_atr_period_is_14(self, tmp_path):
+        raw_dir = tmp_path / 'raw'
+        out_dir = tmp_path / 'prepared'
+        _make_raw_csv(raw_dir, n=500)
+
+        prepare_data(str(raw_dir), str(out_dir))
+
+        with open(out_dir / 'prep_config.json') as f:
+            cfg = json.load(f)
+        assert cfg['atr_period'] == 14
+
     def test_skips_cached_by_default(self, tmp_path):
         raw_dir = tmp_path / 'raw'
         out_dir = tmp_path / 'prepared'
