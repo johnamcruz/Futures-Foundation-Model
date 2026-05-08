@@ -4212,3 +4212,63 @@ def test_health_monitor_val_test_gap_no_false_alarm_from_high_conf_noise():
     assert not any(w.code == 'VAL_TEST_GAP' for w in warnings), (
         'VAL_TEST_GAP fired as false alarm — _compute_p80 must use prec_at_80 field'
     )
+
+
+def test_health_monitor_weight_lock_with_train_start_suppresses_train_start_suggestion():
+    """WEIGHT_LOCK suggestion must NOT mention train_start when fold_config already has it."""
+    monitor = FoldHealthMonitor(weight_lock_threshold=0.99)
+    importance = np.array([0.3, 0.2, 0.25, 0.15, 0.1], dtype=np.float32)
+    m1 = _make_metrics([0.9, 0.6, 0.4], [1, 1, 0], best_epoch=20,
+                       feature_importance=importance)
+    m2 = _make_metrics([0.85, 0.65, 0.35], [1, 1, 0], best_epoch=25,
+                       feature_importance=importance * 1.0001)
+    fold_config = {'name': 'F2', 'train_start': '2023-10-01', 'train_end': '2025-04-01'}
+    monitor.check('F1', m1)
+    warnings = monitor.check('F2', m2, fold_config=fold_config)
+    wl = next(w for w in warnings if w.code == 'WEIGHT_LOCK')
+    assert 'Add train_start' not in wl.suggestion, (
+        'Should not suggest adding train_start when it is already configured'
+    )
+    assert 'strategy_lr_multiplier' in wl.suggestion or 'FREEZE_RATIO' in wl.suggestion
+
+
+def test_health_monitor_p80_decline_with_train_start_suggests_regime_drift():
+    """P80_DECLINE suggestion must say 'regime drift' (not 'Add train_start') when already configured."""
+    monitor = FoldHealthMonitor(p80_decline_window=2)
+
+    def metrics_with_p80(target_p80, seed):
+        rng = np.random.default_rng(seed)
+        n = 300
+        labels = (rng.random(n) < 0.20).astype(int)
+        sig_idx  = np.where(labels == 1)[0]
+        noise_idx = np.where(labels == 0)[0]
+        conf = np.full(n, 0.3, dtype=float)
+        conf[sig_idx] = 0.85
+        if target_p80 < 1.0 and target_p80 > 0:
+            n_fp = min(int(len(sig_idx) * (1 - target_p80) / target_p80), len(noise_idx))
+            conf[noise_idx[:n_fp]] = 0.85
+        return _make_metrics(conf, labels, best_epoch=12)
+
+    fold_config = {'name': 'F3', 'train_start': '2023-10-01', 'train_end': '2025-04-01'}
+    monitor.check('F1', metrics_with_p80(0.70, seed=10))
+    monitor.check('F2', metrics_with_p80(0.55, seed=11))
+    warnings = monitor.check('F3', metrics_with_p80(0.40, seed=12), fold_config=fold_config)
+    pd80 = next(w for w in warnings if w.code == 'P80_DECLINE')
+    assert 'regime drift' in pd80.suggestion, (
+        'P80_DECLINE suggestion must mention regime drift when train_start already set'
+    )
+    assert 'Add train_start' not in pd80.suggestion
+
+
+def test_health_monitor_weight_lock_without_fold_config_still_suggests_train_start():
+    """WEIGHT_LOCK still suggests train_start when fold_config is None (backwards compat)."""
+    monitor = FoldHealthMonitor(weight_lock_threshold=0.99)
+    importance = np.array([0.3, 0.2, 0.25, 0.15, 0.1], dtype=np.float32)
+    m1 = _make_metrics([0.9, 0.6, 0.4], [1, 1, 0], best_epoch=20,
+                       feature_importance=importance)
+    m2 = _make_metrics([0.85, 0.65, 0.35], [1, 1, 0], best_epoch=25,
+                       feature_importance=importance * 1.0001)
+    monitor.check('F1', m1)
+    warnings = monitor.check('F2', m2)  # no fold_config
+    wl = next(w for w in warnings if w.code == 'WEIGHT_LOCK')
+    assert 'train_start' in wl.suggestion

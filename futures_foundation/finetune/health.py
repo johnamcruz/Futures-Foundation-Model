@@ -106,7 +106,12 @@ class FoldHealthMonitor:
         self._prev_n_above: Optional[int]            = None
 
     # ------------------------------------------------------------------
-    def check(self, fold_name: str, metrics: dict) -> List[HealthWarning]:
+    def check(
+        self,
+        fold_name: str,
+        metrics: dict,
+        fold_config: Optional[dict] = None,
+    ) -> List[HealthWarning]:
         """
         Run all health checks for a completed fold.
 
@@ -118,6 +123,9 @@ class FoldHealthMonitor:
             test_metrics dict from _train_fold — must include 'all_conf',
             'all_labels', and optionally 'best_epoch', 'feature_importance',
             'val_p80'.
+        fold_config : dict, optional
+            The fold definition dict (e.g. from the FOLDS list). Used to check
+            whether train_start is already configured before suggesting it.
 
         Returns
         -------
@@ -163,20 +171,31 @@ class FoldHealthMonitor:
             if sim >= self.weight_lock_threshold:
                 best_epoch = metrics.get('best_epoch')
                 early_conv = best_epoch is not None and best_epoch <= 15
+                has_train_start = (
+                    fold_config is not None and fold_config.get('train_start') is not None
+                )
                 if early_conv:
                     suggestion = (
                         f'Model converged early (best_epoch={best_epoch}) before '
                         'strategy weights had pressure to adapt. Options: '
                         '(1) increase LR by 2× for the strategy head; '
-                        '(2) reduce FREEZE_RATIO to allow more backbone layers to update; '
-                        '(3) if train_start is not yet configured, add 18-month sliding window'
+                        '(2) reduce FREEZE_RATIO to allow more backbone layers to update'
                     )
+                    if not has_train_start:
+                        suggestion += '; (3) add 18-month sliding window via train_start'
                 else:
-                    suggestion = (
-                        f'Add train_start to fold {fold_name} and later folds '
-                        '(18-month sliding window): '
-                        'train_start = train_end minus 18 months'
-                    )
+                    if has_train_start:
+                        suggestion = (
+                            f'train_start is already configured — regime drift may be the cause. '
+                            'Options: (1) increase strategy_lr_multiplier; '
+                            '(2) reduce FREEZE_RATIO so more backbone layers update'
+                        )
+                    else:
+                        suggestion = (
+                            f'Add train_start to fold {fold_name} and later folds '
+                            '(18-month sliding window): '
+                            'train_start = train_end minus 18 months'
+                        )
                 w = HealthWarning(
                     fold       = fold_name,
                     code       = 'WEIGHT_LOCK',
@@ -214,6 +233,12 @@ class FoldHealthMonitor:
                         f'{first_val:.1%} → {last_val:.1%})'
                     ),
                     suggestion = (
+                        'train_start is already configured — this is likely regime drift. '
+                        'Options: (1) increase strategy_lr_multiplier to force feature re-weighting; '
+                        '(2) reduce FREEZE_RATIO to allow backbone to adapt more; '
+                        '(3) accept as regime headwind if val/test gap is small'
+                        if fold_config is not None and fold_config.get('train_start') is not None
+                        else
                         'Add train_start to remaining folds '
                         '(18-month sliding window). Example: '
                         'if train_end=2025-04-01, set train_start=2023-10-01'

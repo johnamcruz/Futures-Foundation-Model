@@ -1289,7 +1289,7 @@ def run_walk_forward(
             if fold_callback is not None:
                 fold_callback(fold['name'], test_metrics)
             if health_monitor is not None and test_metrics is not None:
-                health_monitor.check(fold['name'], test_metrics)
+                health_monitor.check(fold['name'], test_metrics, fold_config=fold)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
