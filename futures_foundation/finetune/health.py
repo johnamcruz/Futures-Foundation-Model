@@ -157,28 +157,42 @@ class FoldHealthMonitor:
         # ── 2. Feature importance lock ───────────────────────────────────
         importance = metrics.get('feature_importance')
         if importance is not None and self._prev_importance is not None:
-            sim = _cosine_similarity(importance, self._prev_importance)
+            sim  = _cosine_similarity(importance, self._prev_importance)
+            l2   = float(np.linalg.norm(importance - self._prev_importance))
             prev_fold = self._p80_history[-2][0] if len(self._p80_history) >= 2 else '?'
             if sim >= self.weight_lock_threshold:
+                best_epoch = metrics.get('best_epoch')
+                early_conv = best_epoch is not None and best_epoch <= 15
+                if early_conv:
+                    suggestion = (
+                        f'Model converged early (best_epoch={best_epoch}) before '
+                        'strategy weights had pressure to adapt. Options: '
+                        '(1) increase LR by 2× for the strategy head; '
+                        '(2) reduce FREEZE_RATIO to allow more backbone layers to update; '
+                        '(3) if train_start is not yet configured, add 18-month sliding window'
+                    )
+                else:
+                    suggestion = (
+                        f'Add train_start to fold {fold_name} and later folds '
+                        '(18-month sliding window): '
+                        'train_start = train_end minus 18 months'
+                    )
                 w = HealthWarning(
                     fold       = fold_name,
                     code       = 'WEIGHT_LOCK',
                     severity   = 'warning',
                     message    = (
-                        f'{fold_name}: feature importance cos_sim={sim:.4f} '
-                        f'vs {prev_fold} (≥ {self.weight_lock_threshold}) — '
-                        'weights not adapting fold-to-fold'
+                        f'{fold_name}: feature importance cos_sim={sim:.4f} L2={l2:.4f} '
+                        f'vs {prev_fold} (cos_sim ≥ {self.weight_lock_threshold}) — '
+                        'feature attention pattern not shifting fold-to-fold'
                     ),
-                    suggestion = (
-                        f'Add train_start to fold {fold_name} and later folds '
-                        '(18-month sliding window): '
-                        'train_start = train_end minus 18 months'
-                    ),
+                    suggestion = suggestion,
                 )
                 fold_warnings.append(w)
             else:
-                print(f'  ✅ Feature weights diverged vs {prev_fold}: cos_sim={sim:.4f} '
-                      f'(< {self.weight_lock_threshold} — adapting normally)')
+                print(f'  ✅ Feature weights diverged vs {prev_fold}: '
+                      f'cos_sim={sim:.4f} L2={l2:.4f} '
+                      f'(cos_sim < {self.weight_lock_threshold} — adapting normally)')
         if importance is not None:
             self._prev_importance = importance.copy()
 
@@ -229,7 +243,11 @@ class FoldHealthMonitor:
                 fold_warnings.append(w)
 
         # ── Compute N above 0.80 (shared by N_COLLAPSE and ZERO_SIGNAL) ──
-        n_above = int((conf >= 0.80).sum()) if len(conf) > 0 else 0
+        # Use pre-computed n_at_80 from trainer (applies (conf>=0.80)&(pred>0) mask)
+        # to match the threshold table definition exactly.
+        n_above = int(metrics['n_at_80']) if 'n_at_80' in metrics else (
+            int((conf >= 0.80).sum()) if len(conf) > 0 else 0
+        )
 
         # ── 5. Confidence flat ───────────────────────────────────────────
         if len(conf) > 0 and float(np.std(conf)) < self.conf_flat_threshold:
@@ -342,8 +360,8 @@ class FoldHealthMonitor:
         # Consolidated suggestions
         if 'WEIGHT_LOCK' in codes_seen or 'P80_DECLINE' in codes_seen:
             print(
-                '\n  Primary fix: add train_start to fold dicts\n'
-                '  (18-month sliding window — see suggestions above)'
+                '\n  Primary fix: see per-fold WEIGHT_LOCK suggestion above\n'
+                '  (early convergence → raise LR; no train_start → add sliding window)'
             )
         if 'EARLY_EPOCH' in codes_seen and 'WEIGHT_LOCK' not in codes_seen:
             print('\n  Primary fix: increase LR or reduce FREEZE_RATIO')
@@ -369,11 +387,19 @@ class FoldHealthMonitor:
     # ------------------------------------------------------------------
     @staticmethod
     def _compute_p80(metrics: dict) -> float:
-        conf = np.array(metrics.get('all_conf', []))
+        # prec_at_80 is pre-computed by the trainer with the correct
+        # (conf >= 0.80) & (pred > 0) mask — same definition as the threshold table.
+        if 'prec_at_80' in metrics:
+            return float(metrics['prec_at_80'])
+        conf   = np.array(metrics.get('all_conf', []))
         labels = np.array(metrics.get('all_labels', []))
+        preds  = np.array(metrics.get('all_preds', []))
         if len(conf) == 0:
             return 0.0
-        mask = conf >= 0.80
+        if len(preds) == len(conf):
+            mask = (conf >= 0.80) & (preds > 0)
+        else:
+            mask = conf >= 0.80
         return float((labels[mask] > 0).mean()) if mask.sum() > 0 else 0.0
 
 

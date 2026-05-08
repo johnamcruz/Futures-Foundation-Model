@@ -3774,15 +3774,22 @@ def test_run_finetune_on_fold_complete_fires(tmp_path):
 
 def _make_metrics(all_conf, all_labels, best_epoch=None, feature_importance=None):
     """Build a minimal test_metrics dict for health monitor tests."""
-    n = len(all_conf)
+    conf_arr = np.array(all_conf, dtype=float)
+    lab_arr  = np.array(all_labels, dtype=int)
+    preds    = (conf_arr >= 0.5).astype(int)
+    mask_80  = (conf_arr >= 0.80) & (preds > 0)
+    n_at_80  = int(mask_80.sum())
+    prec_80  = float((lab_arr[mask_80] > 0).mean()) if n_at_80 > 0 else 0.0
     m = {
-        'all_conf':   list(all_conf),
-        'all_labels': list(all_labels),
-        'all_preds':  [1 if c >= 0.5 else 0 for c in all_conf],
-        'tp': int(sum(l > 0 and c >= 0.5 for c, l in zip(all_conf, all_labels))),
-        'fn': int(sum(l > 0 and c < 0.5  for c, l in zip(all_conf, all_labels))),
-        'fp': int(sum(l == 0 and c >= 0.5 for c, l in zip(all_conf, all_labels))),
-        'tn': int(sum(l == 0 and c < 0.5  for c, l in zip(all_conf, all_labels))),
+        'all_conf':   conf_arr.tolist(),
+        'all_labels': lab_arr.tolist(),
+        'all_preds':  preds.tolist(),
+        'tp': int(((preds > 0) & (lab_arr > 0)).sum()),
+        'fn': int(((preds == 0) & (lab_arr > 0)).sum()),
+        'fp': int(((preds > 0) & (lab_arr == 0)).sum()),
+        'tn': int(((preds == 0) & (lab_arr == 0)).sum()),
+        'prec_at_80': prec_80,
+        'n_at_80':    n_at_80,
         'loss': 0.5,
     }
     if best_epoch is not None:
@@ -3844,6 +3851,49 @@ def test_health_monitor_weight_lock_detected():
     monitor.check('F1', m1)
     warnings = monitor.check('F2', m2)
     assert any(w.code == 'WEIGHT_LOCK' for w in warnings)
+
+
+def test_health_monitor_weight_lock_message_includes_l2():
+    """WEIGHT_LOCK message includes both cos_sim and L2 distance."""
+    monitor = FoldHealthMonitor(weight_lock_threshold=0.99)
+    importance = np.array([0.3, 0.2, 0.25, 0.15, 0.1], dtype=np.float32)
+    m1 = _make_metrics([0.9, 0.6, 0.4], [1, 1, 0], best_epoch=10,
+                       feature_importance=importance)
+    m2 = _make_metrics([0.85, 0.65, 0.35], [1, 1, 0], best_epoch=9,
+                       feature_importance=importance * 1.0001)
+    monitor.check('F1', m1)
+    warnings = monitor.check('F2', m2)
+    wl = next(w for w in warnings if w.code == 'WEIGHT_LOCK')
+    assert 'cos_sim=' in wl.message
+    assert 'L2=' in wl.message
+
+
+def test_health_monitor_weight_lock_early_convergence_suggestion():
+    """WEIGHT_LOCK suggestion mentions LR/freeze when best_epoch is low."""
+    monitor = FoldHealthMonitor(weight_lock_threshold=0.99)
+    importance = np.array([0.3, 0.2, 0.25, 0.15, 0.1], dtype=np.float32)
+    m1 = _make_metrics([0.9, 0.6, 0.4], [1, 1, 0], best_epoch=5,
+                       feature_importance=importance)
+    m2 = _make_metrics([0.85, 0.65, 0.35], [1, 1, 0], best_epoch=8,
+                       feature_importance=importance * 1.0001)
+    monitor.check('F1', m1)
+    warnings = monitor.check('F2', m2)
+    wl = next(w for w in warnings if w.code == 'WEIGHT_LOCK')
+    assert 'LR' in wl.suggestion or 'FREEZE_RATIO' in wl.suggestion
+
+
+def test_health_monitor_weight_lock_late_convergence_suggestion():
+    """WEIGHT_LOCK suggestion mentions train_start when best_epoch is high."""
+    monitor = FoldHealthMonitor(weight_lock_threshold=0.99)
+    importance = np.array([0.3, 0.2, 0.25, 0.15, 0.1], dtype=np.float32)
+    m1 = _make_metrics([0.9, 0.6, 0.4], [1, 1, 0], best_epoch=20,
+                       feature_importance=importance)
+    m2 = _make_metrics([0.85, 0.65, 0.35], [1, 1, 0], best_epoch=25,
+                       feature_importance=importance * 1.0001)
+    monitor.check('F1', m1)
+    warnings = monitor.check('F2', m2)
+    wl = next(w for w in warnings if w.code == 'WEIGHT_LOCK')
+    assert 'train_start' in wl.suggestion
 
 
 def test_health_monitor_no_weight_lock_when_diverged():
@@ -4071,3 +4121,43 @@ def test_health_monitor_no_zero_signal_above_minimum():
     m = _make_metrics(conf, labels, best_epoch=10)
     warnings = monitor.check('F1', m)
     assert not any(w.code == 'ZERO_SIGNAL_FOLD' for w in warnings)
+
+
+# ── _compute_p80 / VAL_TEST_GAP bug fix ───────────────────────────────────────
+
+def test_health_monitor_compute_p80_uses_prec_at_80_field():
+    """_compute_p80 should use prec_at_80 from metrics when present (fast path)."""
+    # Scenario: all_conf has many values >= 0.80 from high-confidence no-signal bars
+    # (mimics real trainer where confidence = max(softmax), not P(signal)).
+    # Without the fix, _compute_p80 would compute 0.0; with fix it reads prec_at_80.
+    conf   = np.array([0.90] * 200 + [0.30] * 300)  # 200 high-conf bars
+    labels = np.array([0]    * 200 + [0]    * 300)   # all no-signal (labels=0)
+    m = _make_metrics(conf, labels, best_epoch=10)
+    # Override prec_at_80/n_at_80 as the trainer would compute them
+    # (trainer applies (conf>=0.80)&(pred>0) mask — here preds=1 for conf>=0.5)
+    # prec_at_80 from trainer would reflect signal precision, not all-bar precision
+    m['prec_at_80'] = 0.466   # the correct test P@80 (trainer-computed)
+    m['n_at_80']    = 146
+    p80 = FoldHealthMonitor._compute_p80(m)
+    assert abs(p80 - 0.466) < 1e-6, f'Expected 0.466, got {p80}'
+
+
+def test_health_monitor_val_test_gap_no_false_alarm_from_high_conf_noise():
+    """VAL_TEST_GAP must not fire when test P@80 (from prec_at_80) is close to val P@80.
+
+    This is the F2 false-alarm bug: out['confidence'] stores max-softmax (not P(signal)),
+    so many no-signal bars have conf>=0.80, making the raw _compute_p80 return 0.0.
+    The fix: use prec_at_80 (pre-computed by trainer with (conf>=0.80)&(pred>0)) directly.
+    """
+    monitor = FoldHealthMonitor(val_test_gap_threshold=0.10)
+    conf   = np.array([0.90] * 300 + [0.30] * 200)
+    labels = np.array([0]    * 300 + [0]    * 200)   # all no-signal in all_conf/all_labels
+    m = _make_metrics(conf, labels, best_epoch=12)
+    # Trainer-computed fields that reflect actual signal precision
+    m['prec_at_80'] = 0.466   # real test P@80 at viable level
+    m['n_at_80']    = 146
+    m['val_p80']    = 0.481   # val P@80 — gap = 0.481 - 0.466 = 1.5% < 10%
+    warnings = monitor.check('F1', m)
+    assert not any(w.code == 'VAL_TEST_GAP' for w in warnings), (
+        'VAL_TEST_GAP fired as false alarm — _compute_p80 must use prec_at_80 field'
+    )
