@@ -578,9 +578,9 @@ def _make_optimizer(
 
         if use_strat_lr and strat_proj_trainable:
             param_groups = [
-                {'params': head_params,          'lr': training_cfg.lr},
-                {'params': strat_proj_trainable, 'lr': strat_lr},
-                {'params': backbone_trainable,   'lr': bb_lr},
+                {'params': head_params,          'lr': training_cfg.lr, 'group': 'heads'},
+                {'params': strat_proj_trainable, 'lr': strat_lr,        'group': 'strat_proj'},
+                {'params': backbone_trainable,   'lr': bb_lr,           'group': 'backbone'},
             ]
             max_lrs = [training_cfg.lr, strat_lr, bb_lr]
             print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
@@ -588,8 +588,8 @@ def _make_optimizer(
                   f'backbone: {bb_lr:.2e}')
         else:
             param_groups = [
-                {'params': head_params,        'lr': training_cfg.lr},
-                {'params': backbone_trainable, 'lr': bb_lr},
+                {'params': head_params,        'lr': training_cfg.lr, 'group': 'heads'},
+                {'params': backbone_trainable, 'lr': bb_lr,           'group': 'backbone'},
             ]
             max_lrs = [training_cfg.lr, bb_lr]
             print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
@@ -613,7 +613,7 @@ def _make_optimizer(
 # ── Fold helpers ─────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
-    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start', 'strategy_lr_multiplier'}
+    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start', 'strategy_lr_multiplier', 'lr_boost_at_decay_start'}
     d = {k: v for k, v in training_cfg.__dict__.items() if k not in _hash_exclude}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 
@@ -950,7 +950,45 @@ def _train_fold(
     _gamma_schedule  = training_cfg.focal_gamma_end is not None
     _decay_start     = training_cfg.focal_gamma_decay_start  # mutable: N-triggered acceleration can advance this
     _n_collapse_ctr  = 0                                      # consecutive epochs with N < n_stable_min before decay start
+    _lr_boost_applied = False
+    _boosted_lrs: dict = {}  # group → boosted LR, populated once at decay_start
+    # Patience reset: fires once when epoch first reaches _decay_start.
+    # Pre-mark as done if resuming past decay_start so the reset doesn't re-fire on resume.
+    _patience_reset_done = (start_epoch > _decay_start) if _gamma_schedule else True
     for epoch in range(start_epoch, training_cfg.epochs):
+        # ── LR boost at gamma decay start ──
+        # Fires once when epoch reaches _decay_start; re-applied every epoch after
+        # because scheduler.step() resets param group LRs each step.
+        if (_gamma_schedule
+                and training_cfg.lr_boost_at_decay_start > 1.0
+                and epoch >= _decay_start):
+            if not _lr_boost_applied:
+                _lr_boost_applied = True
+                boost = training_cfg.lr_boost_at_decay_start
+                for pg in optimizer.param_groups:
+                    grp = pg.get('group', 'all')
+                    if grp != 'backbone':
+                        base = (training_cfg.lr * training_cfg.strategy_lr_multiplier
+                                if grp == 'strat_proj' else training_cfg.lr)
+                        _boosted_lrs[grp] = base * boost
+                if verbose and _boosted_lrs:
+                    print(f'  ⚡ LR boost ×{boost:.1f} at E{epoch+1}: '
+                          + ', '.join(f'{k}={v:.2e}' for k, v in _boosted_lrs.items()))
+            for pg in optimizer.param_groups:
+                grp = pg.get('group', 'all')
+                if grp in _boosted_lrs:
+                    pg['lr'] = _boosted_lrs[grp]
+
+        # ── Patience reset at gamma decay start ──
+        # Resets val_loss patience once when decay starts so the model always gets
+        # a clean window to benefit from lower gamma before early-stopping.
+        if _gamma_schedule and not _patience_reset_done and epoch >= _decay_start:
+            _patience_reset_done = True
+            if patience_ctr > 0:
+                if verbose:
+                    print(f'  ↺ Patience reset at E{epoch+1} — gamma decay starting (was {patience_ctr})')
+                patience_ctr = 0
+
         if _gamma_schedule:
             _decay_len    = max(1, training_cfg.epochs - _decay_start - 1)
             _progress     = min(1.0, max(0.0, (epoch - _decay_start) / _decay_len))
@@ -1090,6 +1128,7 @@ def _train_fold(
                 'all_conf':   va.get('all_conf', []),
                 'all_preds':  va.get('all_preds', []),
                 'all_labels': va.get('all_labels', []),
+                'param_lrs':  {pg.get('group', 'all'): pg['lr'] for pg in optimizer.param_groups},
             })
 
         if patience_ctr >= training_cfg.patience:

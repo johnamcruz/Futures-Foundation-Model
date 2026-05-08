@@ -3489,6 +3489,185 @@ def test_n_triggered_acceleration_does_not_fire_after_decay_already_started():
     assert _n_collapse_ctr == 0
 
 
+# ── LR boost at decay start ───────────────────────────────────────────────────
+
+def test_lr_boost_default_is_one():
+    assert TrainingConfig().lr_boost_at_decay_start == 1.0
+
+
+def test_lr_boost_excluded_from_config_hash():
+    cfg_no_boost   = TrainingConfig(lr_boost_at_decay_start=1.0)
+    cfg_with_boost = TrainingConfig(lr_boost_at_decay_start=3.0)
+    assert _config_hash(cfg_no_boost) == _config_hash(cfg_with_boost)
+
+
+def test_lr_boost_fires_at_decay_start_epoch():
+    """Non-backbone param groups get boosted LR when decay_start boost logic fires."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.66)
+    loader = _make_small_loader()
+
+    training_cfg = TrainingConfig(
+        lr=1e-4,
+        backbone_lr_multiplier=0.3,
+        strategy_lr_multiplier=1.0,  # no strat_proj group
+        focal_gamma_end=1.0,         # enables gamma schedule (required for boost gate)
+        focal_gamma_decay_start=3,
+        lr_boost_at_decay_start=2.0,
+    )
+    # is_warm_started=True produces tagged param groups ('heads', 'backbone')
+    optimizer, _ = _make_optimizer(
+        model, training_cfg, is_warm_started=True, train_loader_len=len(loader))
+
+    # Simulate the boost logic from _train_fold (fires when gamma schedule active + boost > 1.0)
+    boost = training_cfg.lr_boost_at_decay_start
+    _boosted_lrs: dict = {}
+    for pg in optimizer.param_groups:
+        grp = pg.get('group', 'all')
+        if grp != 'backbone':
+            base = (training_cfg.lr * training_cfg.strategy_lr_multiplier
+                    if grp == 'strat_proj' else training_cfg.lr)
+            _boosted_lrs[grp] = base * boost
+            pg['lr'] = _boosted_lrs[grp]
+
+    heads_pg = next(pg for pg in optimizer.param_groups if pg.get('group') == 'heads')
+    # lr * boost = 1e-4 * 2.0 = 2e-4
+    assert abs(heads_pg['lr'] - 2e-4) < 1e-9, (
+        f'Expected boosted head LR 2e-4, got {heads_pg["lr"]:.2e}')
+
+
+def test_lr_boost_one_does_not_change_lr():
+    """lr_boost_at_decay_start=1.0 never enters the boost branch."""
+    training_cfg = TrainingConfig(
+        lr=1e-4,
+        focal_gamma_end=1.0,        # gamma schedule active
+        focal_gamma_decay_start=2,
+        lr_boost_at_decay_start=1.0,
+    )
+    # The boost guard in _train_fold: training_cfg.lr_boost_at_decay_start > 1.0
+    # With 1.0 that condition is False — the branch is never entered regardless of epoch.
+    for epoch in range(training_cfg.epochs):
+        would_boost = (
+            training_cfg.focal_gamma_end is not None
+            and training_cfg.lr_boost_at_decay_start > 1.0
+            and epoch >= training_cfg.focal_gamma_decay_start
+        )
+        assert not would_boost, f'Boost fired at epoch {epoch} despite lr_boost_at_decay_start=1.0'
+
+
+def test_lr_boost_backbone_group_not_boosted():
+    """Backbone param group is excluded from the LR boost."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)  # all backbone trainable
+    loader = _make_small_loader()
+
+    training_cfg = TrainingConfig(
+        lr=1e-4,
+        backbone_lr_multiplier=0.3,
+        strategy_lr_multiplier=1.0,
+        focal_gamma_end=1.0,
+        focal_gamma_decay_start=2,
+        lr_boost_at_decay_start=3.0,
+    )
+    optimizer, _ = _make_optimizer(
+        model, training_cfg, is_warm_started=True, train_loader_len=len(loader))
+
+    backbone_lr_before = next(
+        pg['lr'] for pg in optimizer.param_groups if pg.get('group') == 'backbone'
+    )
+
+    # Apply boost (same as _train_fold) — backbone must be excluded
+    _boosted_lrs: dict = {}
+    boost = training_cfg.lr_boost_at_decay_start
+    for pg in optimizer.param_groups:
+        grp = pg.get('group', 'all')
+        if grp != 'backbone':
+            base = (training_cfg.lr * training_cfg.strategy_lr_multiplier
+                    if grp == 'strat_proj' else training_cfg.lr)
+            _boosted_lrs[grp] = base * boost
+            pg['lr'] = _boosted_lrs[grp]
+
+    backbone_lr_after = next(
+        pg['lr'] for pg in optimizer.param_groups if pg.get('group') == 'backbone'
+    )
+    assert backbone_lr_before == backbone_lr_after, (
+        f'Backbone LR changed after boost: {backbone_lr_before:.2e} → {backbone_lr_after:.2e}')
+    assert 'backbone' not in _boosted_lrs
+
+
+# ── Patience reset at gamma decay start ───────────────────────────────────────
+
+def test_patience_reset_fires_once_at_decay_start():
+    """patience_ctr is reset to 0 exactly once when epoch first reaches _decay_start."""
+    decay_start = 5
+    patience = 10
+    patience_ctr = 7  # already accumulated some patience
+    _patience_reset_done = False  # mirrors _train_fold initialization
+
+    for epoch in range(20):
+        # Mirror _train_fold reset logic
+        if not _patience_reset_done and epoch >= decay_start:
+            _patience_reset_done = True
+            if patience_ctr > 0:
+                patience_ctr = 0
+        # Accumulate patience every epoch (simulates no improvement)
+        patience_ctr += 1
+
+    # Reset fires exactly once (at epoch=5), then patience accumulates again
+    assert _patience_reset_done
+    # After reset at E5, patience accumulates for epochs 5..19 = 15 increments
+    assert patience_ctr == 20 - decay_start, (
+        f'Expected {20 - decay_start} epochs of patience after reset, got {patience_ctr}')
+
+
+def test_patience_reset_does_not_fire_if_already_zero():
+    """patience_ctr stays 0 if it was already 0 when decay starts."""
+    decay_start = 3
+    patience_ctr = 0  # already 0
+    _patience_reset_done = False
+    reset_happened = False
+
+    for epoch in range(10):
+        if not _patience_reset_done and epoch >= decay_start:
+            _patience_reset_done = True
+            if patience_ctr > 0:
+                patience_ctr = 0
+                reset_happened = True
+
+    assert not reset_happened, 'Reset should not fire when patience_ctr was already 0'
+
+
+def test_patience_reset_skipped_when_resumed_past_decay():
+    """If start_epoch > decay_start (resume past decay), reset must not fire."""
+    decay_start = 5
+    start_epoch = 8  # resuming past decay
+    patience_ctr = 4
+    _patience_reset_done = (start_epoch > decay_start)  # pre-marked True on resume
+
+    original_patience = patience_ctr
+    for epoch in range(start_epoch, start_epoch + 5):
+        if not _patience_reset_done and epoch >= decay_start:
+            _patience_reset_done = True
+            if patience_ctr > 0:
+                patience_ctr = 0
+
+    # Reset was pre-blocked — patience_ctr was never zeroed
+    assert patience_ctr == original_patience, (
+        f'Reset fired on resume — patience_ctr changed from {original_patience} to {patience_ctr}')
+
+
+def test_patience_reset_not_active_without_gamma_schedule():
+    """When focal_gamma_end is None (no schedule), patience reset must not fire."""
+    training_cfg = TrainingConfig(focal_gamma_end=None, focal_gamma_decay_start=5)
+    _gamma_schedule = training_cfg.focal_gamma_end is not None
+    # _patience_reset_done is True when gamma_schedule is False (mirrors _train_fold init)
+    _patience_reset_done = not _gamma_schedule
+
+    assert _patience_reset_done, 'Without gamma schedule, reset should be pre-blocked'
+
+
 # ── summarize_fold_precision ───────────────────────────────────────────────────
 
 def _make_fold_results(conf_vals, label_vals):

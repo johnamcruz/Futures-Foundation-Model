@@ -70,6 +70,10 @@ class TrainingConfig:
     # Excluded from config hash — schedule changes won't bust in-progress folds.
     focal_gamma_end: Optional[float] = None
     focal_gamma_decay_start: int = 0
+    # When gamma decay starts, multiply non-backbone LR groups by this factor.
+    # Gives the strategy head more gradient pressure during the calibration phase.
+    # Excluded from config hash — can be tuned without busting fold-resume caches.
+    lr_boost_at_decay_start: float = 1.0
 
     # ── Early stopping ──
     patience: int = 15            # epochs without val_loss improvement
