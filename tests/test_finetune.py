@@ -1620,7 +1620,9 @@ def test_layerwise_lr_backbone_gets_lower_lr():
     model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
     model.freeze_backbone(freeze_ratio=0.0)   # all backbone params trainable
 
-    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1)
+    # strategy_lr_multiplier=1.0 keeps 2 groups (heads + backbone)
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1,
+                                  strategy_lr_multiplier=1.0)
     optimizer, _ = _make_optimizer(model, training_cfg,
                                    is_warm_started=True, train_loader_len=10)
 
@@ -1638,7 +1640,8 @@ def test_layerwise_lr_heads_get_full_lr():
     model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
     model.freeze_backbone(freeze_ratio=0.0)
 
-    training_cfg = TrainingConfig(lr=5e-5, backbone_lr_multiplier=0.1)
+    training_cfg = TrainingConfig(lr=5e-5, backbone_lr_multiplier=0.1,
+                                  strategy_lr_multiplier=1.0)
     optimizer, _ = _make_optimizer(model, training_cfg,
                                    is_warm_started=True, train_loader_len=10)
 
@@ -1671,6 +1674,54 @@ def test_layerwise_lr_multiplier_one_gives_single_group():
 
     assert len(optimizer.param_groups) == 1, (
         'multiplier=1.0 should not split param groups')
+
+
+def test_strategy_lr_multiplier_creates_three_param_groups():
+    """strategy_lr_multiplier != 1.0 should produce 3 param groups:
+    heads / strategy_projection / backbone."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)
+
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1,
+                                  strategy_lr_multiplier=2.0)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=True, train_loader_len=10)
+
+    assert len(optimizer.param_groups) == 3, (
+        f'Expected 3 param groups (heads/strat_proj/backbone), got {len(optimizer.param_groups)}')
+
+
+def test_strategy_lr_multiplier_sets_correct_lr():
+    """strategy_projection group LR must equal lr * strategy_lr_multiplier;
+    backbone group must equal lr * backbone_lr_multiplier."""
+    cfg   = small_ffm_config()
+    model = HybridStrategyModel(cfg, NUM_STRATEGY_FEATURES)
+    model.freeze_backbone(freeze_ratio=0.0)
+
+    training_cfg = TrainingConfig(lr=1e-4, backbone_lr_multiplier=0.1,
+                                  strategy_lr_multiplier=2.0)
+    optimizer, _ = _make_optimizer(model, training_cfg,
+                                   is_warm_started=True, train_loader_len=10)
+
+    head_lr   = optimizer.param_groups[0]['max_lr']   # full LR
+    strat_lr  = optimizer.param_groups[1]['max_lr']   # × 2.0
+    bb_lr     = optimizer.param_groups[2]['max_lr']   # × 0.1
+
+    assert abs(head_lr  - 1e-4) < 1e-9, f'Head LR should be 1e-4, got {head_lr}'
+    assert abs(strat_lr - 2e-4) < 1e-9, f'strategy_proj LR should be 2e-4, got {strat_lr}'
+    assert abs(bb_lr    - 1e-5) < 1e-9, f'Backbone LR should be 1e-5, got {bb_lr}'
+
+
+def test_strategy_lr_multiplier_excluded_from_config_hash():
+    """strategy_lr_multiplier must not affect the config hash so fold-resume
+    caches are not busted when tuning it."""
+    cfg_a = TrainingConfig(strategy_lr_multiplier=1.0)
+    cfg_b = TrainingConfig(strategy_lr_multiplier=3.0)
+
+    from futures_foundation.finetune.trainer import _config_hash
+    assert _config_hash(cfg_a) == _config_hash(cfg_b), (
+        'strategy_lr_multiplier should be excluded from config hash')
 
 
 def test_make_optimizer_returns_scheduler():

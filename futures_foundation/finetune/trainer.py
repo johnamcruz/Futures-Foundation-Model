@@ -558,22 +558,44 @@ def _make_optimizer(
     use_layerwise = is_warm_started and training_cfg.backbone_lr_multiplier != 1.0
 
     if use_layerwise:
-        backbone_ids = {id(p) for p in model.backbone.parameters()}
+        backbone_ids     = {id(p) for p in model.backbone.parameters()}
+        strat_proj_ids   = {id(p) for p in model.strategy_projection.parameters()}
+        use_strat_lr     = training_cfg.strategy_lr_multiplier != 1.0
+
         head_params = [
             p for p in model.trainable_parameters()
-            if id(p) not in backbone_ids
+            if id(p) not in backbone_ids and id(p) not in strat_proj_ids
+        ]
+        strat_proj_trainable = [
+            p for p in model.strategy_projection.parameters() if p.requires_grad
         ]
         backbone_trainable = [
             p for p in model.backbone.parameters() if p.requires_grad
         ]
-        param_groups = [
-            {'params': head_params,       'lr': training_cfg.lr},
-            {'params': backbone_trainable, 'lr': training_cfg.lr * training_cfg.backbone_lr_multiplier},
-        ]
+
+        strat_lr = training_cfg.lr * training_cfg.strategy_lr_multiplier
+        bb_lr    = training_cfg.lr * training_cfg.backbone_lr_multiplier
+
+        if use_strat_lr and strat_proj_trainable:
+            param_groups = [
+                {'params': head_params,          'lr': training_cfg.lr},
+                {'params': strat_proj_trainable, 'lr': strat_lr},
+                {'params': backbone_trainable,   'lr': bb_lr},
+            ]
+            max_lrs = [training_cfg.lr, strat_lr, bb_lr]
+            print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
+                  f'strategy_proj: {strat_lr:.2e}  '
+                  f'backbone: {bb_lr:.2e}')
+        else:
+            param_groups = [
+                {'params': head_params,        'lr': training_cfg.lr},
+                {'params': backbone_trainable, 'lr': bb_lr},
+            ]
+            max_lrs = [training_cfg.lr, bb_lr]
+            print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
+                  f'backbone: {bb_lr:.2e}')
+
         optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
-        max_lrs   = [training_cfg.lr, training_cfg.lr * training_cfg.backbone_lr_multiplier]
-        print(f'  Layer-wise LR — heads: {training_cfg.lr:.2e}  '
-              f'backbone: {training_cfg.lr * training_cfg.backbone_lr_multiplier:.2e}')
     else:
         optimizer = torch.optim.AdamW(
             model.trainable_parameters(), lr=training_cfg.lr, weight_decay=0.01)
@@ -591,7 +613,7 @@ def _make_optimizer(
 # ── Fold helpers ─────────────────────────────────────────────────────────────
 
 def _config_hash(training_cfg: TrainingConfig) -> str:
-    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start'}
+    _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start', 'strategy_lr_multiplier'}
     d = {k: v for k, v in training_cfg.__dict__.items() if k not in _hash_exclude}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 

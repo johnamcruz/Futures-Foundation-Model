@@ -31,6 +31,11 @@ class TrainingConfig:
     # Keeps backbone knowledge stable while heads adapt at full speed.
     # Set to 1.0 to disable layerwise LR.
     backbone_lr_multiplier: float = 0.1
+    # LR multiplier for the strategy_projection layer relative to other head layers.
+    # Values > 1.0 give strategy_projection more gradient pressure to adapt its
+    # feature weighting fold-to-fold, reducing WEIGHT_LOCK (cos_sim ≈ 1.0).
+    # Excluded from config hash — can be tuned without busting fold-resume cache.
+    strategy_lr_multiplier: float = 2.0
 
     # ── Iterative fine-tuning (multi-pass) ──
     # Path to a _done.pt from a previous run. When set, F1 warm-starts from that
