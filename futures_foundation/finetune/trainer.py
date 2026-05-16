@@ -23,6 +23,7 @@ from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 from ..config import FFMConfig
 from ..features import get_model_feature_columns
+from ..training_resume import atomic_save_resume, load_resume
 from .base import StrategyLabeler
 from .config import TrainingConfig
 from .dataset import HybridStrategyDataset
@@ -809,20 +810,19 @@ def _train_fold(
     print(f"{'='*60}")
 
     # ── Skip if already complete (Colab disconnect between folds) ──
-    if os.path.exists(ckpt_done):
-        saved = torch.load(ckpt_done, map_location='cpu', weights_only=False)
-        if saved.get('config_hash') == config_hash:
-            print(f'  ✅ {fold_name} already complete — skipping re-training')
-            model = HybridStrategyModel(
-                ffm_config, num_strategy_features,
-                training_cfg.num_labels, training_cfg.risk_weight,
-            ).to(device)
-            model.load_state_dict(
-                {k: v.to(device) for k, v in saved['next_fold_state'].items()})
-            _print_test_threshold_table(saved.get('test_metrics'), fold_name)
-            _print_confidence_calibration(saved.get('test_metrics'))
-            _print_model_diagnostic(model, feature_names=strategy_feature_cols)
-            return model, saved.get('test_metrics'), saved['next_fold_state']
+    saved = load_resume(ckpt_done, config_hash, hash_key='config_hash')
+    if saved is not None:
+        print(f'  ✅ {fold_name} already complete — skipping re-training')
+        model = HybridStrategyModel(
+            ffm_config, num_strategy_features,
+            training_cfg.num_labels, training_cfg.risk_weight,
+        ).to(device)
+        model.load_state_dict(
+            {k: v.to(device) for k, v in saved['next_fold_state'].items()})
+        _print_test_threshold_table(saved.get('test_metrics'), fold_name)
+        _print_confidence_calibration(saved.get('test_metrics'))
+        _print_model_diagnostic(model, feature_names=strategy_feature_cols)
+        return model, saved.get('test_metrics'), saved['next_fold_state']
 
     # ── Datasets ──
     train_dsets, val_dsets, test_dsets = _load_fold_data(
@@ -894,27 +894,27 @@ def _train_fold(
     p80s_patience_ctr = 0
     ratio_bad_ctr   = 0
 
-    if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if ckpt.get('config_hash') == config_hash:
-            model.load_state_dict(ckpt['model_state'])
-            optimizer.load_state_dict(ckpt['optim_state'])
-            start_epoch    = ckpt['epoch'] + 1
-            best_val_loss  = ckpt['val_loss']
-            best_val_epoch = ckpt['epoch']
-            best_signal_f1 = ckpt.get('best_signal_f1', 0.0)
-            best_f1_epoch  = ckpt.get('best_f1_epoch', -1)
-            patience_ctr   = ckpt.get('patience_ctr', 0)
-            ratio_bad_ctr  = ckpt.get('ratio_bad_ctr', 0)
-            print(f'  ▶ Resumed from epoch {start_epoch} '
-                  f'(val_loss={best_val_loss:.4f}, patience={patience_ctr})')
-        else:
-            print(f'  ℹ Config changed — starting fresh')
+    ckpt = load_resume(ckpt_path, config_hash, map_location=device,
+                       hash_key='config_hash')
+    if ckpt is not None:
+        model.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optim_state'])
+        start_epoch    = ckpt['epoch'] + 1
+        best_val_loss  = ckpt['val_loss']
+        best_val_epoch = ckpt['epoch']
+        best_signal_f1 = ckpt.get('best_signal_f1', 0.0)
+        best_f1_epoch  = ckpt.get('best_f1_epoch', -1)
+        patience_ctr   = ckpt.get('patience_ctr', 0)
+        ratio_bad_ctr  = ckpt.get('ratio_bad_ctr', 0)
+        print(f'  ▶ Resumed from epoch {start_epoch} '
+              f'(val_loss={best_val_loss:.4f}, patience={patience_ctr})')
+    elif os.path.exists(ckpt_path):
+        print(f'  ℹ Config changed — starting fresh')
 
     # Restore best_f1_state from disk so a mid-fold disconnect doesn't lose it
-    if start_epoch > 0 and os.path.exists(ckpt_f1):
-        f1_saved = torch.load(ckpt_f1, map_location='cpu', weights_only=False)
-        if f1_saved.get('config_hash') == config_hash:
+    if start_epoch > 0:
+        f1_saved = load_resume(ckpt_f1, config_hash, hash_key='config_hash')
+        if f1_saved is not None:
             best_f1_state  = f1_saved['model_state']
             best_signal_f1 = f1_saved.get('score', best_signal_f1)
             best_f1_epoch  = f1_saved.get('epoch', best_f1_epoch)
@@ -922,9 +922,9 @@ def _train_fold(
                   f'(epoch {best_f1_epoch+1}, F1={best_signal_f1:.4f})')
 
     # Restore best_p80_state from disk — reject if saved with N<15 (pre-fix noise guard)
-    if start_epoch > 0 and os.path.exists(ckpt_p80):
-        p80_saved = torch.load(ckpt_p80, map_location='cpu', weights_only=False)
-        if p80_saved.get('config_hash') == config_hash:
+    if start_epoch > 0:
+        p80_saved = load_resume(ckpt_p80, config_hash, hash_key='config_hash')
+        if p80_saved is not None:
             saved_n = p80_saved.get('n_at_80', 0)
             if saved_n >= 15:
                 best_p80_state  = p80_saved['model_state']
@@ -936,9 +936,9 @@ def _train_fold(
                 print(f'  ⚠ Discarding stale P@0.80 checkpoint (N={saved_n} < 15) — will rescore')
 
     # Restore best_p80s_state (stable, N≥50)
-    if start_epoch > 0 and os.path.exists(ckpt_p80s):
-        p80s_saved = torch.load(ckpt_p80s, map_location='cpu', weights_only=False)
-        if p80s_saved.get('config_hash') == config_hash:
+    if start_epoch > 0:
+        p80s_saved = load_resume(ckpt_p80s, config_hash, hash_key='config_hash')
+        if p80s_saved is not None:
             saved_n = p80s_saved.get('n_at_80', 0)
             best_p80s_state        = p80s_saved['model_state']
             best_prec_at_80_stable = p80s_saved.get('score', best_prec_at_80_stable)
@@ -1013,7 +1013,7 @@ def _train_fold(
             best_val_epoch = epoch
             patience_ctr   = 0
             ratio_bad_ctr  = 0
-            torch.save({
+            atomic_save_resume(ckpt_path, {
                 'config_hash':    config_hash,
                 'epoch':          epoch,
                 'model_state':    model.state_dict(),
@@ -1025,45 +1025,45 @@ def _train_fold(
                 'best_f1_epoch':  best_f1_epoch,
                 'best_prec_at_80': best_prec_at_80,
                 'best_p80_epoch': best_p80_epoch,
-            }, ckpt_path)
+            })
             save_str += ' 💾L'
 
         if f1_better:
             best_signal_f1 = va['f1']
             best_f1_epoch  = epoch
             best_f1_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            torch.save({
+            atomic_save_resume(ckpt_f1, {
                 'config_hash': config_hash,
                 'model_state': best_f1_state,
                 'epoch':       epoch,
                 'score':       best_signal_f1,
-            }, ckpt_f1)
+            })
             save_str += ' 📈F'
 
         if p80_better:
             best_prec_at_80 = va['prec_at_80']
             best_p80_epoch  = epoch
             best_p80_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            torch.save({
+            atomic_save_resume(ckpt_p80, {
                 'config_hash': config_hash,
                 'model_state': best_p80_state,
                 'epoch':       epoch,
                 'score':       best_prec_at_80,
                 'n_at_80':     va['n_at_80'],
-            }, ckpt_p80)
+            })
             save_str += ' 📈8'
 
         if p80s_better:
             best_prec_at_80_stable = va['prec_at_80']
             best_p80s_epoch        = epoch
             best_p80s_state        = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            torch.save({
+            atomic_save_resume(ckpt_p80s, {
                 'config_hash': config_hash,
                 'model_state': best_p80s_state,
                 'epoch':       epoch,
                 'score':       best_prec_at_80_stable,
                 'n_at_80':     va['n_at_80'],
-            }, ckpt_p80s)
+            })
             save_str += ' 📈S'
             p80s_patience_ctr = 0
         elif best_p80s_state is not None:
@@ -1198,11 +1198,11 @@ def _train_fold(
     # ── Save fold-complete checkpoint ──
     # Stores next_fold_state + test_metrics so reconnecting Colab sessions can
     # skip re-training this fold entirely and jump straight to the next one.
-    torch.save({
+    atomic_save_resume(ckpt_done, {
         'config_hash':    config_hash,
         'next_fold_state': next_fold_state,
         'test_metrics':   test_metrics,
-    }, ckpt_done)
+    })
     for p in [ckpt_path, ckpt_f1, ckpt_p80, ckpt_p80s]:
         if os.path.exists(p):
             os.remove(p)
@@ -1586,7 +1586,7 @@ def run_risk_head_calibration(
         )
         print_rr_calibration(fold_name, val_pred, val_true)
 
-        torch.save({
+        atomic_save_resume(rr_ckpt_path, {
             'config_hash':     config_hash,
             'phase':           'phase2_risk_head',
             'next_fold_state': {k: v.cpu() for k, v in model.state_dict().items()},
@@ -1595,7 +1595,7 @@ def run_risk_head_calibration(
                 'val_true': val_true.tolist(),
                 'val_mae':  float(np.mean(np.abs(val_pred - val_true))),
             },
-        }, rr_ckpt_path)
+        })
         print(f'\n  💾 Saved: {rr_ckpt_path}')
         rr_done_paths[fold_name] = rr_ckpt_path
 

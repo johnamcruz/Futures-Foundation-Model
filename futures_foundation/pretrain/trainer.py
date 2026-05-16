@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -21,6 +22,9 @@ from futures_foundation.dataset import (
     FFMMultiInstrumentDataset, interleaved_train_val_split, create_dataloaders,
 )
 from futures_foundation.pretrain.config import PretrainConfig
+from futures_foundation.training_resume import (
+    resume_hash, atomic_save_resume, load_resume, clear_resume,
+)
 
 
 _TASK_NAMES = ['regime', 'volatility', 'structure', 'range']
@@ -340,6 +344,27 @@ def _evaluate_per_instrument(model, loader, device, cfg: PretrainConfig, amp_dty
 # run_pretrain
 # ─────────────────────────────────────────────────────────────────────────────
 
+_RESUME_CFG_FIELDS = (
+    'seq_len', 'train_stride', 'val_ratio', 'epochs', 'batch_size', 'lr',
+    'warmup_steps', 'grad_clip', 'seed', 'patience', 'max_ratio',
+    'ratio_patience', 'overfit_gap_threshold', 'overfit_patience_epochs',
+    'overfit_weight',
+)
+
+
+def _pretrain_resume_hash(config: PretrainConfig, ffm_config: FFMConfig,
+                          instrument_bar_counts: Dict) -> str:
+    """Pretrain's identity via the shared resume_hash (config + arch + data)."""
+    return resume_hash(
+        cfg_fields={k: getattr(config, k) for k in _RESUME_CFG_FIELDS},
+        arch={'h': ffm_config.hidden_size, 'l': ffm_config.num_hidden_layers,
+              'a': ffm_config.num_attention_heads,
+              'f': ffm_config.intermediate_size,
+              'nf': ffm_config.num_features},
+        data=sorted((str(k), int(v)) for k, v in instrument_bar_counts.items()),
+    )
+
+
 def run_pretrain(
     prepared_dir: str,
     checkpoint_dir: str,
@@ -503,7 +528,48 @@ def run_pretrain(
     task_overfit_count = {t: 0     for t in _TASK_NAMES}
     task_downweighted  = {t: False for t in _TASK_NAMES}
 
-    for epoch in range(1, config.epochs + 1):
+    # ── Resume from a disconnected run ────────────────────────────────────────
+    # Full-state epoch checkpoint keyed on config+arch+data identity. A Colab
+    # disconnect mid-pretrain (the budget-dominant job) continues from the next
+    # epoch with optimiser / LR-schedule / early-stop counters intact instead of
+    # restarting from 0.
+    cfg_hash    = _pretrain_resume_hash(config, ffm_config, instrument_bar_counts)
+    resume_path = ckpt_dir / f'resume_{cfg_hash}.pt'
+    start_epoch = 1
+    ck = load_resume(resume_path, cfg_hash, map_location=device)
+    if ck is not None and ck.get('epoch', 0) < config.epochs:
+        model.load_state_dict(ck['model'])
+        optimizer.load_state_dict(ck['optimizer'])
+        scheduler.load_state_dict(ck['scheduler'])
+        if scaler is not None and ck.get('scaler') is not None:
+            scaler.load_state_dict(ck['scaler'])
+        if ck.get('rng_state') is not None:
+            _rs = ck['rng_state']
+            torch.set_rng_state(_rs.cpu() if hasattr(_rs, 'cpu') else _rs)
+        best_val_loss             = ck['best_val_loss']
+        best_backbone_val_loss    = ck['best_backbone_val_loss']
+        best_epoch                = ck['best_epoch']
+        patience_counter          = ck['patience_counter']
+        bad_ratio_counter         = ck['bad_ratio_counter']
+        stable_counter            = ck['stable_counter']
+        history                   = ck['history']
+        backbone_val_loss_history = ck['backbone_val_loss_history']
+        task_overfit_count        = ck['task_overfit_count']
+        task_downweighted         = ck['task_downweighted']
+        # Re-apply the per-task downweight side-effect onto ffm_config so the
+        # resumed objective matches what training had converged to.
+        for _t, _w in ck.get('ffm_task_weights', {}).items():
+            if _t in _TASK_LOSS_WEIGHT_ATTR:
+                setattr(ffm_config, _TASK_LOSS_WEIGHT_ATTR[_t], _w)
+        start_epoch = ck['epoch'] + 1
+        print(f'\n🔄 RESUMING pretrain from epoch {start_epoch} '
+              f'(hash {cfg_hash}, best E{best_epoch} '
+              f'bvl={best_backbone_val_loss:.4f})')
+    elif resume_path.exists():
+        print(f'\n⚠️  Stale/complete resume file {resume_path.name} '
+              f'(hash/epoch mismatch) — starting fresh.')
+
+    for epoch in range(start_epoch, config.epochs + 1):
         t0 = time.time()
 
         train_loss, train_acc, train_task_loss = _train_one_epoch(
@@ -599,12 +665,39 @@ def run_pretrain(
         if on_epoch_end is not None:
             on_epoch_end(epoch_metrics)
 
+        # Persist full training state every epoch (atomic) so a disconnect
+        # continues from the next epoch, not from 0.
+        atomic_save_resume(resume_path, {
+            'cfg_hash': cfg_hash, 'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict() if scaler is not None else None,
+            'rng_state': torch.get_rng_state(),
+            'best_val_loss': best_val_loss,
+            'best_backbone_val_loss': best_backbone_val_loss,
+            'best_epoch': best_epoch,
+            'patience_counter': patience_counter,
+            'bad_ratio_counter': bad_ratio_counter,
+            'stable_counter': stable_counter,
+            'history': history,
+            'backbone_val_loss_history': backbone_val_loss_history,
+            'task_overfit_count': task_overfit_count,
+            'task_downweighted': task_downweighted,
+            'ffm_task_weights': {t: getattr(ffm_config, a)
+                                 for t, a in _TASK_LOSS_WEIGHT_ATTR.items()},
+        })
+
         if bad_ratio_counter >= config.ratio_patience:
             print(f'\n🛑 Ratio > {config.max_ratio} for {config.ratio_patience} consecutive epochs — stopping')
             break
         if patience_counter >= config.patience:
             print(f'\n⏹ Early stop at epoch {epoch} — no improvement for {config.patience} epochs')
             break
+
+    # Training finished (natural / early-stop) — drop the resume file so a
+    # later run with the same identity starts fresh, not mid-flight.
+    clear_resume(resume_path)
 
     # ── Save history ─────────────────────────────────────────────────────────
     with open(ckpt_dir / 'training_history.json', 'w') as f:
