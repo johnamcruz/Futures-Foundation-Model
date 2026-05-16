@@ -144,11 +144,51 @@ class HybridStrategyModel(nn.Module):
         )
 
     def load_backbone(self, path: str) -> None:
-        """Load backbone-only weights (raw backbone state_dict, no prefix)."""
+        """Load backbone-only weights (raw backbone state_dict, no prefix).
+
+        Fails LOUDLY and EARLY (before any training) on an architecture
+        mismatch. The common trap is a max_sequence_length difference: the
+        load is strict=False, so without this guard a shape-mismatched
+        position_embeddings would be skipped and the run would warm-start a
+        degraded backbone, wasting the entire GPU job. We refuse instead.
+        """
         state_dict = torch.load(path, map_location='cpu', weights_only=False)
         if 'model_state' in state_dict:
             state_dict = state_dict['model_state']
+
+        # Pre-flight: any tensor present in BOTH the checkpoint and the model
+        # whose shape differs is a hard architecture mismatch. Abort now.
+        model_sd = self.backbone.state_dict()
+        mism = [
+            (k, tuple(state_dict[k].shape), tuple(model_sd[k].shape))
+            for k in state_dict
+            if k in model_sd and hasattr(state_dict[k], 'shape')
+            and tuple(state_dict[k].shape) != tuple(model_sd[k].shape)
+        ]
+        if mism:
+            detail = '; '.join(f'{k}: ckpt{c} vs model{m}' for k, c, m in mism[:5])
+            pe = next((x for x in mism if 'position_embeddings' in x[0]), None)
+            hint = ''
+            if pe is not None:
+                # table is max_sequence_length + 1 (the prepended CLS slot)
+                ckpt_msl = pe[1][0] - 1
+                hint = (f' → backbone was pretrained with max_sequence_length='
+                        f'{ckpt_msl}; set FFMConfig.max_sequence_length='
+                        f'{ckpt_msl} to match.')
+            raise RuntimeError(
+                f'BACKBONE ARCHITECTURE MISMATCH loading {path}: '
+                f'{len(mism)} tensor(s) differ in shape [{detail}].{hint} '
+                f'Aborting before training — fix the config; do NOT waste GPU '
+                f'on a silently-degraded backbone.'
+            )
+
         missing, unexpected = self.backbone.load_state_dict(state_dict, strict=False)
+        if any('position_embeddings' in k for k in missing):
+            raise RuntimeError(
+                f'BACKBONE position_embeddings missing after loading {path} — '
+                f'architecture mismatch (likely max_sequence_length). Aborting '
+                f'before training.'
+            )
         if unexpected:
             print(f'  ⚠ Backbone unexpected keys: {len(unexpected)}')
         print(f'  ✅ Backbone loaded — {len(state_dict)} tensors, {len(missing)} missing')

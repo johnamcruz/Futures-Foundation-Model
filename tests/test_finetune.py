@@ -4523,3 +4523,37 @@ def test_print_fold_progression_filters_noise_predictions(capsys):
     assert '100.0%' in out, (
         'print_fold_progression must exclude pred=0 bars from P@80 calculation'
     )
+
+
+# =============================================================================
+# load_backbone — architecture-mismatch guard (fail fast, save GPU)
+# =============================================================================
+
+class TestLoadBackboneGuard:
+    """A max_sequence_length mismatch must abort BEFORE training, not
+    silently skip position_embeddings under strict=False."""
+
+    def test_raises_on_max_sequence_length_mismatch(self, tmp_path):
+        # Backbone pretrained at max_sequence_length=SEQ_LEN
+        donor = HybridStrategyModel(small_ffm_config(), NUM_STRATEGY_FEATURES)
+        bpath = tmp_path / 'best_backbone.pt'
+        torch.save(donor.backbone.state_dict(), bpath)
+
+        # Consumer built with a DIFFERENT max_sequence_length
+        cfg2 = FFMConfig(
+            num_features=len(get_model_feature_columns()),
+            hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+            intermediate_size=64, max_sequence_length=SEQ_LEN + 8,
+        )
+        consumer = HybridStrategyModel(cfg2, NUM_STRATEGY_FEATURES)
+
+        with pytest.raises(RuntimeError, match='max_sequence_length'):
+            consumer.load_backbone(str(bpath))
+
+    def test_matching_config_loads_clean(self, tmp_path):
+        donor = HybridStrategyModel(small_ffm_config(), NUM_STRATEGY_FEATURES)
+        bpath = tmp_path / 'best_backbone.pt'
+        torch.save(donor.backbone.state_dict(), bpath)
+
+        consumer = HybridStrategyModel(small_ffm_config(), NUM_STRATEGY_FEATURES)
+        consumer.load_backbone(str(bpath))  # must not raise
