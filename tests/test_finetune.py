@@ -4644,3 +4644,58 @@ def test_shuffle_audit_default_is_backcompat(tmp_path):
     tr_def, _, _ = _load(*a)                                  # no kwarg
     tr_off, _, _ = _load(*a, shuffle_train_labels=False)
     assert np.array_equal(tr_def[0]._labels, tr_off[0]._labels)
+
+
+# =============================================================================
+# Borrow #2 — automated shuffle-audit verdict (pure logic, no training)
+# =============================================================================
+
+from futures_foundation.finetune.trainer import _shuffle_audit_verdict
+from futures_foundation.finetune import run_shuffle_audit  # exported
+
+
+def _sm(p80, sig):
+    return {'F1': {'signals': sig, 'prec_at_70': None,
+                   'prec_at_80': p80, 'prec_at_90': None}}
+
+
+def test_audit_pass_real_beats_shuffled():
+    v = _shuffle_audit_verdict(_sm(0.65, 80), _sm(0.34, 80), ['F1'],
+                               margin=0.10, min_signals=15)
+    assert v['pass'] is True
+    assert v['per_fold']['F1']['fold_pass'] is True
+
+
+def test_audit_fail_leakage_shuffled_keeps_up():
+    v = _shuffle_audit_verdict(_sm(0.42, 80), _sm(0.39, 80), ['F1'],
+                               margin=0.10, min_signals=15)
+    assert v['pass'] is False
+    assert 'LEAKAGE' in v['per_fold']['F1']['reason']
+
+
+def test_audit_fail_real_below_min_signals():
+    v = _shuffle_audit_verdict(_sm(0.80, 5), _sm(0.20, 5), ['F1'],
+                               margin=0.10, min_signals=15)
+    assert v['pass'] is False
+
+
+def test_audit_pass_shuffled_collapsed_none():
+    v = _shuffle_audit_verdict(_sm(0.55, 60), _sm(None, 0), ['F1'],
+                               margin=0.10, min_signals=15)
+    assert v['pass'] is True
+
+
+def test_audit_multifold_one_fail_fails_overall():
+    real = {'F1': {'signals': 80, 'prec_at_80': 0.65},
+            'F2': {'signals': 80, 'prec_at_80': 0.41}}
+    shuf = {'F1': {'signals': 80, 'prec_at_80': 0.30},
+            'F2': {'signals': 80, 'prec_at_80': 0.40}}   # F2 leak
+    v = _shuffle_audit_verdict(real, shuf, ['F1', 'F2'], margin=0.10,
+                               min_signals=15)
+    assert v['per_fold']['F1']['fold_pass'] is True
+    assert v['per_fold']['F2']['fold_pass'] is False
+    assert v['pass'] is False
+
+
+def test_run_shuffle_audit_is_exported():
+    assert callable(run_shuffle_audit)

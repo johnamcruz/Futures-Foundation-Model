@@ -2088,3 +2088,91 @@ def summarize_fold_precision(fold_results: dict) -> dict:
             entry[key] = round(float((labels[mask] > 0).mean()), 3) if mask.sum() > 0 else None
         summary[fname] = entry
     return summary
+
+
+# =============================================================================
+# Borrow #2 — automated label-shuffle leakage gate
+# =============================================================================
+
+def _shuffle_audit_verdict(real_summary: dict, shuf_summary: dict,
+                           audit_folds: list, margin: float = 0.10,
+                           min_signals: int = 15) -> dict:
+    """Pure verdict logic (unit-testable, no training).
+
+    real_summary / shuf_summary: outputs of summarize_fold_precision for the
+    REAL and SHUFFLED runs. A real edge must clear shuffled by `margin` on
+    P@80 with enough signals; shuffled should collapse. If shuffled keeps up
+    (real_p80 - shuf_p80 < margin) the model learns the same with random
+    labels => LEAKAGE/OVERFIT (the CRT signature)."""
+    per_fold = {}
+    overall = True
+    for fn in audit_folds:
+        r = real_summary.get(fn) or {}
+        s = shuf_summary.get(fn) or {}
+        rp = r.get('prec_at_80'); rn = int(r.get('signals', 0))
+        sp = s.get('prec_at_80'); sn = int(s.get('signals', 0))
+        if rp is None or rn < min_signals:
+            ok, why = False, f'real weak (P@80={rp}, N={rn}<{min_signals})'
+        elif sp is None:
+            ok, why = True, f'shuffled collapsed (no P@80 signals) vs real {rp}'
+        elif rp - sp >= margin:
+            ok, why = True, f'real {rp} >= shuffled {sp} + {margin}'
+        else:
+            ok, why = False, (f'LEAKAGE: shuffled {sp} ~= real {rp} '
+                              f'(<{margin} gap) — model learns w/ random labels')
+        overall &= ok
+        per_fold[fn] = {'real_p80': rp, 'real_sig': rn, 'shuf_p80': sp,
+                        'shuf_sig': sn, 'fold_pass': ok, 'reason': why}
+    return {'pass': overall, 'per_fold': per_fold}
+
+
+def print_shuffle_audit(result: dict) -> None:
+    print('\n' + '=' * 60)
+    print('  SHUFFLE-AUDIT (borrow #2) — REAL vs SHUFFLED train labels')
+    print('=' * 60)
+    for fn, d in result['per_fold'].items():
+        print(f'  {fn}: REAL P@80={d["real_p80"]} (N={d["real_sig"]})  |  '
+              f'SHUFFLED P@80={d["shuf_p80"]} (N={d["shuf_sig"]})  -> '
+              f'{"PASS" if d["fold_pass"] else "FAIL"}')
+        print(f'       {d["reason"]}')
+    v = result['pass']
+    print('-' * 60)
+    print(f'  VERDICT: {"PASS — credible edge (survives shuffle)" if v else "FAIL — LEAKAGE/OVERFIT"}')
+    print('=' * 60, flush=True)
+
+
+def run_shuffle_audit(labeler, config, folds: list, tickers: list, **kw) -> dict:
+    """Automated leakage gate: run the finetune pipeline REAL then SHUFFLED
+    on identical config (cheap: F1-only, capped epochs) and emit a verdict.
+
+    A wrapper over run_finetune — run_finetune itself is unchanged. Universal
+    (Phase-D-outcome-independent). kw is forwarded to run_finetune; reserved
+    audit kwargs: audit_folds (default [folds[0]]), audit_epochs (default 15),
+    margin (0.10), min_signals (15). REAL/SHUFFLED use separate output_dirs
+    so checkpoints never collide."""
+    import dataclasses, os
+    audit_folds  = kw.pop('audit_folds', None) or [folds[0]['name']]
+    audit_epochs = kw.pop('audit_epochs', 15)
+    margin       = kw.pop('margin', 0.10)
+    min_signals  = kw.pop('min_signals', 15)
+    sel_folds    = [f for f in folds if f['name'] in audit_folds]
+    cfg          = dataclasses.replace(config,
+                                       epochs=min(config.epochs, audit_epochs))
+    base_out     = kw.pop('output_dir')
+
+    def _run(shuffled: bool):
+        sub = os.path.join(base_out,
+                           '_audit_shuf' if shuffled else '_audit_real')
+        os.makedirs(sub, exist_ok=True)
+        return run_finetune(labeler, cfg, sel_folds, tickers,
+                            output_dir=sub, shuffle_train_labels=shuffled,
+                            **kw)
+
+    print('SHUFFLE-AUDIT: REAL run...', flush=True)
+    real = summarize_fold_precision(_run(False))
+    print('SHUFFLE-AUDIT: SHUFFLED run...', flush=True)
+    shuf = summarize_fold_precision(_run(True))
+    result = _shuffle_audit_verdict(real, shuf, audit_folds, margin,
+                                    min_signals)
+    print_shuffle_audit(result)
+    return result
