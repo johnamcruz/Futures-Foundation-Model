@@ -44,6 +44,9 @@ def main(argv=None):
     ap.add_argument('--timeframe', choices=['5m', '3m'], default='5m')
     ap.add_argument('--instrument', default='ES')
     ap.add_argument('--trials', type=int, default=300)
+    ap.add_argument('--max-windows', type=int, default=None,
+                    help='cap walk-forward windows (smoke: e.g. 3). '
+                         'trials only bounds Optuna; this bounds the run.')
     ap.add_argument('--rf-gate', action='store_true')
     ap.add_argument('--hmm', action='store_true')
     a = ap.parse_args(argv)
@@ -78,9 +81,14 @@ def main(argv=None):
 
     oos_returns, month_rows, last_model = [], [], None
     for w, (tr_m, te_m) in enumerate(walk_forward_windows(idx), 1):
+        if a.max_windows is not None and w > a.max_windows:
+            print(f'  (stopping at --max-windows={a.max_windows})', flush=True)
+            break
         fit_m, val_m = optuna_holdout(tr_m, 0.15)
         if val_m.sum() < 20 or te_m.sum() < 10:
             continue
+        print(f'  window {w}: train={int(tr_m.sum())} val={int(val_m.sum())} '
+              f'test={int(te_m.sum())} bars — tuning...', flush=True)
         Xf, yf = X[fit_m].to_numpy(), y[fit_m]
         Xv = X[val_m].to_numpy()
         dfv = ohlcv[val_m].reset_index(drop=True)
