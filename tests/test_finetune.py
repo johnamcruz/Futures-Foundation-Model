@@ -72,8 +72,21 @@ def make_labels(n=200, signal_rate=0.05, seed=0):
     return pd.DataFrame({'signal_label': sig, 'max_rr': rr, 'sl_distance': rr * 0.5})
 
 
+def make_raw(n=200, seed=0, trend=2.0, start=5000.0):
+    """Raw OHLCV with a DatetimeIndex matching make_ffm_df's range and a
+    gentle uptrend so long triple-barrier events resolve as wins
+    deterministically (borrow #4: base run() needs real df_raw OHLC)."""
+    base = start + np.arange(n) * trend
+    idx  = pd.date_range('2023-01-01', periods=n, freq='5min',
+                          tz='America/New_York')
+    return pd.DataFrame(
+        {'open': base, 'high': base + 1.0, 'low': base - 1.0,
+         'close': base, 'volume': np.full(n, 500.0)}, index=idx)
+
+
 class TrivialLabeler(StrategyLabeler):
-    """Minimal concrete implementation for testing."""
+    """Minimal concrete implementation for testing (borrow #4 ABC):
+    only detect_events() + compute_features(); base run() does the rest."""
 
     @property
     def name(self):
@@ -83,11 +96,18 @@ class TrivialLabeler(StrategyLabeler):
     def feature_cols(self):
         return STRATEGY_COLS
 
-    def run(self, df_raw, ffm_df, ticker):
+    def compute_features(self, df_raw, ffm_df, ticker):
+        return make_strategy_features(len(ffm_df))
+
+    def detect_events(self, df_raw, ffm_df, ticker):
         n = len(ffm_df)
-        feats  = make_strategy_features(n)
-        labels = make_labels(n)
-        return feats, labels
+        idx = list(range(20, n - 5, 4))          # many → wins exist on any data
+        return pd.DataFrame({
+            'bar_idx':     idx,
+            'direction':   1,                    # long
+            'sl_distance': 1.0,
+            'tp_rr':       1.0,                  # TP == SL (>=1 => valid)
+        })
 
 
 # =============================================================================
@@ -129,13 +149,15 @@ def test_trivial_labeler_instantiates():
 def test_trivial_labeler_run_output_shape():
     lb = TrivialLabeler()
     ffm_df = make_ffm_df(100)
-    raw_df = ffm_df.copy()
+    ffm_df.index = pd.to_datetime(ffm_df['_datetime'])   # base run() needs DT index
+    raw_df = make_raw(100)
     feats, labels = lb.run(raw_df, ffm_df, 'TEST')
     assert len(feats) == 100
     assert len(labels) == 100
     assert list(feats.columns) == STRATEGY_COLS
-    assert 'signal_label' in labels.columns
-    assert 'max_rr' in labels.columns
+    # borrow #4 contract: signal_label/max_rr/sl_distance + direction (free)
+    assert {'signal_label', 'max_rr', 'sl_distance', 'direction'} <= set(labels.columns)
+    assert (labels['signal_label'] > 0).sum() > 0        # uptrend → longs win
 
 
 # =============================================================================
@@ -4798,28 +4820,20 @@ from futures_foundation.finetune.trainer import _print_realized_econ
 
 
 class _DirectionLabeler(TrivialLabeler):
-    """Emits the OPTIONAL per-row `direction` column (borrow #1 b2):
-    a handful of long signals so run_labeling computes `realized_r`."""
+    """A few fixed long signals (borrow #4 ABC): base run() emits
+    `direction` for free → run_labeling computes `realized_r`."""
 
     @property
     def name(self):
         return 'direction'
 
-    def run(self, df_raw, ffm_df, ticker):
-        n      = len(ffm_df)
-        feats  = make_strategy_features(n)
-        sig    = np.zeros(n, dtype=np.int8)
-        direc  = np.zeros(n, dtype=np.float32)
-        for s in (50, 100, 150):
-            sig[s] = 1
-            direc[s] = 1.0                       # long
-        labels = pd.DataFrame({
-            'signal_label': sig,
-            'max_rr':       (sig * 3.0).astype(np.float32),
-            'sl_distance':  np.where(sig > 0, 2.0, 0.0).astype(np.float32),
-            'direction':    direc,
+    def detect_events(self, df_raw, ffm_df, ticker):
+        return pd.DataFrame({
+            'bar_idx':     [50, 100, 150],
+            'direction':   1,                    # long
+            'sl_distance': 2.0,
+            'tp_rr':       1.5,
         })
-        return feats, labels
 
 
 def _labeling_dirs(tmp_path, labeler, ticker='DIR', n=300, trend=0.0):
@@ -4855,11 +4869,16 @@ def test_run_labeling_adds_realized_r_when_direction(tmp_path):
 
 
 @pytest.mark.skipif(_skip_no_parquet(), reason='pyarrow not installed')
-def test_run_labeling_no_realized_r_without_direction(tmp_path):
-    """Back-compat: labeler without `direction` → no `realized_r` column."""
-    cache_dir, ticker = _labeling_dirs(tmp_path, TrivialLabeler(), ticker='ND')
+def test_run_labeling_always_emits_direction_and_realized_r(tmp_path):
+    """Borrow #4: every conformant labeler emits `direction` via the base
+    run() (no opt-out) ⇒ `realized_r` is computed for free. The absent-
+    direction back-compat path still exists defensively and is covered at
+    the dataset level by test_dataset_emits_realized_r_key_backcompat."""
+    cache_dir, ticker = _labeling_dirs(tmp_path, TrivialLabeler(),
+                                       ticker='ND', trend=2.0)
     lab = pd.read_parquet(cache_dir / f'{ticker}_strategy_labels.parquet')
-    assert 'realized_r' not in lab.columns
+    assert 'direction' in lab.columns
+    assert 'realized_r' in lab.columns
 
 
 def test_dataset_emits_realized_r_key_backcompat():
@@ -5009,3 +5028,99 @@ def test_econ_config_defaults_off_and_hash_excluded():
     assert base.econ_selection is False and base.econ_patience == 10
     on   = TrainingConfig(econ_selection=True, econ_patience=7)
     assert _config_hash(base) == _config_hash(on)
+
+
+# =============================================================================
+# Borrow #4-locked — clean ABC: detect_events()+compute_features(), final run()
+# =============================================================================
+
+class _ShortLabeler(TrivialLabeler):
+    """One short event — exercises the short barrier path."""
+    @property
+    def name(self):
+        return 'short'
+
+    def detect_events(self, df_raw, ffm_df, ticker):
+        return pd.DataFrame({'bar_idx': [30], 'direction': [-1],
+                             'sl_distance': [2.0], 'tp_rr': [1.5]})
+
+
+class _BadTpLabeler(TrivialLabeler):
+    """tp_rr < 1.0 — base must clamp to 1.0 (TP>=SL) and warn."""
+    def detect_events(self, df_raw, ffm_df, ticker):
+        return pd.DataFrame({'bar_idx': [40], 'direction': [1],
+                             'sl_distance': [1.0], 'tp_rr': [0.5]})
+
+
+class _MissingColLabeler(TrivialLabeler):
+    def detect_events(self, df_raw, ffm_df, ticker):
+        return pd.DataFrame({'bar_idx': [40], 'direction': [1]})  # no sl/tp
+
+
+class _NoHookLabeler(StrategyLabeler):
+    name = 'nohook'
+    feature_cols = STRATEGY_COLS                 # detect_events/compute_features absent
+
+
+def _dt_ffm(n=120):
+    f = make_ffm_df(n)
+    f.index = pd.to_datetime(f['_datetime'])
+    return f
+
+
+def test_abc_requires_detect_events_and_compute_features():
+    with pytest.raises(TypeError):
+        _NoHookLabeler()                          # abstract hooks unimplemented
+
+
+def test_base_run_triple_barrier_long_win_sets_label_and_direction():
+    ffm = _dt_ffm(120)
+    feats, labels = TrivialLabeler().run(make_raw(120, trend=2.0), ffm, 'T')
+    assert {'signal_label', 'max_rr', 'sl_distance', 'direction'} <= set(labels.columns)
+    sig = labels['signal_label'].values > 0
+    assert sig.sum() > 0                          # uptrend longs win
+    assert (labels['direction'].values[sig] == 1).all()
+    assert (labels['sl_distance'].values[sig] == 1.0).all()
+    assert (labels['max_rr'].values[sig] > 0).all()   # realized R on wins
+
+
+def test_base_run_entry_is_next_bar_open():
+    """Signal at bar i, entry at i+1. A long with a hard drop AT the signal
+    bar but rising AFTER must still win (entry uses i+1, not i)."""
+    ffm = _dt_ffm(60)
+    raw = make_raw(60, trend=2.0)
+    raw.iloc[25, raw.columns.get_loc('low')] = 1.0     # crash on signal bar 25 only
+
+    class _L(TrivialLabeler):
+        def detect_events(self, d, f, t):
+            return pd.DataFrame({'bar_idx': [25], 'direction': [1],
+                                 'sl_distance': [1.0], 'tp_rr': [1.0]})
+
+    _, labels = _L().run(raw, ffm, 'T')
+    assert labels['signal_label'].iloc[25] == 1        # entry at 26 → unaffected
+
+
+def test_base_run_short_path():
+    ffm = _dt_ffm(80)
+    _, labels = _ShortLabeler().run(make_raw(80, trend=-2.0), ffm, 'T')
+    assert labels['signal_label'].iloc[30] == 1        # downtrend short wins
+    assert labels['direction'].iloc[30] == -1
+
+
+def test_base_run_clamps_tp_rr_below_one_and_warns():
+    ffm = _dt_ffm(80)
+    with pytest.warns(UserWarning, match='tp_rr < 1.0 clamped'):
+        _, labels = _BadTpLabeler().run(make_raw(80, trend=2.0), ffm, 'T')
+    assert labels['signal_label'].iloc[40] in (0, 1)   # resolved, no crash
+
+
+def test_base_run_missing_event_columns_raises():
+    ffm = _dt_ffm(80)
+    with pytest.raises(ValueError, match='missing columns'):
+        _MissingColLabeler().run(make_raw(80), ffm, 'T')
+
+
+def test_base_run_features_from_compute_features():
+    ffm = _dt_ffm(100)
+    feats, _ = TrivialLabeler().run(make_raw(100), ffm, 'T')
+    assert list(feats.columns) == STRATEGY_COLS and len(feats) == 100

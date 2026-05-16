@@ -9,9 +9,18 @@ Usage — implement one class, get everything else for free:
         name = 'my_strategy'
         feature_cols = ['zone_height', 'entry_depth', ...]
 
-        def run(self, df_raw, ffm_df, ticker):
-            # compute features + labels aligned to ffm_df.index
-            return strategy_features_df, labels_df
+        def detect_events(self, df_raw, ffm_df, ticker):
+            # one row per signal bar:
+            #   bar_idx, direction(+1/-1), sl_distance(>0), tp_rr(>=1)
+            return events_df
+
+        def compute_features(self, df_raw, ffm_df, ticker):
+            # feature_cols matrix aligned to ffm_df.index
+            return strategy_features_df
+
+        # run() is FINAL — the base applies the session-calibrated TP>=SL
+        # triple barrier (entry = next-bar open) and emits signal_label /
+        # max_rr / sl_distance / direction for free.
 
     labeler = MyStrategyLabeler()
     run_labeling(labeler, tickers, raw_dir, ffm_dir, cache_dir)
