@@ -15,6 +15,8 @@ from futures_foundation.primitives import (
     detect_pivots,
     apply_rr_barriers,
     best_rr_hit,
+    realized_r_trailing,
+    r_bucket,
     session_mask,
     session_end_mask,
     compute_vwap,
@@ -663,3 +665,104 @@ def test_ote_zones_top_above_bot():
     valid = ~np.isnan(ft)
     if valid.any():
         assert np.all(ft[valid] >= fb[valid])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# realized_r_trailing  +  r_bucket
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _flat(n, px=100.0):
+    return (np.full(n, px + 0.1), np.full(n, px - 0.1), np.full(n, px))
+
+
+def test_realized_r_immediate_stop_long():
+    h, l, c = _flat(30)
+    l[6] = 98.0   # breaches sl=99 before arming
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=True,
+                            entry_price=100.0, sl_price=99.0,
+                            atr=1.0, trail_atr_k=2.0)
+    assert r['outcome'] == 'stopped'
+    assert r['realized_r'] == pytest.approx(-1.0)
+
+
+def test_realized_r_trails_out_in_profit_long():
+    n = 30
+    h = np.full(n, 100.1); l = np.full(n, 99.9); c = np.full(n, 100.0)
+    # rise: extreme climbs, trail = extreme - 2*atr ratchets up
+    h[6], l[6]  = 101.0, 100.5   # arms (fav_r=1.0), trail->99
+    h[7], l[7]  = 102.0, 101.5   # trail->100
+    h[8], l[8]  = 103.0, 102.5   # trail->101
+    h[9], l[9]  = 104.0, 103.5   # trail->102
+    h[10], l[10] = 105.0, 104.5  # trail->103
+    h[11], l[11] = 104.0, 102.0  # l<=103 -> exit at trail 103
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=True,
+                            entry_price=100.0, sl_price=99.0,
+                            atr=1.0, trail_atr_k=2.0, activate_r=1.0)
+    assert r['outcome'] == 'trailed'
+    assert r['realized_r'] == pytest.approx(3.0)   # (103-100)/1
+    assert r['exit_idx'] == 11
+
+
+def test_realized_r_never_arms_then_stopped():
+    n = 30
+    h = np.full(n, 100.1); l = np.full(n, 99.9); c = np.full(n, 100.0)
+    h[6], l[6] = 100.5, 100.0    # fav_r=0.5 < activate_r -> not armed
+    l[7] = 98.5                  # hits initial sl
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=True,
+                            entry_price=100.0, sl_price=99.0,
+                            atr=1.0, trail_atr_k=2.0, activate_r=1.0)
+    assert r['outcome'] == 'stopped'
+    assert r['realized_r'] == pytest.approx(-1.0)
+
+
+def test_realized_r_session_end_marks_to_close():
+    n = 20
+    h = np.full(n, 100.6); l = np.full(n, 99.95); c = np.full(n, 100.5)
+    se = np.zeros(n, dtype=bool); se[8] = True
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=True,
+                            entry_price=100.0, sl_price=99.0,
+                            atr=1.0, trail_atr_k=2.0,
+                            is_session_end=se)
+    assert r['outcome'] == 'session_end'
+    assert r['realized_r'] == pytest.approx(0.5)   # (100.5-100)/1
+
+
+def test_realized_r_horizon_cap():
+    h, l, c = _flat(30); c[:] = 100.0
+    c[8] = 100.4; h[8] = 100.5; l[8] = 99.95
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=True,
+                            entry_price=100.0, sl_price=99.0,
+                            atr=1.0, trail_atr_k=2.0, max_hold=3)
+    assert r['outcome'] == 'horizon'
+    assert r['exit_idx'] == 8                       # entry+max_hold
+    assert r['realized_r'] == pytest.approx(0.4)
+
+
+def test_realized_r_immediate_stop_short():
+    n = 30
+    h = np.full(n, 100.1); l = np.full(n, 99.9); c = np.full(n, 100.0)
+    h[6] = 102.0   # breaches short sl=101
+    r = realized_r_trailing(h, l, c, entry_idx=5, is_long=False,
+                            entry_price=100.0, sl_price=101.0,
+                            atr=1.0, trail_atr_k=2.0)
+    assert r['outcome'] == 'stopped'
+    assert r['realized_r'] == pytest.approx(-1.0)
+
+
+def test_realized_r_invalid_zero_risk():
+    h, l, c = _flat(10)
+    r = realized_r_trailing(h, l, c, entry_idx=2, is_long=True,
+                            entry_price=100.0, sl_price=100.0,
+                            atr=1.0, trail_atr_k=2.0)
+    assert r['outcome'] == 'invalid'
+
+
+@pytest.mark.parametrize('val,expected', [
+    (-0.5, 0), (-1.0, 0),
+    (0.0, 1), (1.9, 1),
+    (2.0, 2), (4.99, 2),
+    (5.0, 3), (9.99, 3),
+    (10.0, 4), (25.0, 4),
+])
+def test_r_bucket_edges(val, expected):
+    assert r_bucket(val) == expected

@@ -26,6 +26,8 @@ from .detection import (
 from .barriers import (
     apply_rr_barriers,
     best_rr_hit,
+    realized_r_trailing,
+    r_bucket,
 )
 from .session import (
     session_mask,
@@ -38,6 +40,6 @@ __all__ = [
     "compute_ema", "compute_rsi",
     "rolling_mean", "rolling_atr_percentile",
     "detect_pivots", "detect_cisd_signals", "compute_ote_zones",
-    "apply_rr_barriers", "best_rr_hit",
+    "apply_rr_barriers", "best_rr_hit", "realized_r_trailing", "r_bucket",
     "session_mask", "session_end_mask", "compute_vwap",
 ]
