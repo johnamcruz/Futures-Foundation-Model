@@ -613,9 +613,20 @@ def _make_optimizer(
 
 # ── Fold helpers ─────────────────────────────────────────────────────────────
 
-def _config_hash(training_cfg: TrainingConfig) -> str:
+def _config_hash(training_cfg: TrainingConfig, ffm_config: "FFMConfig" = None) -> str:
     _hash_exclude = {'baseline_wr', 'f1_ok_ceiling', 'continue_from', 'backbone_swap_path', 'p80_patience', 'n_stable_min', 'focal_gamma_end', 'focal_gamma_decay_start', 'strategy_lr_multiplier', 'lr_boost_at_decay_start'}
     d = {k: v for k, v in training_cfg.__dict__.items() if k not in _hash_exclude}
+    if ffm_config is not None:
+        # Architecture-determining FFMConfig fields. A change here changes
+        # state_dict tensor shapes, so a stale resume/done checkpoint MUST NOT
+        # hash-match — otherwise the strict load_state_dict crashes (e.g.
+        # max_sequence_length 128→160 → position_embeddings [129] vs [161]).
+        # Excluding ffm_config from the hash was a real bug: it let pre-arch-
+        # change probe checkpoints poison a re-run.
+        _arch_keys = ('max_sequence_length', 'num_features', 'hidden_size',
+                      'num_hidden_layers', 'num_attention_heads',
+                      'intermediate_size', 'num_instruments', 'num_sessions')
+        d['__ffm_arch__'] = {k: getattr(ffm_config, k, None) for k in _arch_keys}
     return hashlib.md5(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
 
 
@@ -1270,7 +1281,7 @@ def run_walk_forward(
         pretrained_path=pretrained_path,
     )
 
-    config_hash = _config_hash(training_cfg)
+    config_hash = _config_hash(training_cfg, ffm_config)
     weights_label = pretrained_path or backbone_path
     print(f'\n{"="*60}')
     print(f'  WALK-FORWARD — {len(folds)} folds | config hash: {config_hash}')

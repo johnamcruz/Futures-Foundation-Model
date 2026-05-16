@@ -4557,3 +4557,39 @@ class TestLoadBackboneGuard:
 
         consumer = HybridStrategyModel(small_ffm_config(), NUM_STRATEGY_FEATURES)
         consumer.load_backbone(str(bpath))  # must not raise
+
+
+# =============================================================================
+# _config_hash — must include ffm_config architecture (stale-resume guard)
+# =============================================================================
+
+class TestConfigHashArch:
+    """A max_sequence_length (or any arch) change MUST change the resume
+    hash, else a stale checkpoint strict-loads and crashes."""
+
+    def test_max_sequence_length_changes_hash(self):
+        tc = TrainingConfig(seq_len=96)
+        c128 = FFMConfig(num_features=len(get_model_feature_columns()),
+                         hidden_size=32, num_hidden_layers=2,
+                         num_attention_heads=4, intermediate_size=64,
+                         max_sequence_length=128)
+        c160 = FFMConfig(num_features=len(get_model_feature_columns()),
+                         hidden_size=32, num_hidden_layers=2,
+                         num_attention_heads=4, intermediate_size=64,
+                         max_sequence_length=160)
+        assert _config_hash(tc, c128) != _config_hash(tc, c160)
+
+    def test_same_arch_same_hash(self):
+        tc = TrainingConfig(seq_len=96)
+        assert _config_hash(tc, small_ffm_config()) == \
+               _config_hash(tc, small_ffm_config())
+
+    def test_omitting_ffm_config_is_backward_compatible(self):
+        # Optional arg → existing callers (and tests) still work.
+        tc = TrainingConfig(seq_len=96)
+        h = _config_hash(tc)
+        assert isinstance(h, str) and len(h) == 8
+
+    def test_passing_ffm_config_changes_hash_vs_omitting(self):
+        tc = TrainingConfig(seq_len=96)
+        assert _config_hash(tc) != _config_hash(tc, small_ffm_config())
