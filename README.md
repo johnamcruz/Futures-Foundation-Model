@@ -62,13 +62,24 @@ class MyStrategyLabeler(StrategyLabeler):
     @property
     def feature_cols(self): return ['zone_height', 'entry_depth', 'risk_norm']
 
-    def run(self, df_raw, ffm_df, ticker):
-        # df_raw:  raw 5-min OHLCV (tz-aware NY index)
-        # ffm_df:  FFM-prepared features — use htf_1h_structure, vty_atr_raw, etc.
-        #          directly rather than recomputing from raw bars
-        features_df, labels_df = my_signal_logic(df_raw, ffm_df)
-        return features_df, labels_df  # both aligned to ffm_df.index
+    def detect_events(self, df_raw, ffm_df, ticker):
+        # one row per signal bar: bar_idx, direction(+1/-1),
+        # sl_distance(>0), tp_rr(>=1).  Entry is the NEXT bar's open.
+        return my_events_df
+
+    def compute_features(self, df_raw, ffm_df, ticker):
+        # feature_cols matrix aligned to ffm_df.index
+        return my_features_df
 ```
+
+> **v1.3 ABC change:** `run()` is now **FINAL** — the base applies a
+> session-calibrated **TP≥SL triple barrier** (entry = next-bar open),
+> centralising the entry-after-signal / orientation bug class once. A
+> strategy implements only `detect_events()` + `compute_features()`. The
+> base auto-emits `signal_label` / `max_rr` / `sl_distance` **and
+> `direction`**, so realized-R economics and economic checkpoint
+> selection work *for free* for every new strategy. The legacy
+> `run()`-override path was removed (CISD/Session VP were historical-only).
 
 ```python
 # Single call — labeling, walk-forward training, evaluation, and fold progression all in one
@@ -198,7 +209,10 @@ export_onnx(
 
 | Component | Description |
 |---|---|
-| `StrategyLabeler` | ABC — implement `name`, `feature_cols`, `run()` to define any strategy |
+| `StrategyLabeler` | ABC — implement `name`, `feature_cols`, **`detect_events()`** + **`compute_features()`**; the **final** `run()` applies a session-calibrated TP≥SL triple barrier (entry = next-bar open) and emits `signal_label`/`max_rr`/`sl_distance`/`direction` (v1.3) |
+| `run_shuffle_audit()` | **Leakage gate** — trains REAL vs label-SHUFFLED on identical seed/folds; PASS only if real ≫ shuffled, FAIL=LEAKAGE if shuffled≈real (the audit that killed CRT's false positive). Pure `_shuffle_audit_verdict`, CI-assertable exit code (v1.3 #2) |
+| Realized-R econ block | `print_eval_summary` / per-fold table print PF/WR/mean-R/maxDD/no-top-1% from **realized R under a trailing exit** (not the optimistic MFE/`max_rr`), labeled realized-vs-MFE; back-compat skip if absent (v1.3 #1) |
+| `econ_selection` (TrainingConfig) | Opt-in **economic checkpoint selection** — adds an `_econ.pt` tier + early-stop on a CAGR·√Sortino *product* objective (can't be won by not-trading; rewards more signals only while profitable). Default **off** → selection byte-identical to the proven `_p80s>_p80>_f1>_loss` path (v1.3 #3) |
 | `TrainingConfig` | Dataclass holding all training hyperparameters |
 | `HybridStrategyModel` | FFM backbone + strategy feature projection + signal/risk/confidence heads |
 | `HybridStrategyDataset` | Sliding-window dataset parameterised by your strategy feature columns |
@@ -374,7 +388,44 @@ run_pipeline(MyLabeler(bar_minutes=5), timeframe='5m', instrument='ES', trials=3
 
 > **Verdict gate (non-negotiable):** a model is credible only if **every OOS month is profitable (PF > 1)** on the *full multi-year* rolling walk-forward — not a smoke window. The plug-in makes strategies cheap to *try*; the gate is what makes one *real*.
 
+The consolidated **leakage** check carries a **degenerate-shuffled guard** (`_shuf_robust`, v1.3): a shuffled run that is economically dead (≈0 PnL / tiny N) is the *desired* no-leakage outcome — raw Profit Factor is meaningless there (∞ on ~1 trade), so it can no longer raise a *false* leakage flag; only a meaningfully-trading shuffled run gets the PF test.
+
 Build spec: [`docs/xgboost-pipeline.md`](docs/xgboost-pipeline.md). Extra deps (in `requirements.txt`): `xgboost>=2.0`, `optuna>=3.0`, `joblib>=1.3`.
+
+---
+
+## RL Pipeline (Standalone)
+
+**`pipelines/rl/` — a generic PPO walk-forward pipeline, reusing the validated spine, with the proprietary strategy supplied as a private plug-in.**
+
+Some strategies are sequential, regime-adaptive decisions — *how to manage a trade*, not just *whether to take it*. A tree or a fixed rule can't express that; an RL policy conditioned on FFM's market understanding can. The RL pipeline mirrors the XGBoost pipeline's structure and **reuses `pipelines/common`** (walk-forward windows, economic objective, robustness gates) — only the per-window fit (PPO) differs.
+
+**Design:** mechanical entry candidates (the strategy plug-in) → a PPO policy that learns, on a **frozen FFM context-head embedding ⊕ position state**, an asymmetric *chop-veto* on entries (a veto must pay for itself — closes the "skip-everything" collapse) **and** the exit, jointly, under one **realized-R** reward. One frozen context encoder = a stationary observation manifold (the property financial RL usually lacks). Episode = one trade.
+
+```python
+from pipelines.rl import RLStrategy, register, run_walkforward
+
+@register("my_strategy")
+class MyStrategy(RLStrategy):
+    name = "my_strategy"
+    entry_filter = True                       # PPO learns the chop-veto
+    def detect_entries(self, df_raw, ctx_df, ticker):
+        return events_df                      # bar_idx, direction, sl_distance, tp_rr
+
+run_walkforward(MyStrategy(), {"ES": (df, ctx)})   # windows, gates, seeds free
+```
+
+| Component | Description |
+|---|---|
+| `RLStrategy` | ABC + registry — `detect_entries()` (mandatory causal-parity), `entry_filter` on/off, realized-R exit knobs |
+| `shape_reward()` | The **single** optional extension point for *all* custom/account-aware reward (prop-firm balance, Maximum-Loss-Limit / trailing drawdown). Default = identity — **FFM has zero account/prop-firm concept**; that IP lives only in the plug-in |
+| `SingleTradeEnv` | Episode = one trade; obs = context-head ⊕ position-state; asymmetric veto + hold/exit; mechanical SL; evaluation begins entry+1 (matches `apply_rr_barriers`); terminal realized-R |
+| `causal.py` | Generic **causal-parity harness** — streaming==batch; the look-ahead falsifier the shuffle audit *cannot* catch; mandatory gate for any detector before training |
+| `device.py` | Auto device — CUDA → MPS → CPU |
+| `run_walkforward()` | Windows (`common`) → injected `trainer.train(episodes,seed)→policy` seam → OOS rollout → every-OOS-month-PF>1 + **shuffle + multi-seed** verdict |
+| `pipelines/common/robustness.py` | `shuffle_robust` (degenerate-guarded) + `multiseed_verdict` (financial-RL seed-variance gate — the dominant RL failure mode shuffle-audit can't catch) |
+
+> **IP boundary:** the public repo holds **only generic machinery** — no proprietary strategy logic. A concrete strategy (e.g. a CRT sweep detector) subclasses `RLStrategy` and is authored in the **private** strategies repo, exactly as the CISD scripts plug into `futures_foundation.finetune`. The default PPO trainer (`stable-baselines3`) is imported **lazily** at train time only — the pipeline and its tests are dependency-light.
 
 ---
 
@@ -586,8 +637,8 @@ Futures-Foundation-Model/
 │   │   └── trainer.py          # prepare_data, run_pretrain, verify_backbone
 │   └── finetune/               # ★ Strategy fine-tuning framework
 │       ├── __init__.py
-│       ├── base.py             # StrategyLabeler ABC
-│       ├── config.py           # TrainingConfig dataclass
+│       ├── base.py             # StrategyLabeler ABC (detect_events + compute_features; final run() = TP≥SL triple barrier)
+│       ├── config.py           # TrainingConfig dataclass (incl. econ_selection)
 │       ├── health.py           # FoldHealthMonitor — 7-signal post-fold pathology detection
 │       ├── model.py            # HybridStrategyModel
 │       ├── dataset.py          # HybridStrategyDataset
@@ -595,23 +646,34 @@ Futures-Foundation-Model/
 │       └── trainer.py          # run_finetune, run_labeling, run_walk_forward, print_eval_summary
 ├── pipelines/                  # ★ Standalone pipelines (transformer-independent)
 │   ├── __init__.py
-│   └── xgboost/                # XGBoost direction classifier (spec: docs/xgboost-pipeline.md)
-│       ├── base.py             # XGBStrategyLabeler ABC + registry
-│       ├── labeler.py          # V2 session triple-barrier (registered default)
-│       ├── trail.py            # Rogers-Satchell hybrid ATR/structure trail
-│       ├── backtest.py         # exit-priority trade sim → per-trade returns
-│       ├── walkforward.py      # rolling 3:1 unanchored splitter
-│       ├── objective.py        # combined CAGR·√Sortino Optuna objective
-│       ├── tuner.py            # Optuna TPE study (lazy xgboost/optuna)
-│       ├── train.py            # run_pipeline() API + CLI
-│       └── predictor.py        # XGBPredictor inference wrapper
+│   ├── common/                 # shared spine (reused by xgboost + rl)
+│   │   ├── walkforward.py      # rolling 3:1 unanchored splitter
+│   │   ├── objective.py        # combined CAGR·√Sortino objective
+│   │   └── robustness.py       # shuffle_robust + multiseed_verdict
+│   ├── xgboost/                # XGBoost direction classifier (spec: docs/xgboost-pipeline.md)
+│   │   ├── base.py             # XGBStrategyLabeler ABC + registry
+│   │   ├── labeler.py          # V2 session triple-barrier (registered default)
+│   │   ├── trail.py            # Rogers-Satchell hybrid ATR/structure trail
+│   │   ├── backtest.py         # exit-priority trade sim → per-trade returns
+│   │   ├── tuner.py            # Optuna TPE study (lazy xgboost/optuna)
+│   │   ├── train.py            # run_pipeline() API + CLI
+│   │   ├── phase_d.py          # verdict run + _shuf_robust degenerate guard
+│   │   └── predictor.py        # XGBPredictor inference wrapper
+│   └── rl/                     # generic PPO walk-forward pipeline
+│       ├── base.py             # RLStrategy ABC + registry + shape_reward
+│       ├── env.py              # SingleTradeEnv (veto+exit, realized-R)
+│       ├── causal.py           # causal-parity harness (look-ahead gate)
+│       ├── device.py           # auto CUDA→MPS→CPU
+│       ├── pipeline.py         # run_walkforward (injected trainer seam)
+│       └── ppo.py              # lazy SB3-PPO default trainer
 ├── docs/
 │   └── xgboost-pipeline.md     # XGBoost pipeline build specification
-├── tests/                      # Unit tests (518+ total)
+├── tests/                      # Unit tests (660+ total)
 │   ├── test_model.py           # Backbone + heads
 │   ├── test_pretrain.py        # Pretraining pipeline
 │   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage, FoldHealthMonitor)
-│   ├── test_xgboost_pipeline.py # XGBoost pipeline (objective, V2 labeler, trail, walk-forward, plug-in)
+│   ├── test_xgboost_pipeline.py # XGBoost pipeline (objective, V2 labeler, trail, walk-forward, _shuf_robust)
+│   ├── test_rl_pipeline.py     # RL pipeline (ABC/registry, env, causal harness, run_walkforward)
 │   ├── test_features_crt.py    # CRT sweep features
 │   ├── test_features_core.py   # Core feature groups
 │   ├── test_labels.py          # Label generation
@@ -629,6 +691,8 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
+| **v1.4** | **`pipelines/rl` — generic PPO walk-forward pipeline.** `RLStrategy` ABC + registry; `SingleTradeEnv` (episode=one trade, obs = frozen FFM context-head ⊕ position-state, asymmetric chop-veto + hold/exit, mechanical SL, entry+1 convention, terminal realized-R); `causal.py` generic causal-parity harness (the look-ahead falsifier the shuffle audit cannot catch — mandatory pre-train gate); `device.py` auto CUDA→MPS→CPU; `run_walkforward` reusing `pipelines/common` (windows) with an injected `trainer.train(episodes,seed)→policy` seam → every-OOS-month-PF>1 + shuffle + multi-seed verdict; `shape_reward()` the single optional extension point for all custom/account-aware reward (prop-firm balance / MLL) — default identity, **zero account/prop-firm concept in FFM**; SB3-PPO is the lazy default trainer (pipeline + tests dependency-light); `pipelines/common/robustness.py` (`shuffle_robust` + `multiseed_verdict`). IP boundary: proprietary strategies (e.g. CRT) are private plug-ins, never in this repo. 16 RL tests |
+| **v1.3** | **Finetune framework hardening (4 borrows) + verdict-fix + shared spine.** **#1** realized-R economic eval (PF/WR/mean-R/maxDD/no-top-1% under a trailing exit, labeled realized-vs-MFE — replaces the optimistic `max_rr`/MFE proxy). **#2** `run_shuffle_audit` leakage gate (REAL vs label-SHUFFLED, pure `_shuffle_audit_verdict`, CI-assertable — the audit that killed CRT's false positive). **#3** opt-in `econ_selection` — `_econ.pt` tier + early-stop on a CAGR·√Sortino *product* (can't win by not-trading; default off ⇒ selection byte-identical to `_p80s>_p80>_f1>_loss`). **#4** clean `StrategyLabeler` ABC — `run()` FINAL, implement only `detect_events()`+`compute_features()`; base applies session-calibrated TP≥SL triple barrier (entry=next-bar open) emitting `signal_label`/`max_rr`/`sl_distance`/`direction` (so #1/#3 work free for every strategy); legacy `run()`-override removed. xgboost `phase_d` **degenerate-shuffled guard** (`_shuf_robust`): a ≈0-PnL/tiny-N shuffled run no longer raises a false leakage flag. `pipelines/common/` extracted (walk-forward + objective) reused by both pipelines. CISD v19 / Session VP retired (pre-causality-fix lineage, not-validated). 660+ tests |
 | **v1.2** | **`pipelines/xgboost` — standalone XGBoost direction pipeline**, independent of the transformer (reuses only causal `derive_features`/68 features): V2 session triple-barrier labeler, Rogers-Satchell hybrid ATR/structure trail, rolling 3:1 unanchored walk-forward, Optuna TPE combined `CAGR·√Sortino` objective (product → can't win by not trading), every-OOS-month-PF>1 gate, `XGBPredictor` artifact; `XGBStrategyLabeler` ABC + registry give finetune-parity strategy plug-in (`run_pipeline()` API + `--labeler` CLI; `--max-windows` bounds smoke runs); 26 pipeline tests. Also — finetune/pretrain robustness guards: `run_pretrain` fails fast on `seq_len > max_sequence_length`; `load_backbone` hard-fails on architecture mismatch instead of silently dropping `position_embeddings` under `strict=False`; `_config_hash` now includes `ffm_config` arch so a stale resume cannot poison a re-run; mandatory no-look-ahead causal-parity discipline (every feature proven batch==streaming per bar) |
 | **v1.1** | `FoldHealthMonitor` — stateful post-fold pathology detector; 7 signals (EARLY_EPOCH, WEIGHT_LOCK, P80_DECLINE, VAL_TEST_GAP, N_COLLAPSE, CONFIDENCE_FLAT, ZERO_SIGNAL_FOLD); prints immediately on detection + consolidated `summary()` after all folds; always prints feature importance `cos_sim` between folds even when healthy so the WEIGHT_LOCK fix is visually confirmed; `train_start` fold key — 18-month sliding window training prevents weight lock in `continue_from` runs by forcing each fold to re-adapt to its local regime; `val_p80` stored in test_metrics from the selected checkpoint to power VAL_TEST_GAP; 10 new health monitor tests (492 total) |
 | **v1.0** | `futures_foundation.pretrain` — full backbone pretraining pipeline in the library; `prepare_data()` derives 68 features + 4 labels from raw OHLCV CSVs (idempotent, skips cached); `run_pretrain()` full training loop with AMP (bfloat16/float16), per-task overfit guards, collapse detection, backbone val loss checkpointing (structure excluded — overfits early while other heads improve); `verify_backbone()` confirms checkpoint health and instrument embedding diversity; `PretrainConfig` dataclass with v8/v9 defaults baked in; Colab script reduced from ~990 → ~90 lines; stale `scripts/pretrain.py` and `scripts/prepare_data.py` (42-feature era) deleted; 21 new unit tests (452 total) |
