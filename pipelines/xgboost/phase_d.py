@@ -15,8 +15,16 @@ fast bounded probe before committing to the full 300-trial run.
 
 PASS (real edge) requires, for EVERY ticker:
   • real: every-OOS-month-PF>1 gate PASS  AND  aggregate PF > 1.2
-  • robustness: shuffled aggregate PF < 1.10  AND  real PF clearly > shuffled
+  • robustness: the real edge survives label-shuffling — either the shuffled
+    run is economically dead (< SHUF_MIN_TRADES trades or ~0 |PnL| ⇒ the
+    edge did NOT survive ⇒ good, no leakage) or, if it traded meaningfully,
+    shuffled PF < 1.10 AND real PF clearly above it.
 Anything else => FAIL (no credible edge / leakage).
+
+Note: Profit Factor is degenerate on a ~0-PnL / tiny-N sample (∞ or
+inflated on ~1 trade). The degenerate-shuffled guard prevents that artifact
+from raising a FALSE leakage flag (the ES/YM Phase-D probe case) without
+weakening detection when the shuffled run genuinely makes money.
 """
 import argparse
 import sys
@@ -31,6 +39,32 @@ def _row(tag, agg, gate, nм):
     return (f"  {tag:18s} months={nм:3d} gate={'PASS' if gate else 'FAIL':4s} "
             f"PF={pf:6.2f} WR={agg['win_rate']:.1%} PnL={agg['pnl']:+.4f} "
             f"maxDD={agg['max_dd']:+.2%}")
+
+
+# Below either floor the shuffled run is economically dead — the edge did
+# NOT survive label-shuffling, which is the DESIRED no-leakage outcome.
+SHUF_MIN_TRADES = 20
+SHUF_MIN_ABS_PNL = 0.05
+
+
+def _shuf_robust(ra: dict, sa: dict,
+                 shuf_min_trades: int = SHUF_MIN_TRADES,
+                 shuf_min_abs_pnl: float = SHUF_MIN_ABS_PNL) -> bool:
+    """Did the real edge survive label-shuffling (True) or is this leakage
+    (False)?  ``ra``/``sa`` are the real/shuffled aggregate-stats dicts.
+
+    A *degenerate* shuffled run — fewer than ``shuf_min_trades`` trades or
+    |PnL| below ``shuf_min_abs_pnl`` — means the edge did NOT survive the
+    shuffle: exactly the no-leakage result we want.  Profit Factor is
+    meaningless on such a sample (∞ or inflated on ~1 trade), so it must NOT
+    raise a false leakage flag (the ES/YM Phase-D probe artifact).  Only
+    when the shuffled run traded meaningfully do we apply the original
+    PF test: shuffled PF stays low AND real PF is clearly above it.
+    """
+    if sa['trades'] < shuf_min_trades or abs(sa['pnl']) < shuf_min_abs_pnl:
+        return True
+    return (sa['profit_factor'] < 1.10 and
+            ra['profit_factor'] > sa['profit_factor'] + 0.30)
 
 
 def main(argv=None):
@@ -102,12 +136,12 @@ def main(argv=None):
             print(_row('SHUFFLED', shuf['aggregate'], shuf['gate_pass'],
                        shuf['n_months']))
             sa = shuf['aggregate']
-            robust = sa['profit_factor'] < 1.10 and \
-                ra['profit_factor'] > sa['profit_factor'] + 0.30
-            if not robust:
+            if not _shuf_robust(ra, sa):
                 tk_ok = False
-                reasons.append(f"{tk}: shuffled PF {sa['profit_factor']:.2f} "
-                               f"too high / real not clearly above (leakage)")
+                reasons.append(
+                    f"{tk}: shuffled PF {sa['profit_factor']:.2f} "
+                    f"(trades={sa['trades']} pnl={sa['pnl']:+.4f}) "
+                    f"too high / real not clearly above (leakage)")
         overall &= tk_ok
         print(f'  -> {tk}: {"PASS" if tk_ok else "FAIL"}')
 

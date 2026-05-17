@@ -304,3 +304,44 @@ def test_duplicate_register_raises():
             name = "dup_x"
             def label(self, df): return pd.Series([], dtype=int)
     del LABELERS["dup_x"]
+
+
+# ── Phase-D verdict: degenerate-shuffled guard (_shuf_robust) ────────────────
+
+from pipelines.xgboost.phase_d import _shuf_robust
+
+
+def _agg(trades, pnl, pf):
+    return {'trades': trades, 'pnl': pnl, 'profit_factor': pf}
+
+
+def test_shuf_robust_es_ym_artifact_not_flagged():
+    """ES/YM probe case: real strong, shuffled economically dead (~1 trade,
+    ~0 PnL) but high/inf PF — must NOT be flagged as leakage."""
+    ra = _agg(1800, 1.04, 2.15)
+    assert _shuf_robust(ra, _agg(1, 0.0013, 3.83)) is True       # ES
+    assert _shuf_robust(ra, _agg(2, 0.0056, float('inf'))) is True  # YM
+
+
+def test_shuf_robust_degenerate_by_zero_pnl_even_with_trades():
+    """Many trades but ~0 net PnL = still economically dead = not leakage."""
+    assert _shuf_robust(_agg(2000, 0.9, 2.2), _agg(300, 0.001, 1.5)) is True
+
+
+def test_shuf_robust_dead_shuffled_passes():
+    assert _shuf_robust(_agg(2000, 1.3, 2.1), _agg(0, 0.0, 0.0)) is True
+
+
+def test_shuf_robust_genuine_leakage_flagged():
+    """Shuffled trades a lot AND makes real money with high PF = leakage."""
+    assert _shuf_robust(_agg(2000, 1.2, 1.6), _agg(1500, 0.8, 1.55)) is False
+
+
+def test_shuf_robust_meaningful_shuffled_but_clean_passes():
+    """Shuffled traded meaningfully but PF<1.10 and real clearly above."""
+    assert _shuf_robust(_agg(2000, 1.5, 2.00), _agg(400, 0.20, 1.05)) is True
+
+
+def test_shuf_robust_meaningful_real_not_clearly_above_flagged():
+    """Shuffled meaningful & low-PF, but real not 0.30 above shuffled PF."""
+    assert _shuf_robust(_agg(800, 0.30, 1.20), _agg(400, 0.20, 1.05)) is False
