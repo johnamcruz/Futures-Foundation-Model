@@ -348,11 +348,22 @@ def _compute_session_features(df: pd.DataFrame):
     session_high = df.groupby(session_keys)["high"].transform("cummax")
     session_low = df.groupby(session_keys)["low"].transform("cummin")
     bars_elapsed = df.groupby(session_keys).cumcount()
-    max_bars = bars_elapsed.groupby(session_keys).transform("max").replace(0, 1)
+    # Causal normalisation. The original divided by groupby.transform("max") —
+    # the realised bar count of the *whole* session, including future bars — a
+    # look-ahead bug: batch backtests see the full session so the value ramps
+    # 0->1, but live the current bar is always the last bar so far, pinning the
+    # feature at 1.0 on every bar. Divide instead by the EXPECTED bar count of
+    # each session window (id 1 = 03:00-08:00 = 5h, id 2 = 08:00-12:00 = 4h,
+    # id 3 = 12:00-16:00 = 4h, id 0 = 16:00-03:00 overnight = 11h).
+    bar_minutes = max(
+        1, int(df["datetime"].diff().dt.total_seconds().median() / 60)
+    )
+    session_hours = session_ids.map({0: 11.0, 1: 5.0, 2: 4.0, 3: 4.0})
+    expected_bars = (session_hours * 60.0 / bar_minutes).clip(lower=1.0)
 
     session_info = pd.DataFrame({
         "time_of_day": time_of_day,
-        "bars_elapsed": bars_elapsed / max_bars,
+        "bars_elapsed": bars_elapsed / expected_bars,
         "dist_from_open": df["close"] - session_open,
         "dist_from_high": df["close"] - session_high,
         "dist_from_low": df["close"] - session_low,
@@ -370,11 +381,21 @@ def _compute_session_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def _detect_swings(df: pd.DataFrame, lookback: int = 10):
+    # Causal swing detection. A bar is a swing extreme when it is the high/low
+    # of the [-lookback, +lookback] window, but that can only be *confirmed*
+    # `lookback` bars later, once the forward bars exist. We evaluate the centre
+    # of a *trailing* 2*lookback+1 window and place the confirmed swing price at
+    # the confirmation bar, so .ffill() and _classify_structure stay causal.
+    # rolling(center=True) was a look-ahead bug: batch backtests have the
+    # forward bars so swings appear instantly; live they cannot — train/serve
+    # skew.
     window = 2 * lookback + 1
-    rolling_max = df["high"].rolling(window, center=True).max()
-    rolling_min = df["low"].rolling(window, center=True).min()
-    swing_highs = df["high"].where(df["high"] == rolling_max)
-    swing_lows = df["low"].where(df["low"] == rolling_min)
+    rolling_max = df["high"].rolling(window).max()
+    rolling_min = df["low"].rolling(window).min()
+    centre_high = df["high"].shift(lookback)
+    centre_low = df["low"].shift(lookback)
+    swing_highs = centre_high.where(centre_high == rolling_max)
+    swing_lows = centre_low.where(centre_low == rolling_min)
     return swing_highs, swing_lows
 
 
