@@ -16,6 +16,7 @@ Add a strategy:
 then:  --labeler my_strategy   (CLI)   or   run_pipeline(labeler=MyLabeler())
 """
 from abc import ABC, abstractmethod
+import numpy as np
 import pandas as pd
 
 from futures_foundation.features import get_model_feature_columns
@@ -35,6 +36,18 @@ class XGBStrategyLabeler(ABC):
         finetune's config_dict (cache-hash / provenance). Override; include a
         version + every threshold that changes labels."""
         return {}
+
+    def event_mask(self, df: pd.DataFrame) -> np.ndarray:
+        """Boolean array (len == len(df)) marking the DECISION rows the model
+        trains/predicts on. Default = all True (every bar — unchanged
+        behaviour for the V2 default labeler and any existing labeler).
+
+        A sparse-event strategy (e.g. SuperTrend: a decision exists only at a
+        flip) overrides this to return its event bars, so the model learns
+        the actual decision (ride vs chop AT a flip) instead of being drowned
+        by ~97% non-event Hold rows. The backtest still uses the FULL bar
+        series — only model fit/predict is restricted to these rows."""
+        return np.ones(len(df), dtype=bool)
 
     @abstractmethod
     def label(self, df: pd.DataFrame) -> pd.Series:

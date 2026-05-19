@@ -406,3 +406,54 @@ def test_parquet_seam_alignment_guard_predicate():
     b = pd.to_datetime(pd.Series(
         ['2024-01-02 09:30', '2024-01-02 09:36']), utc=True).to_numpy()
     assert np.array_equal(a, a) and not np.array_equal(a, b)
+
+
+# ── event_mask seam + pooled multi-ticker (generic, strategy-agnostic) ───────
+
+from pipelines.xgboost.train import _load_ticker
+from pipelines.xgboost.labeler import TripleBarrierV2Labeler
+
+
+def test_event_mask_default_is_all_true():
+    """Default event_mask = every bar -> legacy behaviour unchanged for the
+    V2 default labeler and any pre-existing labeler."""
+    lab = TripleBarrierV2Labeler(bar_minutes=3)
+    df = pd.DataFrame({'datetime': pd.date_range(
+        '2024-01-02 09:30', periods=50, freq='3min', tz='America/New_York'),
+        'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'atr': 1.0})
+    m = lab.event_mask(df)
+    assert m.dtype == bool and m.shape == (50,) and m.all()
+
+
+def test_event_mask_override_propagates():
+    """A sparse-event labeler's event_mask is honoured (every-3rd-bar here)."""
+    @register("ut_evmask")
+    class _Ev(XGBStrategyLabeler):
+        name = "ut_evmask"
+        def __init__(self, *, bar_minutes): self.bar_minutes = bar_minutes
+        def event_mask(self, df):
+            m = np.zeros(len(df), bool); m[::3] = True; return m
+        def label(self, df):
+            return pd.Series(np.zeros(len(df), np.int8), index=df.index)
+    lab = get_labeler("ut_evmask", bar_minutes=3)
+    df = pd.DataFrame({'datetime': pd.date_range(
+        '2024-01-02', periods=30, freq='3min', tz='UTC'),
+        'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'atr': 1.0})
+    m = lab.event_mask(df)
+    assert m.sum() == 10 and m[0] and not m[1]
+    del LABELERS["ut_evmask"]
+
+
+@pytest.mark.skipif(not _ES3.exists(), reason='data/ES_3min.csv absent')
+def test_load_ticker_wiring_and_backcompat():
+    """_load_ticker returns aligned X/y/ev/ohlcv/periods; for the V2 default
+    labeler ev is all-True => pooled fit-row selection == legacy all-bars."""
+    from futures_foundation.features import get_model_feature_columns
+    lab = TripleBarrierV2Labeler(bar_minutes=3)
+    d = _load_ticker(lab, 'ES', '3min', 20, None, get_model_feature_columns())
+    n = len(d['y'])
+    assert d['X'].shape[0] == n == d['ev'].shape[0] == len(d['ohlcv'])
+    assert d['X'].shape[1] == 68
+    assert d['ev'].dtype == bool and d['ev'].all()      # back-compat invariant
+    assert str(d['periods'].dtype) == 'period[M]'
+    assert d['inst'] == 'ES' and len(d['span']) == 2

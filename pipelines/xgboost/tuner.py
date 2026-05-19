@@ -47,10 +47,31 @@ def _fit_xgb(params, Xf, yf, device: str = 'cpu'):
     return m
 
 
-def tune(Xf, yf, Xv, df_val, timeframe: str, n_trials: int = 300,
+def _score_val_blocks(model, val_blocks: list, ppy: int) -> float:
+    """Score the Optuna objective on PER-TICKER val backtests.
+
+    Pooled training mixes tickers, but a backtest simulates ONE sequential
+    position book — it cannot span tickers. So each ticker is backtested on
+    its own contiguous val slice (full bar series; model fires only on the
+    event rows) and the per-trade returns are concatenated before scoring.
+    Single-ticker is just the 1-block case (== prior behaviour)."""
+    rets = []
+    for b in val_blocks:
+        proba = model.predict_proba(b['Xv'])
+        ev_sig = _signals_from_proba(proba, CONF_THRESHOLD)
+        sig = np.zeros(len(b['ohlcv']), dtype=np.int8)
+        sig[b['ev_pos']] = ev_sig                  # signals only at event rows
+        rets.append(run_backtest(b['ohlcv'], sig)['returns'])
+    if not rets:
+        return 0.0
+    return combined_objective(pd.concat(rets, ignore_index=True), ppy)
+
+
+def tune(Xf, yf, val_blocks: list, timeframe: str, n_trials: int = 300,
          seed: int = 42, device: str = 'cpu') -> dict:
-    """Xf/yf: train-fit features/labels. Xv: val-fold features. df_val:
-    val-fold OHLCV+datetime (row-aligned to Xv) for the backtest. Returns the
+    """Xf/yf: pooled train-fit EVENT-row features/labels. val_blocks: list of
+    {'Xv': event-row features, 'ohlcv': full val bar series, 'ev_pos': int
+    positions of the event rows within ohlcv} — one per ticker. Returns the
     best XGB param dict."""
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -71,10 +92,7 @@ def tune(Xf, yf, Xv, df_val, timeframe: str, n_trials: int = 300,
                                            *_BOUNDS["n_estimators"]),
         )
         model = _fit_xgb(params, Xf, yf, device)
-        proba = model.predict_proba(Xv)
-        sig = _signals_from_proba(proba, CONF_THRESHOLD)
-        res = run_backtest(df_val, sig)
-        return combined_objective(res['returns'], ppy)
+        return _score_val_blocks(model, val_blocks, ppy)
 
     study = optuna.create_study(
         direction="maximize",
