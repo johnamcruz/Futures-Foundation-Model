@@ -1,11 +1,14 @@
 """Basic unit tests for the generic Chronos finetune framework.
 
-Pure-logic tests run always; tests that touch the Chronos-Bolt backbone
-skip cleanly if the library/weights are unavailable. The framework's
-non-negotiables pinned here: deterministic fine-tune, pristine backbone
-reset (independent runs), correct pooling shape, and the honest-ruler
-orchestration over the StrategyLabeler protocol.
+This process must stay TORCH-FREE: torch's libomp and xgboost's libomp
+segfault in one process on macOS. So we never `import torch`/`chronos`
+here — availability is probed via find_spec (no import), embedding runs in
+a subprocess (backbone.embed), and the in-process torch tests (legacy NN
+fine-tune, raw pool/reset) are gated behind CHRONOS_TORCH_TESTS=1 to be run
+in their own isolated process.
 """
+import importlib.util
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -14,18 +17,33 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipelines.chronos import finetune as ft
+from pipelines.chronos import finetune as ft     # torch is lazy inside it
 from pipelines.chronos import evaluate, strategy
+from pipelines.chronos.head_xgb import XGBHead
 
-try:
-    import chronos                                    # noqa: F401
-    import torch                                      # noqa: F401
-    _CHRONOS = True
-except Exception:                                     # pragma: no cover
-    _CHRONOS = False
+# find_spec does NOT import the module -> pytest process stays torch-free.
+_CHRONOS = (importlib.util.find_spec('chronos') is not None
+            and importlib.util.find_spec('torch') is not None)
 
 chronos_only = pytest.mark.skipif(
     not _CHRONOS, reason='chronos-forecasting / torch unavailable')
+
+# The repo's FFM tests import torch into the shared `pytest tests/`
+# process. xgboost in that same process segfaults (macOS OpenMP). So
+# in-process-xgboost tests are gated and run in their OWN process:
+#   CHRONOS_ISOLATED=1 pytest tests/test_chronos_framework.py
+iso_only = pytest.mark.skipif(
+    os.environ.get('CHRONOS_ISOLATED') != '1',
+    reason='in-process xgboost clashes with FFM torch in the combined '
+           'suite; run: CHRONOS_ISOLATED=1 pytest '
+           'tests/test_chronos_framework.py')
+
+# torch in-process conflicts with xgboost's OpenMP; run these isolated:
+#   CHRONOS_TORCH_TESTS=1 pytest -k <name>
+torch_inproc = pytest.mark.skipif(
+    os.environ.get('CHRONOS_TORCH_TESTS') != '1',
+    reason='torch in-process (xgboost OpenMP clash); set '
+           'CHRONOS_TORCH_TESTS=1 to run isolated')
 
 
 # ---- pure logic (no backbone) -------------------------------------------
@@ -54,6 +72,7 @@ def test_strategy_protocol_is_duck_typed():
 
 # ---- backbone-dependent --------------------------------------------------
 
+@torch_inproc
 @chronos_only
 def test_backbone_loads_pools_and_resets():
     import torch
@@ -73,6 +92,7 @@ def test_backbone_loads_pools_and_resets():
     assert torch.allclose(next(m.parameters()).detach(), orig)
 
 
+@torch_inproc
 @chronos_only
 def test_finetune_deterministic_and_bounded():
     rng = np.random.default_rng(1)
@@ -114,13 +134,57 @@ class _DummyLabeler:
                          for p in preds if p != 0])
 
 
+class _DummyLabelerFeat(_DummyLabeler):
+    """Adds the optional features() hook — exercises embedding+feature
+    fusion (one extra column per decision)."""
+
+    def features(self, keys):
+        return np.asarray(keys, np.float32).reshape(-1, 1)
+
+
+# ---- XGBoost head (in-process xgboost — isolated from FFM torch) ---------
+
+@iso_only
+def test_xgbhead_deterministic_and_bounded():
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((60, 16)).astype('float32')
+    y = rng.integers(0, 3, 60)
+    p1 = XGBHead(3).fit(X, y, seed=0).predict(X)
+    p2 = XGBHead(3).fit(X, y, seed=0).predict(X)
+    assert np.array_equal(p1, p2)                 # same seed -> identical
+    assert len(p1) == 60 and set(np.unique(p1)) <= {0, 1, 2}
+    proba = XGBHead(3).fit(X, y, seed=0).predict_proba(X)
+    assert proba.shape == (60, 3)
+    assert np.allclose(proba.sum(1), 1.0, atol=1e-4)
+
+
+# ---- frozen embedding + head-agnostic honest ruler -----------------------
+
+@chronos_only
+def test_backbone_embed_is_frozen_deterministic():
+    from pipelines.chronos import backbone
+    C = [np.random.default_rng(k).standard_normal(48).astype('float32')
+         for k in range(10)]
+    e1 = backbone.embed(C)
+    e2 = backbone.embed(C)
+    assert e1.shape == (10, 256)
+    assert np.array_equal(e1, e2)                 # frozen -> deterministic
+
+
+@iso_only
 @chronos_only
 def test_evaluate_run_orchestrates_honest_ruler():
-    res = evaluate.run(_DummyLabeler(),
-                       cfg=ft.FTConfig(steps=2, batch=4, n_classes=3),
-                       seeds=(0,), max_folds=1)
+    res = evaluate.run(_DummyLabeler(), seeds=(0,), max_folds=1)
     assert len(res) == 1
     r = res[0]
     assert {'fold', 'seed', 'REAL', 'SHUFFLE', 'RANDOM'} <= set(r)
     assert all(isinstance(r[k], np.ndarray)
                for k in ('REAL', 'SHUFFLE', 'RANDOM'))
+
+
+@iso_only
+@chronos_only
+def test_evaluate_run_fuses_optional_features():
+    res = evaluate.run(_DummyLabelerFeat(), seeds=(0,), max_folds=1)
+    assert len(res) == 1                          # runs with embed+feature
+    assert isinstance(res[0]['REAL'], np.ndarray)

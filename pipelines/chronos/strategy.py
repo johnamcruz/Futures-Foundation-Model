@@ -13,6 +13,14 @@ Contract (all implementations MUST honour):
     window reaches >= test_start (None on the test split = no purge).
   * evaluate() walks the realized future from each decision and returns
     per-trade R INCLUDING cost (cost is the strategy's, not the harness's).
+  * contexts are EQUAL-LENGTH 1-D windows (the harness batches them into a
+    tensor; ragged lengths break embedding).
+
+Optional: a labeler MAY also expose `features(decision_keys) -> 2-D float
+array` (one row per key, aligned to build()'s order). The harness fuses it
+with the frozen Chronos embedding (hstack) before the head. Omit it for an
+embedding-only model. Keep features causal and reproducible as plain tensor
+ops (the deployed single-ONNX export folds them in).
 """
 from typing import Protocol, Tuple, List, runtime_checkable
 
