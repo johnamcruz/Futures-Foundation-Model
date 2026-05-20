@@ -1,0 +1,49 @@
+# Bolt fine-tune config — amazon/chronos-bolt-tiny on our futures data.
+#
+# NOTE: this is the CONFIG scaffolding. Bolt fine-tuning requires a Bolt-
+# specific training driver. The vendored pipelines/chronos/_ft/train.py
+# supports only `model_type in {seq2seq, causal}` (T5/causal-LM heads).
+# Bolt is a patch-based encoder for forecasting with its own loss path
+# (quantile regression — see chronos/chronos_bolt.py:forward, returns
+# `loss` directly when `labels` is passed). To actually run a Bolt fine-
+# tune, either:
+#   (a) Pull the official Bolt training script from the chronos-forecasting
+#       repo if/when Amazon releases one, OR
+#   (b) Implement a custom Bolt fine-tune driver (~200-300 lines): load
+#       ChronosBoltPipeline.from_pretrained() → inner_model is a torch
+#       module exposing forward(input_seq, labels) → loss; wrap in HF
+#       Trainer with our arrow-format dataset; train. See chronos/
+#       chronos_bolt.py:294 for the forward signature.
+#
+# Until then, run_ft.py --bolt errors out cleanly with this guidance.
+#
+# Once the trainer is in place, these values are reasonable starting points
+# (mirrored from upstream chronos-bolt-tiny.yaml).
+
+training_data_paths:
+- "PLACEHOLDER.arrow"
+probability:
+- 1.0
+context_length: 2048              # Bolt's native context (much larger than T5's 256)
+prediction_length: 64
+min_past: 60
+max_steps: 20000
+save_steps: 20000
+log_steps: 25
+per_device_train_batch_size: 4    # smaller batch — Bolt context is 8× larger
+learning_rate: 0.001
+optim: adamw_torch
+num_samples: 20
+shuffle_buffer_length: 10000
+gradient_accumulation_steps: 1
+model_id: amazon/chronos-bolt-tiny
+model_type: bolt                   # NOT supported by vendored train.py (T5 only) —
+                                   # would need Bolt-specific trainer per the note above
+random_init: false
+tie_embeddings: false              # Bolt does not tie input/output embeddings
+output_dir: "PLACEHOLDER_OUT"
+tf32: false
+torch_compile: false
+dataloader_num_workers: 0
+max_missing_prop: 0.9
+use_eos_token: true

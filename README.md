@@ -394,6 +394,71 @@ Build spec: [`docs/xgboost-pipeline.md`](docs/xgboost-pipeline.md). Extra deps (
 
 ---
 
+## Chronos Pipeline (Standalone)
+
+**`pipelines/chronos/` — a frozen Amazon Chronos backbone (`amazon/chronos-bolt-tiny`) + XGBoost head, with a strategy-pluggable walk-forward evaluator, production trainer, and ONNX export. Strategy-agnostic, transformer-independent.**
+
+Not every strategy fits the FFM transformer (regime/structure context heads) or the XGBoost-on-FFM-features path (direction classification on hand-crafted features). Some strategies are *selection meta-labelers* — "is this mechanical signal worth taking?" — and benefit from a pretrained time-series foundation model's embedding fused with strategy-specific features. The Chronos pipeline pairs **frozen `amazon/chronos-bolt-tiny`** (a 256-dim embedding of a 128-bar log-close context) with an **XGBoost classifier head** + optional **regression head for predicted max-favorable-R** (dynamic TP).
+
+**What it does:** strategy labeler defines event candidates (e.g., SuperTrend flips); for each event, the trailing 128-bar log-close context → frozen Chronos embedding → fused with hand-crafted features → XGBoost predicts `(P(take), R̂)`. Walk-forward 3-month-train / 1-month-test with **REAL/SHUFFLE/RANDOM/NAIVE honest-ruler controls** and a **6-check pre-registered PASS/FAIL auto-verdict** at run-end (no human interpretation drift). Production trainer fits ONE signal head + ONE risk head on the full corpus minus N-month holdout, evaluates on the unseen holdout, and saves a single joblib bundle the bot loads. ONNX exporter produces three deployable files (`*_chronos.onnx` + `*_signal.onnx` + `*_risk.onnx`) with a **3-layer end-to-end verification** before shipping.
+
+### Add a strategy — same protocol as the fine-tune framework
+
+```python
+from pipelines.chronos.strategy import StrategyLabeler
+
+class MyLabeler:
+    n_classes = 2     # binary selection (take / skip)
+    def calendar(self): ...                     # ticker × timestamp × target
+    def build(self, lo, hi, test_start):
+        # → (contexts: list of 128-bar log-close, labels: ndarray, keys)
+        ...
+    def features(self, keys): ...               # optional hand-craft to fuse
+    def evaluate(self, keys, preds, risk_preds=None):
+        # → per-trade realized R array
+        ...
+```
+
+```bash
+# Walk-forward evaluator — auto-verdict prints PASS/FAIL on 6 pre-registered checks
+python3 colabs/my_strategy_chronos.py
+
+# Production training (1-month holdout, n_estimators=600, max_depth=5)
+python3 colabs/my_strategy_chronos_produce.py --holdout-months 1
+
+# ONNX export + 3-layer verify (requires: pip install onnxmltools skl2onnx)
+python3 -m pipelines.chronos.export_onnx <bundle.joblib>
+```
+
+### Pipeline components
+
+| Component | Role |
+|---|---|
+| `backbone.py` | The ONLY module that touches torch+Chronos. `embed()` runs in a SUBPROCESS (macOS OpenMP collision: torch+xgboost segfault in one process). `active_source()` + `stamp_active_source()` surface which backbone (vanilla HF vs fine-tuned local) is about to load — eliminates the silent-wrong-backbone class of bugs. |
+| `evaluate.py` | Walk-forward harness — batch-embed ONCE across all folds (vs N subprocess loads) → per-fold thread-parallel XGBoost (5–10× speedup). Dual dashboard: 🎯 fixed-TP @ RR=3 + 💎 dynamic-TP @ `clip(0.8 × R̂, 1.5, 8.0)`. Auto-verdict with 6 pre-registered checks (constants at module top — goalpost-moving requires editing constants before the next run, not after seeing results). |
+| `produce.py` | Production training: ONE fit on full corpus minus N-month holdout; saves joblib bundle (signal head + risk head + `feat_dim` + `ctx_window` + `chronos_ckpt` + labeler config + holdout proba/threshold sweep). Defaults bumped to `n_estimators=600, max_depth=5` because per-fold walk-forward defaults (200/4) underfit at production scale (~20× more rows). |
+| `export_onnx.py` | joblib → 3 ONNX files (chronos + signal + risk) via subprocess-isolated phases (torch in one child, xgboost in another). End-to-end `verify()` asserts: **Layer 1** per-stage drift < 1e-3, **Layer 2** chained-pipeline equivalence (joblib path vs ONNX path on synthetic inputs), **Layer 3** decision parity at the trading threshold + dynamic-TP agreement to the cent. |
+| `head_xgb.py` | `XGBHead` (binary or multi-class signal classifier; ONNX-convertible via `onnxmltools`) + `XGBRiskHead` (log1p-transformed max_rr regression for dynamic TP — log1p tames the heavy right tail). |
+| `_primitives.py` | Torch-free numpy implementations of `compute_supertrend`, `compute_atr`, `compute_adx`, `apply_rr_barriers`, `max_favorable_rr` — keeps the parent process xgboost-only when calling labelers from the eval/produce paths (no torch import path through FFM). |
+| `_ft/` | Optional Chronos backbone fine-tune (vendored Apache-2.0 upstream Chronos `scripts/training/train.py`). T5 path (`amazon/chronos-t5-tiny`) works end-to-end via `python -m pipelines.chronos._ft.run_ft`. Bolt path (`amazon/chronos-bolt-tiny`) is config-scaffolded (`bolt.yaml`, `--bolt` flag) but the vendored trainer doesn't yet support Bolt's patch-encoder + quantile-loss training path (chronos's `chronos_bolt.py:forward` returns the loss; needs a custom HF Trainer wrapper, ~200–300 LoC). |
+
+### Wiring-gap guards (post-incident)
+
+The fine-tune output → downstream training pipeline is **not** auto-wired. Every walk-forward / production run must explicitly `export CHRONOS_FT_CKPT=<path/to/checkpoint-final>` or the frozen vanilla `amazon/chronos-bolt-tiny` is silently used (this bit us on 2026-05-19: a fine-tuned T5 checkpoint sat unused while three POC runs + a production model trained against vanilla Bolt). As of v1.5 this gap is guarded by:
+
+- **`backbone.stamp_active_source(context)`** — called at the start of every `evaluate.run()` and `produce.train()`. Prints a loud one-line stamp of the active backbone (`🧪 FINE-TUNED (local)` vs `❄️ FROZEN (vanilla HF)`). Scans `temp/` for unused fine-tune checkpoints; if any exist while `CHRONOS_FT_CKPT` is unset, prints the exact `export` command needed to fix it.
+- **`_embed_worker.py`** — defense in depth: even if a caller bypasses the stamp, the subprocess that actually loads the backbone prints `[chronos worker] loading {FINE-TUNED|FROZEN-VANILLA} backbone: {src}` to stderr. Visible in any run log.
+- **`_ft/run_ft.py`** — on fine-tune completion, prints the exact `export CHRONOS_FT_CKPT=...` command the user must run before the next downstream call.
+- **`bundle['chronos_ckpt']`** — production joblib bundle records which backbone was actually baked in. Always inspect post-train to confirm before shipping.
+
+### Strategy IP boundary
+
+Same as XGBoost / RL pipelines: the public repo holds only generic machinery. Concrete strategies (e.g. SuperTrend selection, CRT meta-label) are private plug-ins under `colabs/` (gitignored; live in the private strategies repo). The labelers conform to the duck-typed `StrategyLabeler` protocol — `evaluate.run()` and `produce.train()` are strategy-agnostic.
+
+Build artifacts (`*.joblib`, `*.onnx`) are also gitignored — distributed to consuming repos out-of-band (the bot loads from its own model storage). Extra deps (not in `requirements.txt`): `chronos-forecasting` (backbone), `xgboost>=2.0` (already in deps), `onnxmltools` + `skl2onnx` (only when running the ONNX export path).
+
+---
+
 ## RL Pipeline (Standalone)
 
 **`pipelines/rl/` — a generic PPO walk-forward pipeline, reusing the validated spine, with the proprietary strategy supplied as a private plug-in.**
@@ -659,6 +724,22 @@ Futures-Foundation-Model/
 │   │   ├── train.py            # run_pipeline() API + CLI
 │   │   ├── phase_d.py          # verdict run + _shuf_robust degenerate guard
 │   │   └── predictor.py        # XGBPredictor inference wrapper
+│   ├── chronos/                # Frozen Chronos backbone + XGBoost head (selection meta-labelers)
+│   │   ├── backbone.py         # The ONLY module touching torch+Chronos; embed() subprocess-isolated; active_source() / stamp_active_source() wiring-gap guards
+│   │   ├── _embed_worker.py    # Subprocess worker for frozen embeddings (torch isolated from xgboost)
+│   │   ├── evaluate.py         # Walk-forward harness + auto-verdict (6 pre-registered PASS/FAIL checks)
+│   │   ├── produce.py          # Production trainer (full-corpus fit + N-month holdout + joblib bundle)
+│   │   ├── export_onnx.py      # joblib → 3 ONNX files + 3-layer end-to-end verify (drift + chained + decision parity)
+│   │   ├── head_xgb.py         # XGBHead (binary/multi-class) + XGBRiskHead (log1p target — tames the heavy R right tail)
+│   │   ├── strategy.py         # StrategyLabeler duck-type protocol (calendar/build/features/evaluate)
+│   │   ├── data.py             # walk_forward_folds + arrow helpers
+│   │   ├── finetune.py         # Legacy in-process NN fine-tune (gated, kept for parity tests)
+│   │   ├── _primitives.py      # Torch-free numpy: compute_supertrend, compute_atr, compute_adx, apply_rr_barriers, max_favorable_rr
+│   │   └── _ft/                # Optional Chronos backbone fine-tune (vendored Apache-2.0 upstream)
+│   │       ├── train.py        # Vendored upstream Chronos training (T5/causal only)
+│   │       ├── run_ft.py       # Driver: prep arrow → call train.py → print export-env-var command
+│   │       ├── poc.yaml        # T5 fine-tune config (works end-to-end)
+│   │       └── bolt.yaml       # Bolt fine-tune config (SCAFFOLDED; vendored trainer doesn't yet handle Bolt's loss path)
 │   └── rl/                     # generic PPO walk-forward pipeline
 │       ├── base.py             # RLStrategy ABC + registry + shape_reward
 │       ├── env.py              # SingleTradeEnv (veto+exit, realized-R)
@@ -674,6 +755,8 @@ Futures-Foundation-Model/
 │   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage, FoldHealthMonitor)
 │   ├── test_xgboost_pipeline.py # XGBoost pipeline (objective, V2 labeler, trail, walk-forward, _shuf_robust)
 │   ├── test_rl_pipeline.py     # RL pipeline (ABC/registry, env, causal harness, run_walkforward)
+│   ├── test_chronos_framework.py # Chronos pipeline (heads, evaluator, finetune determinism — gated CHRONOS_ISOLATED=1)
+│   ├── test_chronos_data.py    # Chronos pipeline (calendar/walk-forward folds, arrow helpers)
 │   ├── test_features_crt.py    # CRT sweep features
 │   ├── test_features_core.py   # Core feature groups
 │   ├── test_labels.py          # Label generation
@@ -691,6 +774,7 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
+| **v1.5** | **`pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline.** Strategy-agnostic selection meta-labeler: `amazon/chronos-bolt-tiny` (256-dim embedding of 128-bar log-close context) fused with hand-crafted features → `XGBHead` for `P(take)` + `XGBRiskHead` for predicted max-favorable-R (dynamic TP via `clip(0.8 × R̂, 1.5, 8.0)`). **`evaluate.py`** walk-forward 3:1 with batch-embed across all folds + per-fold thread-parallel XGB (5–10× speedup), REAL/SHUFFLE/RANDOM/NAIVE honest-ruler controls, dual dashboard (fixed-TP + dynamic-TP), and a **6-check pre-registered auto-verdict** at run-end (constants at module top — no post-hoc goalpost moving). **`produce.py`** single-shot production training on the full corpus minus N-month holdout, saves a joblib bundle (heads + feat_dim + ctx_window + chronos_ckpt + labeler config + holdout proba/threshold sweep); production-scale capacity defaults (`n_estimators=600, max_depth=5`) because per-fold walk-forward defaults underfit at ~20× more rows. **`export_onnx.py`** joblib → 3 ONNX files via subprocess-isolated phases (torch + xgboost can't co-reside on macOS), with end-to-end `verify()` asserting per-stage drift < 1e-3 + chained-pipeline equivalence + decision-parity at the trading threshold. **`head_xgb.py:XGBRiskHead`** uses `log1p`/`expm1` target transform — the heavy right tail in `max_rr_realized` was median-shrinking the regressor by ~3R systematically; transform restores tail-capture. **Wiring-gap guards (post-incident, 2026-05-19):** `backbone.stamp_active_source()` called at the start of every `evaluate.run()` and `produce.train()`, prints a loud one-line stamp of the active backbone (vanilla vs fine-tuned-local) and scans `temp/` for unused fine-tune checkpoints → prints the exact `export CHRONOS_FT_CKPT=...` command if one exists but isn't being used (prevents the silent vanilla-fallback that wasted three POC runs); `_embed_worker.py` also prints what it loaded to stderr (defense in depth); `_ft/run_ft.py` on completion prints the env-var export command the next downstream call needs. T5 fine-tune (`amazon/chronos-t5-tiny`) works end-to-end; Bolt fine-tune scaffolded (`bolt.yaml` + `--bolt` flag) but trainer requires upstream Bolt-specific script (chronos's `chronos_bolt.py:forward` returns loss; vendored T5 trainer can't drive it). |
 | **v1.4** | **`pipelines/rl` — generic PPO walk-forward pipeline.** `RLStrategy` ABC + registry; `SingleTradeEnv` (episode=one trade, obs = frozen FFM context-head ⊕ position-state, asymmetric chop-veto + hold/exit, mechanical SL, entry+1 convention, terminal realized-R); `causal.py` generic causal-parity harness (the look-ahead falsifier the shuffle audit cannot catch — mandatory pre-train gate); `device.py` auto CUDA→MPS→CPU; `run_walkforward` reusing `pipelines/common` (windows) with an injected `trainer.train(episodes,seed)→policy` seam → every-OOS-month-PF>1 + shuffle + multi-seed verdict; `shape_reward()` the single optional extension point for all custom/account-aware reward (prop-firm balance / MLL) — default identity, **zero account/prop-firm concept in FFM**; SB3-PPO is the lazy default trainer (pipeline + tests dependency-light); `pipelines/common/robustness.py` (`shuffle_robust` + `multiseed_verdict`). IP boundary: proprietary strategies (e.g. CRT) are private plug-ins, never in this repo. 16 RL tests |
 | **v1.3** | **Finetune framework hardening (4 borrows) + verdict-fix + shared spine.** **#1** realized-R economic eval (PF/WR/mean-R/maxDD/no-top-1% under a trailing exit, labeled realized-vs-MFE — replaces the optimistic `max_rr`/MFE proxy). **#2** `run_shuffle_audit` leakage gate (REAL vs label-SHUFFLED, pure `_shuffle_audit_verdict`, CI-assertable — the audit that killed CRT's false positive). **#3** opt-in `econ_selection` — `_econ.pt` tier + early-stop on a CAGR·√Sortino *product* (can't win by not-trading; default off ⇒ selection byte-identical to `_p80s>_p80>_f1>_loss`). **#4** clean `StrategyLabeler` ABC — `run()` FINAL, implement only `detect_events()`+`compute_features()`; base applies session-calibrated TP≥SL triple barrier (entry=next-bar open) emitting `signal_label`/`max_rr`/`sl_distance`/`direction` (so #1/#3 work free for every strategy); legacy `run()`-override removed. xgboost `phase_d` **degenerate-shuffled guard** (`_shuf_robust`): a ≈0-PnL/tiny-N shuffled run no longer raises a false leakage flag. `pipelines/common/` extracted (walk-forward + objective) reused by both pipelines. CISD v19 / Session VP retired (pre-causality-fix lineage, not-validated). 660+ tests |
 | **v1.2** | **`pipelines/xgboost` — standalone XGBoost direction pipeline**, independent of the transformer (reuses only causal `derive_features`/68 features): V2 session triple-barrier labeler, Rogers-Satchell hybrid ATR/structure trail, rolling 3:1 unanchored walk-forward, Optuna TPE combined `CAGR·√Sortino` objective (product → can't win by not trading), every-OOS-month-PF>1 gate, `XGBPredictor` artifact; `XGBStrategyLabeler` ABC + registry give finetune-parity strategy plug-in (`run_pipeline()` API + `--labeler` CLI; `--max-windows` bounds smoke runs); 26 pipeline tests. Also — finetune/pretrain robustness guards: `run_pretrain` fails fast on `seq_len > max_sequence_length`; `load_backbone` hard-fails on architecture mismatch instead of silently dropping `position_embeddings` under `strict=False`; `_config_hash` now includes `ffm_config` arch so a stale resume cannot poison a re-run; mandatory no-look-ahead causal-parity discipline (every feature proven batch==streaming per bar) |
@@ -770,6 +854,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [x] **XGBoost direction pipeline** — V2 session triple-barrier + Rogers-Satchell hybrid trail + rolling 3:1 walk-forward + Optuna combined objective + every-OOS-month-PF>1 gate
 - [x] **`XGBStrategyLabeler` plug-in** — finetune-parity strategy customization for XGBoost (`run_pipeline()` API + `--labeler` registry)
 - [x] **Robustness guards** — `seq_len`>`max_sequence_length` fail-fast; `load_backbone` arch-mismatch hard-fail; `_config_hash` includes ffm arch (stale-resume poison fix); no-look-ahead causal-parity rule
+- [x] **`pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline** for selection meta-labelers (binary "take vs skip" on mechanical signals)
+- [x] **Subprocess-isolated Chronos embed** — torch lives only in the child; parent (xgboost) stays torch-free (macOS OpenMP collision solved)
+- [x] **Walk-forward batch-embed + per-fold thread-parallel XGB** — 5–10× speedup over per-fold subprocess loads
+- [x] **`evaluate.py` auto-verdict** — 6 pre-registered PASS/FAIL checks at run-end (constants at module top — eliminates post-hoc interpretation drift)
+- [x] **REAL / SHUFFLE / RANDOM / NAIVE honest-ruler controls** for the Chronos pipeline (mirrors XGBoost pipeline robustness gates)
+- [x] **`produce.py` production trainer** — full-corpus fit minus N-month holdout, joblib bundle with heads + metadata + holdout proba/threshold sweep
+- [x] **`XGBRiskHead` with log1p target transform** — restores tail-capture for heavy-right-tail max-favorable-R regression (Huber on raw R was median-shrinking by ~3R systematically)
+- [x] **Dynamic-TP via risk head** — `TP_R = clip(0.8 × R̂, 1.5, 8.0)` at trade entry (production knob)
+- [x] **`export_onnx.py` joblib → 3 ONNX files** with subprocess-isolated export phases + 3-layer end-to-end `verify()` (per-stage drift + chained pipeline + decision parity at trading threshold)
+- [x] **Chronos backbone-wiring guards** — `stamp_active_source()` surfaces the active backbone at run-start; scans `temp/` for unused fine-tune checkpoints; prints the exact `export CHRONOS_FT_CKPT=...` command needed if a fine-tune exists but is being silently ignored
+- [x] **T5 Chronos fine-tune driver** (`pipelines/chronos/_ft/`) — prep arrow → vendored upstream `train.py` → checkpoint; works end-to-end
+- [ ] **Bolt Chronos fine-tune driver** — config scaffolded (`bolt.yaml`, `--bolt` flag), needs custom HF Trainer wrapper around `ChronosBoltPipeline.forward` (quantile-loss path, ~200–300 LoC)
 - [ ] Full multi-year walk-forward validation of the XGBoost pipeline (every OOS month PF>1, incl. 2022/2025)
 - [ ] Additional strategy implementations (ORB, ICT breaker blocks)
 - [ ] Multi-timeframe input support

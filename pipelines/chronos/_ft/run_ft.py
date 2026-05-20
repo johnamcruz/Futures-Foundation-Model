@@ -50,9 +50,9 @@ def prep_arrow(out_path, months=6, tickers=None, tfs=None):
     return [len(s['target']) for s in series]
 
 
-def _write_config(arrow, out_dir, steps):
+def _write_config(arrow, out_dir, steps, source_yaml='poc.yaml'):
     import yaml
-    cfg = yaml.safe_load((_HERE / 'poc.yaml').read_text())
+    cfg = yaml.safe_load((_HERE / source_yaml).read_text())
     cfg['training_data_paths'] = [str(arrow)]
     cfg['output_dir'] = str(out_dir)
     cfg['max_steps'] = int(steps)
@@ -62,9 +62,31 @@ def _write_config(arrow, out_dir, steps):
     return p
 
 
-def run(months=6, steps=200, smoke=False, tickers=None, tfs=None):
+def run(months=6, steps=200, smoke=False, tickers=None, tfs=None,
+        bolt=False):
     if smoke:
         months, steps = 1, 2
+    if bolt:
+        # Scaffold only — the vendored train.py supports model_type in
+        # {seq2seq, causal} (T5/causal-LM). Bolt is a patch-encoder with
+        # its own quantile-regression loss path (see chronos/chronos_bolt.py:
+        # forward → returns `loss` when `labels` passed). To run a real
+        # Bolt fine-tune, either pull the official Bolt training script
+        # if/when released, OR write a ~200-300 line custom Bolt trainer
+        # using ChronosBoltPipeline + HF Trainer. See bolt.yaml for the
+        # config skeleton.
+        print("\n⚠ --bolt: Bolt fine-tune is SCAFFOLDED but not yet "
+              "executable.")
+        print("  Reason: vendored pipelines/chronos/_ft/train.py supports "
+              "only seq2seq+causal (T5).")
+        print("  Bolt uses a different training path "
+              "(chronos.chronos_bolt:forward → quantile loss).")
+        print("  Next steps: see pipelines/chronos/_ft/bolt.yaml header "
+              "(option a: pull upstream Bolt train script when released; "
+              "option b: implement custom Bolt trainer ~200-300 LoC).")
+        print("  For now, the T5 fine-tune path (default, no --bolt) works "
+              "end-to-end.\n")
+        return None
     work = _ROOT / 'temp' / 'chronos_t5_ft'
     if work.exists():
         shutil.rmtree(work)
@@ -73,7 +95,7 @@ def run(months=6, steps=200, smoke=False, tickers=None, tfs=None):
     lens = prep_arrow(arrow, months, tickers=tickers, tfs=tfs)
     print(f"arrow: {arrow.name} | series={len(lens)} lens={lens} "
           f"total_pts={sum(lens):,}")
-    cfg = _write_config(arrow, work / 'out', steps)
+    cfg = _write_config(arrow, work / 'out', steps, source_yaml='poc.yaml')
     cmd = [sys.executable, str(_HERE / 'train.py'), '--config', str(cfg),
            '--model-id', 'amazon/chronos-t5-tiny', '--no-random-init',
            '--max-steps', str(steps)]
@@ -108,4 +130,5 @@ if __name__ == '__main__':
         steps=_arg('--steps', int, 200),
         tickers=_arg('--tickers', lambda s: s.split(','), None),
         tfs=_arg('--tfs', lambda s: s.split(','), None),
-        smoke='--smoke' in a)
+        smoke='--smoke' in a,
+        bolt='--bolt' in a)
