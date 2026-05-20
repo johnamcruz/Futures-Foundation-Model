@@ -38,3 +38,36 @@ class XGBHead:
 
     def predict_proba(self, X):
         return self._clf.predict_proba(np.asarray(X, np.float32))
+
+
+class XGBRiskHead:
+    """Regression head — predicts max_rr_realized per signal (the peak R
+    reached before stop / vertical barrier). Used at inference to set
+    dynamic TP per trade (TP = clip(0.8 * R_hat, 1.5, 8.0)). Mirrors the
+    FFM risk-head design: Huber loss (less outlier-sensitive than MSE),
+    same input features as the signal head, ONNX-convertible head."""
+
+    def __init__(self, n_estimators=300, max_depth=4, learning_rate=0.05,
+                 subsample=0.8, colsample_bytree=0.8):
+        self._p = dict(n_estimators=n_estimators, max_depth=max_depth,
+                       learning_rate=learning_rate, subsample=subsample,
+                       colsample_bytree=colsample_bytree)
+        self._reg = None
+
+    def fit(self, X, y_max_rr, seed=0):
+        # FFM uses Huber/SmoothL1; XGBoost has pseudohubererror which is
+        # twice-differentiable and equivalent in spirit.
+        import xgboost as xgb
+        self._reg = xgb.XGBRegressor(
+            objective='reg:pseudohubererror', huber_slope=1.0,
+            tree_method='hist', random_state=seed, n_jobs=1,
+            verbosity=0, **self._p)
+        self._reg.fit(np.asarray(X, np.float32),
+                      np.asarray(y_max_rr, np.float32))
+        return self
+
+    def predict(self, X):
+        # Clip to plausible R range to silence absurd extrapolations.
+        return np.clip(
+            self._reg.predict(np.asarray(X, np.float32)).astype(np.float32),
+            0.0, 15.0)

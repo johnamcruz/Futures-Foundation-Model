@@ -114,6 +114,30 @@ def compute_adx(h, l, c, period=14):
     return _rma(dx, period)
 
 
+def max_favorable_rr(h, l, entry_idx, is_long, entry_price, sl_price,
+                     lookahead=None):
+    """Maximum favorable excursion (MFE) in R-units before stop / lookahead.
+    Walks bars from entry_idx+1 forward; returns peak (h-entry)/risk for
+    longs or (entry-l)/risk for shorts; stops at SL hit. The risk-head's
+    regression target — 'how far does this signal actually reach.'"""
+    h = np.asarray(h, np.float64)
+    l = np.asarray(l, np.float64)
+    n = len(h)
+    risk = abs(entry_price - sl_price)
+    if risk <= 0:
+        return 0.0
+    end = n if lookahead is None else min(entry_idx + lookahead + 1, n)
+    peak = 0.0
+    for j in range(entry_idx + 1, end):
+        if (is_long and l[j] <= sl_price) or (not is_long and h[j] >= sl_price):
+            return peak                                # stop hit
+        r = ((h[j] - entry_price) if is_long
+             else (entry_price - l[j])) / risk
+        if r > peak:
+            peak = r
+    return peak                                        # lookahead exhausted
+
+
 def apply_rr_barriers(h, l, c, entry_idx, is_long, entry_price, sl_price,
                       rr_targets, lookahead=None, is_session_end=None):
     """Walk forward from entry_idx measuring R:R outcomes. Stops early on

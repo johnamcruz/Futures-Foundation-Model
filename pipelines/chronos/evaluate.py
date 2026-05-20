@@ -13,7 +13,7 @@ import numpy as np
 
 from .data import walk_forward_folds
 from . import backbone
-from .head_xgb import XGBHead
+from .head_xgb import XGBHead, XGBRiskHead
 
 
 def _stats(R):
@@ -124,41 +124,85 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
         else:
             d['Xtr'], d['Xte'] = Etr, Ete
     print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}\n")
-    # Phase 3 — per-fold XGBoost train+predict (CPU-bound but fast).
-    for d in fold_data:
-        fold = d['fold']
-        Ytr, Xtr, Xte, Kte, Yte = (d['Ytr'], d['Xtr'], d['Xte'],
-                                    d['Kte'], d['Yte'])
-        print(f"== fold {fold} | ntr={len(Ytr)} nte={len(Kte)} | "
-              f"feat_dim={Xtr.shape[1]} | classes={labeler.n_classes} ==")
-        for seed in seeds:
-            head = head_factory(labeler.n_classes).fit(Xtr, Ytr, seed)
-            p_real = head.predict(Xte)
-            R = labeler.evaluate(Kte, p_real)
-            if binary:
-                # P(class 1) — confidence the model would TAKE this signal
-                proba = head.predict_proba(Xte)[:, 1].astype(np.float32)
+
+    # Phase 3 — per-(fold, seed) XGBoost work, parallelized via threads.
+    # XGBoost releases the GIL in its C tree-builder + numpy ops, so a
+    # ThreadPoolExecutor extracts multi-core speedup without pickling the
+    # labeler's large bar arrays (which a ProcessPool would force).
+    # Risk-head training target: max_rr_realized embedded in keys (4th
+    # element). Falls back to 0 if labeler keys are 3-tuples (legacy).
+    def _max_rr_targets(keys):
+        return np.asarray(
+            [k[3] if len(k) > 3 else 0.0 for k in keys], np.float32)
+
+    def _work(d, seed):
+        Ytr, Xtr, Xte, Kte = d['Ytr'], d['Xtr'], d['Xte'], d['Kte']
+        Yte_np = d['Yte']
+        nc = labeler.n_classes
+        # signal head — binary take/skip
+        head = head_factory(nc).fit(Xtr, Ytr, seed)
+        p_real = head.predict(Xte)
+        R = labeler.evaluate(Kte, p_real)               # fixed-TP baseline
+        proba = (head.predict_proba(Xte)[:, 1].astype(np.float32)
+                 if binary else None)
+        # risk head — predicts max_rr_realized per signal (binary only;
+        # 3-class direction strategies don't have a single risk regression
+        # target). Trained alongside on the same Xtr.
+        risk_pred = None
+        if binary:
+            mrr_tr = _max_rr_targets(d['Ktr'])
+            risk_head = XGBRiskHead().fit(Xtr, mrr_tr, seed)
+            risk_pred = risk_head.predict(Xte)
+        # shuffle + random controls (unchanged)
+        ysh = Ytr.copy()
+        np.random.default_rng(seed + 1).shuffle(ysh)
+        p_sh = head_factory(nc).fit(Xtr, ysh, seed).predict(Xte)
+        Rs = labeler.evaluate(Kte, p_sh)
+        p_rd = np.random.default_rng(seed + 2).integers(0, nc, len(Kte))
+        Rr = labeler.evaluate(Kte, p_rd)
+        return dict(fold=d['fold'], seed=seed, R=R, Rs=Rs, Rr=Rr,
+                    p_real=p_real, p_sh=p_sh, p_rd=p_rd,
+                    proba=proba, risk_pred=risk_pred,
+                    Yte=Yte_np, Kte=Kte)
+
+    import concurrent.futures as cf
+    import os
+    n_workers = min(os.cpu_count() or 4, 8)
+    print(f"[parallel] running {len(fold_data) * len(seeds)} (fold, seed) "
+          f"work units across {n_workers} threads...")
+    work_units = [(d, s) for d in fold_data for s in seeds]
+    results = [None] * len(work_units)
+    with cf.ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_work, d, s): i
+                   for i, (d, s) in enumerate(work_units)}
+        for fut in cf.as_completed(futures):
+            results[futures[fut]] = fut.result()
+
+    # Print in fold/seed order + aggregate.
+    by_fold = defaultdict(list)
+    for r in results:
+        by_fold[r['fold']].append(r)
+    for fold in sorted(by_fold):
+        d = next(x for x in fold_data if x['fold'] == fold)
+        print(f"== fold {fold} | ntr={len(d['Ytr'])} nte={len(d['Kte'])} "
+              f"| feat_dim={d['Xtr'].shape[1]} | classes={labeler.n_classes} ==")
+        for r in sorted(by_fold[fold], key=lambda x: x['seed']):
+            print(f"  seed {r['seed']}  [REAL   ] {_stats(r['R'])}")
+            print(f"          [SHUFFLE] {_stats(r['Rs'])}")
+            print(f"          [RANDOM ] {_stats(r['Rr'])}")
+            out.append({'fold': r['fold'], 'seed': r['seed'],
+                        'REAL': r['R'], 'SHUFFLE': r['Rs'],
+                        'RANDOM': r['Rr']})
+            pool['REAL'][0].append(r['R'])
+            pool['REAL'][1].extend(_taken_tickers(r['Kte'], r['p_real']))
+            pool['SHUFFLE'][0].append(r['Rs'])
+            pool['SHUFFLE'][1].extend(_taken_tickers(r['Kte'], r['p_sh']))
+            pool['RANDOM'][0].append(r['Rr'])
+            pool['RANDOM'][1].extend(_taken_tickers(r['Kte'], r['p_rd']))
+            if binary and r['proba'] is not None:
                 proba_records.append(
-                    (Kte, proba, np.asarray(Yte, np.int8)))
-            ysh = Ytr.copy()
-            np.random.default_rng(seed + 1).shuffle(ysh)
-            p_sh = (head_factory(labeler.n_classes)
-                    .fit(Xtr, ysh, seed).predict(Xte))
-            Rs = labeler.evaluate(Kte, p_sh)
-            p_rd = np.random.default_rng(seed + 2).integers(
-                0, labeler.n_classes, len(Kte))
-            Rr = labeler.evaluate(Kte, p_rd)
-            print(f"  seed {seed}  [REAL   ] {_stats(R)}")
-            print(f"          [SHUFFLE] {_stats(Rs)}")
-            print(f"          [RANDOM ] {_stats(Rr)}")
-            out.append({'fold': fold, 'seed': seed,
-                        'REAL': R, 'SHUFFLE': Rs, 'RANDOM': Rr})
-            pool['REAL'][0].append(R)
-            pool['REAL'][1].extend(_taken_tickers(Kte, p_real))
-            pool['SHUFFLE'][0].append(Rs)
-            pool['SHUFFLE'][1].extend(_taken_tickers(Kte, p_sh))
-            pool['RANDOM'][0].append(Rr)
-            pool['RANDOM'][1].extend(_taken_tickers(Kte, p_rd))
+                    (r['Kte'], r['proba'], r['Yte'].astype(np.int8),
+                     r['risk_pred']))
     print(f"\n== AGGREGATE | folds={len({r['fold'] for r in out})} "
           f"seeds={len(seeds)} | pooled across all (fold,seed) ==")
     for name in ('REAL', 'SHUFFLE', 'RANDOM'):
@@ -175,18 +219,35 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
     # calibration test for downstream RL/account managers — pick the
     # threshold where WR is high enough AND trade frequency is meaningful.
     if binary and proba_records:
-        # NAIVE-WR baseline = take every signal -> WR = base-rate of label==1
-        all_y = np.concatenate([y for _, _, y in proba_records])
+        all_y = np.concatenate([y for _, _, y, _ in proba_records])
         naive_wr = float(np.mean(all_y == 1)) if len(all_y) else 0.0
+        total_pos = int((all_y == 1).sum())
+        # risk-head MAE on confirmed signals (only ones we'd take) — the
+        # quality of the dynamic-TP prediction.
+        rp_have_risk = any(r is not None for _, _, _, r in proba_records)
+        if rp_have_risk:
+            r_pred_all = np.concatenate(
+                [r for _, _, _, r in proba_records if r is not None])
+            r_true_all = np.concatenate(
+                [np.asarray([k[3] if len(k) > 3 else 0.0 for k in keys],
+                            np.float32)
+                 for keys, _, _, _ in proba_records])
+            mae = float(np.mean(np.abs(r_pred_all - r_true_all)))
+            corr = float(np.corrcoef(r_pred_all, r_true_all)[0, 1]) \
+                if r_pred_all.std() > 0 and r_true_all.std() > 0 else 0.0
+            print(f"\n📐 RISK-HEAD (predicts max_rr_realized per signal)")
+            print(f"   MAE: {mae:.2f}R  |  Pearson r(pred, actual): "
+                  f"{corr:+.3f}  |  pred mean: {r_pred_all.mean():.2f}R  |  "
+                  f"actual mean: {r_true_all.mean():.2f}R")
 
-        print(f"\n🎯 CONFIDENCE THRESHOLDS — REAL (pooled all fold,seed)")
+        # ---- Fixed-TP confidence dashboard (signal-head only) ------------
+        print(f"\n🎯 CONFIDENCE THRESHOLDS — REAL @ fixed-TP (pooled)")
         print(f"   {'Thresh':>6}  {'Trades':>6}  {'Wins':>5}  {'WR':>6}  "
               f"{'Recall':>6}  {'PF':>6}  {'vs NAIVE':>8}  Verdict")
         print(f"   {'-' * 66}")
-        total_pos = int((all_y == 1).sum())
         for thr in (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90):
             R_all, tp_total, fp_total = [], 0, 0
-            for keys, proba, yte in proba_records:
+            for keys, proba, yte, _r in proba_records:
                 preds_t = (proba >= thr).astype(int)
                 R_t = labeler.evaluate(keys, preds_t)
                 if len(R_t):
@@ -212,9 +273,47 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
             print(f"   {thr:>5.2f}  {trades:>6}  {tp_total:>5}  "
                   f"{100 * wr:>5.1f}%  {100 * recall:>5.1f}%  {pf_s}  "
                   f"{100 * delta:>+7.1f}%  {verdict}")
+
+        # ---- Dynamic-TP confidence dashboard (signal + risk head) --------
+        # The deployment-equivalent metric: per signal, TP is set from
+        # the risk-head prediction. This is what the bot will earn.
+        if rp_have_risk:
+            print(f"\n💎 CONFIDENCE THRESHOLDS — REAL @ dynamic-TP "
+                  f"(TP = clip(0.8 × R̂, 1.5, 8.0))")
+            print(f"   {'Thresh':>6}  {'Trades':>6}  {'WR':>6}  "
+                  f"{'AvgR':>6}  {'sumR':>7}  {'PF':>6}  Verdict")
+            print(f"   {'-' * 56}")
+            for thr in (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90):
+                R_all = []
+                for keys, proba, _yte, risk in proba_records:
+                    if risk is None:
+                        continue
+                    preds_t = (proba >= thr).astype(int)
+                    R_t = labeler.evaluate(keys, preds_t, risk_preds=risk)
+                    if len(R_t):
+                        R_all.append(R_t)
+                if not R_all:
+                    print(f"   {thr:>5.2f}  {0:>6}     —      —       —"
+                          f"      —     ⚠️ no trades")
+                    continue
+                Rc = np.concatenate(R_all)
+                trades = len(Rc)
+                wr = float(np.mean(Rc > 0))
+                meanR = float(Rc.mean())
+                wins_R = Rc[Rc > 0]; losses_R = Rc[Rc < 0]
+                pf = (wins_R.sum() / abs(losses_R.sum())
+                      if len(losses_R) and losses_R.sum() < 0
+                      else float('inf'))
+                pf_s = f"{pf:>6.2f}" if pf < 999 else "   inf"
+                # The combine-pass metric — both axes captured.
+                verdict = ('✅ EDGE' if meanR >= 1.5 and trades >= 20
+                           else ('⚠️ THIN' if trades < 20
+                                 else ('🟡 LIFT' if meanR > 0.5 else '❌')))
+                print(f"   {thr:>5.2f}  {trades:>6}  {100*wr:>5.1f}%  "
+                      f"{meanR:+5.2f}R  {Rc.sum():+7.1f}  {pf_s}  {verdict}")
+
         print(f"\n   NAIVE-WR baseline (take every signal): "
               f"{100 * naive_wr:.1f}%")
-        print(f"   Target for RL entry signal: WR ≥ 60% at meaningful "
-              f"trade frequency (don't chase 100% WR by shrinking to ~0 "
-              f"trades).")
+        print(f"   Target: WR ≥ 60% AND meanR ≥ 1.5R at meaningful trade "
+              f"frequency (combine-pass-ready entry signal).")
     return out

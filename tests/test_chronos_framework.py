@@ -19,7 +19,7 @@ import pytest
 
 from pipelines.chronos import finetune as ft     # torch is lazy inside it
 from pipelines.chronos import evaluate, strategy
-from pipelines.chronos.head_xgb import XGBHead
+from pipelines.chronos.head_xgb import XGBHead, XGBRiskHead
 
 # find_spec does NOT import the module -> pytest process stays torch-free.
 _CHRONOS = (importlib.util.find_spec('chronos') is not None
@@ -143,6 +143,20 @@ class _DummyLabelerFeat(_DummyLabeler):
 
 
 # ---- XGBoost head (in-process xgboost — isolated from FFM torch) ---------
+
+@iso_only
+def test_xgbriskhead_deterministic_and_bounded():
+    """Risk head: predicts max_rr_realized (continuous, R-units). Same
+    seed -> identical predictions; outputs clipped to plausible R range."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((300, 20)).astype('float32')
+    y = np.abs(rng.standard_normal(300) * 2.0 + 2.0).astype('float32')
+    p1 = XGBRiskHead().fit(X, y, seed=0).predict(X)
+    p2 = XGBRiskHead().fit(X, y, seed=0).predict(X)
+    assert np.array_equal(p1, p2)
+    assert p1.ndim == 1 and len(p1) == 300
+    assert p1.min() >= 0.0 and p1.max() <= 15.0   # clipped to plausible R
+
 
 @iso_only
 @pytest.mark.parametrize('nc', [2, 3])
