@@ -76,14 +76,13 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
     binary = labeler.n_classes == 2
     out = []
     pool = {'REAL': ([], []), 'SHUFFLE': ([], []), 'RANDOM': ([], [])}
-    # WR-sweep scratch (binary only): per (fold, seed) save
-    # (keys, proba_class1, Yte) so the post-hoc dashboard can compute
-    # Prec/Recall/PF/vs-baseline at each confidence threshold.
     proba_records = []
+    # Phase 1 — collect all (Ctr, Ytr, Ktr, Cte, Yte, Kte) across folds
+    # WITHOUT calling backbone.embed. Pure pandas/numpy; fast.
+    fold_data = []
     for fold, tr, te in walk_forward_folds(labeler.calendar(), train_m,
                                            test_m):
-        if max_folds is not None and len(out) // max(1, len(seeds)) \
-                >= max_folds:
+        if max_folds is not None and len(fold_data) >= max_folds:
             break
         ts0 = te['timestamp'].min()
         Ctr, Ytr, Ktr = labeler.build(tr['timestamp'].min(),
@@ -92,11 +91,45 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
             te['timestamp'].min(),
             te['timestamp'].max() + np.timedelta64(1, 'ns'), None)
         if len(Ytr) < 50 or len(Cte) < 50:
-            continue                       # unproductive fold
-        Ytr = np.asarray(Ytr)
-        Xtr = _featurize(labeler, Ctr, Ktr)
-        Xte = _featurize(labeler, Cte, Kte)
-        print(f"\n== fold {fold} | ntr={len(Ytr)} nte={len(Cte)} | "
+            continue
+        fold_data.append(dict(fold=fold, Ctr=Ctr, Ytr=np.asarray(Ytr),
+                              Ktr=Ktr, Cte=Cte, Yte=np.asarray(Yte),
+                              Kte=Kte))
+    if not fold_data:
+        print("No productive folds — nothing to evaluate.")
+        return out
+    # Phase 2 — ONE batched Chronos embed across all productive folds.
+    # Replaces ~2*N_folds subprocess loads with 1. Major speedup on long
+    # walk-forwards; numpy/torch parallelize the single big inference call.
+    flat_contexts = []
+    for d in fold_data:
+        flat_contexts.extend(d['Ctr']); flat_contexts.extend(d['Cte'])
+    print(f"\n[batch-embed] {len(flat_contexts):,} contexts across "
+          f"{len(fold_data)} folds in ONE Chronos call...")
+    flat_embed = backbone.embed(flat_contexts)
+    # slice back per fold + fuse with labeler features
+    o = 0
+    for d in fold_data:
+        ntr, nte = len(d['Ctr']), len(d['Cte'])
+        Etr = flat_embed[o:o + ntr]; o += ntr
+        Ete = flat_embed[o:o + nte]; o += nte
+        feats_fn = getattr(labeler, 'features', None)
+        if feats_fn is not None:
+            xtr_extra = np.asarray(feats_fn(d['Ktr']), np.float32)
+            xte_extra = np.asarray(feats_fn(d['Kte']), np.float32)
+            d['Xtr'] = (np.hstack([Etr, xtr_extra.reshape(len(Etr), -1)])
+                        if xtr_extra.size else Etr)
+            d['Xte'] = (np.hstack([Ete, xte_extra.reshape(len(Ete), -1)])
+                        if xte_extra.size else Ete)
+        else:
+            d['Xtr'], d['Xte'] = Etr, Ete
+    print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}\n")
+    # Phase 3 — per-fold XGBoost train+predict (CPU-bound but fast).
+    for d in fold_data:
+        fold = d['fold']
+        Ytr, Xtr, Xte, Kte, Yte = (d['Ytr'], d['Xtr'], d['Xte'],
+                                    d['Kte'], d['Yte'])
+        print(f"== fold {fold} | ntr={len(Ytr)} nte={len(Kte)} | "
               f"feat_dim={Xtr.shape[1]} | classes={labeler.n_classes} ==")
         for seed in seeds:
             head = head_factory(labeler.n_classes).fit(Xtr, Ytr, seed)
