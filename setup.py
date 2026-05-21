@@ -2,12 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name="futures-foundation-model",
-    version="0.1.0",
+    version="1.5.0",
     description="Pretrained transformer backbone for futures market structure and regime classification",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     license="Apache-2.0",
-    url="https://github.com/YOUR_USERNAME/futures-foundation-model",
+    url="https://github.com/johnamcruz/Futures-Foundation-Model",
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[
