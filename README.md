@@ -246,8 +246,7 @@ Futures-Foundation-Model/
 │   └── demo_regime_model.py      # OOS certification: calibration + regime model
 ├── docs/                         # Build specs + runbooks
 ├── tests/                        # 460+ unit tests (pre-commit gated; torch-free by contract)
-├── data/                         # Raw OHLCV CSVs (gitignored)
-└── checkpoints/                  # Legacy FFM checkpoints (resolve at tag ffm-transformer-final)
+└── data/                         # Raw OHLCV CSVs (gitignored)
 ```
 
 ---
