@@ -207,3 +207,18 @@ def test_evaluate_run_fuses_optional_features():
     res = evaluate.run(_DummyLabelerFeat(), seeds=(0,), max_folds=1)
     assert len(res) == 1                          # runs with embed+feature
     assert isinstance(res[0]['REAL'], np.ndarray)
+
+
+def test_legacy_pipelines_chronos_pickle_compat(tmp_path):
+    """Production bundles trained pre-consolidation reference classes under
+    'pipelines.chronos.*'. Importing futures_foundation.chronos installs a
+    sys.modules alias so those pickles keep loading — pin that contract."""
+    import importlib
+    import joblib
+    import futures_foundation.chronos  # noqa: F401 — installs the alias
+    legacy = importlib.import_module('pipelines.chronos.head_xgb')
+    assert hasattr(legacy, 'XGBHead') and hasattr(legacy, 'XGBRiskHead')
+    # round-trip a class reference exactly as pickle's find_class resolves it
+    p = tmp_path / 'legacy.joblib'
+    joblib.dump({'cls': legacy.XGBHead}, p)
+    assert joblib.load(p)['cls'] is legacy.XGBHead
