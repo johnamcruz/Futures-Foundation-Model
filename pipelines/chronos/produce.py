@@ -36,12 +36,14 @@ import numpy as np
 import pandas as pd
 
 from . import backbone
+from . import context_fusion
 from .head_xgb import XGBHead, XGBRiskHead
 
 
 def train(labeler, *, holdout_months: int = 1, seed: int = 0,
           n_estimators: int = 600, max_depth: int = 5,
           output_path: Optional[str | Path] = None,
+          context_heads_path: Optional[str] = None, emb_mode: str = 'both',
           verbose: bool = True) -> dict:
     """Fit on all signals strictly before `cal_max - holdout_months`
     (with the same leak-purge the walk-forward uses), evaluate on the
@@ -67,9 +69,19 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
     # run-START prevents the 2026-05-19 wiring gap (fine-tuned ckpt
     # silently ignored because CHRONOS_FT_CKPT was unset).
     backbone.stamp_active_source(context='production training')
+    heads = context_fusion.resolve_heads(context_heads_path)
     cal = labeler.calendar()
     cal_min = pd.Timestamp(cal['timestamp'].min())
     cal_max = pd.Timestamp(cal['timestamp'].max())
+    if heads is not None:
+        # LEAK GUARD: heads trained on pre-cutoff bars; the signal head
+        # may not train on them too (double-dip). Trim the span, loudly.
+        from futures_foundation.context import HEADS_CUTOFF
+        if cal_min < HEADS_CUTOFF:
+            print(f"[context-heads] leak guard: training span trimmed "
+                  f"{cal_min} -> {HEADS_CUTOFF} (heads saw earlier bars)")
+            cal_min = HEADS_CUTOFF
+        context_fusion.enforce_cutoff(heads, cal_min, what='production train')
     holdout_start = (cal_max - pd.DateOffset(months=holdout_months)
                      if holdout_months > 0 else cal_max + pd.Timedelta('1ns'))
 
@@ -111,19 +123,17 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
     if verbose:
         print(f"[embed] done. shape={Etr.shape}  ({time.time()-t0:.1f}s)")
 
-    # ---- Stage 3: fuse with hand-crafted features ----
+    # ---- Stage 3: fuse with ctx heads + hand-crafted features ----
     feats_fn = getattr(labeler, 'features', None)
-    if feats_fn is not None:
-        Ftr = np.asarray(feats_fn(Ktr), np.float32).reshape(len(Etr), -1)
-        Xtr = (np.hstack([Etr, Ftr]).astype(np.float32) if Ftr.size
-               else Etr.astype(np.float32))
-    else:
-        Xtr = Etr.astype(np.float32)
+    Ftr = (np.asarray(feats_fn(Ktr), np.float32) if feats_fn is not None
+           else None)
+    Xtr = context_fusion.fuse(Etr, Ftr, heads, emb_mode)
     feat_dim = Xtr.shape[1]
     if verbose:
+        n_ctx = len(heads.active_names) if heads is not None else 0
         print(f"\n[fuse] X_train: {Xtr.shape}  "
-              f"(embed {Etr.shape[1]} + hand-craft "
-              f"{feat_dim - Etr.shape[1]})")
+              f"(emb_mode={emb_mode}, ctx {n_ctx}, hand-craft "
+              f"{0 if Ftr is None else Ftr.reshape(len(Etr), -1).shape[1]})")
 
     # ---- Stage 4: fit signal head ----
     t0 = time.time()
@@ -163,13 +173,9 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
                 print("  [holdout] no signals in window — skipped")
         else:
             Ete = backbone.embed(Cte)
-            if feats_fn is not None:
-                Fte = np.asarray(feats_fn(Kte), np.float32).reshape(
-                    len(Ete), -1)
-                Xte = (np.hstack([Ete, Fte]).astype(np.float32) if Fte.size
-                       else Ete.astype(np.float32))
-            else:
-                Xte = Ete.astype(np.float32)
+            Fte = (np.asarray(feats_fn(Kte), np.float32)
+                   if feats_fn is not None else None)
+            Xte = context_fusion.fuse(Ete, Fte, heads, emb_mode)
             # threshold sweep mirrors the walk-forward dashboard — argmax
             # `predict()` is wrong here because class imbalance (~70/30)
             # parks the model below 0.50 on most signals; what matters in
@@ -273,6 +279,14 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         'labeler_config': (labeler.config_dict()
                            if hasattr(labeler, 'config_dict') else {}),
         'n_classes': nc,
+        'context_heads': ({
+            'path': str(context_heads_path
+                        or os.environ.get(context_fusion.ENV_VAR)),
+            'emb_mode': emb_mode,
+            'active_names': heads.active_names,
+            'metrics': heads.metrics,
+            'meta': heads.meta,
+        } if heads is not None else None),
         'training_metadata': {
             'train_span': (str(cal_min), str(holdout_start)),
             'holdout_span': ((str(holdout_start), str(cal_max))

@@ -50,86 +50,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pipelines.chronos import backbone  # noqa: E402  (torch-free parent)
+from futures_foundation.context import (  # noqa: E402
+    compute_context_labels as compute_labels,
+    HEAD_SPECS as HEADS,
+    GATE_REG_PEARSON, GATE_CLF_AUC, HEADS_CUTOFF,
+)
 
 CTX = 128                    # bars per Bolt context (matches *_chronos labelers)
-HEADS_CUTOFF = pd.Timestamp('2023-01-01', tz='UTC')
 VAL_START = pd.Timestamp('2022-11-01', tz='UTC')
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI']
 TFS = ['3min', '5min']
 EMBED_CHUNK = 50_000
-
-# Pre-registered probe gates — change only BEFORE a run, never after.
-GATE_REG_PEARSON = 0.05
-GATE_CLF_AUC = 0.55
-
-HEADS = [
-    # (name, kind)  kind: 'reg' | 'clf'
-    ('fwd_return', 'reg'),
-    ('vol_expansion', 'clf'),
-    ('volatility', 'reg'),
-    ('structure', 'clf'),
-    ('range_pos', 'reg'),
-]
-
-
-def compute_labels(close: pd.Series) -> pd.DataFrame:
-    """All five forward-looking labels from a close series. NaN where a
-    trailing or forward window is unavailable — never filled."""
-    lc = np.log(close)
-    r1 = lc.diff()
-
-    out = pd.DataFrame(index=close.index)
-
-    # fwd_return: 20-bar forward log-return / trailing std of 20-bar returns
-    fwd20 = lc.shift(-20) - lc
-    sigma20 = lc.diff(20).rolling(200, min_periods=50).std()
-    out['fwd_return'] = (fwd20 / sigma20.replace(0, np.nan)).clip(-4, 4)
-
-    # trailing realized vols (std of 1-bar log-returns); causal at t
-    v10 = r1.rolling(10).std()
-    v20 = r1.rolling(20).std()
-
-    # vol_expansion: fwd 20-bar vol (= v20 at t+20) vs 1.5x trailing median
-    fwd_v20 = v20.shift(-20)
-    med_v20 = v20.rolling(200, min_periods=50).median()
-    ve = (fwd_v20 > 1.5 * med_v20).astype(float)
-    ve[fwd_v20.isna() | med_v20.isna()] = np.nan
-    out['vol_expansion'] = ve
-
-    # volatility: percentile of fwd 10-bar vol (= v10 at t+10) within the
-    # trailing 100 bars' v10 distribution. Vectorized sliding-window rank.
-    fwd_v10 = v10.shift(-10).to_numpy()
-    v10a = v10.to_numpy()
-    pct = np.full(len(v10a), np.nan)
-    W = 100
-    if len(v10a) > W:
-        sw = np.lib.stride_tricks.sliding_window_view(v10a, W)  # [N-W+1, W]
-        tgt = fwd_v10[W - 1:]
-        with np.errstate(invalid='ignore'):
-            ranks = np.nanmean(sw < tgt[:, None], axis=1)
-        bad = np.isnan(tgt) | np.isnan(sw).any(axis=1)
-        ranks[bad] = np.nan
-        pct[W - 1:] = ranks
-    out['volatility'] = pct
-
-    # structure (close-only): fwd 20-bar max/min vs trailing 12-bar max/min
-    ref_hi = close.rolling(12).max()
-    ref_lo = close.rolling(12).min()
-    fwd_hi = close.rolling(20).max().shift(-20)   # covers t+1..t+20
-    fwd_lo = close.rolling(20).min().shift(-20)
-    st = pd.Series(np.nan, index=close.index)
-    valid = ref_hi.notna() & ref_lo.notna() & fwd_hi.notna() & fwd_lo.notna()
-    st[valid & (fwd_hi > ref_hi) & (fwd_lo > ref_lo)] = 1.0   # bull
-    st[valid & (fwd_hi < ref_hi) & (fwd_lo < ref_lo)] = 0.0   # bear
-    out['structure'] = st                                      # mixed = NaN
-
-    # range_pos: close at t+10 within trailing 20-bar close range
-    rh = close.rolling(20).max()
-    rl = close.rolling(20).min()
-    width = (rh - rl).replace(0, np.nan)
-    out['range_pos'] = ((close.shift(-10) - rl) / width).clip(0, 1)
-
-    return out
 
 
 def trivial_features(close: pd.Series) -> pd.DataFrame:

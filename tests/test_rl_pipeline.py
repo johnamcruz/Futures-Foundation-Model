@@ -89,11 +89,23 @@ def test_get_strategy_type_checks():
 
 
 # ── device helper ────────────────────────────────────────────────────────────
-from pipelines.rl.device import get_device, device_str
-import torch
+# In-process torch is GATED: the default suite is torch-free by contract
+# (futures_foundation parent processes run xgboost; torch+xgboost libomp
+# collide on macOS — see test_chronos_framework.py). A module-top
+# `import torch` here poisons the whole shared pytest process at
+# COLLECTION time and segfaults the first native xgboost call.
+import os as _os
+
+torch_inproc = pytest.mark.skipif(
+    _os.environ.get('CHRONOS_TORCH_TESTS') != '1',
+    reason='in-process torch poisons the shared (xgboost) suite; run '
+           'with CHRONOS_TORCH_TESTS=1')
 
 
+@torch_inproc
 def test_device_auto_and_explicit():
+    import torch
+    from pipelines.rl.device import get_device, device_str
     d = get_device("auto")
     assert isinstance(d, torch.device)
     assert device_str("auto") in ("cuda", "mps", "cpu")
