@@ -212,7 +212,7 @@ data/
 
 ### Labels
 
-`futures_foundation.labels` holds the legacy 4-task self-supervised generators (regime / volatility / structure / range). The probe-validated close-only redefinitions (regression-form volatility/range, close-only structure, split regime) currently live in `scripts/probe_context_heads.py` and are promoted into the library with the context-heads work (next milestone).
+Two label sets live in the library. `futures_foundation.labels` — the original 4-task self-supervised generators (regime / volatility / structure / range), still produced by `prepare_data` for the XGBoost pipeline's parquet cache. `futures_foundation.context.compute_context_labels` — the forward-looking, close-only context-head targets (volatility, vol-expansion, quiet-persist, structure, range-bound, trendiness, fwd-return) that train the FFM 2.1 context heads.
 
 ---
 
@@ -237,7 +237,6 @@ Futures-Foundation-Model/
 │       └── trainer.py            # run_labeling + reporting + realized-R economics
 ├── pipelines/
 │   ├── common/                   # Walk-forward windows, econ objective, robustness gates
-│   ├── chronos/                  # Back-compat shims → futures_foundation/chronos
 │   ├── xgboost/                  # Standalone direction classifier on 68 features
 │   └── rl/                       # Generic PPO walk-forward pipeline
 ├── scripts/
@@ -245,7 +244,7 @@ Futures-Foundation-Model/
 │   ├── train_context_heads.py    # Trains the production enriched heads bundle
 │   └── demo_regime_model.py      # OOS certification: calibration + regime model
 ├── docs/                         # Build specs + runbooks
-├── tests/                        # 460+ unit tests (pre-commit gated; torch-free by contract)
+├── tests/                        # 470 unit tests (pre-commit gated; torch-free by contract)
 └── data/                         # Raw OHLCV CSVs (gitignored)
 ```
 
