@@ -236,7 +236,7 @@ def main():
     C, labels, T, ts = build_dataset(tickers, tfs, stride)
     print(f"[probe] total decision bars: {len(C):,}")
     E = embed_chunked(C)
-    assert E.shape == (len(C), backbone.D_MODEL), E.shape
+    assert E.shape[0] == len(C), E.shape   # d_model varies by backbone
     np.nan_to_num(T, copy=False)   # XGBoost handles NaN, but keep parity
 
     results = run_probes(E, T, labels, ts, a.seed, trees)
