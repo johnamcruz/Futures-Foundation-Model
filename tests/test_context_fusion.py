@@ -1,4 +1,4 @@
-"""Tests — pipelines/chronos/context_fusion seam + per-candle readout.
+"""Tests — futures_foundation/chronos/context_fusion seam + per-candle readout.
 
 backbone.embed is monkeypatched (deterministic, torch-free) so the full
 evaluate.run() path runs in-process with XGBoost only — the default suite
@@ -9,9 +9,9 @@ import pandas as pd
 import pytest
 
 from futures_foundation.context import ContextHeads, HEADS_CUTOFF
-from pipelines.chronos import context_fusion as cf
-from pipelines.chronos import evaluate as ev
-from pipelines.chronos import backbone
+from futures_foundation.chronos import context_fusion as cf
+from futures_foundation.chronos import evaluate as ev
+from futures_foundation import foundation as backbone
 
 RNG = np.random.default_rng(3)
 D = backbone.D_MODEL

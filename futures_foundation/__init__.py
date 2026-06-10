@@ -8,9 +8,9 @@ feature/label/primitive libraries and a strategy labeling/eval framework.
 The from-scratch FFM transformer (model/dataset/pretrain/torch fine-tune
 trainer) was retired in favor of Chronos-Bolt (see git tag
 `ffm-transformer-final` for the last version with the full torch backbone
-stack). Walk-forward training now lives in `pipelines/chronos`
-(Bolt embeddings + XGBoost). The foundation surface is
-`futures_foundation.foundation`:
+stack). Walk-forward training now lives in `futures_foundation.chronos`
+(Bolt embeddings + XGBoost; training now in `futures_foundation.chronos`
+shims). The foundation surface is `futures_foundation.foundation`:
 
     from futures_foundation import foundation
 
@@ -26,6 +26,13 @@ torch/transformers.
 
 # Torch-free, always available.
 from . import foundation
+# NOTE: the `chronos` SUBPACKAGE itself is torch/xgboost-free to import
+# (its __init__ is docstring-only; head_xgb/finetune/bolt_* lazy-load
+# xgboost/torch inside functions), but its pipeline modules are NOT
+# re-imported here — users import `futures_foundation.chronos.<mod>`
+# explicitly. This keeps `import futures_foundation` lean and guarantees
+# the package stays importable without xgboost installed.
+from . import chronos
 from .foundation import embed_bars, stamp_active_source, D_MODEL
 from .features import derive_features, get_model_feature_columns, INSTRUMENT_MAP
 from .labels import (

@@ -1,7 +1,7 @@
 # Bolt fine-tune config — amazon/chronos-bolt-tiny on our futures data.
 #
 # NOTE: this is the CONFIG scaffolding. Bolt fine-tuning requires a Bolt-
-# specific training driver. The vendored pipelines/chronos/_ft/train.py
+# specific training driver. The vendored futures_foundation/chronos/_ft/train.py
 # supports only `model_type in {seq2seq, causal}` (T5/causal-LM heads).
 # Bolt is a patch-based encoder for forecasting with its own loss path
 # (quantile regression — see chronos/chronos_bolt.py:forward, returns

@@ -3,7 +3,7 @@ frozen Chronos-Bolt embeddings at all?
 
 Throwaway experiment that gates whether `futures_foundation.context`
 (XGBoost context heads on Bolt embeddings) deserves to be built. No
-refactor required: runs on the existing `pipelines.chronos.backbone.embed`
+refactor required: runs on the `futures_foundation.foundation.embed`
 subprocess seam, so the parent stays torch-free (macOS libomp constraint).
 
 Five fixed forward-looking labels (the Step-2 redefinitions — all
@@ -49,7 +49,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pipelines.chronos import backbone  # noqa: E402  (torch-free parent)
+from futures_foundation import foundation as backbone  # noqa: E402  (torch-free parent)
 from futures_foundation.context import (  # noqa: E402
     compute_context_labels as compute_labels,
     HEAD_SPECS as HEADS,

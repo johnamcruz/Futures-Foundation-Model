@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import backbone
+from futures_foundation import foundation as backbone
 
 
 @dataclass

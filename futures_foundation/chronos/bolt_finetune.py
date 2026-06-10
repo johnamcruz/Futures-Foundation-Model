@@ -30,9 +30,9 @@ Torch/chronos are imported INSIDE run() (lazy) — never at module top — mirro
 backbone.py so the package stays import-safe in torch-free contexts.
 
 CLI:
-    python3 -m pipelines.chronos.bolt_finetune                 # 6tk, 3m+5m, 20k steps
-    python3 -m pipelines.chronos.bolt_finetune --smoke         # 2-step sanity
-    python3 -m pipelines.chronos.bolt_finetune \
+    python3 -m futures_foundation.chronos.bolt_finetune                 # 6tk, 3m+5m, 20k steps
+    python3 -m futures_foundation.chronos.bolt_finetune --smoke         # 2-step sanity
+    python3 -m futures_foundation.chronos.bolt_finetune \
         --tickers ES,NQ,RTY,YM,GC,SI,CL,ZB,ZN --tfs 3min,5min  # widest domain
 Then (per the wiring gap — NOT auto-applied — see backbone.stamp_active_source):
     export CHRONOS_FT_CKPT=<printed path>
@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# pipelines/chronos/bolt_finetune.py -> parents: [chronos, pipelines, REPO_ROOT]
+# futures_foundation/chronos/bolt_finetune.py -> parents: [chronos, futures_foundation, REPO_ROOT]
 _ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = _ROOT / 'data'
 OUT_DIR = _ROOT / 'temp' / 'chronos_bolt_ft'

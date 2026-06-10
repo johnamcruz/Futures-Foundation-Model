@@ -17,9 +17,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipelines.chronos import finetune as ft     # torch is lazy inside it
-from pipelines.chronos import evaluate, strategy
-from pipelines.chronos.head_xgb import XGBHead, XGBRiskHead
+from futures_foundation.chronos import finetune as ft  # torch is lazy inside it
+from futures_foundation.chronos import evaluate, strategy
+from futures_foundation.chronos.head_xgb import XGBHead, XGBRiskHead
 
 # find_spec does NOT import the module -> pytest process stays torch-free.
 _CHRONOS = (importlib.util.find_spec('chronos') is not None
@@ -76,7 +76,7 @@ def test_strategy_protocol_is_duck_typed():
 @chronos_only
 def test_backbone_loads_pools_and_resets():
     import torch
-    from pipelines.chronos import backbone
+    from futures_foundation import foundation as backbone
     assert backbone.d_model() == 256
     m = backbone.fresh_model()
     ctx = torch.tensor(np.random.default_rng(0).standard_normal(
@@ -181,7 +181,7 @@ def test_xgbhead_deterministic_and_bounded(nc):
 
 @chronos_only
 def test_backbone_embed_is_frozen_deterministic():
-    from pipelines.chronos import backbone
+    from futures_foundation import foundation as backbone
     C = [np.random.default_rng(k).standard_normal(48).astype('float32')
          for k in range(10)]
     e1 = backbone.embed(C)

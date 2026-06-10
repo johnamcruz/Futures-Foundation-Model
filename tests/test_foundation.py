@@ -25,7 +25,7 @@ def test_package_import_is_torch_free():
     can't mask a leak."""
     code = (
         "import sys; import futures_foundation; "
-        "import pipelines.chronos.backbone; "
+        "import futures_foundation.chronos; "
         "leaked = [m for m in ('torch', 'transformers', 'chronos') "
         "if m in sys.modules]; "
         "sys.exit(1 if leaked else 0)"
@@ -107,19 +107,6 @@ def test_embed_bars_empty_indices_short_circuits():
 def test_embed_empty_contexts_short_circuits():
     out = foundation.embed(np.zeros((0, 128), np.float32))
     assert out.shape == (0, foundation.D_MODEL)
-
-
-# ---------------------------------------------------------------------------
-# pipelines.chronos.backbone shim — must stay aliased to foundation
-# ---------------------------------------------------------------------------
-
-def test_backbone_shim_reexports_foundation():
-    from pipelines.chronos import backbone
-    assert backbone.embed is foundation.embed
-    assert backbone.embed_bars is foundation.embed_bars
-    assert backbone.stamp_active_source is foundation.stamp_active_source
-    assert backbone.D_MODEL == foundation.D_MODEL
-    assert backbone.MODEL == foundation.MODEL
 
 
 def test_stamp_active_source_prints_frozen_tag(monkeypatch, capsys):

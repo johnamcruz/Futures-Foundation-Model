@@ -8,7 +8,7 @@ Flow: our 3-min bars -> GluonTS Arrow -> official scripts/training/train.py
 (vendored, Apache-2.0) -> fine-tuned T5 checkpoint dir (printed). The
 backbone is then pointed at that checkpoint for the frozen-embed CRT POC.
 
-  python -m pipelines.chronos._ft.run_ft [--months N] [--steps N] [--smoke]
+  python -m futures_foundation.chronos._ft.run_ft [--months N] [--steps N] [--smoke]
 """
 import os
 import sys
@@ -77,11 +77,11 @@ def run(months=6, steps=200, smoke=False, tickers=None, tfs=None,
         # config skeleton.
         print("\n⚠ --bolt: Bolt fine-tune is SCAFFOLDED but not yet "
               "executable.")
-        print("  Reason: vendored pipelines/chronos/_ft/train.py supports "
+        print("  Reason: vendored futures_foundation/chronos/_ft/train.py supports "
               "only seq2seq+causal (T5).")
         print("  Bolt uses a different training path "
               "(chronos.chronos_bolt:forward → quantile loss).")
-        print("  Next steps: see pipelines/chronos/_ft/bolt.yaml header "
+        print("  Next steps: see futures_foundation/chronos/_ft/bolt.yaml header "
               "(option a: pull upstream Bolt train script when released; "
               "option b: implement custom Bolt trainer ~200-300 LoC).")
         print("  For now, the T5 fine-tune path (default, no --bolt) works "

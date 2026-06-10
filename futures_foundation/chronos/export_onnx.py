@@ -24,8 +24,8 @@ torch+xgboost OpenMP collision (macOS): the orchestrator parent imports
 neither — each export stage runs in its own subprocess.
 
 Usage:
-    python3 -m pipelines.chronos.export_onnx chronos_supertrendchronos_production_20260519.joblib
-    python3 -m pipelines.chronos.export_onnx <bundle.joblib> --out-dir models/
+    python3 -m futures_foundation.chronos.export_onnx chronos_supertrendchronos_production_20260519.joblib
+    python3 -m futures_foundation.chronos.export_onnx <bundle.joblib> --out-dir models/
 """
 import argparse
 import json
@@ -213,7 +213,7 @@ def verify(bundle_path: Path, chronos_onnx: Path, signal_onnx: Path,
 
     # --- Path A (joblib): backbone.embed (subprocess-isolated torch)
     #     + XGB heads in parent (xgboost; no torch). No collision.
-    from . import backbone
+    from futures_foundation import foundation as backbone
     print(f"\n  Path A (joblib): backbone.embed + signal/risk heads")
     emb_jl = backbone.embed(contexts)
     X_jl = np.hstack([emb_jl, hand]).astype(np.float32)

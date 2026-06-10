@@ -57,22 +57,21 @@ E = foundation.embed_bars(close, indices)          # [N, 256] float32, strictly 
 - `embed_bars(close, indices, ctx=128)` builds log-close windows of bars `<= t` for each decision index and embeds them. `embed(contexts)` is the lower-level batched form.
 - **Process contract:** all torch/Chronos work runs in an **isolated subprocess** (`futures_foundation/_embed_worker.py`). The parent stays torch-free — torch and xgboost segfault in one process on macOS (libomp collision). `D_MODEL = 256` and `CTX = 128` are torch-free constants. Do not "optimize" the embed back in-process.
 - **Backbone wiring guards** (post-incident, 2026-05-19): `$CHRONOS_FT_CKPT` selects a local fine-tuned checkpoint; unset = frozen vanilla. `stamp_active_source()` prints which backbone will load (`❄️ FROZEN` vs `🧪 FINE-TUNED`), scans `temp/` for fine-tune checkpoints sitting unused, and prints the exact `export` command if one is being silently ignored. The worker also stamps what it loaded to stderr (defense in depth).
-- `pipelines.chronos.backbone` remains as a back-compat shim re-exporting this module — all existing strategy scripts work unchanged.
 
-Domain-adapting the foundation is supported but optional: `pipelines/chronos/bolt_finetune.py` (forecasting-loss fine-tune on our 9-instrument corpus) + `bolt_ab.py` (vanilla-vs-fine-tuned A/B on a real strategy). The measured verdict to date: domain fine-tuning improves forecasting loss but **not** selection edge — production runs vanilla frozen weights.
+Domain-adapting the foundation is supported but optional: `futures_foundation/chronos/bolt_finetune.py` (forecasting-loss fine-tune on our 9-instrument corpus) + `bolt_ab.py` (vanilla-vs-fine-tuned A/B on a real strategy). The measured verdict to date: domain fine-tuning improves forecasting loss but **not** selection edge — production runs vanilla frozen weights.
 
 ---
 
 ## Chronos Pipeline — training, evaluation, deployment
 
-**`pipelines/chronos/` — the strategy-pluggable harness around the foundation: walk-forward evaluator with honest-ruler controls, production trainer, ONNX export.** This is the proven path every new strategy goes through.
+**`futures_foundation/chronos/` — the strategy-pluggable harness around the foundation: walk-forward evaluator with honest-ruler controls, production trainer, ONNX export.** This is the proven path every new strategy goes through.
 
 **What it does:** a strategy labeler defines event candidates (e.g., SuperTrend flips); for each event, the trailing 128-bar context → frozen foundation embedding → fused with hand-crafted features → XGBoost predicts `(P(take), R̂)`. Walk-forward 3-month-train / 1-month-test with **REAL/SHUFFLE/RANDOM/NAIVE controls** and a **6-check pre-registered PASS/FAIL auto-verdict** at run-end. The production trainer fits ONE signal head + ONE risk head on the full corpus minus an N-month holdout and saves a single joblib bundle the bot loads.
 
 ### Add a strategy
 
 ```python
-from pipelines.chronos.strategy import StrategyLabeler
+from futures_foundation.chronos.strategy import StrategyLabeler
 
 class MyLabeler:
     n_classes = 2     # binary selection (take / skip)
@@ -87,21 +86,21 @@ class MyLabeler:
 ```
 
 ```python
-from pipelines.chronos import evaluate as ev, produce
+from futures_foundation.chronos import evaluate as ev, produce
 ev.run(MyLabeler())                                      # walk-forward + auto-verdict
 produce.train(MyLabeler(), holdout_months=1)             # production bundle
 ```
 
 ```bash
 # ONNX export + 3-layer verify (requires: pip install onnxmltools skl2onnx)
-python3 -m pipelines.chronos.export_onnx <bundle.joblib>
+python3 -m futures_foundation.chronos.export_onnx <bundle.joblib>
 ```
 
 ### Pipeline components
 
 | Component | Role |
 |---|---|
-| `backbone.py` | Back-compat shim → `futures_foundation.foundation` (the promoted seam). |
+| (backbone) | The seam is `futures_foundation.foundation`; modules here import it as `backbone` (removed `pipelines/chronos` entirely). |
 | `evaluate.py` | Walk-forward harness — batch-embed ONCE across all folds → per-fold thread-parallel XGBoost (5–10× speedup). Dual dashboard: 🎯 fixed-TP @ RR=3 + 💎 dynamic-TP @ `clip(0.8 × R̂, 1.5, 8.0)`. Auto-verdict with 6 pre-registered checks (constants at module top — goalpost-moving requires editing constants *before* the next run). |
 | `produce.py` | Production training: ONE fit on full corpus minus N-month holdout; saves joblib bundle (signal head + risk head + `feat_dim` + `ctx_window` + `chronos_ckpt` + labeler config + holdout threshold sweep). Production-scale defaults (`n_estimators=600, max_depth=5`). |
 | `export_onnx.py` | joblib → 3 ONNX files (chronos + signal + risk) via subprocess-isolated phases. End-to-end `verify()`: per-stage drift < 1e-3, chained-pipeline equivalence, decision parity at the trading threshold. |
@@ -117,7 +116,7 @@ Extra deps (not in `requirements.txt`): `chronos-forecasting`, `xgboost>=2.0`, `
 
 ## Strategy Labeling & Evaluation Framework
 
-**`futures_foundation.finetune` — the torch-free survivors of the v0.3–v1.3 fine-tuning framework: labeling, health monitoring, reporting, realized-R economics.** The torch walk-forward trainer was retired with the from-scratch backbone (training now happens in `pipelines/chronos`); the layers every pipeline still leans on remain:
+**`futures_foundation.finetune` — the torch-free survivors of the v0.3–v1.3 fine-tuning framework: labeling, health monitoring, reporting, realized-R economics.** The torch walk-forward trainer was retired with the from-scratch backbone (training now happens in `futures_foundation.chronos`); the layers every pipeline still leans on remain:
 
 | Component | Description |
 |---|---|
@@ -215,6 +214,7 @@ Futures-Foundation-Model/
 │   ├── labels.py                 # Legacy forward-looking label generation
 │   ├── prepare.py                # prepare_data: raw CSVs → features+labels parquet
 │   ├── primitives/               # Indicators, barriers, rolling, session, detection
+│   ├── chronos/                  # ★ Foundation training/eval/deploy harness (see above)
 │   └── finetune/                 # Torch-free framework survivors
 │       ├── base.py               # StrategyLabeler ABC (final run() = TP≥SL triple barrier)
 │       ├── config.py             # TrainingConfig (labeling/eval params)
@@ -222,7 +222,7 @@ Futures-Foundation-Model/
 │       └── trainer.py            # run_labeling + reporting + realized-R economics
 ├── pipelines/
 │   ├── common/                   # Walk-forward windows, econ objective, robustness gates
-│   ├── chronos/                  # ★ Foundation training/eval/deploy harness (see above)
+│   ├── chronos/                  # Back-compat shims → futures_foundation/chronos
 │   ├── xgboost/                  # Standalone direction classifier on 68 features
 │   └── rl/                       # Generic PPO walk-forward pipeline
 ├── scripts/

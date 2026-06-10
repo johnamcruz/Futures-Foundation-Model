@@ -3,7 +3,7 @@ Labeling, reporting, and realized-R economics for strategy evaluation.
 
 The torch walk-forward trainer was retired with the from-scratch FFM
 backbone (see git tag `ffm-transformer-final` for the last full version).
-Walk-forward training now lives in `pipelines/chronos` (frozen Chronos-Bolt
+Walk-forward training now lives in `futures_foundation.chronos` (frozen Chronos-Bolt
 embeddings + XGBoost selection head). What survives here are the torch-free
 layers that remain useful to any strategy pipeline:
 

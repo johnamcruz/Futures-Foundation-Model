@@ -8,7 +8,7 @@ activate it downstream.
 Leak discipline: trains ONLY on bars whose forward label window ends before
 HEADS_CUTOFF (2023-01-01 UTC); validation = last 2 pre-cutoff months,
 sanity/gate only. Downstream signal training that fuses these heads is
-restricted to >= HEADS_CUTOFF by pipelines/chronos/context_fusion.
+restricted to >= HEADS_CUTOFF by futures_foundation/chronos/context_fusion.
 
 Usage:
   python3 scripts/train_context_heads.py --smoke    # ES 3min, minutes

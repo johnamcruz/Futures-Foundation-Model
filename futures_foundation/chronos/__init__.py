@@ -1,14 +1,15 @@
 """Chronos pipeline — a generic, strategy-pluggable fine-tune framework.
 
-Independent, standalone (no FFM-transformer dependency). The Chronos-Bolt
-backbone is fine-tuned with a small classification head on labels supplied
-by a pluggable strategy; results are judged only under a leak-free,
-shuffle/random/cost honest ruler. Strategy specifics live OUTSIDE this
-public package (private colabs/); this package stays strategy-agnostic.
+Lives inside `futures_foundation` (promoted from the former `pipelines/chronos`). The Chronos-Bolt backbone is fine-tuned with a
+small classification head on labels supplied by a pluggable strategy; results
+are judged only under a leak-free, shuffle/random/cost honest ruler. Strategy
+specifics live OUTSIDE this public package (private colabs/); this package
+stays strategy-agnostic.
 
 Files:
-  backbone.py — the ONLY Chronos seam: Bolt load, pristine reset (each
-                fine-tune independent), causal masked-mean encoder pooling.
+  (backbone)  — the ONLY Chronos seam is `futures_foundation.foundation`;
+                modules here import it as `backbone` (Bolt load, pristine
+                reset, causal masked-mean encoder pooling).
   finetune.py — generic seeded/deterministic backbone+head supervised
                 fine-tune (train/predict); no strategy or eval logic.
   strategy.py — StrategyLabeler protocol (calendar/build/evaluate);
