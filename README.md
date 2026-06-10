@@ -2,407 +2,74 @@
 
 ![Python Unit Tests](https://github.com/johnamcruz/Futures-Foundation-Model/actions/workflows/main.yml/badge.svg)
 
-**A pretrained transformer backbone for futures market structure and regime classification — with a plug-and-play fine-tuning framework for any trading strategy.**
+**A futures-market foundation layer built on pretrained Chronos-Bolt — frozen embeddings of intraday market context, plus strategy-pluggable training, evaluation, and deployment pipelines.**
 
 ---
 
 ## Overview
 
-Futures Foundation Model (FFM) is an open-source pretrained transformer designed to learn **market structure** and **regime dynamics** from raw OHLCV futures data. The backbone learns general representations of market behavior that can be fine-tuned for any downstream trading strategy.
+FFM gives downstream trading models a shared **market-understanding layer**. The foundation is **`amazon/chronos-bolt-tiny`** — a time-series transformer pretrained by Amazon on large forecasting corpora — used **frozen**: a 128-bar log-close context ending at the decision bar becomes a 256-dim embedding that downstream heads (XGBoost classifiers/regressors) consume alongside strategy-specific features.
+
+> **History.** FFM v0.x–v1.x trained a transformer backbone from scratch (68 hand-derived features, 4 self-supervised heads, ~2.3M bars). That stack is retired — building on a foundation model pretrained on vastly more data proved better than pretraining our own. The last version with the full from-scratch stack is preserved at git tag **`ffm-transformer-final`**. The *philosophy* survives unchanged; only who provides the embedding changed.
 
 ### Philosophy
 
 > Separate **"understanding market context"** from **"making strategy-specific decisions."**
 
-Just as BERT learns language structure before being fine-tuned for sentiment or Q&A, FFM learns market structure before being fine-tuned for ORB entries, ICT setups, mean reversion signals, or any other strategy. The backbone handles all market context — trend, volatility, session, HTF structure, order flow. Your strategy adds only the setup-specific features it uniquely knows.
+Just as BERT learns language structure before being fine-tuned for sentiment or Q&A, the foundation embedding captures market state before any strategy logic runs. The strategy adds only what the foundation cannot derive: setup geometry, zone age, entry distance, risk sizing. Market-context knowledge is never duplicated across strategies.
 
-### Why This Architecture
+This architecture is **proven live**: the production SuperTrend selection model (frozen Bolt embedding + XGBoost head) runs in production at 60.5% WR / PF 4.45, certified on the honest-ruler walk-forward with pre-registered controls.
 
-**1. Regime changes don't require retraining.**
+### What the foundation actually knows (measured)
 
-The four frozen context heads produce live regime/volatility/structure/range probabilities at every inference bar. When the market shifts — say a high-volatility trending selloff — the regime head's softmax output changes from `[0.1, 0.7, 0.1, 0.1]` (ranging) to `[0.1, 0.1, 0.7, 0.1]` (trending). The signal head already trained against this context, so it adjusts confidence automatically. The backbone was pretrained on 2020–2026 data spanning multiple distinct regimes (COVID crash, 2021 melt-up, 2022 bear, 2023 recovery, 2025 tariff selloff) — a new market phase maps to the same embedding space without any code changes.
+We probe the frozen embedding with XGBoost heads against five forward-looking targets, with pre-registered gates, a shuffled-label control (leak detector), and a **trivial baseline** (8 trailing summary stats — "does the embedding know more than cheap features?"). Full pre-2023 corpus, 6 tickers × {3min, 5min}, ~236k decision bars, validated on held-out late-2022:
 
-**2. Adding new data is just a re-run.**
+| Forward target (close-only) | Embedding | Shuffle | Trivial stats | Verdict |
+|---|---|---|---|---|
+| Realized-vol percentile (10-bar fwd) | **r = +0.52** | +0.01 | +0.41 | ✅ knows it, **beyond trivial** |
+| Vol expansion >1.5× median (20-bar fwd) | **AUC 0.78** | 0.51 | 0.70 | ✅ knows it, **beyond trivial** |
+| Structure: HH/HL vs LH/LL (20-bar fwd) | AUC 0.79 | 0.49 | 0.81 | 🟡 knows it; trivial matches |
+| Range position of fwd close (10-bar) | r = +0.48 | +0.01 | +0.53 | 🟡 knows it; trivial matches |
+| Direction: z-scored fwd return (20-bar) | r = +0.03 | +0.01 | +0.07 | ❌ does not know |
 
-When new bars arrive (monthly or quarterly), you only re-run strategy fine-tuning. The backbone representations are stable. Walk-forward folds shift forward automatically, so your test set becomes more recent and training signals increase — making the model progressively better with no architectural changes.
+The division of labor this implies is exactly the design: the foundation understands **conditions** (volatility regime, expansion risk, structural state); the strategy heads supply the **edge** (signal selection, direction, sizing). Probe script: `scripts/probe_context_heads.py`; results JSON in `temp/`.
 
-| Event | Action required |
-|-------|----------------|
-| New bars added to existing tickers | Re-run fine-tuning only |
-| New strategy to trade | Implement one `StrategyLabeler` class |
-| New market regime (within seen volatility) | Nothing — context heads adapt at inference |
-| New input features added to backbone | Retrain backbone, then re-run fine-tuning |
-| Genuinely unprecedented market structure | Retrain backbone (rare — 5+ year training window covers most regimes) |
+### Why this architecture
 
-**3. One backbone, unlimited strategies.**
-
-The pretrained backbone is a shared market context layer. CISD+OTE, SuperTrend, ORB, breaker blocks — each is a thin fine-tuned head on top of the same backbone. Each strategy adds only what the backbone cannot derive: its own setup geometry, zone age, entry distance. Market structure knowledge is never duplicated.
-
-**4. Context heads give the signal head named market handles.**
-
-Prior to context heads, regime information was implicit in the 256-dim CLS embedding — present but unaddressable. The four frozen context heads expose regime, volatility, structure, and range as an explicit 15-dim probability vector. The signal head can learn "when structure head says bearish + volatility head says elevated → tighten confidence threshold" rather than reverse-engineering that from the embedding.
+1. **Regime changes don't require retraining.** The frozen embedding maps any market state into the same representation space; downstream heads trained across regimes adjust automatically. Domain shift handling comes from Bolt's pretraining breadth, not from our retraining cadence.
+2. **Adding new data is just a re-run.** The foundation is frozen; only the cheap XGBoost heads retrain (quarterly runbook: `docs/`).
+3. **One foundation, unlimited strategies.** Each strategy is a thin labeler + features plug-in; SuperTrend, Kalman-NW, CISD all ride the same embedding.
+4. **Honest by construction.** Every result passes the honest ruler: walk-forward × {REAL, SHUFFLE, RANDOM, NAIVE} × seeds with a pre-registered auto-verdict. A number is believed only if REAL clearly beats every control.
 
 ---
 
-## Fine-Tuning Framework
+## The Foundation Surface
 
-**v0.3 introduced `futures_foundation.finetune` — a reusable, fully-tested walk-forward training framework.**
-
-Adding a new strategy now requires implementing one class. Everything else — training loop, walk-forward splits, warm start between folds, dual checkpointing, evaluation tables, ONNX export — is handled by the framework.
-
-### Add a new strategy in ~30 lines
+`futures_foundation.foundation` is the canonical seam — the only way downstream code gets foundation embeddings:
 
 ```python
-from futures_foundation.finetune import StrategyLabeler, TrainingConfig, run_finetune
+from futures_foundation import foundation
 
-class MyStrategyLabeler(StrategyLabeler):
-    @property
-    def name(self): return 'my_strategy'
-
-    @property
-    def feature_cols(self): return ['zone_height', 'entry_depth', 'risk_norm']
-
-    def detect_events(self, df_raw, ffm_df, ticker):
-        # one row per signal bar: bar_idx, direction(+1/-1),
-        # sl_distance(>0), tp_rr(>=1).  Entry is the NEXT bar's open.
-        return my_events_df
-
-    def compute_features(self, df_raw, ffm_df, ticker):
-        # feature_cols matrix aligned to ffm_df.index
-        return my_features_df
+foundation.stamp_active_source(context='my run')   # loud backbone stamp — always call first
+E = foundation.embed_bars(close, indices)          # [N, 256] float32, strictly causal
 ```
 
-> **v1.3 ABC change:** `run()` is now **FINAL** — the base applies a
-> session-calibrated **TP≥SL triple barrier** (entry = next-bar open),
-> centralising the entry-after-signal / orientation bug class once. A
-> strategy implements only `detect_events()` + `compute_features()`. The
-> base auto-emits `signal_label` / `max_rr` / `sl_distance` **and
-> `direction`**, so realized-R economics and economic checkpoint
-> selection work *for free* for every new strategy. The legacy
-> `run()`-override path was removed (CISD/Session VP were historical-only).
+- `embed_bars(close, indices, ctx=128)` builds log-close windows of bars `<= t` for each decision index and embeds them. `embed(contexts)` is the lower-level batched form.
+- **Process contract:** all torch/Chronos work runs in an **isolated subprocess** (`futures_foundation/_embed_worker.py`). The parent stays torch-free — torch and xgboost segfault in one process on macOS (libomp collision). `D_MODEL = 256` and `CTX = 128` are torch-free constants. Do not "optimize" the embed back in-process.
+- **Backbone wiring guards** (post-incident, 2026-05-19): `$CHRONOS_FT_CKPT` selects a local fine-tuned checkpoint; unset = frozen vanilla. `stamp_active_source()` prints which backbone will load (`❄️ FROZEN` vs `🧪 FINE-TUNED`), scans `temp/` for fine-tune checkpoints sitting unused, and prints the exact `export` command if one is being silently ignored. The worker also stamps what it loaded to stderr (defense in depth).
+- `pipelines.chronos.backbone` remains as a back-compat shim re-exporting this module — all existing strategy scripts work unchanged.
 
-```python
-# Single call — labeling, walk-forward training, evaluation, and fold progression all in one
-labeler = MyStrategyLabeler()
-monitor = FoldHealthMonitor()   # optional — auto-detects training pathologies
-fold_results = run_finetune(
-    labeler=labeler,
-    config=TrainingConfig(),
-    folds=FOLDS,
-    tickers=TICKERS,
-    backbone_path=BACKBONE_PATH,
-    ffm_config=ffm_config,
-    output_dir=OUTPUT_DIR,
-    raw_dir=RAW_DATA_DIR,
-    ffm_dir=PREPARED_DIR,
-    strategy_dir=CACHE_DIR,
-    baseline_wr=BASELINE_WR,
-    health_monitor=monitor,
-    on_epoch_end=lambda m: print(f"  {m['fold']} E{m['epoch']} P@80:{m['prec_at_80']:.3f}(N={m['n_at_80']})"),
-    on_fold_complete=lambda fold, metrics: print(f"  {fold} done — P@80:{metrics.get('prec_at_80', 0):.3f}"),
-)
-monitor.summary()   # consolidated report across all folds
-```
-
-`run_finetune` executes the full pipeline in order: (1) label all tickers with cache, (2) walk-forward training across all folds, (3) `print_eval_summary` confidence threshold table, (4) `print_fold_progression` fold-to-fold P@80 table with Gate 2 check. The lower-level `run_labeling`, `run_walk_forward`, and `print_eval_summary` remain available for scripts that need intermediate access between steps.
-
-**Backbone reuse across runs** — after a walk-forward completes, extract the trained backbone to use as the starting point for the next run. The backbone accumulates domain knowledge across runs; the signal head always cold-starts to stay honest to each fold's regime:
-
-```python
-from futures_foundation.finetune import extract_backbone
-
-# After F5 completes — pull backbone weights from final fold's checkpoint
-extract_backbone(
-    done_path='F5_68cdfded_done.pt',
-    output_path='backbone_strategy_run2.pt',
-)
-# Use backbone_strategy_run2.pt as backbone_path in the next run
-```
-
-**Iterative fine-tuning (multi-pass)** — run successive refinement passes by setting `continue_from` to the prior run's final `_done.pt`. F1 of the new run warm-starts (full transfer) from that checkpoint, carrying over both backbone and strategy heads. F2-F5 then continue fold-to-fold using `warm_start_mode` as configured. Each pass bypasses cold-start waste and spends every epoch on refinement:
-
-```python
-training_cfg = TrainingConfig(
-    warm_start_mode='full',
-    continue_from='runs/v15/F5_68cdfded_done.pt',  # prior run's final fold
-    lr=2e-5,       # lower LR for refinement pass
-    epochs=60,
-)
-fold_results = run_walk_forward(..., training_cfg=training_cfg)
-```
-
-`continue_from` is excluded from the config hash so changing the path does not bust fold-resume cache.
-
-**Backbone swap** — upgrade the backbone mid-chain without re-learning strategy heads. Set `backbone_swap_path` alongside `continue_from` to splice a newer backbone into the prior run's checkpoint before F1 trains. Strategy heads, signal projection, and context heads all carry over from `continue_from`; only backbone weights are replaced:
-
-```python
-training_cfg = TrainingConfig(
-    continue_from='runs/v18/F5_done.pt',              # strategy heads from v18
-    backbone_swap_path='backbones/backbone_v19.pt',   # newer backbone weights
-    warm_start_mode='full',
-    lr=2e-5,
-)
-# Result: v19 backbone knowledge + v18 strategy head calibration → no cold start
-fold_results = run_walk_forward(..., training_cfg=training_cfg)
-```
-
-**Per-fold epoch override** — set an `epochs` key in any fold dict to override the global `TrainingConfig.epochs` for that fold only. Useful when later folds have less training data (fewer bars before the val cutoff) and don't need as many epochs:
-
-```python
-FOLDS = [
-    {'name': 'F1', 'train_end': '2022-04-01', 'val_end': '2022-10-01', 'test_end': '2023-04-01'},
-    {'name': 'F4', 'train_end': '2025-04-01', 'val_end': '2025-08-01', 'test_end': '2026-01-01', 'epochs': 20},
-    # F4 uses 20 epochs; all others use TrainingConfig.epochs
-]
-```
-
-The config hash is computed from `TrainingConfig` only — fold-level overrides do not affect it.
-
-**Sliding window training (`train_start`)** — set a `train_start` key in any fold dict to limit training to a recent window. Critical for `continue_from` runs: without it, later folds train on the full historical range while the model's initialization is anchored to the prior run's weights — the tiny gradient (small LR + high freeze ratio) cannot overcome the anchor, so feature weights are identical across all folds (WEIGHT_LOCK). With an 18-month window, each fold's training data is local to its regime, forcing genuine re-adaptation:
-
-```python
-FOLDS = [
-    {'name': 'F1', 'train_start': '2020-10-01', 'train_end': '2022-04-01', 'val_end': '2022-10-01', 'test_end': '2023-04-01'},
-    {'name': 'F2', 'train_start': '2021-10-01', 'train_end': '2023-04-01', 'val_end': '2023-10-01', 'test_end': '2024-04-01'},
-    {'name': 'F3', 'train_start': '2022-10-01', 'train_end': '2024-04-01', 'val_end': '2024-10-01', 'test_end': '2025-04-01'},
-    {'name': 'F4', 'train_start': '2023-10-01', 'train_end': '2025-04-01', 'val_end': '2025-08-01', 'test_end': '2026-01-01'},
-]
-# Folds without train_start default to full history (backward-compatible)
-```
-
-The `train_start` window is a *training data* constraint only — val and test windows are unchanged. The `FoldHealthMonitor` detects if the fix is needed (WEIGHT_LOCK) and confirms it is working (prints `cos_sim` between folds even when healthy).
-
-**Phase 2: risk head calibration** (separate script, run after Phase 1 completes)
-
-```python
-from futures_foundation.finetune import run_risk_head_calibration
-
-# Loads Phase 1 checkpoints, freezes signal head + backbone, trains risk_head
-# with Huber loss on confirmed signal windows only. Prints calibration table
-# showing how well predicted_rr tracks actual max_rr at each R threshold.
-rr_done_paths = run_risk_head_calibration(
-    folds=FOLDS, tickers=TICKERS,
-    ffm_dir=PREPARED_DIR, strategy_dir=CACHE_DIR, output_dir=OUTPUT_DIR,
-    strategy_feature_cols=labeler.feature_cols, ffm_config=ffm_config,
-    rr_lr=1e-5, rr_epochs=20, rr_patience=5,
-)
-# rr_done_paths['F5'] → path to the F5 _rr_done.pt used for ONNX export
-```
-
-**Risk head donor** — if the final fold's risk head degrades (e.g. F5 val MAE is noticeably worse than F3), pass `risk_head_donor_path` to `export_onnx()` to splice a better fold's calibrated risk head into the export while keeping F5's backbone and signal head:
-
-```python
-from futures_foundation.finetune import export_onnx
-
-export_onnx(
-    model,                          # loaded from F5 checkpoint
-    'strategy_hybrid.onnx',
-    seq_len=96,
-    num_ffm_features=68,
-    num_strategy_features=len(feature_cols),
-    risk_head_donor_path='F3_hash_rr_done.pt',  # F3 risk head replaces F5's
-)
-# Backbone and signal_head always come from model (F5); risk_head comes from donor
-```
-
-### What the framework provides
-
-| Component | Description |
-|---|---|
-| `StrategyLabeler` | ABC — implement `name`, `feature_cols`, **`detect_events()`** + **`compute_features()`**; the **final** `run()` applies a session-calibrated TP≥SL triple barrier (entry = next-bar open) and emits `signal_label`/`max_rr`/`sl_distance`/`direction` (v1.3) |
-| `run_shuffle_audit()` | **Leakage gate** — trains REAL vs label-SHUFFLED on identical seed/folds; PASS only if real ≫ shuffled, FAIL=LEAKAGE if shuffled≈real (the audit that killed CRT's false positive). Pure `_shuffle_audit_verdict`, CI-assertable exit code (v1.3 #2) |
-| Realized-R econ block | `print_eval_summary` / per-fold table print PF/WR/mean-R/maxDD/no-top-1% from **realized R under a trailing exit** (not the optimistic MFE/`max_rr`), labeled realized-vs-MFE; back-compat skip if absent (v1.3 #1) |
-| `econ_selection` (TrainingConfig) | Opt-in **economic checkpoint selection** — adds an `_econ.pt` tier + early-stop on a CAGR·√Sortino *product* objective (can't be won by not-trading; rewards more signals only while profitable). Default **off** → selection byte-identical to the proven `_p80s>_p80>_f1>_loss` path (v1.3 #3) |
-| `TrainingConfig` | Dataclass holding all training hyperparameters |
-| `HybridStrategyModel` | FFM backbone + strategy feature projection + signal/risk/confidence heads |
-| `HybridStrategyDataset` | Sliding-window dataset parameterised by your strategy feature columns |
-| `FoldHealthMonitor` | **Stateful post-fold health checker** — pass to `run_finetune(health_monitor=...)` to auto-detect 7 training pathologies; call `monitor.summary()` for a consolidated report after all folds |
-| `run_finetune()` | **Single-call full pipeline** — labeling → walk-forward → eval summary → fold progression; `on_epoch_end` and `on_fold_complete` callbacks for custom monitoring; `health_monitor` for automatic pathology detection |
-| `run_labeling()` | Lower-level: CSV I/O, timezone normalization, parquet caching per ticker |
-| `run_walk_forward()` | Lower-level: N-fold walk-forward, selective warm start, tiered checkpoint selection, disconnect recovery |
-| `run_risk_head_calibration()` | Phase 2: freeze signal head, fine-tune risk_head with Huber loss on signal-only subsets |
-| `print_eval_summary()` | Confidence threshold table with AvgMaxRR column, per-fold breakdown, vs-baseline comparison |
-| `print_rr_calibration()` | Phase 2 calibration table: predicted R:R vs actual max_rr at each threshold |
-| `export_onnx()` | Production ONNX export; `risk_head_donor_path` splices a better fold's calibrated risk head when the final fold's degrades |
-| `extract_backbone()` | Extract backbone weights from a completed fold for use as the starting point of the next training run |
-| `continue_from` (TrainingConfig) | Path to a prior run's `_done.pt` — F1 warm-starts (full) from that checkpoint for iterative multi-pass refinement |
-| `backbone_swap_path` (TrainingConfig) | Replaces backbone weights inside the `continue_from` checkpoint before training — upgrades backbone without re-learning strategy heads |
-| `p80_patience` (TrainingConfig) | Dual patience: fires early stop when P@80 stable (N≥50) hasn't improved for N epochs, independent of val_loss patience |
-| Fold `epochs` key | Per-fold epoch override — set `{'epochs': 20}` in any fold dict to override the global `TrainingConfig.epochs` for that fold only |
-| Fold `train_start` key | Sliding window training — limits training data to a recent window (e.g. 18 months) so each fold re-adapts to its local regime; required for `continue_from` runs to prevent WEIGHT_LOCK |
-| Auto-scaled `n_stable_min` | `n_stable_min` in `TrainingConfig` is a cap, not a fixed threshold. Per fold, the trainer computes `effective_n_stable = min(cfg.n_stable_min, max(10, int(val_pos_count × 0.08)))` from actual val signal count. Later walk-forward folds have shorter val windows and fewer signals — a fixed threshold blocks stable checkpoints from forming in F4/F5. The scaled floor ensures the bar is proportional to signal density, not absolute count. Val print line shows the computed value vs the cfg cap. |
-
-After each fold evaluation, the framework automatically prints two diagnostic blocks:
-
-**Per-threshold table** — precision, EV@2R, recall, signal rate, and **AvgMaxRR** (average max R:R of winning trades at each confidence threshold). AvgMaxRR confirms the edge has real follow-through — a high-precision threshold where winners average only 0.5R is a different risk profile than one averaging 2.5R.
-
-**Confidence calibration block** — win rate by confidence band (50–60%, 60–70%, 70–80%, 80–90%, 90%+), filtered to predicted positives only. Includes a monotonicity check: win rate must rise with confidence or a ⚠️ flag is printed. A non-monotonic calibration (model more accurate at 70% than 80%) is a deployment blocker — it means the model is guessing at high confidence rather than genuinely discriminating.
-
-**`FoldHealthMonitor` — automatic pathology detection.** Pass a `FoldHealthMonitor` instance to `run_finetune` and it runs 7 checks after every fold, printing immediately when something is wrong and a consolidated summary at the end. No manual log inspection needed:
-
-```python
-from futures_foundation.finetune import FoldHealthMonitor
-
-monitor = FoldHealthMonitor()
-fold_results = run_finetune(..., health_monitor=monitor)
-monitor.summary()
-```
-
-| Signal | Severity | Triggers when | Suggested fix |
-|---|---|---|---|
-| `EARLY_EPOCH` | warning | best_epoch ≤ 5 | Increase LR 3×, or reduce freeze ratio |
-| `WEIGHT_LOCK` | warning | feature importance cos_sim ≥ 0.99 vs prev fold | Add `train_start` sliding window to folds |
-| `P80_DECLINE` | critical | P@80 declined for 2+ consecutive folds | Add `train_start` sliding window |
-| `VAL_TEST_GAP` | warning | val P@80 − test P@80 > 10 ppts | Reduce epochs or increase focal_gamma |
-| `N_COLLAPSE` | warning | N above threshold dropped > 50% vs prev fold | Check label distribution shift; lower threshold |
-| `CONFIDENCE_FLAT` | critical | std of output confidences < 0.05 | Check feature scaling; lower LR |
-| `ZERO_SIGNAL_FOLD` | critical | N above threshold < 20 | Widen fold date range; lower threshold |
-
-Between consecutive folds, the monitor also prints the feature importance cosine similarity even when healthy — `✅ Feature weights diverged vs F1: cos_sim=0.847` — so you can confirm the model is genuinely re-adapting each fold rather than silently inheriting the prior fold's solution.
-
-### Model architecture
-
-```
-FFM Backbone (frozen lower layers)
-     │  → CLS embedding (256-dim)
-     │
-     ├── Context Heads (frozen, loaded from best_pretrained.pt)
-     │   regime(4) + volatility(4) + structure(2) + range(5)
-     │   → softmax → 15-dim explicit context vector
-     │
-┌────┴──────────────────────────────────────────────┐
-│                                                    │
-│   Strategy features (N strategy-specific)          │
-│        → Linear(64) → GELU → Linear(64)           │
-│                                        │           │
-└─────── cat ────────────────────────────┘
-              │ (256 + 15 + 64 = 335)
-          fusion: Linear → GELU → LayerNorm
-              │ (256)
-       ┌──────┼──────────┐
-       │      │          │
-   signal    risk   confidence
-    head     head     head
-```
-
-The backbone handles **all market context** — HTF trend, volatility regime, session structure, CRT sweeps, order flow. The four frozen context heads expose regime, volatility, structure, and range as an explicit 15-dim probability vector so the signal head has named handles on market state rather than relying on implicit encoding. Strategy features cover only what the backbone cannot derive: setup geometry, zone age, entry distance, risk sizing.
-
-Pass `pretrained_path` (not just `backbone_path`) to load context head weights:
-
-```python
-fold_results = run_walk_forward(
-    ...,
-    backbone_path=BACKBONE_PATH,      # fallback if pretrained not found
-    pretrained_path=PRETRAINED_PATH,  # loads backbone + 4 context heads
-)
-```
-
-### Strategy implementations
-
-Each strategy is a `StrategyLabeler` subclass with a two-phase training pipeline — Phase 1 trains the signal classifier, Phase 2 fine-tunes the risk head (Huber loss on confirmed signals only) to produce a calibrated predicted R:R at trade entry.
-
-| Strategy | Features | Edge |
-|---|---|---|
-| **CISD+OTE** | 10 (zone geometry, entry mechanics) | ICT institutional order flow — mean reversion at swept zones |
-| **SuperTrend Trend Follow** | 8 (ST distance, prior trend stats, HTF alignment) | Trend-following entries with HTF alignment filter |
+Domain-adapting the foundation is supported but optional: `pipelines/chronos/bolt_finetune.py` (forecasting-loss fine-tune on our 9-instrument corpus) + `bolt_ab.py` (vanilla-vs-fine-tuned A/B on a real strategy). The measured verdict to date: domain fine-tuning improves forecasting loss but **not** selection edge — production runs vanilla frozen weights.
 
 ---
 
-## Pretraining Pipeline
+## Chronos Pipeline — training, evaluation, deployment
 
-**`futures_foundation.pretrain` — a two-step pipeline to train a new backbone from scratch.**
+**`pipelines/chronos/` — the strategy-pluggable harness around the foundation: walk-forward evaluator with honest-ruler controls, production trainer, ONNX export.** This is the proven path every new strategy goes through.
 
-Step 1 (`prepare_data`) derives 68 features and 4 self-supervised labels from raw OHLCV CSVs and saves them as parquet. Step 2 (`run_pretrain`) trains the backbone with AMP, per-task overfit guards, and backbone-quality checkpointing. Use `verify_backbone` to confirm the checkpoint is healthy before fine-tuning.
+**What it does:** a strategy labeler defines event candidates (e.g., SuperTrend flips); for each event, the trailing 128-bar context → frozen foundation embedding → fused with hand-crafted features → XGBoost predicts `(P(take), R̂)`. Walk-forward 3-month-train / 1-month-test with **REAL/SHUFFLE/RANDOM/NAIVE controls** and a **6-check pre-registered PASS/FAIL auto-verdict** at run-end. The production trainer fits ONE signal head + ONE risk head on the full corpus minus an N-month holdout and saves a single joblib bundle the bot loads.
 
-```python
-from futures_foundation import FFMConfig, PretrainConfig, prepare_data, run_pretrain, verify_backbone
-
-# Step 1 — derive features + labels (skips tickers already prepared)
-prepare_data(raw_dir='/data/5min/', output_dir='/cache/prepared/')
-
-# Step 2 — train backbone
-results = run_pretrain(
-    prepared_dir   = '/cache/prepared/',
-    checkpoint_dir = '/models/backbone_v10/',
-    ffm_config     = FFMConfig(
-        num_features          = 68,
-        hidden_size           = 256,
-        num_hidden_layers     = 6,
-        num_attention_heads   = 8,
-        intermediate_size     = 512,
-        label_smoothing       = 0.1,
-        structure_loss_weight = 0.3,                       # v9: prevents structure from dominating
-        range_class_weights   = [1.0, 2.5, 3.0, 2.5, 1.0],  # v8: prevents U-shaped range collapse
-    ),
-    config         = PretrainConfig(epochs=50, lr=1e-4),
-    on_epoch_end   = lambda m: print(f"E{m['epoch']}  BVL:{m['backbone_val_loss']:.4f}"),
-)
-
-# Verify saved backbone — shape check + instrument similarity matrix
-verify_backbone('/models/backbone_v10/')
-
-# → Use backbone_v10/best_backbone.pt as backbone_path in run_finetune()
-```
-
-| Component | Description |
-|---|---|
-| `prepare_data(raw_dir, output_dir, force=False)` | Derive 68 features + 4 labels from raw OHLCV CSVs → parquet. Idempotent — skips tickers already prepared unless `force=True`. |
-| `run_pretrain(prepared_dir, checkpoint_dir, ffm_config, config, on_epoch_end)` | Full training loop with AMP (bfloat16 on A100, float16 on T4), interleaved 80/20 val split across 20 time blocks, per-task overfit guards (downweights heads that overfit without stopping them), collapse detection, backbone val loss checkpointing (regime+vol+range — structure excluded as it overfits early), and per-instrument accuracy breakdown at the end. |
-| `verify_backbone(checkpoint_dir, seq_len)` | Load saved backbone, run a forward pass, print instrument embedding cosine similarity matrix. Values near 1.0 mean the instrument embedding isn't learning — a deployment blocker. |
-| `PretrainConfig` | Dataclass with all training hyperparameters. Defaults match the v8/v9 backbone configuration. |
-
-**Checkpoint priority:** early stopping and `best_backbone.pt` are gated on *backbone val loss* (regime + volatility + range combined) rather than combined val loss — structure head is excluded because it overfits the 48-bar binary label while the other three tasks are still improving. The saved `best_backbone.pt` is always the best generalization point for the backbone, not just the lowest total loss.
-
----
-
-## XGBoost Pipeline (Standalone)
-
-**`pipelines/xgboost/` — a gradient-boosted direction classifier, fully independent of the transformer backbone.**
-
-Not every strategy needs a 256-dim transformer. Some need a fast, robust tabular model on the same causal features. The XGBoost pipeline lives under a new top-level **`pipelines/`** package (one subfolder per standalone pipeline) and shares **only** feature engineering with FFM — `derive_features` (the 68 causal features as of the look-ahead fix). It does not touch `model.py`, pretraining, or the fine-tune framework.
-
-**What it does:** every RTH bar is a candidate (no hand-coded pattern); a **V2 session-calibrated triple-barrier** labeler defines the target (long / no-trade / short); XGBoost predicts direction from the 68 features; a **hybrid Rogers-Satchell ATR/structure trailing stop** manages the exit; **rolling 3-month-train / 1-month-test** walk-forward with a per-window Optuna study (TPE, 300 trials). The tuning objective is **CAGR·√Sortino with a −20% DD penalty** — a *product*, so the optimizer cannot win by learning to not trade (the exact degenerate collapse that sinks naive classifiers).
-
-### Add a strategy — same ergonomics as the fine-tune framework
-
-```python
-from pipelines.xgboost.base import XGBStrategyLabeler, register
-
-@register("my_strategy")
-class MyLabeler(XGBStrategyLabeler):
-    name = "my_strategy"
-    def __init__(self, *, bar_minutes): self.bar_minutes = bar_minutes
-    def label(self, df):        # df: datetime, OHLC, atr  →  Series of {-1,0,+1}
-        return my_direction_logic(df)
-```
-
-```bash
-python -m pipelines.xgboost.train --timeframe 5m --instrument ES --labeler my_strategy --trials 300
-```
-```python
-from pipelines.xgboost.train import run_pipeline
-run_pipeline(MyLabeler(bar_minutes=5), timeframe='5m', instrument='ES', trials=300)
-```
-
-`V2TripleBarrierLabeler` is the registered default (`v2_triple_barrier`). The harness owns features / walk-forward / Optuna / trail / gate / `*.joblib` artifact + `XGBPredictor` inference wrapper; the labeler owns only the `{-1,0,+1}` target (and optionally `feature_cols`, default = all 68). `--max-windows N` bounds the walk-forward for fast smoke runs. Optional RF-gate / HMM (spec §10/11) are intentionally not built.
-
-> **Verdict gate (non-negotiable):** a model is credible only if **every OOS month is profitable (PF > 1)** on the *full multi-year* rolling walk-forward — not a smoke window. The plug-in makes strategies cheap to *try*; the gate is what makes one *real*.
-
-The consolidated **leakage** check carries a **degenerate-shuffled guard** (`_shuf_robust`, v1.3): a shuffled run that is economically dead (≈0 PnL / tiny N) is the *desired* no-leakage outcome — raw Profit Factor is meaningless there (∞ on ~1 trade), so it can no longer raise a *false* leakage flag; only a meaningfully-trading shuffled run gets the PF test.
-
-Build spec: [`docs/xgboost-pipeline.md`](docs/xgboost-pipeline.md). Extra deps (in `requirements.txt`): `xgboost>=2.0`, `optuna>=3.0`, `joblib>=1.3`.
-
----
-
-## Chronos Pipeline (Standalone)
-
-**`pipelines/chronos/` — a frozen Amazon Chronos backbone (`amazon/chronos-bolt-tiny`) + XGBoost head, with a strategy-pluggable walk-forward evaluator, production trainer, and ONNX export. Strategy-agnostic, transformer-independent.**
-
-Not every strategy fits the FFM transformer (regime/structure context heads) or the XGBoost-on-FFM-features path (direction classification on hand-crafted features). Some strategies are *selection meta-labelers* — "is this mechanical signal worth taking?" — and benefit from a pretrained time-series foundation model's embedding fused with strategy-specific features. The Chronos pipeline pairs **frozen `amazon/chronos-bolt-tiny`** (a 256-dim embedding of a 128-bar log-close context) with an **XGBoost classifier head** + optional **regression head for predicted max-favorable-R** (dynamic TP).
-
-**What it does:** strategy labeler defines event candidates (e.g., SuperTrend flips); for each event, the trailing 128-bar log-close context → frozen Chronos embedding → fused with hand-crafted features → XGBoost predicts `(P(take), R̂)`. Walk-forward 3-month-train / 1-month-test with **REAL/SHUFFLE/RANDOM/NAIVE honest-ruler controls** and a **6-check pre-registered PASS/FAIL auto-verdict** at run-end (no human interpretation drift). Production trainer fits ONE signal head + ONE risk head on the full corpus minus N-month holdout, evaluates on the unseen holdout, and saves a single joblib bundle the bot loads. ONNX exporter produces three deployable files (`*_chronos.onnx` + `*_signal.onnx` + `*_risk.onnx`) with a **3-layer end-to-end verification** before shipping.
-
-### Add a strategy — same protocol as the fine-tune framework
+### Add a strategy
 
 ```python
 from pipelines.chronos.strategy import StrategyLabeler
@@ -434,249 +101,105 @@ python3 -m pipelines.chronos.export_onnx <bundle.joblib>
 
 | Component | Role |
 |---|---|
-| `backbone.py` | The ONLY module that touches torch+Chronos. `embed()` runs in a SUBPROCESS (macOS OpenMP collision: torch+xgboost segfault in one process). `active_source()` + `stamp_active_source()` surface which backbone (vanilla HF vs fine-tuned local) is about to load — eliminates the silent-wrong-backbone class of bugs. |
-| `evaluate.py` | Walk-forward harness — batch-embed ONCE across all folds (vs N subprocess loads) → per-fold thread-parallel XGBoost (5–10× speedup). Dual dashboard: 🎯 fixed-TP @ RR=3 + 💎 dynamic-TP @ `clip(0.8 × R̂, 1.5, 8.0)`. Auto-verdict with 6 pre-registered checks (constants at module top — goalpost-moving requires editing constants before the next run, not after seeing results). |
-| `produce.py` | Production training: ONE fit on full corpus minus N-month holdout; saves joblib bundle (signal head + risk head + `feat_dim` + `ctx_window` + `chronos_ckpt` + labeler config + holdout proba/threshold sweep). Defaults bumped to `n_estimators=600, max_depth=5` because per-fold walk-forward defaults (200/4) underfit at production scale (~20× more rows). |
-| `export_onnx.py` | joblib → 3 ONNX files (chronos + signal + risk) via subprocess-isolated phases (torch in one child, xgboost in another). End-to-end `verify()` asserts: **Layer 1** per-stage drift < 1e-3, **Layer 2** chained-pipeline equivalence (joblib path vs ONNX path on synthetic inputs), **Layer 3** decision parity at the trading threshold + dynamic-TP agreement to the cent. |
-| `head_xgb.py` | `XGBHead` (binary or multi-class signal classifier; ONNX-convertible via `onnxmltools`) + `XGBRiskHead` (log1p-transformed max_rr regression for dynamic TP — log1p tames the heavy right tail). |
-| `_primitives.py` | Torch-free numpy implementations of `compute_supertrend`, `compute_atr`, `compute_adx`, `apply_rr_barriers`, `max_favorable_rr` — keeps the parent process xgboost-only when calling labelers from the eval/produce paths (no torch import path through FFM). |
-| `_ft/` | Optional Chronos backbone fine-tune (vendored Apache-2.0 upstream Chronos `scripts/training/train.py`). T5 path (`amazon/chronos-t5-tiny`) works end-to-end via `python -m pipelines.chronos._ft.run_ft`. Bolt path (`amazon/chronos-bolt-tiny`) is config-scaffolded (`bolt.yaml`, `--bolt` flag) but the vendored trainer doesn't yet support Bolt's patch-encoder + quantile-loss training path (chronos's `chronos_bolt.py:forward` returns the loss; needs a custom HF Trainer wrapper, ~200–300 LoC). |
+| `backbone.py` | Back-compat shim → `futures_foundation.foundation` (the promoted seam). |
+| `evaluate.py` | Walk-forward harness — batch-embed ONCE across all folds → per-fold thread-parallel XGBoost (5–10× speedup). Dual dashboard: 🎯 fixed-TP @ RR=3 + 💎 dynamic-TP @ `clip(0.8 × R̂, 1.5, 8.0)`. Auto-verdict with 6 pre-registered checks (constants at module top — goalpost-moving requires editing constants *before* the next run). |
+| `produce.py` | Production training: ONE fit on full corpus minus N-month holdout; saves joblib bundle (signal head + risk head + `feat_dim` + `ctx_window` + `chronos_ckpt` + labeler config + holdout threshold sweep). Production-scale defaults (`n_estimators=600, max_depth=5`). |
+| `export_onnx.py` | joblib → 3 ONNX files (chronos + signal + risk) via subprocess-isolated phases. End-to-end `verify()`: per-stage drift < 1e-3, chained-pipeline equivalence, decision parity at the trading threshold. |
+| `head_xgb.py` | `XGBHead` (signal classifier) + `XGBRiskHead` (log1p-transformed max-favorable-R regression for dynamic TP). |
+| `bolt_finetune.py` / `bolt_ab.py` | Optional Bolt domain-adaptation fine-tune + vanilla-vs-fine-tuned A/B harness on a real strategy. |
+| `_primitives.py` | Pure-numpy indicator/barrier primitives the **live** strategies certified against. Numerically divergent from `futures_foundation.primitives` — deliberately not consolidated (see module docstring). |
+| `data.py` | Long-format assembly + leak-guarded rolling walk-forward folds. |
+| `_ft/` | Vendored upstream Chronos T5 fine-tune path (historical). |
 
-### Wiring-gap guards (post-incident)
+Extra deps (not in `requirements.txt`): `chronos-forecasting`, `xgboost>=2.0`, `onnxmltools` + `skl2onnx` (ONNX export only).
 
-The fine-tune output → downstream training pipeline is **not** auto-wired. Every walk-forward / production run must explicitly `export CHRONOS_FT_CKPT=<path/to/checkpoint-final>` or the frozen vanilla `amazon/chronos-bolt-tiny` is silently used (this bit us on 2026-05-19: a fine-tuned T5 checkpoint sat unused while three POC runs + a production model trained against vanilla Bolt). As of v1.5 this gap is guarded by:
+---
 
-- **`backbone.stamp_active_source(context)`** — called at the start of every `evaluate.run()` and `produce.train()`. Prints a loud one-line stamp of the active backbone (`🧪 FINE-TUNED (local)` vs `❄️ FROZEN (vanilla HF)`). Scans `temp/` for unused fine-tune checkpoints; if any exist while `CHRONOS_FT_CKPT` is unset, prints the exact `export` command needed to fix it.
-- **`_embed_worker.py`** — defense in depth: even if a caller bypasses the stamp, the subprocess that actually loads the backbone prints `[chronos worker] loading {FINE-TUNED|FROZEN-VANILLA} backbone: {src}` to stderr. Visible in any run log.
-- **`_ft/run_ft.py`** — on fine-tune completion, prints the exact `export CHRONOS_FT_CKPT=...` command the user must run before the next downstream call.
-- **`bundle['chronos_ckpt']`** — production joblib bundle records which backbone was actually baked in. Always inspect post-train to confirm before shipping.
+## Strategy Labeling & Evaluation Framework
 
-Extra deps (not in `requirements.txt`): `chronos-forecasting` (backbone), `xgboost>=2.0` (already in deps), `onnxmltools` + `skl2onnx` (only when running the ONNX export path).
+**`futures_foundation.finetune` — the torch-free survivors of the v0.3–v1.3 fine-tuning framework: labeling, health monitoring, reporting, realized-R economics.** The torch walk-forward trainer was retired with the from-scratch backbone (training now happens in `pipelines/chronos`); the layers every pipeline still leans on remain:
+
+| Component | Description |
+|---|---|
+| `StrategyLabeler` | ABC — implement `detect_events()` + `compute_features()`; the **final** `run()` applies a session-calibrated TP≥SL triple barrier (entry = next-bar open) and emits `signal_label` / `max_rr` / `sl_distance` / `direction`. The entry-after-signal / orientation bug class is centralized once, for every strategy. |
+| `run_labeling()` | CSV I/O, timezone normalization, parquet caching per ticker. |
+| `FoldHealthMonitor` | Stateful post-fold pathology detection (7 signals: EARLY_EPOCH, WEIGHT_LOCK, P80_DECLINE, VAL_TEST_GAP, N_COLLAPSE, CONFIDENCE_FLAT, ZERO_SIGNAL_FOLD) + consolidated `summary()`. Model-agnostic — feed it metrics from any trainer. |
+| Reporting | `print_eval_summary` (confidence-threshold table), `print_fold_progression`, calibration block with monotonicity check. |
+| Realized-R economics | PF / WR / mean-R / maxDD / no-top-1% from realized R under a trailing exit (not optimistic MFE), plus the CAGR·√Sortino *product* objective (can't be won by not-trading). |
+
+`prepare_data()` (in `futures_foundation.prepare`) derives the 68 causal features from raw OHLCV CSVs to parquet — shared by the XGBoost pipeline and the quarterly retrain runbook.
+
+---
+
+## XGBoost Pipeline (Standalone)
+
+**`pipelines/xgboost/` — a gradient-boosted direction classifier on the 68 causal features, fully independent of the foundation embedding.**
+
+Every RTH bar is a candidate; a **V2 session-calibrated triple-barrier** labeler defines the target (long / no-trade / short); XGBoost predicts direction; a **hybrid Rogers-Satchell ATR/structure trailing stop** manages the exit; rolling 3-month-train / 1-month-test walk-forward with a per-window Optuna study. Objective: **CAGR·√Sortino with a −20% DD penalty** — a *product*, so the optimizer cannot win by not trading.
+
+```python
+from pipelines.xgboost.base import XGBStrategyLabeler, register
+
+@register("my_strategy")
+class MyLabeler(XGBStrategyLabeler):
+    name = "my_strategy"
+    def __init__(self, *, bar_minutes): self.bar_minutes = bar_minutes
+    def label(self, df):        # df: datetime, OHLC, atr  →  Series of {-1,0,+1}
+        return my_direction_logic(df)
+```
+
+```bash
+python -m pipelines.xgboost.train --timeframe 5m --instrument ES --labeler my_strategy --trials 300
+```
+
+> **Verdict gate (non-negotiable):** a model is credible only if **every OOS month is profitable (PF > 1)** on the full multi-year rolling walk-forward. The leakage check carries a degenerate-shuffled guard (`_shuf_robust`): an economically-dead shuffled run is the desired no-leakage outcome and cannot raise a false flag.
+
+Build spec: [`docs/xgboost-pipeline.md`](docs/xgboost-pipeline.md).
 
 ---
 
 ## RL Pipeline (Standalone)
 
-**`pipelines/rl/` — a generic PPO walk-forward pipeline, reusing the validated spine, with the proprietary strategy supplied as a private plug-in.**
+**`pipelines/rl/` — a generic PPO walk-forward pipeline; the proprietary strategy is a private plug-in.**
 
-Some strategies are sequential, regime-adaptive decisions — *how to manage a trade*, not just *whether to take it*. A tree or a fixed rule can't express that; an RL policy conditioned on FFM's market understanding can. The RL pipeline mirrors the XGBoost pipeline's structure and **reuses `pipelines/common`** (walk-forward windows, economic objective, robustness gates) — only the per-window fit (PPO) differs.
-
-**Design:** mechanical entry candidates (the strategy plug-in) → a PPO policy that learns, on a **frozen FFM context-head embedding ⊕ position state**, an asymmetric *chop-veto* on entries (a veto must pay for itself — closes the "skip-everything" collapse) **and** the exit, jointly, under one **realized-R** reward. One frozen context encoder = a stationary observation manifold (the property financial RL usually lacks). Episode = one trade.
-
-```python
-from pipelines.rl import RLStrategy, register, run_walkforward
-
-@register("my_strategy")
-class MyStrategy(RLStrategy):
-    name = "my_strategy"
-    entry_filter = True                       # PPO learns the chop-veto
-    def detect_entries(self, df_raw, ctx_df, ticker):
-        return events_df                      # bar_idx, direction, sl_distance, tp_rr
-
-run_walkforward(MyStrategy(), {"ES": (df, ctx)})   # windows, gates, seeds free
-```
+Mechanical entry candidates (the strategy plug-in) → a PPO policy that learns, on a **frozen context embedding ⊕ position state**, an asymmetric *chop-veto* on entries (a veto must pay for itself) **and** the exit, jointly, under one **realized-R** reward. One frozen encoder = a stationary observation manifold. Episode = one trade.
 
 | Component | Description |
 |---|---|
 | `RLStrategy` | ABC + registry — `detect_entries()` (mandatory causal-parity), `entry_filter` on/off, realized-R exit knobs |
-| `shape_reward()` | The **single** optional extension point for *all* custom/account-aware reward (prop-firm balance, Maximum-Loss-Limit / trailing drawdown). Default = identity — **FFM has zero account/prop-firm concept**; that IP lives only in the plug-in |
-| `SingleTradeEnv` | Episode = one trade; obs = context-head ⊕ position-state; asymmetric veto + hold/exit; mechanical SL; evaluation begins entry+1 (matches `apply_rr_barriers`); terminal realized-R |
-| `causal.py` | Generic **causal-parity harness** — streaming==batch; the look-ahead falsifier the shuffle audit *cannot* catch; mandatory gate for any detector before training |
-| `device.py` | Auto device — CUDA → MPS → CPU |
-| `run_walkforward()` | Windows (`common`) → injected `trainer.train(episodes,seed)→policy` seam → OOS rollout → every-OOS-month-PF>1 + **shuffle + multi-seed** verdict |
-| `pipelines/common/robustness.py` | `shuffle_robust` (degenerate-guarded) + `multiseed_verdict` (financial-RL seed-variance gate — the dominant RL failure mode shuffle-audit can't catch) |
+| `shape_reward()` | The **single** extension point for account-aware reward (prop-firm balance, MLL / trailing drawdown). Default = identity — **FFM has zero account/prop-firm concept**; that IP lives only in the plug-in |
+| `SingleTradeEnv` | obs = context ⊕ position-state; asymmetric veto + hold/exit; mechanical SL; terminal realized-R |
+| `causal.py` | Generic causal-parity harness — streaming==batch; the look-ahead falsifier the shuffle audit *cannot* catch; mandatory gate for any detector before training |
+| `run_walkforward()` | Windows (`common`) → injected trainer seam → OOS rollout → every-OOS-month-PF>1 + shuffle + multi-seed verdict |
 
-> **IP boundary:** the public repo holds **only generic machinery** — no proprietary strategy logic. A concrete strategy (e.g. a CRT sweep detector) subclasses `RLStrategy` and is authored in the **private** strategies repo, exactly as the CISD scripts plug into `futures_foundation.finetune`. The default PPO trainer (`stable-baselines3`) is imported **lazily** at train time only — the pipeline and its tests are dependency-light.
+> **IP boundary:** the public repo holds only generic machinery. Concrete strategies live in the private strategies repo.
 
 ---
 
-## Architecture
+## Data
+
+### Supported instruments
+
+9 instruments registered: **ES, NQ, RTY, YM** (equity indices), **GC, SI** (metals), **CL** (energy), **ZB, ZN** (rates).
+
+### Input format
 
 ```
-Input: OHLCV Bars (sequence of N bars × 68 continuous features + candle_type embedding)
-         │
-    [Instrument Embedding + Session Embedding + Temporal Encoding]
-         │
-    [Transformer Encoder × 6 layers]
-      • Multi-head self-attention (8 heads, optional causal mask)
-      • Feed-forward network (512-dim)
-      • Pre-norm LayerNorm + residual connections
-      • Dropout regularization
-         │
-    [CLS Token Pooling]  or  [Per-Bar Hidden States (output_sequence=True)]
-         │
-    BACKBONE OUTPUT: Market Context Embedding (256-dim)
-         │
-    ┌────┴────────┴──────────┴────────┴───┐
- [Regime]  [Volatility]  [Structure]  [Range]    ← Pretraining heads
-    │
-    └──→ Fine-tune: [Classification] [Regression] [Strategy+Risk] [HybridStrategy]
-```
-
-### Pretraining Objectives (Forward-Looking, Self-Supervised)
-
-All labels are **forward-looking** — the model must predict what happens in the **next N bars**, not read the current state. Labels are derived automatically from price data with no manual annotation:
-
-| Task | Classes | Horizon | Description |
-|------|---------|---------|-------------|
-| **Regime** | Trending Up, Trending Down, Rotational, Volatile | 20 bars | Future return direction + volatility expansion |
-| **Volatility State** | Low, Normal, Elevated, Extreme | 10 bars | Forward realized vol ranked vs recent history |
-| **Market Structure** | Bullish, Bearish | 20 bars | Predicts forward `htf_1h_structure` — majority close direction of the 3 completed 1H bars at T+horizon. Learnable because the 8-hour context window contains the 1H price action that drives 1H direction. Choppy/mixed bars → sentinel (skipped in loss) |
-| **Range Position** | 5 quintiles (0-20%, ..., 80-100%) | 10 bars | Where future close lands in current range |
-
-> **Structure labels are forward-looking 1H structure.** A bar is labeled bullish (0) when `htf_1h_structure` at T+20 bars equals +1 (all 3 completed 1H bars at that point closed higher), bearish (1) when it equals -1. Choppy/mixed bars (0) and data unavailability are masked via `ignore_index=-100`. This label is learnable — the 8-hour context window (96 bars × 5min) contains the full price action that determines 1H direction, so the model can genuinely predict it rather than memorize noise.
-
----
-
-## Quick Start
-
-### Installation
-
-```bash
-git clone https://github.com/johnamcruz/Futures-Foundation-Model.git
-cd Futures-Foundation-Model
-pip install -e .
-```
-
-### Using the Pretrained Backbone
-
-```python
-from futures_foundation import FFMConfig, FFMBackbone
-
-config   = FFMConfig()
-backbone = FFMBackbone(config)
-backbone.load_pretrained("path/to/checkpoint")
-
-embeddings = backbone(features_tensor)  # (batch, 256)
-```
-
-### Fine-Tuning with the Framework
-
-```python
-from futures_foundation.finetune import (
-    StrategyLabeler, TrainingConfig,
-    run_labeling, run_walk_forward, print_eval_summary,
-)
-```
-
-See the [Fine-Tuning Framework](#fine-tuning-framework) section above for a complete working example.
-
-### Causal Attention Mask (Per-Bar Predictions)
-
-All model classes support a `causal=True` parameter that applies a strict lower-triangular mask so bar *i* cannot attend to any bar *j > i*. Use this when fine-tuning with `output_sequence=True` for per-bar predictions where lookahead must be eliminated:
-
-```python
-# Per-bar volatility prediction — no lookahead allowed
-logits = model(features, output_sequence=True, causal=True)
-
-# Global summary inference — use full bidirectional attention (default)
-embedding = backbone(features, causal=False)
-```
-
----
-
-## Data Preparation
-
-### Supported Instruments
-
-9 instruments registered in the library (v8 backbone pretraining adds ZB/ZN for rate regime coverage):
-
-| Instrument | Symbol | Description |
-|-----------|--------|-------------|
-| **ES** | E-mini S&P 500 | US large cap index |
-| **NQ** | E-mini Nasdaq 100 | US tech index |
-| **RTY** | E-mini Russell 2000 | US small cap index |
-| **YM** | E-mini Dow | US blue chip index |
-| **GC** | Gold Futures | Precious metals |
-| **SI** | Silver Futures | Precious metals |
-| **CL** | Crude Oil Futures | Energy |
-| **ZB** | 30-Year Treasury Bond | Interest rates |
-| **ZN** | 10-Year Treasury Note | Interest rates |
-
-ZB and ZN add rate/macro regime context genuinely uncorrelated from equities, metals, and energy — the backbone learns how rate market structure interacts with equity volatility regimes.
-
-### Input Format
-
-```
-data/raw/
+data/
+├── ES_3min.csv      # datetime, open, high, low, close, volume
 ├── ES_5min.csv
-├── NQ_5min.csv
-├── RTY_5min.csv
-├── YM_5min.csv
-└── GC_5min.csv
+└── ...
 ```
 
-Each CSV should have columns: `datetime, open, high, low, close, volume`
+`databento/append_update.py` splices new DBN/CSV exports into `data/` continuously (see the quarterly retrain runbook in `docs/`).
 
-### Feature Derivation (69 Inputs: 68 Continuous + 1 Embedding)
+### Feature derivation (68 causal features)
 
-Features are instrument-agnostic via ATR normalization:
+`derive_features` produces 68 instrument-agnostic (ATR-normalized), strictly causal features in 10 groups — bar anatomy, returns/momentum, volume dynamics, volatility, session context, market structure, CRT sweep state (1H/4H liquidity sweeps), candle psychology, HTF context (1H/4H/daily structure), and volume absorption/order flow. Used by the XGBoost pipeline and available as fusion features anywhere. Every feature is held to the no-look-ahead causal-parity rule (streaming == batch, per bar).
 
-| Group | Count | Examples |
-|-------|-------|---------|
-| 1 — Bar Anatomy | 8 | Body/wick ratios, range in ATR |
-| 2 — Returns & Momentum | 8 | Multi-horizon returns, acceleration |
-| 3 — Volume Dynamics | 6 | Relative volume, delta proxy |
-| 4 — Volatility Measures | 6 | ATR z-score, realized vol |
-| 5 — Session Context | 5 | Distance from session OHLC + VWAP |
-| 6 — Market Structure | 9 | Swing distances, range position |
-| 7 — CRT Sweep State | 10 | 1H/4H prior-candle liquidity sweep events |
-| 8 — Candle Psychology | 5 + 1 emb | engulf count, momentum speed, wick rejection, dir consistency, bar size vs session; candle_type → dedicated model embedding |
-| 9 — HTF Timeframe Context | 7 | 1H/4H close position, returns, TF alignment, 1H structure, daily structure |
-| 10 — Volume Absorption & Order Flow | 4 | Cumulative signed delta, absorption ratio, volume-momentum alignment |
+### Labels
 
-#### CRT Sweep State Features
-
-Candle Range Theory (CRT) sweeps occur when a bar wicks beyond the prior candle's high or low and closes back inside it — a liquidity sweep that often precedes directional expansion. These features capture sweep activity on the 1-hour and 4-hour timeframes and align it to each base bar:
-
-| Feature | Description |
-|---------|-------------|
-| `swp_1h_bull_active` | 1H bull sweep active (wicked below prior low, closed above it) |
-| `swp_1h_bear_active` | 1H bear sweep active (wicked above prior high, closed below it) |
-| `swp_1h_age_norm` | Normalized age of the most recent 1H sweep (0 = fresh, 1 = expired) |
-| `swp_1h_magnitude` | ATR-normalized wick penetration depth of the 1H sweep, clipped to [0, 3] |
-| `swp_4h_bull_active` | 4H bull sweep active |
-| `swp_4h_bear_active` | 4H bear sweep active |
-| `swp_4h_age_norm` | Normalized age of the most recent 4H sweep |
-| `swp_4h_magnitude` | ATR-normalized wick penetration depth of the 4H sweep, clipped to [0, 3] |
-| `swp_tf_alignment` | Timeframe alignment: +1 (both bullish), -1 (both bearish), 0 (mixed) |
-| `swp_dominant_dir` | Dominant sweep direction across timeframes (same as `swp_tf_alignment`) |
-
-Sweep state is forward-filled for a frequency-agnostic expiry window (1 hour = `round(60 / bar_minutes)` bars) so the features work correctly on 3-min, 5-min, or any other base timeframe.
-
-#### Candle Psychology Features
-
-Strategy-agnostic price action descriptors computed from raw OHLCV:
-
-| Feature | Description |
-|---------|-------------|
-| `candle_type` | Categorical candle class (0=doji, 1=bull strong, 2=bear strong, 3=bull pin, 4=bear pin, 5=neutral) — routed through a dedicated `nn.Embedding(6, 256)` |
-| `engulf_count` | Count of prior N bars whose bodies are fully engulfed by the current bar |
-| `momentum_speed_ratio` | Ratio of impulse speed to retrace speed; >1 = impulse dominant |
-| `wick_rejection` | Signed wick asymmetry: `(lower_wick − upper_wick) / range`, range [−1, 1] |
-| `dir_consistency` | Fraction of last N bars whose direction matches the current bar |
-| `bar_size_vs_session` | Current bar range relative to running session average |
-
-#### HTF Timeframe Context Features (Group 9)
-
-| Feature | Description |
-|---------|-------------|
-| `htf_1h_close_pos` | Close position within the current 1H bar's range |
-| `htf_1h_ret` | Return of the current 1H bar so far |
-| `htf_4h_close_pos` | Close position within the current 4H bar's range |
-| `htf_4h_ret` | Return of the current 4H bar so far |
-| `htf_tf_alignment` | 1H/4H trend agreement: +1 both bullish, -1 both bearish, 0 mixed |
-| `htf_1h_structure` | Majority close direction of last 3 completed 1H bars (+1=bullish, -1=bearish, 0=mixed) |
-| `htf_daily_structure` | Majority close direction of last 3 completed daily bars (+1=bullish, -1=bearish, 0=mixed) — macro regime context |
-
-#### Volume Absorption & Order Flow Features (Group 10)
-
-| Feature | Description |
-|---------|-------------|
-| `vol_cum_signed_5` | Rolling 5-bar net buying/selling pressure |
-| `vol_cum_signed_20` | Same over 20 bars |
-| `vol_absorption` | High volume + small body = price being absorbed |
-| `vol_momentum_align` | Elevated volume confirming or diverging from trend direction |
+`futures_foundation.labels` holds the legacy 4-task self-supervised generators (regime / volatility / structure / range). The probe-validated close-only redefinitions (regression-form volatility/range, close-only structure, split regime) currently live in `scripts/probe_context_heads.py` and are promoted into the library with the context-heads work (next milestone).
 
 ---
 
@@ -684,84 +207,30 @@ Strategy-agnostic price action descriptors computed from raw OHLCV:
 
 ```
 Futures-Foundation-Model/
-├── futures_foundation/          # Core library
-│   ├── __init__.py
-│   ├── config.py               # FFMConfig (HuggingFace compatible)
-│   ├── model.py                # Backbone + Classification/Regression/Strategy heads
-│   ├── features.py             # OHLCV → 68 derived features (10 groups)
-│   ├── candle_psychology.py    # Candle psychology features
-│   ├── labels.py               # Forward-looking label generation
-│   ├── dataset.py              # PyTorch Dataset + DataLoader
-│   ├── pretrain/               # ★ Backbone pretraining pipeline
-│   │   ├── __init__.py
-│   │   ├── config.py           # PretrainConfig dataclass
-│   │   └── trainer.py          # prepare_data, run_pretrain, verify_backbone
-│   └── finetune/               # ★ Strategy fine-tuning framework
-│       ├── __init__.py
-│       ├── base.py             # StrategyLabeler ABC (detect_events + compute_features; final run() = TP≥SL triple barrier)
-│       ├── config.py           # TrainingConfig dataclass (incl. econ_selection)
-│       ├── health.py           # FoldHealthMonitor — 7-signal post-fold pathology detection
-│       ├── model.py            # HybridStrategyModel
-│       ├── dataset.py          # HybridStrategyDataset
-│       ├── losses.py           # FocalLoss
-│       └── trainer.py          # run_finetune, run_labeling, run_walk_forward, print_eval_summary
-├── pipelines/                  # ★ Standalone pipelines (transformer-independent)
-│   ├── __init__.py
-│   ├── common/                 # shared spine (reused by xgboost + rl)
-│   │   ├── walkforward.py      # rolling 3:1 unanchored splitter
-│   │   ├── objective.py        # combined CAGR·√Sortino objective
-│   │   └── robustness.py       # shuffle_robust + multiseed_verdict
-│   ├── xgboost/                # XGBoost direction classifier (spec: docs/xgboost-pipeline.md)
-│   │   ├── base.py             # XGBStrategyLabeler ABC + registry
-│   │   ├── labeler.py          # V2 session triple-barrier (registered default)
-│   │   ├── trail.py            # Rogers-Satchell hybrid ATR/structure trail
-│   │   ├── backtest.py         # exit-priority trade sim → per-trade returns
-│   │   ├── tuner.py            # Optuna TPE study (lazy xgboost/optuna)
-│   │   ├── train.py            # run_pipeline() API + CLI
-│   │   ├── phase_d.py          # verdict run + _shuf_robust degenerate guard
-│   │   └── predictor.py        # XGBPredictor inference wrapper
-│   ├── chronos/                # Frozen Chronos backbone + XGBoost head (selection meta-labelers)
-│   │   ├── backbone.py         # The ONLY module touching torch+Chronos; embed() subprocess-isolated; active_source() / stamp_active_source() wiring-gap guards
-│   │   ├── _embed_worker.py    # Subprocess worker for frozen embeddings (torch isolated from xgboost)
-│   │   ├── evaluate.py         # Walk-forward harness + auto-verdict (6 pre-registered PASS/FAIL checks)
-│   │   ├── produce.py          # Production trainer (full-corpus fit + N-month holdout + joblib bundle)
-│   │   ├── export_onnx.py      # joblib → 3 ONNX files + 3-layer end-to-end verify (drift + chained + decision parity)
-│   │   ├── head_xgb.py         # XGBHead (binary/multi-class) + XGBRiskHead (log1p target — tames the heavy R right tail)
-│   │   ├── strategy.py         # StrategyLabeler duck-type protocol (calendar/build/features/evaluate)
-│   │   ├── data.py             # walk_forward_folds + arrow helpers
-│   │   ├── finetune.py         # Legacy in-process NN fine-tune (gated, kept for parity tests)
-│   │   ├── _primitives.py      # Torch-free numpy: compute_supertrend, compute_atr, compute_adx, apply_rr_barriers, max_favorable_rr
-│   │   └── _ft/                # Optional Chronos backbone fine-tune (vendored Apache-2.0 upstream)
-│   │       ├── train.py        # Vendored upstream Chronos training (T5/causal only)
-│   │       ├── run_ft.py       # Driver: prep arrow → call train.py → print export-env-var command
-│   │       ├── poc.yaml        # T5 fine-tune config (works end-to-end)
-│   │       └── bolt.yaml       # Bolt fine-tune config (SCAFFOLDED; vendored trainer doesn't yet handle Bolt's loss path)
-│   └── rl/                     # generic PPO walk-forward pipeline
-│       ├── base.py             # RLStrategy ABC + registry + shape_reward
-│       ├── env.py              # SingleTradeEnv (veto+exit, realized-R)
-│       ├── causal.py           # causal-parity harness (look-ahead gate)
-│       ├── device.py           # auto CUDA→MPS→CPU
-│       ├── pipeline.py         # run_walkforward (injected trainer seam)
-│       └── ppo.py              # lazy SB3-PPO default trainer
-├── docs/
-│   └── xgboost-pipeline.md     # XGBoost pipeline build specification
-├── tests/                      # Unit tests (660+ total)
-│   ├── test_model.py           # Backbone + heads
-│   ├── test_pretrain.py        # Pretraining pipeline
-│   ├── test_finetune.py        # Fine-tuning framework (incl. FFM field coverage, FoldHealthMonitor)
-│   ├── test_xgboost_pipeline.py # XGBoost pipeline (objective, V2 labeler, trail, walk-forward, _shuf_robust)
-│   ├── test_rl_pipeline.py     # RL pipeline (ABC/registry, env, causal harness, run_walkforward)
-│   ├── test_chronos_framework.py # Chronos pipeline (heads, evaluator, finetune determinism — gated CHRONOS_ISOLATED=1)
-│   ├── test_chronos_data.py    # Chronos pipeline (calendar/walk-forward folds, arrow helpers)
-│   ├── test_features_crt.py    # CRT sweep features
-│   ├── test_features_core.py   # Core feature groups
-│   ├── test_labels.py          # Label generation
-│   └── test_candle_psychology.py  # Candle psychology
-├── .githooks/
-│   └── pre-commit              # Runs all unit tests before every commit
-├── setup.py
-├── requirements.txt
-└── README.md
+├── futures_foundation/           # The foundation package (torch-free to import)
+│   ├── foundation.py             # ★ Chronos-Bolt seam: embed_bars/embed (subprocess), stamp_active_source, D_MODEL
+│   ├── _embed_worker.py          # Subprocess worker (the only torch at runtime)
+│   ├── features.py               # OHLCV → 68 causal features (10 groups)
+│   ├── candle_psychology.py      # Candle psychology features
+│   ├── labels.py                 # Legacy forward-looking label generation
+│   ├── prepare.py                # prepare_data: raw CSVs → features+labels parquet
+│   ├── primitives/               # Indicators, barriers, rolling, session, detection
+│   └── finetune/                 # Torch-free framework survivors
+│       ├── base.py               # StrategyLabeler ABC (final run() = TP≥SL triple barrier)
+│       ├── config.py             # TrainingConfig (labeling/eval params)
+│       ├── health.py             # FoldHealthMonitor
+│       └── trainer.py            # run_labeling + reporting + realized-R economics
+├── pipelines/
+│   ├── common/                   # Walk-forward windows, econ objective, robustness gates
+│   ├── chronos/                  # ★ Foundation training/eval/deploy harness (see above)
+│   ├── xgboost/                  # Standalone direction classifier on 68 features
+│   └── rl/                       # Generic PPO walk-forward pipeline
+├── scripts/
+│   └── probe_context_heads.py    # Phase-0 capability probe (labels + gates + controls)
+├── docs/                         # Build specs + runbooks
+├── tests/                        # 436+ unit tests (pre-commit gated)
+├── data/                         # Raw OHLCV CSVs (gitignored)
+└── checkpoints/                  # Legacy FFM checkpoints (resolve at tag ffm-transformer-final)
 ```
 
 ---
@@ -770,101 +239,25 @@ Futures-Foundation-Model/
 
 | Version | Description |
 |---------|-------------|
-| **v1.5** | **`pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline.** Strategy-agnostic selection meta-labeler: `amazon/chronos-bolt-tiny` (256-dim embedding of 128-bar log-close context) fused with hand-crafted features → `XGBHead` for `P(take)` + `XGBRiskHead` for predicted max-favorable-R (dynamic TP via `clip(0.8 × R̂, 1.5, 8.0)`). **`evaluate.py`** walk-forward 3:1 with batch-embed across all folds + per-fold thread-parallel XGB (5–10× speedup), REAL/SHUFFLE/RANDOM/NAIVE honest-ruler controls, dual dashboard (fixed-TP + dynamic-TP), and a **6-check pre-registered auto-verdict** at run-end (constants at module top — no post-hoc goalpost moving). **`produce.py`** single-shot production training on the full corpus minus N-month holdout, saves a joblib bundle (heads + feat_dim + ctx_window + chronos_ckpt + labeler config + holdout proba/threshold sweep); production-scale capacity defaults (`n_estimators=600, max_depth=5`) because per-fold walk-forward defaults underfit at ~20× more rows. **`export_onnx.py`** joblib → 3 ONNX files via subprocess-isolated phases (torch + xgboost can't co-reside on macOS), with end-to-end `verify()` asserting per-stage drift < 1e-3 + chained-pipeline equivalence + decision-parity at the trading threshold. **`head_xgb.py:XGBRiskHead`** uses `log1p`/`expm1` target transform — the heavy right tail in `max_rr_realized` was median-shrinking the regressor by ~3R systematically; transform restores tail-capture. **Wiring-gap guards (post-incident, 2026-05-19):** `backbone.stamp_active_source()` called at the start of every `evaluate.run()` and `produce.train()`, prints a loud one-line stamp of the active backbone (vanilla vs fine-tuned-local) and scans `temp/` for unused fine-tune checkpoints → prints the exact `export CHRONOS_FT_CKPT=...` command if one exists but isn't being used (prevents the silent vanilla-fallback that wasted three POC runs); `_embed_worker.py` also prints what it loaded to stderr (defense in depth); `_ft/run_ft.py` on completion prints the env-var export command the next downstream call needs. T5 fine-tune (`amazon/chronos-t5-tiny`) works end-to-end; Bolt fine-tune scaffolded (`bolt.yaml` + `--bolt` flag) but trainer requires upstream Bolt-specific script (chronos's `chronos_bolt.py:forward` returns loss; vendored T5 trainer can't drive it). |
-| **v1.4** | **`pipelines/rl` — generic PPO walk-forward pipeline.** `RLStrategy` ABC + registry; `SingleTradeEnv` (episode=one trade, obs = frozen FFM context-head ⊕ position-state, asymmetric chop-veto + hold/exit, mechanical SL, entry+1 convention, terminal realized-R); `causal.py` generic causal-parity harness (the look-ahead falsifier the shuffle audit cannot catch — mandatory pre-train gate); `device.py` auto CUDA→MPS→CPU; `run_walkforward` reusing `pipelines/common` (windows) with an injected `trainer.train(episodes,seed)→policy` seam → every-OOS-month-PF>1 + shuffle + multi-seed verdict; `shape_reward()` the single optional extension point for all custom/account-aware reward (prop-firm balance / MLL) — default identity, **zero account/prop-firm concept in FFM**; SB3-PPO is the lazy default trainer (pipeline + tests dependency-light); `pipelines/common/robustness.py` (`shuffle_robust` + `multiseed_verdict`). IP boundary: proprietary strategies (e.g. CRT) are private plug-ins, never in this repo. 16 RL tests |
-| **v1.3** | **Finetune framework hardening (4 borrows) + verdict-fix + shared spine.** **#1** realized-R economic eval (PF/WR/mean-R/maxDD/no-top-1% under a trailing exit, labeled realized-vs-MFE — replaces the optimistic `max_rr`/MFE proxy). **#2** `run_shuffle_audit` leakage gate (REAL vs label-SHUFFLED, pure `_shuffle_audit_verdict`, CI-assertable — the audit that killed CRT's false positive). **#3** opt-in `econ_selection` — `_econ.pt` tier + early-stop on a CAGR·√Sortino *product* (can't win by not-trading; default off ⇒ selection byte-identical to `_p80s>_p80>_f1>_loss`). **#4** clean `StrategyLabeler` ABC — `run()` FINAL, implement only `detect_events()`+`compute_features()`; base applies session-calibrated TP≥SL triple barrier (entry=next-bar open) emitting `signal_label`/`max_rr`/`sl_distance`/`direction` (so #1/#3 work free for every strategy); legacy `run()`-override removed. xgboost `phase_d` **degenerate-shuffled guard** (`_shuf_robust`): a ≈0-PnL/tiny-N shuffled run no longer raises a false leakage flag. `pipelines/common/` extracted (walk-forward + objective) reused by both pipelines. CISD v19 / Session VP retired (pre-causality-fix lineage, not-validated). 660+ tests |
-| **v1.2** | **`pipelines/xgboost` — standalone XGBoost direction pipeline**, independent of the transformer (reuses only causal `derive_features`/68 features): V2 session triple-barrier labeler, Rogers-Satchell hybrid ATR/structure trail, rolling 3:1 unanchored walk-forward, Optuna TPE combined `CAGR·√Sortino` objective (product → can't win by not trading), every-OOS-month-PF>1 gate, `XGBPredictor` artifact; `XGBStrategyLabeler` ABC + registry give finetune-parity strategy plug-in (`run_pipeline()` API + `--labeler` CLI; `--max-windows` bounds smoke runs); 26 pipeline tests. Also — finetune/pretrain robustness guards: `run_pretrain` fails fast on `seq_len > max_sequence_length`; `load_backbone` hard-fails on architecture mismatch instead of silently dropping `position_embeddings` under `strict=False`; `_config_hash` now includes `ffm_config` arch so a stale resume cannot poison a re-run; mandatory no-look-ahead causal-parity discipline (every feature proven batch==streaming per bar) |
-| **v1.1** | `FoldHealthMonitor` — stateful post-fold pathology detector; 7 signals (EARLY_EPOCH, WEIGHT_LOCK, P80_DECLINE, VAL_TEST_GAP, N_COLLAPSE, CONFIDENCE_FLAT, ZERO_SIGNAL_FOLD); prints immediately on detection + consolidated `summary()` after all folds; always prints feature importance `cos_sim` between folds even when healthy so the WEIGHT_LOCK fix is visually confirmed; `train_start` fold key — 18-month sliding window training prevents weight lock in `continue_from` runs by forcing each fold to re-adapt to its local regime; `val_p80` stored in test_metrics from the selected checkpoint to power VAL_TEST_GAP; 10 new health monitor tests (492 total) |
-| **v1.0** | `futures_foundation.pretrain` — full backbone pretraining pipeline in the library; `prepare_data()` derives 68 features + 4 labels from raw OHLCV CSVs (idempotent, skips cached); `run_pretrain()` full training loop with AMP (bfloat16/float16), per-task overfit guards, collapse detection, backbone val loss checkpointing (structure excluded — overfits early while other heads improve); `verify_backbone()` confirms checkpoint health and instrument embedding diversity; `PretrainConfig` dataclass with v8/v9 defaults baked in; Colab script reduced from ~990 → ~90 lines; stale `scripts/pretrain.py` and `scripts/prepare_data.py` (42-feature era) deleted; 21 new unit tests (452 total) |
-| **v0.9** | `run_finetune()` — single-call full pipeline replacing the prior 3-step sequence (labeling + walk-forward + eval); accepts `on_epoch_end` and `on_fold_complete` callbacks; auto-scaled `n_stable_min` — trainer computes `effective_n_stable = min(cfg, max(10, int(val_pos_count × 0.08)))` per fold from actual val signal count so later walk-forward folds with shorter val windows no longer fail to produce stable checkpoints |
-| **v0.8** | Dual patience (`p80_patience`) — P@80 stable (N≥50) tracked independently of val_loss patience; fires early stop when P@80 plateaus even while val_loss is still declining, saving ~30–40% of epochs in typical runs; `backbone_swap_path` in `TrainingConfig` — splices a newer backbone into a `continue_from` checkpoint before training (upgrade backbone, keep strategy heads, no cold start); `risk_head_donor_path` in `export_onnx()` — replaces the final fold's risk head with a better-calibrated earlier fold's risk head at export time; per-fold `epochs` key — overrides global epoch count for a specific fold without touching the config hash |
-| **v0.7** | `AvgMaxRR` column in per-threshold table (average max R:R of winning trades — confirms edge has real follow-through); confidence calibration block auto-printed after every fold (win rate by confidence band with monotonicity check; non-monotonic = deployment blocker); full warm start gracefully skips shape-mismatched keys with a warning instead of crashing (enables `continue_from` across runs with minor architectural differences) |
-| **v0.6** | 9-instrument library support (added CL, ZB, ZN); `continue_from` in `TrainingConfig` for iterative multi-pass fine-tuning (F1 warm-starts full from prior run's `_done.pt`, F2-F5 use `warm_start_mode`); `continue_from` excluded from config hash to preserve fold-resume cache |
-| **v0.5** | Tiered checkpoint selection (`_p80s` stable N≥50 > `_p80` peak N≥15 > `_f1` > `_loss`); selective warm start (backbone transfers fold-to-fold, signal head cold-starts); layerwise LR (backbone at lower LR to preserve pretrained knowledge); `epoch_callback` full metrics dict; `extract_backbone()` utility for backbone reuse across runs; stale checkpoint guard on resume; `verbose` param |
-| **v0.4** | Backbone v2 (68 features, 6 instruments, 2.3M bars); structure label redesigned to predict forward 1H structure; `HybridStrategyModel` context heads — 4 frozen pretrained heads expose 15-dim regime/vol/structure/range context at fine-tuning; `pretrained_path` API in `run_walk_forward`; CISD+OTE v9 |
-| **v0.3** | `futures_foundation.finetune` framework — plug-and-play walk-forward fine-tuning; CISD+OTE migrated as first concrete strategy |
-| **v0.2** | FFM backbone + CISD+OTE fine-tuning pipeline (v7); 58 backbone features |
-| **v0.1** | Last stable backbone checkpoint reference |
-
----
-
-## Contributing
-
-We welcome contributions! Key areas:
-
-- **New strategy implementations**: Add a `StrategyLabeler` subclass for ORB, ICT breaker blocks, mean reversion, etc.
-- **New instruments**: Add support for crypto, forex, additional commodities
-- **Additional pretraining tasks**: Order flow proxies, session pattern recognition
-- **Feature engineering**: Novel OHLCV-derived features
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+| **v2.0** | **Chronos-Bolt IS the foundation.** The from-scratch FFM transformer (model/dataset/pretrain/torch fine-tune trainer, ~6k lines) retired — preserved at tag `ffm-transformer-final`. The proven `pipelines/chronos` backbone seam promoted to **`futures_foundation.foundation`** (`embed_bars`, subprocess isolation, wiring-gap stamps); `import futures_foundation` is now torch-free by contract (tested). `finetune/` reduced to its torch-free, model-agnostic survivors (StrategyLabeler triple-barrier ABC, run_labeling, FoldHealthMonitor, reporting, realized-R economics); `prepare_data` rescued to `futures_foundation.prepare`. **Phase-0 capability probe** (`scripts/probe_context_heads.py`): frozen Bolt embeddings know future volatility regime beyond trivial features (vol percentile r=0.52 vs 0.41 trivial; expansion AUC 0.78 vs 0.70), know structure/range at trivial-matching level, don't know direction — with shuffle controls clean. 436+ tests. |
+| **v1.5** | `pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline: walk-forward batch-embed evaluator with REAL/SHUFFLE/RANDOM/NAIVE controls + 6-check pre-registered auto-verdict; `produce.py` production bundles; `export_onnx.py` 3-file export with 3-layer verify; `XGBRiskHead` log1p dynamic-TP; backbone wiring-gap guards (`stamp_active_source`). |
+| **v1.4** | `pipelines/rl` — generic PPO walk-forward pipeline (SingleTradeEnv, causal-parity harness, shuffle + multi-seed verdicts, `shape_reward` IP seam). |
+| **v1.3** | Finetune hardening: realized-R economic eval, shuffle-audit leakage gate, opt-in econ checkpoint selection, final-`run()` StrategyLabeler ABC; `pipelines/common` extracted. |
+| **v1.2** | `pipelines/xgboost` standalone direction pipeline (V2 triple-barrier, RS hybrid trail, Optuna product objective, every-OOS-month gate). |
+| **≤ v1.1** | From-scratch FFM era: backbone pretraining pipeline, walk-forward fine-tune framework, FoldHealthMonitor, 68-feature derivation, CRT/psychology/HTF features. Full history at tag `ffm-transformer-final`. |
 
 ---
 
 ## Roadmap
 
-- [x] Core transformer backbone with HuggingFace compatibility
-- [x] OHLCV feature derivation pipeline (68 ATR-normalized continuous features)
-- [x] CRT sweep state features — 1H/4H prior-candle liquidity sweeps (10 features)
-- [x] Candle psychology features — 5 continuous + candle_type embedding
-- [x] HTF timeframe context features — 1H/4H position, returns, alignment, structure (7 features)
-- [x] Daily macro structure feature — `htf_daily_structure` for regime blindness fix
-- [x] Volume absorption & order flow features
-- [x] Forward-looking self-supervised label generation (4 tasks)
-- [x] Structure label — predicts forward 1H structure (learnable from 8h context window)
-- [x] Confidence sentinel masking for regime + structure heads
-- [x] Causal attention mask for per-bar predictions
-- [x] **6-instrument pretraining — ES, NQ, RTY, YM, GC, SI (~2.3M bars)**
-- [x] **`futures_foundation.finetune` — reusable walk-forward fine-tuning framework**
-- [x] **`StrategyLabeler` ABC — implement one class, get everything else for free**
-- [x] **CISD+OTE strategy as first concrete fine-tune implementation**
-- [x] Unit test suite with per-column FFM field coverage checks
-- [x] ONNX export for production inference
-- [x] **SuperTrend Trend Follow strategy**
-- [x] **Phase 2 risk head calibration — Huber fine-tune for predicted R:R at trade entry**
-- [x] **`HybridStrategyModel` context heads — 4 frozen pretrained heads give signal head explicit market context (regime/vol/structure/range)**
-- [x] **CISD+OTE v9 — backbone v2 + context heads**
-- [x] **Pretrained weights released on HuggingFace Hub** — [johnamcruz/futures-foundation-model](https://huggingface.co/johnamcruz/futures-foundation-model)
-- [x] **Tiered checkpoint selection** — stable (N≥50) > peak (N≥15) > F1 > val_loss; eliminates noise-driven early epoch selection
-- [x] **Selective warm start** — backbone transfers fold-to-fold; signal head cold-starts each fold for honest regime calibration
-- [x] **Layerwise LR** — backbone trained at lower LR to preserve pretrained knowledge while signal head adapts at full speed
-- [x] **`extract_backbone()` utility** — pull backbone weights from any completed fold for warm re-runs and cross-strategy transfer
-- [x] **`epoch_callback` API** — full per-epoch metrics dict for custom logging, early-stop hooks, or external monitoring
-- [x] **Stale checkpoint guard** — rejects low-N checkpoints saved by older code versions on resume
-- [x] **CL (Crude Oil) instrument support** — energy/macro regime context
-- [x] **ZB/ZN (Treasury Bond/Note) instrument support** — rate regime context for v8 backbone
-- [x] **`continue_from` in `TrainingConfig`** — iterative multi-pass fine-tuning; full checkpoint transfer from prior run into F1
-- [x] **`AvgMaxRR` column in threshold table** — average max R:R of winning trades per confidence threshold; confirms edge has follow-through beyond precision alone
-- [x] **Confidence calibration block** — auto-printed after every fold; win rate by band (50–90%+) with monotonicity check; flags non-monotonic calibration before deployment
-- [x] **Full warm start graceful key skip** — shape-mismatched keys are skipped with a warning instead of crashing; enables `continue_from` across runs with minor architectural differences
-- [x] **`backbone_swap_path` in `TrainingConfig`** — upgrade backbone mid-chain without re-learning strategy heads; splices new backbone into `continue_from` checkpoint before F1 trains
-- [x] **`risk_head_donor_path` in `export_onnx()`** — replace final fold's degraded risk head with a better-calibrated earlier fold's risk head at export time
-- [x] **Per-fold epoch override** — `epochs` key in fold dict overrides global `TrainingConfig.epochs` for that fold only; config hash unaffected
-- [x] **Dual patience (`p80_patience`)** — P@80 stable (N≥50) patience tracked independently of val_loss; fires early stop when P@80 plateaus even while val_loss is still declining; saves ~30–40% of epoch budget in typical runs
-- [x] **`run_finetune()` single-call pipeline** — replaces the prior 3-step sequence (run_labeling + run_walk_forward + print_eval_summary); adds `on_epoch_end` and `on_fold_complete` callbacks; lower-level functions remain available for scripts needing intermediate access
-- [x] **Auto-scaled `n_stable_min`** — trainer computes effective threshold from actual val signal count per fold; `n_stable_min` in `TrainingConfig` is a cap; later walk-forward folds with shorter val windows scale down proportionally (floor=10), floored to prevent noise-driven checkpoints; fixes F4/F5 stable checkpoint collapse in sparse-signal strategies
-- [x] **`futures_foundation.pretrain` — single-call pretraining pipeline** — `prepare_data`, `run_pretrain`, `verify_backbone`; per-task overfit guards, AMP, backbone val loss checkpointing, instrument similarity verification; captures all v8/v9 fixes in the library; Colab reduced to ~90 lines
-- [x] **`FoldHealthMonitor` — automatic training pathology detection** — 7 signals (EARLY_EPOCH, WEIGHT_LOCK, P80_DECLINE, VAL_TEST_GAP, N_COLLAPSE, CONFIDENCE_FLAT, ZERO_SIGNAL_FOLD); fires immediately per fold + consolidated summary; always prints feature weight cos_sim between folds to confirm WEIGHT_LOCK fix is working
-- [x] **`train_start` fold key** — sliding window training (e.g. 18 months) prevents weight lock in `continue_from` runs; each fold re-adapts to its local regime rather than being anchored to the prior run's initialization; backward-compatible (folds without `train_start` use full history)
-- [x] **`pipelines/` — standalone non-transformer pipeline package** (one subfolder per pipeline; shares only `derive_features`)
-- [x] **XGBoost direction pipeline** — V2 session triple-barrier + Rogers-Satchell hybrid trail + rolling 3:1 walk-forward + Optuna combined objective + every-OOS-month-PF>1 gate
-- [x] **`XGBStrategyLabeler` plug-in** — finetune-parity strategy customization for XGBoost (`run_pipeline()` API + `--labeler` registry)
-- [x] **Robustness guards** — `seq_len`>`max_sequence_length` fail-fast; `load_backbone` arch-mismatch hard-fail; `_config_hash` includes ffm arch (stale-resume poison fix); no-look-ahead causal-parity rule
-- [x] **`pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline** for selection meta-labelers (binary "take vs skip" on mechanical signals)
-- [x] **Subprocess-isolated Chronos embed** — torch lives only in the child; parent (xgboost) stays torch-free (macOS OpenMP collision solved)
-- [x] **Walk-forward batch-embed + per-fold thread-parallel XGB** — 5–10× speedup over per-fold subprocess loads
-- [x] **`evaluate.py` auto-verdict** — 6 pre-registered PASS/FAIL checks at run-end (constants at module top — eliminates post-hoc interpretation drift)
-- [x] **REAL / SHUFFLE / RANDOM / NAIVE honest-ruler controls** for the Chronos pipeline (mirrors XGBoost pipeline robustness gates)
-- [x] **`produce.py` production trainer** — full-corpus fit minus N-month holdout, joblib bundle with heads + metadata + holdout proba/threshold sweep
-- [x] **`XGBRiskHead` with log1p target transform** — restores tail-capture for heavy-right-tail max-favorable-R regression (Huber on raw R was median-shrinking by ~3R systematically)
-- [x] **Dynamic-TP via risk head** — `TP_R = clip(0.8 × R̂, 1.5, 8.0)` at trade entry (production knob)
-- [x] **`export_onnx.py` joblib → 3 ONNX files** with subprocess-isolated export phases + 3-layer end-to-end `verify()` (per-stage drift + chained pipeline + decision parity at trading threshold)
-- [x] **Chronos backbone-wiring guards** — `stamp_active_source()` surfaces the active backbone at run-start; scans `temp/` for unused fine-tune checkpoints; prints the exact `export CHRONOS_FT_CKPT=...` command needed if a fine-tune exists but is being silently ignored
-- [x] **T5 Chronos fine-tune driver** (`pipelines/chronos/_ft/`) — prep arrow → vendored upstream `train.py` → checkpoint; works end-to-end
-- [ ] **Bolt Chronos fine-tune driver** — config scaffolded (`bolt.yaml`, `--bolt` flag), needs custom HF Trainer wrapper around `ChronosBoltPipeline.forward` (quantile-loss path, ~200–300 LoC)
-- [ ] Full multi-year walk-forward validation of the XGBoost pipeline (every OOS month PF>1, incl. 2022/2025)
-- [ ] Additional strategy implementations (ORB, ICT breaker blocks)
-- [ ] Multi-timeframe input support
+- [x] Chronos-Bolt as the foundation (seam promoted, torch stack retired, torch-free import contract)
+- [x] Phase-0 capability probe — measured what the frozen embedding knows (vol regime ✅ beyond trivial)
+- [x] Bolt domain-adaptation fine-tune + A/B harness (verdict: vanilla wins for selection — stay frozen)
+- [ ] **Context heads** — promote probe labels into the library; expose `ctx_*` features (volatility pair first) as named handles
+- [ ] **Fusion A/B on the honest ruler** — pre-registered: heads adopt only if ≥ +0.10R over the embedding-only baseline at comparable trade count
+- [ ] Single-file ONNX export (foundation + heads in one graph) for the bot
+- [ ] Additional strategies through the proven pipeline (the bar: beat live SuperTrend on the honest ruler)
+- [ ] Multivariate context / Chronos-2 (close-only is the foundation's current information boundary)
 
 ---
 

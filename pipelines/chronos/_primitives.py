@@ -1,8 +1,18 @@
-"""Pure-numpy primitives — vendored locally so the chronos pipeline has
-NO futures_foundation import chain (importing futures_foundation pulls in
-the FFM PyTorch transformer, which loads libomp into the parent and then
-segfaults when XGBoost runs — see project_chronos_openmp_isolation).
-Internal: same contracts as futures_foundation.primitives versions.
+"""Pure-numpy primitives for the chronos pipeline's live labelers.
+
+Originally vendored to avoid the futures_foundation import chain (which,
+pre-refactor, pulled the FFM PyTorch transformer into the parent —
+libomp segfault with XGBoost). That import reason is GONE: importing
+futures_foundation is torch-free since the Bolt-foundation refactor.
+
+DELIBERATELY KEPT SEPARATE ANYWAY: these implementations are numerically
+DIVERGENT from futures_foundation.primitives (compute_atr / supertrend
+warm-up & smoothing seeding differ — same contracts, different outputs).
+The live production strategies (supertrend_chronos et al. in colabs/)
+trained and certified against THESE numerics. Do not "consolidate" onto
+futures_foundation.primitives — that silently changes live signal
+generation. Any unification must re-certify every live bundle on the
+honest ruler first.
 """
 import numpy as np
 
