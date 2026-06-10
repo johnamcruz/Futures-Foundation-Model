@@ -46,6 +46,22 @@ HEAD_SPECS = [
     ('volatility', 'reg'),
     ('structure', 'clf'),
     ('range_pos', 'reg'),
+    # promoted 2026-06-10: beat gate AND trivial on the full probe
+    # (AUC 0.693 vs trivial 0.591) — the rotational/"quiet stays quiet"
+    # detector; consistent with Bolt's vol-dynamics advantage.
+    ('quiet_persist', 'clf'),
+]
+
+#: Candidate heads under probe evaluation — promoted into HEAD_SPECS only
+#: after beating BOTH their gate AND the trivial baseline on the probe
+#: (scripts/probe_context_heads.py). Direction-agnostic by design: Bolt's
+#: proven advantage is shape/volatility dynamics, not direction.
+#: Probed 2026-06-10 and NOT promoted (kept for the record, labels still
+#: computed): trendiness r=.120 == trivial .120 (dead tie — knowable, but
+#: trivially); range_bound AUC .588 < trivial .670 (trivial wins).
+CANDIDATE_HEAD_SPECS = [
+    ('trendiness', 'reg'),       # trend vs chop: fwd 20-bar efficiency ratio
+    ('range_bound', 'clf'),      # ranging: fwd 10-bar closes stay in range
 ]
 
 
@@ -110,6 +126,31 @@ def compute_context_labels(close: pd.Series) -> pd.DataFrame:
     rl = close.rolling(20).min()
     width = (rh - rl).replace(0, np.nan)
     out['range_pos'] = ((close.shift(-10) - rl) / width).clip(0, 1)
+
+    # trendiness: efficiency ratio of the NEXT 20 bars — |net move| over
+    # path length. 1 = clean trend (either direction), ~0 = chop.
+    net = (lc.shift(-20) - lc).abs()
+    path = r1.abs().rolling(20).sum().shift(-20)      # covers t+1..t+20
+    out['trendiness'] = (net / path.replace(0, np.nan)).clip(0, 1)
+
+    # range_bound: next 10 bars' closes stay inside the current 20-bar
+    # close range (the "ranging" state, direction-agnostic).
+    fwd_hi10 = close.rolling(10).max().shift(-10)
+    fwd_lo10 = close.rolling(10).min().shift(-10)
+    rb = ((fwd_hi10 <= rh) & (fwd_lo10 >= rl)).astype(float)
+    rb[fwd_hi10.isna() | fwd_lo10.isna() | rh.isna() | rl.isna()] = np.nan
+    out['range_bound'] = rb
+
+    # quiet_persist: defined ONLY on currently-quiet bars (trailing 20-bar
+    # vol <= trailing median); does quiet persist — no meaningful expansion
+    # (fwd vol <= 1.25x median) — over the next 20 bars? The 1.25x buffer
+    # keeps the label clean inside a uniform quiet regime (vs comparing to
+    # the median itself, which flips ~half the bars by construction).
+    # Conditional label — non-quiet bars are NaN (dropped per-head).
+    quiet_now = v20 <= med_v20
+    qp = (fwd_v20 <= 1.25 * med_v20).astype(float)
+    qp[~quiet_now | fwd_v20.isna() | med_v20.isna() | v20.isna()] = np.nan
+    out['quiet_persist'] = qp
 
     return out
 

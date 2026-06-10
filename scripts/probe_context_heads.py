@@ -52,9 +52,17 @@ sys.path.insert(0, str(ROOT))
 from futures_foundation import foundation as backbone  # noqa: E402  (torch-free parent)
 from futures_foundation.context import (  # noqa: E402
     compute_context_labels as compute_labels,
-    HEAD_SPECS as HEADS,
+    HEAD_SPECS, CANDIDATE_HEAD_SPECS,
     GATE_REG_PEARSON, GATE_CLF_AUC, HEADS_CUTOFF,
 )
+
+# probe evaluates established heads AND candidates; candidates are promoted
+# into HEAD_SPECS only if they beat their gate AND the trivial baseline.
+HEADS = HEAD_SPECS + CANDIDATE_HEAD_SPECS
+
+# unconditional labels every decision bar must have (conditional labels
+# like quiet_persist are NaN by design on most bars — never row-filtered).
+REQUIRED_LABELS = ['fwd_return', 'vol_expansion', 'volatility', 'range_pos']
 
 CTX = 128                    # bars per Bolt context (matches *_chronos labelers)
 VAL_START = pd.Timestamp('2022-11-01', tz='UTC')
@@ -109,7 +117,7 @@ def build_dataset(tickers, tfs, stride):
             ok = (np.arange(len(df)) >= max(CTX, 200)) \
                 & ts20.notna().to_numpy() \
                 & (ts20 < HEADS_CUTOFF).to_numpy() \
-                & lab.notna().drop(columns=['structure']).all(axis=1).to_numpy()
+                & lab[REQUIRED_LABELS].notna().all(axis=1).to_numpy()
             idx = np.flatnonzero(ok)[::stride]
             if not len(idx):
                 print(f"  [skip] {tk}_{tf}: no pre-cutoff rows")

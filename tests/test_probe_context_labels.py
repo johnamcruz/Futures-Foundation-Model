@@ -36,7 +36,8 @@ def random_close():
 
 def test_all_heads_present_and_tail_nan(random_close):
     lab = probe.compute_labels(random_close)
-    assert list(lab.columns) == [name for name, _ in probe.HEADS]
+    # every probed head has a label column (order is not a contract)
+    assert set(lab.columns) == {name for name, _ in probe.HEADS}
     # forward-looking: the last `horizon` rows must be NaN, never filled
     assert lab['fwd_return'].iloc[-20:].isna().all()
     assert lab['vol_expansion'].iloc[-20:].isna().all()
@@ -131,3 +132,41 @@ def test_trivial_features_are_strictly_trailing():
     mod[400:] *= 1.5
     b = probe.trivial_features(_series(mod))
     pd.testing.assert_frame_equal(a.iloc[:400], b.iloc[:400])
+
+
+# ---------------------------------------------------------------------------
+# Candidate heads (trend/range/chop set) — known answers + conditionality
+# ---------------------------------------------------------------------------
+
+def test_trendiness_known_answer():
+    """Monotonic line -> efficiency ratio ~1; alternating chop -> ~0."""
+    trend = probe.compute_labels(_series(np.arange(100, 100 + N)))
+    assert (trend['trendiness'].dropna() > 0.95).all()
+    osc = 100 + 0.5 * (np.arange(N) % 2)          # +/- alternating closes
+    chop = probe.compute_labels(_series(osc))
+    assert (chop['trendiness'].dropna() < 0.10).all()
+
+
+def test_range_bound_known_answer():
+    """Oscillation inside a fixed band -> 1; strong trend -> 0."""
+    osc = 100 + 0.5 * (np.arange(N) % 2)
+    rb = probe.compute_labels(_series(osc))['range_bound']
+    assert (rb.dropna() == 1.0).all()
+    trend = probe.compute_labels(_series(np.arange(100, 100 + N)))
+    assert (trend['range_bound'].dropna() == 0.0).all()
+
+
+def test_quiet_persist_conditional_and_known_answer():
+    """Defined ONLY on currently-quiet bars; 1 when quiet persists,
+    0 just before a vol burst."""
+    quiet = RNG.normal(0, 0.0002, 500)
+    burst = RNG.normal(0, 0.01, 100)
+    close = _series(100 * np.exp(np.cumsum(np.r_[quiet, burst])))
+    qp = probe.compute_labels(close)['quiet_persist']
+    # uniform quiet: overwhelmingly 1 (the label is statistical — rare
+    # sampling-noise flips are inherent; discrimination is the probe's job)
+    assert qp.iloc[300:450].dropna().mean() > 0.85
+    # any bar defined just before the burst (fwd window inside it) must be 0
+    pre_burst = qp.iloc[478:500].dropna()
+    assert (pre_burst == 0.0).all()
+    assert qp.iloc[530:560].isna().all()               # not quiet -> NaN

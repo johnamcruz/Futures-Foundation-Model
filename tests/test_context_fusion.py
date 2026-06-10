@@ -36,7 +36,8 @@ def _heads(n=2000):
         'vol_expansion': (E[:, 1] > 0).astype(float),
         'volatility': 1 / (1 + np.exp(-E[:, 2])),
         'structure': (E[:, 0] > 0).astype(float),
-        'range_pos': 1 / (1 + np.exp(-E[:, 1]))})
+        'range_pos': 1 / (1 + np.exp(-E[:, 1])),
+        'quiet_persist': (E[:, 2] > 0).astype(float)})
     cut = int(n * .8)
     return ContextHeads(seed=0, n_estimators=40).fit(
         E[:cut], lab.iloc[:cut], E[cut:], lab.iloc[cut:], verbose=False)

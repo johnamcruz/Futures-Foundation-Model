@@ -108,7 +108,9 @@ def main():
               ('ctx_vol_expansion', lab['vol_expansion'],
                'realized expansion rate'),
               ('ctx_structure', lab['structure'], 'realized bull-structure rate'),
-              ('ctx_range_pos', lab['range_pos'], 'realized range position')]
+              ('ctx_range_pos', lab['range_pos'], 'realized range position'),
+              ('ctx_quiet_persist', lab['quiet_persist'],
+               'realized quiet-persists rate (quiet bars only)')]
     print(f"\n{'=' * 64}\nPROOF 1 — OOS CALIBRATION (prediction decile -> "
           f"realized outcome)\n{'=' * 64}")
     for feat, realized, what in checks:
@@ -140,8 +142,8 @@ def main():
     yte = y[te].astype(int)
     acc = float((pred == yte).mean())
     base = float(np.bincount(yte).max() / len(yte))
-    print(f"\n{'=' * 64}\nPROOF 2 — SAMPLE REGIME MODEL (4 ctx features "
-          f"ONLY)\n{'=' * 64}")
+    print(f"\n{'=' * 64}\nPROOF 2 — SAMPLE REGIME MODEL ({len(names)} ctx "
+          f"features ONLY)\n{'=' * 64}")
     print(f"  train: 2023-2024 ({tr.sum():,} bars)   "
           f"test: 2025+ ({te.sum():,} bars)")
     print(f"  4-class accuracy : {acc:.1%}   vs majority baseline "

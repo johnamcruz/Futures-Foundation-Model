@@ -24,7 +24,7 @@ def test_probe_script_uses_library_generators():
     probe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(probe)
     assert probe.compute_labels is compute_context_labels
-    assert probe.HEADS is ctx.HEAD_SPECS
+    assert probe.HEADS == ctx.HEAD_SPECS + ctx.CANDIDATE_HEAD_SPECS
 
 
 def _synthetic_dataset(n=3000, d=24, informative=True):
@@ -40,12 +40,15 @@ def _synthetic_dataset(n=3000, d=24, informative=True):
         s = E[:, 3] + RNG.normal(0, .3, n)
         lab['structure'] = np.where(s > .5, 1.0, np.where(s < -.5, 0.0, np.nan))
         lab['range_pos'] = 1 / (1 + np.exp(-(E[:, 4] + RNG.normal(0, .3, n))))
+        q = E[:, 5] + RNG.normal(0, .3, n)          # conditional label: some NaN
+        lab['quiet_persist'] = np.where(q > 1.2, np.nan, (q > 0).astype(float))
     else:
         lab['fwd_return'] = RNG.normal(0, 1, n)
         lab['vol_expansion'] = (RNG.random(n) > .5).astype(float)
         lab['volatility'] = RNG.random(n)
         lab['structure'] = (RNG.random(n) > .5).astype(float)
         lab['range_pos'] = RNG.random(n)
+        lab['quiet_persist'] = (RNG.random(n) > .5).astype(float)
     cut = int(n * .8)
     return E[:cut], lab.iloc[:cut], E[cut:], lab.iloc[cut:]
 
@@ -83,7 +86,8 @@ def test_transform_include_override_for_ablation(fitted_heads):
 
 
 def test_noise_labels_fail_gates_and_transform_is_empty():
-    E_tr, lab_tr, E_va, lab_va = _synthetic_dataset(informative=False)
+    # large n: with 3 clf heads, chance AUC > 0.55 must be ~impossible
+    E_tr, lab_tr, E_va, lab_va = _synthetic_dataset(n=8000, informative=False)
     heads = ContextHeads(seed=0, n_estimators=40).fit(
         E_tr, lab_tr, E_va, lab_va, verbose=False)
     assert heads.active_names == []          # nothing may pass on noise
