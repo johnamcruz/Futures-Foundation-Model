@@ -277,6 +277,12 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
           "RANDOM on sumR/meanR (cost in evaluate()), AND the per-ticker "
           "lift over the labeler's NAIVE baseline is consistent.")
 
+    # ---- Robustness block (additive; never breaks the run) ---------------
+    try:
+        _print_robustness(out, pool)
+    except Exception as e:                              # pragma: no cover
+        print(f"  [robustness] skipped: {e}")
+
     # ---- Confidence-threshold dashboard (binary labelers only) -----------
     # FFM/XGBoost-pipeline-style: per threshold, report trades / wins / WR
     # (= Prec) / Recall / PF / vs-NAIVE / verdict. The entry-signal
@@ -387,6 +393,74 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
         _print_verdict(dyn_rows, pool, mae if rp_have_risk else None,
                        corr if rp_have_risk else None)
     return out
+
+
+# Degenerate-shuffle floors (ported from the original XGBoost pipeline's
+# phase_d): below either, the shuffled run is too thin for PF to be meaningful,
+# so the shuffle line falls back to the meanR margin instead of a PF claim.
+SHUF_MIN_TRADES_PF = 50
+
+
+def _pf(R):
+    """Profit factor of a realized-R array (gross win / gross loss)."""
+    R = np.asarray(R, float)
+    w = R[R > 0].sum()
+    loss = abs(R[R < 0].sum())
+    return (w / loss) if loss > 0 else float('inf')
+
+
+def _print_robustness(out, pool):
+    """Additive robustness views (no effect on any computed R, model, or the
+    pre-registered verdict): per-OOS-month PF consistency, per-ticker PF, and a
+    shuffle-survival check with a degenerate-sample guard. Print-only."""
+    bar = "─" * 60
+    print(f"\n{bar}\n🛡  ROBUSTNESS — per-OOS-month + per-ticker + shuffle "
+          f"survival\n{bar}")
+
+    # 1) per-OOS-month (fold) REAL PF gate — consistency across time
+    by_fold = defaultdict(list)
+    for r in out:
+        by_fold[r['fold']].append(np.asarray(r['REAL'], float))
+    fold_pf = {f: _pf(np.concatenate(v)) for f, v in by_fold.items()
+               if sum(len(a) for a in v)}
+    if fold_pf:
+        n_mo = len(fold_pf)
+        n_pos = sum(1 for pf in fold_pf.values() if pf > 1.0)
+        flag = '✓ all months profitable' if n_pos == n_mo else \
+               f'✗ {n_mo - n_pos} negative month(s)'
+        print(f"  per-OOS-month PF>1: {n_pos}/{n_mo}  {flag}")
+
+    # 2) per-ticker REAL PF + positivity
+    realR = (np.concatenate(pool['REAL'][0]) if pool['REAL'][0]
+             else np.array([], float))
+    tks = pool['REAL'][1]
+    if len(realR) and len(realR) == len(tks):
+        by_tk = defaultdict(list)
+        for r, t in zip(realR, tks):
+            by_tk[t].append(r)
+        n_pos = sum(1 for rs in by_tk.values() if np.mean(rs) > 0)
+        cells = "  ".join(f"{t}:PF{_pf(rs):.2f}"
+                          for t, rs in sorted(by_tk.items()))
+        flag = '✓' if n_pos == len(by_tk) else '✗'
+        print(f"  per-ticker meanR>0: {n_pos}/{len(by_tk)} {flag}   [{cells}]")
+
+    # 3) shuffle survival (with degenerate-sample guard)
+    shufR = (np.concatenate(pool['SHUFFLE'][0]) if pool['SHUFFLE'][0]
+             else np.array([], float))
+    if len(realR) and len(shufR):
+        r_mean = float(realR.mean())
+        s_mean = float(shufR.mean())
+        margin = r_mean - s_mean
+        ok = margin >= PASS_LIFT_MARGIN_R
+        if len(shufR) < SHUF_MIN_TRADES_PF:
+            print(f"  shuffle thin (n={len(shufR)}) — margin only: REAL "
+                  f"{r_mean:+.3f} − SHUF {s_mean:+.3f} = {margin:+.3f}R "
+                  f"{'✓' if ok else '✗'}")
+        else:
+            print(f"  REAL PF {_pf(realR):.2f} (meanR {r_mean:+.3f}) vs "
+                  f"SHUFFLE PF {_pf(shufR):.2f} (meanR {s_mean:+.3f}) → "
+                  f"margin {margin:+.3f}R  "
+                  f"{'✓ real clears shuffle' if ok else '✗ margin below bar'}")
 
 
 def _print_verdict(dyn_rows, pool, risk_mae, risk_corr):

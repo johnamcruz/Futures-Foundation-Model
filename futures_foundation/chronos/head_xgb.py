@@ -15,11 +15,14 @@ class XGBHead:
     Conforms to the head-agnostic contract evaluate.py speaks."""
 
     def __init__(self, n_classes, n_estimators=200, max_depth=4,
-                 learning_rate=0.05, subsample=0.8, colsample_bytree=0.8):
+                 learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+                 **extra):
+        # **extra forwards any additional XGBClassifier args (e.g. reg_lambda,
+        # min_child_weight) — used by the head-tuner. Default {} = unchanged.
         self.n_classes = int(n_classes)
         self._p = dict(n_estimators=n_estimators, max_depth=max_depth,
                        learning_rate=learning_rate, subsample=subsample,
-                       colsample_bytree=colsample_bytree)
+                       colsample_bytree=colsample_bytree, **extra)
         self._clf = None
 
     def fit(self, X, y, seed=0):
