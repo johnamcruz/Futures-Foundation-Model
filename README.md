@@ -4,7 +4,7 @@
 
 **A futures-market foundation layer built on pretrained Chronos-Bolt — frozen embeddings of intraday market context, plus strategy-pluggable training, evaluation, and deployment pipelines.**
 
-**Contents:** [Quick Start](#quick-start) · [Overview](#overview) · [Foundation Surface](#the-foundation-surface) · [Chronos Pipeline](#chronos-pipeline--training-evaluation-deployment) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Standalone Pipelines](#xgboost-pipeline-standalone) · [Data](#data) · [Project Structure](#project-structure) · [Releases](#releases)
+**Contents:** [Quick Start](#quick-start) · [Overview](#overview) · [Foundation Surface](#the-foundation-surface) · [Chronos Pipeline](#chronos-pipeline--training-evaluation-deployment) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Standalone Pipelines](#xgboost-pipeline-standalone) · [Data](#data) · [Project Structure](#project-structure)
 
 ---
 
@@ -295,21 +295,6 @@ Futures-Foundation-Model/
 ├── tests/                        # 487 unit tests (pre-commit gated; torch-free by contract)
 └── data/                         # Raw OHLCV CSVs (gitignored)
 ```
-
----
-
-## Releases
-
-| Version | Description |
-|---------|-------------|
-| **v2.2** | **Overfit-driven training loop (train / validate / test + detect-and-fix).** The whole training process is now one self-correcting loop — `ev.run(labeler, loop=True)`: default walk-forward → **VAL→TEST generalization gate** → Optuna **only if overfit** → rerun → repeat until it passes → one final FULL walk-forward (`futures_foundation/chronos/train_loop.py`). Fixes a regression where the Chronos rebuild had collapsed the walk-forward to a 2-way train→test split (threshold-on-test bias): restored the **3-way split** (`walk_forward_folds` yields `train/val/test`, hard-asserted `train.max < val.min < test.min`) — head fit on **train**, threshold picked on **validation**, **test** reported untouched and never used for any selection. The **generalization gate** is a hard PASS/FAIL (an edge that decays val→test is rejected as fake). **Auto-regularize** re-fits down a regularization ladder when a head overfits train→val, keeping the best **validation** rung. The tuner (`tune_head`) optimizes a **generalization-robust** objective (cross-fold mean − penalty·std) and **auto-falls-back to defaults** unless tuned params beat them on a held-out guard. One entry point everywhere (`ev.run(loop=True)`); `loop=False` stays the single-pass primitive for A/B harnesses. 487 tests. |
-| **v2.1** | **Enriched context heads — the foundation's second input pillar.** Measured recipe (5-arm probe, 236k bars): heads on **`[Bolt embedding \| 68-feature library]`** beat embedding-alone AND the trivial adversary on every shipped target — volume/orderflow/wicks/session/CRT/HTF were the missing inputs; close-only was the binding constraint. Ships 7 heads (`fwd_return`✱, `vol_expansion` .82, `volatility` r .64, `structure` .82 — beats trivial for the first time, `quiet_persist` .74, `trendiness` r .15✱, `range_bound` .69; ✱=weak/marginal, flagged). `context_at(df, idx, instrument)` consumes OHLCV; emb-only bundles back-compatible. OOS-certified on 80,786 unseen bars: monotone calibration, regime model +22.0pts over baseline. 462 tests. |
-| **v2.0** | **Chronos-Bolt IS the foundation.** The from-scratch FFM transformer (model/dataset/pretrain/torch fine-tune trainer, ~6k lines) retired — preserved at tag `ffm-transformer-final`. The proven `pipelines/chronos` backbone seam promoted to **`futures_foundation.foundation`** (`embed_bars`, subprocess isolation, wiring-gap stamps); `import futures_foundation` is now torch-free by contract (tested). `finetune/` reduced to its torch-free, model-agnostic survivors (StrategyLabeler triple-barrier ABC, run_labeling, FoldHealthMonitor, reporting, realized-R economics); `prepare_data` rescued to `futures_foundation.prepare`. **Phase-0 capability probe** (`scripts/probe_context_heads.py`): frozen Bolt embeddings know future volatility regime beyond trivial features (vol percentile r=0.52 vs 0.41 trivial; expansion AUC 0.78 vs 0.70) — with shuffle controls clean. 436+ tests. |
-| **v1.5** | `pipelines/chronos` — frozen Chronos backbone + XGBoost head pipeline: walk-forward batch-embed evaluator with REAL/SHUFFLE/RANDOM/NAIVE controls + 6-check pre-registered auto-verdict; `produce.py` production bundles; `export_onnx.py` 3-file export with 3-layer verify; `XGBRiskHead` log1p dynamic-TP; backbone wiring-gap guards (`stamp_active_source`). |
-| **v1.4** | `pipelines/rl` — generic PPO walk-forward pipeline (SingleTradeEnv, causal-parity harness, shuffle + multi-seed verdicts, `shape_reward` IP seam). |
-| **v1.3** | Finetune hardening: realized-R economic eval, shuffle-audit leakage gate, opt-in econ checkpoint selection, final-`run()` StrategyLabeler ABC; `pipelines/common` extracted. |
-| **v1.2** | `pipelines/xgboost` standalone direction pipeline (V2 triple-barrier, RS hybrid trail, Optuna product objective, every-OOS-month gate). |
-| **≤ v1.1** | From-scratch FFM era: backbone pretraining pipeline, walk-forward fine-tune framework, FoldHealthMonitor, 68-feature derivation, CRT/psychology/HTF features. Full history at tag `ffm-transformer-final`. |
 
 ---
 
