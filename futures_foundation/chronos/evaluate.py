@@ -84,7 +84,7 @@ def _agg_stats(name, R, tks=None):
         print(f"            {tk:<5} {_stats(Rt)}")
 
 
-def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
+def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, context_heads_path=None, emb_mode='both',
         min_train_start=None):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
@@ -117,12 +117,13 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
     out = []
     pool = {'REAL': ([], []), 'SHUFFLE': ([], []), 'RANDOM': ([], [])}
     proba_records = []
+    val_records = []                   # (keys, proba) on VALIDATION — for thr select
     # Phase 1 — collect all (Ctr, Ytr, Ktr, Cte, Yte, Kte) across folds
     # WITHOUT calling backbone.embed. Pure pandas/numpy; fast.
     fold_data = []
     n_excluded = 0
-    for fold, tr, te in walk_forward_folds(labeler.calendar(), train_m,
-                                           test_m):
+    for fold, tr, val, te in walk_forward_folds(labeler.calendar(), train_m,
+                                                val_m, test_m):
         if max_folds is not None and len(fold_data) >= max_folds:
             break
         if min_train_start is not None \
@@ -132,17 +133,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
         if heads is not None:
             context_fusion.enforce_cutoff(
                 heads, tr['timestamp'].min(), what=f'fold {fold} train')
-        ts0 = te['timestamp'].min()
+        val0 = val['timestamp'].min()
+        te0 = te['timestamp'].min()
+        # TRAIN purged so its outcome window can't reach VAL; VAL purged so its
+        # outcome window can't reach TEST; TEST unpurged (outcomes resolve forward,
+        # never used for training). Strict train < val < test separation.
         Ctr, Ytr, Ktr = labeler.build(tr['timestamp'].min(),
-                                       tr['timestamp'].max(), ts0)
+                                       tr['timestamp'].max(), val0)
+        Cval, Yval, Kval = labeler.build(val0, val['timestamp'].max(), te0)
         Cte, Yte, Kte = labeler.build(
             te['timestamp'].min(),
             te['timestamp'].max() + np.timedelta64(1, 'ns'), None)
-        if len(Ytr) < 50 or len(Cte) < 50:
+        if len(Ytr) < 50 or len(Cte) < 50 or len(Cval) < 10:
             continue
-        fold_data.append(dict(fold=fold, Ctr=Ctr, Ytr=np.asarray(Ytr),
-                              Ktr=Ktr, Cte=Cte, Yte=np.asarray(Yte),
-                              Kte=Kte))
+        fold_data.append(dict(fold=fold, Ctr=Ctr, Ytr=np.asarray(Ytr), Ktr=Ktr,
+                              Cval=Cval, Yval=np.asarray(Yval), Kval=Kval,
+                              Cte=Cte, Yte=np.asarray(Yte), Kte=Kte))
     if n_excluded:
         print(f"[folds] {n_excluded} fold(s) excluded by min_train_start="
               f"{pd.Timestamp(min_train_start).date()}")
@@ -154,23 +160,28 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
     # walk-forwards; numpy/torch parallelize the single big inference call.
     flat_contexts = []
     for d in fold_data:
-        flat_contexts.extend(d['Ctr']); flat_contexts.extend(d['Cte'])
+        flat_contexts.extend(d['Ctr']); flat_contexts.extend(d['Cval'])
+        flat_contexts.extend(d['Cte'])
     print(f"\n[batch-embed] {len(flat_contexts):,} contexts across "
           f"{len(fold_data)} folds in ONE Chronos call...")
     flat_embed = backbone.embed(flat_contexts)
     # slice back per fold + fuse with labeler features
     o = 0
     feats_fn = getattr(labeler, 'features', None)
+
+    def _fuse(keys, E):
+        extra = (np.asarray(feats_fn(keys), np.float32)
+                 if feats_fn is not None else None)
+        return context_fusion.fuse(E, extra, heads, emb_mode)
+
     for d in fold_data:
-        ntr, nte = len(d['Ctr']), len(d['Cte'])
+        ntr, nva, nte = len(d['Ctr']), len(d['Cval']), len(d['Cte'])
         Etr = flat_embed[o:o + ntr]; o += ntr
+        Eva = flat_embed[o:o + nva]; o += nva
         Ete = flat_embed[o:o + nte]; o += nte
-        xtr_extra = (np.asarray(feats_fn(d['Ktr']), np.float32)
-                     if feats_fn is not None else None)
-        xte_extra = (np.asarray(feats_fn(d['Kte']), np.float32)
-                     if feats_fn is not None else None)
-        d['Xtr'] = context_fusion.fuse(Etr, xtr_extra, heads, emb_mode)
-        d['Xte'] = context_fusion.fuse(Ete, xte_extra, heads, emb_mode)
+        d['Xtr'] = _fuse(d['Ktr'], Etr)
+        d['Xval'] = _fuse(d['Kval'], Eva)
+        d['Xte'] = _fuse(d['Kte'], Ete)
     mode_note = (f" (emb_mode={emb_mode}, ctx heads: "
                  f"{len(heads.active_names)})" if heads is not None else "")
     print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}"
@@ -190,12 +201,15 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
         Ytr, Xtr, Xte, Kte = d['Ytr'], d['Xtr'], d['Xte'], d['Kte']
         Yte_np = d['Yte']
         nc = labeler.n_classes
-        # signal head — binary take/skip
+        # signal head — binary take/skip. FIT ON TRAIN ONLY.
         head = head_factory(nc).fit(Xtr, Ytr, seed)
         p_real = head.predict(Xte)
         R = labeler.evaluate(Kte, p_real)               # fixed-TP baseline
         proba = (head.predict_proba(Xte)[:, 1].astype(np.float32)
                  if binary else None)
+        # VALIDATION proba — for threshold SELECTION (never on test). Same head.
+        proba_val = (head.predict_proba(d['Xval'])[:, 1].astype(np.float32)
+                     if binary else None)
         # risk head — predicts max_rr_realized per signal (binary only;
         # 3-class direction strategies don't have a single risk regression
         # target). Trained alongside on the same Xtr.
@@ -221,7 +235,8 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
         return dict(fold=d['fold'], seed=seed, R=R, Rs=Rs, Rr=Rr, Rn=Rn,
                     p_real=p_real, p_sh=p_sh, p_rd=p_rd,
                     proba=proba, risk_pred=risk_pred,
-                    Yte=Yte_np, Kte=Kte)
+                    Yte=Yte_np, Kte=Kte,
+                    proba_val=proba_val, Kval=d['Kval'], Yval=d['Yval'])
 
     import concurrent.futures as cf
     import os
@@ -267,6 +282,8 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
                 proba_records.append(
                     (r['Kte'], r['proba'], r['Yte'].astype(np.int8),
                      r['risk_pred']))
+                if r.get('proba_val') is not None:
+                    val_records.append((r['Kval'], r['proba_val']))
     print(f"\n== AGGREGATE | folds={len({r['fold'] for r in out})} "
           f"seeds={len(seeds)} | pooled across all (fold,seed) ==")
     for name in ('REAL', 'SHUFFLE', 'RANDOM'):
@@ -385,13 +402,82 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, test_m=1,
 
         print(f"\n   NAIVE-WR baseline (take every signal): "
               f"{100 * naive_wr:.1f}%")
-        print(f"   Target: WR ≥ {int(PASS_TARGET_WR*100)}% AND meanR ≥ "
-              f"{PASS_TARGET_MEAN_R}R at ≥ {PASS_MIN_TRADES_AGG} trades "
-              f"(combine-pass-ready entry signal).")
+        print(f"   (the threshold tables above are a TEST DIAGNOSTIC — the "
+              f"operating point below is selected on VALIDATION, not test.)")
 
-        # ---- Auto-verdict (pre-registered PASS/FAIL, no interpretation) --
-        _print_verdict(dyn_rows, pool, mae if rp_have_risk else None,
-                       corr if rp_have_risk else None)
+        # ---- OPERATING POINT: threshold SELECTED ON VALIDATION, reported on
+        # TEST. This is the standard train/validate/test discipline — test is
+        # never used to choose the threshold, so the reported number has no
+        # threshold-on-test bias. The fixed-TP sweep above is diagnostic only.
+        def _fixedtp(records, thr):
+            R_all = []
+            for keys, proba in records:
+                preds = (proba >= thr).astype(int)
+                Rt = labeler.evaluate(keys, preds)
+                if len(Rt):
+                    R_all.append(Rt)
+            if not R_all:
+                return None
+            Rc = np.concatenate(R_all)
+            w = Rc[Rc > 0].sum(); loss = abs(Rc[Rc < 0].sum())
+            return dict(n=len(Rc), wr=float(np.mean(Rc > 0)),
+                        meanR=float(Rc.mean()), sumR=float(Rc.sum()),
+                        pf=(w / loss if loss > 0 else float('inf')))
+
+        test_recs = [(k, p) for k, p, _, _ in proba_records]
+        grid = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
+        thr_star, best = 0.50, None                         # selected on VAL
+        for thr in grid:
+            mv = _fixedtp(val_records, thr)
+            if mv and mv['n'] >= 30 and (best is None or mv['meanR'] > best):
+                best, thr_star = mv['meanR'], thr
+        v_at = _fixedtp(val_records, thr_star)
+        t_at = _fixedtp(test_recs, thr_star)
+        bar = "═" * 60
+        print(f"\n{bar}\n🚦 OPERATING POINT — thr {thr_star:.2f} SELECTED ON "
+              f"VALIDATION → reported on TEST\n{bar}")
+        if v_at:
+            pfv = f"{v_at['pf']:.2f}" if v_at['pf'] < 999 else "inf"
+            print(f"   VAL  @{thr_star:.2f}:  n={v_at['n']:5d}  "
+                  f"WR={100*v_at['wr']:.1f}%  meanR={v_at['meanR']:+.3f}  PF={pfv}")
+        if t_at:
+            pft = f"{t_at['pf']:.2f}" if t_at['pf'] < 999 else "inf"
+            print(f"   TEST @{thr_star:.2f}:  n={t_at['n']:5d}  "
+                  f"WR={100*t_at['wr']:.1f}%  meanR={t_at['meanR']:+.3f}  "
+                  f"PF={pft}   ← honest OOS")
+        if v_at and t_at:
+            gap = v_at['meanR'] - t_at['meanR']
+            print(f"   VAL→TEST gap: {gap:+.3f}R  "
+                  f"{'⚠️ OVERFIT to val' if gap > 0.30 else '✓ generalizes'}")
+
+        # pre-registered verdict on the VAL-locked TEST operating point + the
+        # threshold-free control margins (edge). risk-head/dynamic-TP omitted —
+        # the live exit is the RL ratchet, not the risk head.
+        real_m = (float(np.concatenate(pool['REAL'][0]).mean())
+                  if pool['REAL'][0] else 0.0)
+        shuf_m = (float(np.concatenate(pool['SHUFFLE'][0]).mean())
+                  if pool['SHUFFLE'][0] else 0.0)
+        rand_m = (float(np.concatenate(pool['RANDOM'][0]).mean())
+                  if pool['RANDOM'][0] else 0.0)
+        naive_m = (float(np.concatenate(pool['NAIVE'][0]).mean())
+                   if pool.get('NAIVE', ([], []))[0] else 0.0)
+        checks = [
+            (t_at is not None and t_at['wr'] >= PASS_TARGET_WR
+             and t_at['n'] >= PASS_MIN_TRADES_AGG,
+             f"TEST@val-thr: WR≥{int(PASS_TARGET_WR*100)}% + trades≥"
+             f"{PASS_MIN_TRADES_AGG}"
+             + (f" (WR={100*t_at['wr']:.1f}%, n={t_at['n']})" if t_at else "")),
+            (real_m - shuf_m >= PASS_LIFT_MARGIN_R,
+             f"edge REAL−SHUFFLE ≥{PASS_LIFT_MARGIN_R}R (got {real_m-shuf_m:+.2f}R)"),
+            (real_m - rand_m >= PASS_LIFT_MARGIN_R,
+             f"edge REAL−RANDOM ≥{PASS_LIFT_MARGIN_R}R (got {real_m-rand_m:+.2f}R)"),
+            (real_m - naive_m >= PASS_LIFT_MARGIN_R,
+             f"edge REAL−NAIVE ≥{PASS_LIFT_MARGIN_R}R (got {real_m-naive_m:+.2f}R)"),
+        ]
+        all_pass = all(ok for ok, _ in checks)
+        print(f"\n   {'✅ PASS' if all_pass else '❌ FAIL'} — operating point:")
+        for ok, msg in checks:
+            print(f"     {'✓' if ok else '✗'} {msg}")
     return out
 
 

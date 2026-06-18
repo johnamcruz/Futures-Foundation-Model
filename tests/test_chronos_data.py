@@ -45,17 +45,18 @@ def test_walk_forward_is_strictly_leak_free():
     df = _toy()
     folds = list(walk_forward_folds(df, train_months=3, test_months=1))
     assert len(folds) >= 1
-    for i, tr, te in folds:
-        # the core invariant: training never sees a bar at/after test start
-        assert tr['timestamp'].max() < te['timestamp'].min()
-        assert len(tr) and len(te)
+    for i, tr, val, te in folds:
+        # core invariant: train < val < test, strictly (no leak across windows)
+        assert tr['timestamp'].max() < val['timestamp'].min()
+        assert val['timestamp'].max() < te['timestamp'].min()
+        assert len(tr) and len(val) and len(te)
         assert set(tr.columns) == {'item_id', 'timestamp', 'target'}
 
 
 def test_folds_roll_and_are_deterministic():
     df = _toy()
-    f1 = [(i, len(tr), len(te)) for i, tr, te in walk_forward_folds(df)]
-    f2 = [(i, len(tr), len(te)) for i, tr, te in walk_forward_folds(df)]
+    f1 = [(i, len(tr), len(te)) for i, tr, val, te in walk_forward_folds(df)]
+    f2 = [(i, len(tr), len(te)) for i, tr, val, te in walk_forward_folds(df)]
     assert f1 == f2 and [x[0] for x in f1] == list(range(len(f1)))
 
 

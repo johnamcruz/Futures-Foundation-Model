@@ -69,7 +69,8 @@ def _suggest(trial):
 def _build_folds(labeler, train_m, test_m, max_folds):
     """Build + batch-embed + fuse folds (mirrors evaluate.run phases 1-2)."""
     fold_data = []
-    for fold, tr, te in walk_forward_folds(labeler.calendar(), train_m, test_m):
+    for fold, tr, _val, te in walk_forward_folds(labeler.calendar(), train_m,
+                                                 test_months=test_m):
         if max_folds is not None and len(fold_data) >= max_folds:
             break
         ts0 = te['timestamp'].min()

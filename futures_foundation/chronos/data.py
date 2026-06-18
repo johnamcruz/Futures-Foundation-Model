@@ -51,27 +51,39 @@ def load_long(timeframe: str = '3min', tickers=None, target: str = 'logret',
 
 
 def walk_forward_folds(long_df: pd.DataFrame, train_months: int = 3,
-                       test_months: int = 1):
-    """Yield (fold_idx, train_df, test_df) rolling month-aligned folds.
-    HARD leak guard: train.timestamp.max() < test.timestamp.min() always.
-    Unanchored (drop oldest month each step), stride = test_months."""
+                       val_months: int = 1, test_months: int = 1):
+    """Yield (fold_idx, train_df, val_df, test_df) — three CONTIGUOUS,
+    month-aligned, forward-chained windows (the STANDARD train/validate/test
+    split). The head is FIT on train, any SELECTION (confidence threshold,
+    checkpoint) is done on VAL, and TEST is reported untouched by selection —
+    so the test number has no threshold-on-test bias. Mirrors the original FFM
+    finetune convention (train_end / val_end / test_end + VAL_TEST_GAP check).
+
+    HARD leak guards: train.max < val.min AND val.max < test.min. Unanchored
+    (drop oldest month each step), stride = test_months."""
     ts = pd.DatetimeIndex(long_df['timestamp'])
     per = ts.tz_localize(None).to_period('M') if ts.tz is not None \
         else ts.to_period('M')
     months = per.unique().sort_values()
     fold = 0
     s = 0
-    while s + train_months + test_months <= len(months):
+    span = train_months + val_months + test_months
+    while s + span <= len(months):
         tr = months[s:s + train_months]
-        te = months[s + train_months:s + train_months + test_months]
+        va = months[s + train_months:s + train_months + val_months]
+        te = months[s + train_months + val_months:s + span]
         trm = np.asarray(per.isin(tr))
+        vam = np.asarray(per.isin(va))
         tem = np.asarray(per.isin(te))
-        if trm.any() and tem.any():
+        if trm.any() and vam.any() and tem.any():
             train_df = long_df[trm].reset_index(drop=True)
+            val_df = long_df[vam].reset_index(drop=True)
             test_df = long_df[tem].reset_index(drop=True)
-            # non-negotiable: the fine-tune NEVER sees forward bars
-            assert train_df['timestamp'].max() < test_df['timestamp'].min(), \
-                f'LEAK: fold {fold} train overlaps/precedes test'
+            # non-negotiable: train < val < test, no overlap, no forward bars
+            assert train_df['timestamp'].max() < val_df['timestamp'].min(), \
+                f'LEAK: fold {fold} train overlaps/precedes val'
+            assert val_df['timestamp'].max() < test_df['timestamp'].min(), \
+                f'LEAK: fold {fold} val overlaps/precedes test'
             fold += 1
-            yield fold - 1, train_df, test_df
+            yield fold - 1, train_df, val_df, test_df
         s += test_months
