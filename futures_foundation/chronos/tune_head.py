@@ -201,11 +201,27 @@ def main():
     ap.add_argument('--max-folds', type=int, default=14)
     ap.add_argument('--holdout-frac', type=float, default=0.3)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--walkforward', action='store_true',
+                    help='after the Optuna scan, run the FULL train/validate/test '
+                         'walk-forward with the tuned params (honest OOS + VAL→TEST '
+                         'generalization gate). This is the "scan → walk-forward" '
+                         'process.')
     args = ap.parse_args()
     backbone.stamp_active_source(context='head-tuner')
     lab = _load_labeler(args.labeler)
-    tune_head(lab, n_trials=args.trials, seed=args.seed,
-              max_folds=args.max_folds, holdout_frac=args.holdout_frac)
+    res = tune_head(lab, n_trials=args.trials, seed=args.seed,
+                    max_folds=args.max_folds, holdout_frac=args.holdout_frac)
+    if args.walkforward:
+        from . import evaluate as ev
+        from .head_xgb import XGBHead
+        p = res['params']
+        bar = "█" * 64
+        print(f"\n{bar}\n  WALK-FORWARD with Optuna-tuned params:\n  {p}\n{bar}")
+        # auto_regularize OFF — params are already tuned by the scan; the
+        # walk-forward just reports the honest 3-way OOS at those params, and
+        # the VAL→TEST gate confirms the tuned params actually generalize.
+        ev.run(lab, head_factory=lambda nc: XGBHead(nc, **p),
+               auto_regularize=False)
 
 
 if __name__ == '__main__':

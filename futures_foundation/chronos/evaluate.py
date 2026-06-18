@@ -36,6 +36,26 @@ PASS_MAX_RISK_MAE_R   = 2.50   # risk-head useful if MAE <= this (R-units)
 PASS_MIN_RISK_CORR    = 0.10   # Pearson r(predicted, actual max_rr) >= this
 PASS_MIN_TICKERS_LIFT = 2      # >= this many tickers above NAIVE on meanR
 
+# ── Auto-regularization (overfit DETECTION + REMEDIATION) ──────────────────
+# Overfit signal = in-sample (TRAIN) meanR exceeds VALIDATION meanR by more than
+# OVERFIT_GAP_R → the head memorized train. When that fires, re-fit a
+# progressively more-regularized head and keep the one with the best VALIDATION
+# meanR (selection NEVER touches test). The XGBoost analog of the original FFM
+# FoldHealthMonitor's "reduce epochs / increase regularisation" remediation —
+# but as a CLOSED LOOP (detect → adjust → re-check), not just a printed suggestion.
+# Ladder is most→least capable (XGBHead kwargs); default head is rung 0.
+OVERFIT_GAP_R = 0.30
+# Generalization gate: VAL→TEST meanR gap above this = the operating point does
+# NOT generalize (edge held on validation but decayed on test = fake/fragile
+# edge). A HARD verdict failure — we want real OOS generalization, not a number
+# that only looks good on the data the threshold was tuned on.
+GEN_GAP_TOL = 0.30
+REG_LADDER = [
+    dict(max_depth=3, min_child_weight=20, reg_lambda=5.0),
+    dict(max_depth=3, min_child_weight=50, reg_lambda=10.0, subsample=0.6),
+    dict(max_depth=2, min_child_weight=80, reg_lambda=15.0, n_estimators=150),
+]
+
 
 def _stats(R):
     R = np.asarray(R, float)
@@ -86,7 +106,7 @@ def _agg_stats(name, R, tks=None):
 
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, context_heads_path=None, emb_mode='both',
-        min_train_start=None):
+        min_train_start=None, auto_regularize=True):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
     (XGBoost-pipeline convention). Prints REAL/SHUFFLE/RANDOM per
@@ -112,6 +132,7 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         min_train_start = HEADS_CUTOFF
         print(f"[context-heads] leak guard: folds restricted to train "
               f"windows starting >= {min_train_start.date()}")
+    _default_head = head_factory is None      # auto-regularize only the default head
     head_factory = head_factory or (lambda nc: XGBHead(nc))
     binary = labeler.n_classes == 2
     out = []
@@ -203,8 +224,30 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         nc = labeler.n_classes
         # signal head — binary take/skip. FIT ON TRAIN ONLY.
         head = head_factory(nc).fit(Xtr, Ytr, seed)
+
+        # ---- overfit DETECT + auto-REGULARIZE (REAL head; default head only) --
+        # If the head memorized train (train meanR ≫ val meanR), step down the
+        # regularization ladder and keep the rung with the best VALIDATION meanR.
+        # Selection uses TRAIN + VAL only — TEST is never consulted.
+        remediated = None
+        if binary and auto_regularize and _default_head:
+            tr_R = labeler.evaluate(d['Ktr'], head.predict(Xtr))
+            vl_R = labeler.evaluate(d['Kval'], head.predict(d['Xval']))
+            tr_m = float(tr_R.mean()) if len(tr_R) else 0.0
+            vl_m = float(vl_R.mean()) if len(vl_R) else 0.0
+            if tr_m - vl_m > OVERFIT_GAP_R:             # overfit to train → remediate
+                best_vm, best_head, best_tag = vl_m, head, None
+                for cfg in REG_LADDER:
+                    h = XGBHead(nc, **cfg).fit(Xtr, Ytr, seed)
+                    vR = labeler.evaluate(d['Kval'], h.predict(d['Xval']))
+                    vm = float(vR.mean()) if len(vR) else -1e9
+                    if vm > best_vm:
+                        best_vm, best_head, best_tag = vm, h, cfg
+                if best_head is not head:
+                    head, remediated = best_head, best_tag
+
         p_real = head.predict(Xte)
-        R = labeler.evaluate(Kte, p_real)               # fixed-TP baseline
+        R = labeler.evaluate(Kte, p_real)               # fixed-TP baseline (final head)
         proba = (head.predict_proba(Xte)[:, 1].astype(np.float32)
                  if binary else None)
         # VALIDATION proba — for threshold SELECTION (never on test). Same head.
@@ -235,7 +278,7 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         return dict(fold=d['fold'], seed=seed, R=R, Rs=Rs, Rr=Rr, Rn=Rn,
                     p_real=p_real, p_sh=p_sh, p_rd=p_rd,
                     proba=proba, risk_pred=risk_pred,
-                    Yte=Yte_np, Kte=Kte,
+                    Yte=Yte_np, Kte=Kte, remediated=remediated,
                     proba_val=proba_val, Kval=d['Kval'], Yval=d['Yval'])
 
     import concurrent.futures as cf
@@ -293,6 +336,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     print("\n-> Believe a result only if REAL clearly beats SHUFFLE AND "
           "RANDOM on sumR/meanR (cost in evaluate()), AND the per-ticker "
           "lift over the labeler's NAIVE baseline is consistent.")
+
+    # ---- Auto-regularization summary (overfit detect + fix) --------------
+    if binary and auto_regularize and _default_head:
+        n_units = len(results)
+        rem = [r['remediated'] for r in results if r.get('remediated')]
+        if rem:
+            from collections import Counter
+            tags = Counter(str(t) for t in rem)
+            print(f"\n🛠  AUTO-REGULARIZE: {len(rem)}/{n_units} (fold,seed) units "
+                  f"overfit train→val by >{OVERFIT_GAP_R}R → re-fit with a more "
+                  f"regularized head (selected on validation):")
+            for tag, cnt in tags.most_common():
+                print(f"     {cnt}× → {tag}")
+        else:
+            print(f"\n🛠  AUTO-REGULARIZE: 0/{n_units} units triggered "
+                  f"(no head overfit train→val by >{OVERFIT_GAP_R}R) — none needed.")
 
     # ---- Robustness block (additive; never breaks the run) ---------------
     try:
@@ -445,10 +504,11 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             print(f"   TEST @{thr_star:.2f}:  n={t_at['n']:5d}  "
                   f"WR={100*t_at['wr']:.1f}%  meanR={t_at['meanR']:+.3f}  "
                   f"PF={pft}   ← honest OOS")
+        gap = None
         if v_at and t_at:
             gap = v_at['meanR'] - t_at['meanR']
             print(f"   VAL→TEST gap: {gap:+.3f}R  "
-                  f"{'⚠️ OVERFIT to val' if gap > 0.30 else '✓ generalizes'}")
+                  f"{'⚠️ OVERFIT to val (does NOT generalize)' if gap > GEN_GAP_TOL else '✓ generalizes'}")
 
         # pre-registered verdict on the VAL-locked TEST operating point + the
         # threshold-free control margins (edge). risk-head/dynamic-TP omitted —
@@ -473,6 +533,9 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
              f"edge REAL−RANDOM ≥{PASS_LIFT_MARGIN_R}R (got {real_m-rand_m:+.2f}R)"),
             (real_m - naive_m >= PASS_LIFT_MARGIN_R,
              f"edge REAL−NAIVE ≥{PASS_LIFT_MARGIN_R}R (got {real_m-naive_m:+.2f}R)"),
+            (gap is not None and gap <= GEN_GAP_TOL,
+             f"GENERALIZES: VAL→TEST gap ≤{GEN_GAP_TOL}R"
+             + (f" (got {gap:+.2f}R)" if gap is not None else " (no val/test)")),
         ]
         all_pass = all(ok for ok, _ in checks)
         print(f"\n   {'✅ PASS' if all_pass else '❌ FAIL'} — operating point:")
