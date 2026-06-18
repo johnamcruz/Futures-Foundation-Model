@@ -227,6 +227,8 @@ colabs/
 
 # DataBento raw compressed data (large binary files — not for git)
 databento/*.zst
+databento/**/*.zst
+databento/_incremental/
 
 # Live trade log and monitor (local only — not for git)
 logs/trades.csv
