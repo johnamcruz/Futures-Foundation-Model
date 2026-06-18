@@ -57,6 +57,13 @@ REG_LADDER = [
 ]
 
 
+def _should_loop(loop, binary, default_head):
+    """Run the overfit-driven training loop only when explicitly requested, on a
+    binary labeler, with the default head (the gen-gate + Optuna path needs all
+    three). A custom head or a 3-class labeler runs a single pass instead."""
+    return bool(loop and binary and default_head)
+
+
 def _overfit_trigger(train_meanR, val_meanR):
     """True if the head overfit TRAIN relative to VALIDATION by more than
     OVERFIT_GAP_R → the auto-regularize remediation should fire."""
@@ -158,7 +165,8 @@ def _agg_stats(name, R, tks=None):
 
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, context_heads_path=None, emb_mode='both',
-        min_train_start=None, auto_regularize=True, return_verdict=False):
+        min_train_start=None, auto_regularize=True, return_verdict=False,
+        loop=False):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
     (XGBoost-pipeline convention). Prints REAL/SHUFFLE/RANDOM per
@@ -185,8 +193,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         print(f"[context-heads] leak guard: folds restricted to train "
               f"windows starting >= {min_train_start.date()}")
     _default_head = head_factory is None      # auto-regularize only the default head
-    head_factory = head_factory or (lambda nc: XGBHead(nc))
     binary = labeler.n_classes == 2
+
+    # loop=True → run the OVERFIT-DRIVEN TRAINING LOOP (default WF → generalize
+    # check → Optuna only if overfit → rerun → repeat → final full WF), so every
+    # validation entry point works the same way. Only the default head on a
+    # binary labeler can be loop-tuned; a custom head or 3-class labeler runs a
+    # single pass. train_loop calls back into run() with loop=False (the single-
+    # pass primitive), so there is no recursion.
+    if _should_loop(loop, binary, _default_head):
+        from .train_loop import train_loop
+        res = train_loop(labeler, seeds=seeds, loop_max_folds=max_folds,
+                         final_max_folds=max_folds)
+        final = res.get('final') or {}
+        return res if return_verdict else (final.get('records') or [])
+
+    head_factory = head_factory or (lambda nc: XGBHead(nc))
     out = []
     verdict = None              # set in the binary operating-point block below
     pool = {'REAL': ([], []), 'SHUFFLE': ([], []), 'RANDOM': ([], [])}
