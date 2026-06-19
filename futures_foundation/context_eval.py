@@ -119,6 +119,57 @@ def _score(kind, model, X, y):
     return float(roc_auc_score(y, model.predict_proba(X)[:, 1]))
 
 
+class WalkForwardCtxProvider:
+    """Per-fold context heads for NESTED walk-forward ctx fusion (used by
+    evaluate.run(ctx_provider=…)). Holds the dense ctx dataset; `fit` retrains
+    the heads on one fold's TRAIN window (label-purged before val), `transform`
+    emits ctx_* for query bars. Same overfit-safe discipline as the strategy
+    folds — the heads never see the fold's val/test.
+
+    X_ctx: [N, 324] dense [emb|ff68]. labels: DataFrame (head columns).
+    ts / ts_end: decision-bar timestamp / its forward-label close time.
+    """
+
+    def __init__(self, X_ctx, labels, ts, ts_end, seed=0, specs=HEAD_SPECS):
+        self.X = np.asarray(X_ctx, np.float32)
+        self.labels = labels
+        self.ts = pd.DatetimeIndex(ts)
+        self.ts_end = pd.DatetimeIndex(ts_end)
+        self.seed = seed
+        self.specs = specs
+        self._models = {}
+
+    def fit(self, tr_lo, tr_hi, val0):
+        mask = (np.asarray(self.ts >= tr_lo) & np.asarray(self.ts <= tr_hi)
+                & np.asarray(self.ts_end < val0))       # leak purge before val
+        idx = np.flatnonzero(mask)
+        self._models = {}
+        for name, kind in self.specs:
+            if name not in self.labels.columns:
+                continue
+            y = self.labels[name].to_numpy(np.float32)
+            ok = idx[np.isfinite(y[idx])]
+            if len(ok) < 100:
+                continue
+            self._models[name] = (kind, _fit(kind, self.X[ok], y[ok], self.seed))
+
+    def transform(self, E, ff68):
+        """ctx_* for query bars, from [E | ff68] (one column per head, in
+        specs order; 0.0 for any head that did not fit this fold)."""
+        Xq = np.hstack([np.asarray(E, np.float32),
+                        np.asarray(ff68, np.float32)])
+        cols = []
+        for name, kind in self.specs:
+            m = self._models.get(name)
+            if m is None:
+                cols.append(np.zeros(len(Xq), np.float32))
+            elif m[0] == 'reg':
+                cols.append(m[1].predict(Xq).astype(np.float32))
+            else:
+                cols.append(m[1].predict_proba(Xq)[:, 1].astype(np.float32))
+        return np.column_stack(cols)
+
+
 def run_context_eval(X, labels, ts, ts_end, item_ids, *, train_m=6, val_m=2,
                      test_m=2, seed=0, T=None, specs=HEAD_SPECS,
                      min_generalize_frac=MIN_GENERALIZE_FRAC, verbose=True):

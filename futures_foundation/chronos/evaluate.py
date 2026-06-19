@@ -181,7 +181,7 @@ def _agg_stats(name, R, tks=None):
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, context_heads_path=None, emb_mode='both',
         min_train_start=None, auto_regularize=True, return_verdict=False,
-        loop=False):
+        loop=False, ctx_provider=None, embed_cache=None):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
     (XGBoost-pipeline convention). Prints REAL/SHUFFLE/RANDOM per
@@ -259,7 +259,9 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             continue
         fold_data.append(dict(fold=fold, Ctr=Ctr, Ytr=np.asarray(Ytr), Ktr=Ktr,
                               Cval=Cval, Yval=np.asarray(Yval), Kval=Kval,
-                              Cte=Cte, Yte=np.asarray(Yte), Kte=Kte))
+                              Cte=Cte, Yte=np.asarray(Yte), Kte=Kte,
+                              tr_lo=tr['timestamp'].min(),
+                              tr_hi=tr['timestamp'].max(), val0=val0))
     if n_excluded:
         print(f"[folds] {n_excluded} fold(s) excluded by min_train_start="
               f"{pd.Timestamp(min_train_start).date()}")
@@ -269,13 +271,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     # Phase 2 — ONE batched Chronos embed across all productive folds.
     # Replaces ~2*N_folds subprocess loads with 1. Major speedup on long
     # walk-forwards; numpy/torch parallelize the single big inference call.
-    flat_contexts = []
+    flat_contexts, flat_keys = [], []
     for d in fold_data:
         flat_contexts.extend(d['Ctr']); flat_contexts.extend(d['Cval'])
         flat_contexts.extend(d['Cte'])
-    print(f"\n[batch-embed] {len(flat_contexts):,} contexts across "
-          f"{len(fold_data)} folds in ONE Chronos call...")
-    flat_embed = backbone.embed(flat_contexts)
+        flat_keys.extend(d['Ktr']); flat_keys.extend(d['Kval'])
+        flat_keys.extend(d['Kte'])
+    if embed_cache is not None:
+        # positional cache: look up each bar's embedding by key (tk, i) — no
+        # re-embedding (the bars were embedded once globally).
+        print(f"\n[embed-cache] {len(flat_keys):,} embeddings via positional "
+              f"cache ({len(fold_data)} folds, no re-embed)")
+        flat_embed = np.stack([embed_cache[k[0]][k[1]] for k in flat_keys])
+    else:
+        print(f"\n[batch-embed] {len(flat_contexts):,} contexts across "
+              f"{len(fold_data)} folds in ONE Chronos call...")
+        flat_embed = backbone.embed(flat_contexts)
     # slice back per fold + fuse with labeler features
     o = 0
     feats_fn = getattr(labeler, 'features', None)
@@ -290,18 +301,34 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             "(canonical get_model_feature_columns order). Or use an emb-only "
             "bundle / emb_mode='emb'.")
 
+    _ctx_need_ff68 = (ctx_provider is not None or
+                      (_enriched and _ff68_hook is not None))
+    if ctx_provider is not None and _ff68_hook is None:
+        raise ValueError(
+            "ctx_provider (walk-forward ctx fusion) needs the labeler's "
+            "ff68_at(keys) hook to build the [emb|ff68] head input.")
+
     def _fuse(keys, E):
         extra = (np.asarray(feats_fn(keys), np.float32)
                  if feats_fn is not None else None)
         ff68 = (np.asarray(_ff68_hook(keys), np.float32)
-                if (_enriched and _ff68_hook is not None) else None)
-        return context_fusion.fuse(E, extra, heads, emb_mode, ff68=ff68)
+                if _ctx_need_ff68 else None)
+        X = context_fusion.fuse(E, extra, heads, emb_mode, ff68=ff68)
+        if ctx_provider is not None:
+            # per-fold ctx_* (heads trained on THIS fold's train window only)
+            ctx = np.asarray(ctx_provider.transform(E, ff68), np.float32)
+            X = np.hstack([X, ctx]).astype(np.float32)
+        return X
 
     for d in fold_data:
         ntr, nva, nte = len(d['Ctr']), len(d['Cval']), len(d['Cte'])
         Etr = flat_embed[o:o + ntr]; o += ntr
         Eva = flat_embed[o:o + nva]; o += nva
         Ete = flat_embed[o:o + nte]; o += nte
+        if ctx_provider is not None:
+            # retrain ctx heads on THIS fold's TRAIN window (dense bars, purged
+            # before val) — the nested walk-forward; never sees val/test.
+            ctx_provider.fit(d['tr_lo'], d['tr_hi'], d['val0'])
         d['Xtr'] = _fuse(d['Ktr'], Etr)
         d['Xval'] = _fuse(d['Kval'], Eva)
         d['Xte'] = _fuse(d['Kte'], Ete)

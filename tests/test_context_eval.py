@@ -100,6 +100,53 @@ def test_run_context_eval_walkforward_learnable_heads():
         assert v['accurate'] is True
 
 
+def _provider_synth(n=3000, D=16, K=8, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, D + K)).astype(np.float32)        # [emb | ff68]
+    ts = pd.Series(pd.date_range('2021-01-01', '2024-12-31', periods=n, tz='UTC'))
+    ts_end = ts + pd.Timedelta(days=1)
+    labels = pd.DataFrame({
+        'vol_expansion': (X[:, 1] + 0.2 * rng.normal(size=n) > 0).astype(float),
+        'structure': np.sign(X[:, 2]).astype(float),
+        'range_bound': (X[:, 3] > 0).astype(float),
+        'volatility': (3.0 * X[:, 0]).astype(float)})
+    return X, labels, ts, ts_end, D, K
+
+
+def test_walkforward_provider_fit_transform_shape():
+    X, labels, ts, ts_end, D, K = _provider_synth()
+    prov = CE.WalkForwardCtxProvider(X, labels, ts, ts_end, seed=0)
+    prov.fit(pd.Timestamp('2021-01-01', tz='UTC'),
+             pd.Timestamp('2024-05-01', tz='UTC'),
+             pd.Timestamp('2024-06-01', tz='UTC'))
+    ctx = prov.transform(X[:40, :D], X[:40, D:])
+    assert ctx.shape == (40, len(CE.HEAD_SPECS))      # one column per head
+    assert np.isfinite(ctx).all()
+
+
+def test_walkforward_provider_learnable_head_correlates():
+    X, labels, ts, ts_end, D, K = _provider_synth()
+    prov = CE.WalkForwardCtxProvider(X, labels, ts, ts_end, seed=0)
+    prov.fit(pd.Timestamp('2021-01-01', tz='UTC'),
+             pd.Timestamp('2024-12-31', tz='UTC'),
+             pd.Timestamp('2025-06-01', tz='UTC'))
+    ctx = prov.transform(X[:, :D], X[:, D:])
+    vol_col = [n for n, _ in CE.HEAD_SPECS].index('volatility')
+    r = np.corrcoef(ctx[:, vol_col], labels['volatility'].to_numpy())[0, 1]
+    assert r > 0.5                                     # learnable head recovered
+
+
+def test_walkforward_provider_empty_window_returns_zeros():
+    X, labels, ts, ts_end, D, K = _provider_synth()
+    prov = CE.WalkForwardCtxProvider(X, labels, ts, ts_end, seed=0)
+    prov.fit(pd.Timestamp('2030-01-01', tz='UTC'),      # window with no bars
+             pd.Timestamp('2030-02-01', tz='UTC'),
+             pd.Timestamp('2030-03-01', tz='UTC'))
+    ctx = prov.transform(X[:10, :D], X[:10, D:])
+    assert ctx.shape == (10, len(CE.HEAD_SPECS))
+    assert (ctx == 0.0).all()                          # no fitted heads → zeros
+
+
 def test_run_context_eval_skips_unlabeled_head():
     X, labels, ts, T, items = _synth()
     labels['empty_head'] = np.nan
