@@ -53,16 +53,16 @@ This architecture is **proven live**: a production selection model (frozen Bolt 
 
 Every context target is probed with pre-registered gates, a shuffled-label control (leak detector), and a **trivial baseline** (8 trailing summary stats — "does the foundation know more than cheap features?"), on the full pre-2023 corpus (6 tickers × {3min, 5min}, ~236k decision bars).
 
-The heads ship as **four context concepts** downstream models consume — **market regime, market structure, range, volatility** — each measured on the **enriched input `[Bolt embedding | 68-feature library]`** (which beats both embedding-alone and the trivial baseline; close-only context was the binding constraint):
+The heads ship as **four context concepts** downstream models consume — **market regime, market structure, range, volatility** — on the **enriched input `[Bolt embedding | 68-feature library]`**. **Validated walk-forward** (the same overfit-driven process as the strategy heads: rolling train/validate/test across all regimes, generalization gate, shuffle + trivial controls — `scripts/eval_context_heads.py`). Each beats the trivial baseline (8 trailing stats), generalizes in 100% of folds, and the regression heads have shuffle ≈ 0 (no leak):
 
-| Context concept | Head (forward target) | Emb only | Trivial | **Emb + 68 features** |
+| Context concept | Forward target | Trivial | **Foundation `[emb｜ff68]`** | margin |
 |---|---|---|---|---|
-| **market regime** | Vol expansion >1.5× median (20-bar) | AUC .78 | .70 | **AUC .82** |
-| **market structure** | HH/HL vs LL/LH (20-bar) | AUC .79 | .81 | **AUC .82** |
-| **range** | Range-bound (10-bar) | AUC .59 | .67 | **AUC .70** |
-| **volatility** | Realized-vol percentile (10-bar) | r .52 | .41 | **r .64** |
+| **volatility** | realized-vol percentile (10-bar) | r .38 | **r .59** | **+.21** |
+| **market regime** | vol expansion >1.5× median (20-bar) | AUC .70 | **AUC .82** | **+.12** |
+| **market structure** | forward **BOS/ChoCH** — continuation (+1) vs reversal (−1) in {−1,0,+1} | r .32 | **r .44** | **+.13** |
+| **range** | range-bound: closes stay in band (10-bar) | AUC .67 | **AUC .69** | +.02 |
 
-Pruned 2026-06-18 (kept only what downstream needs): `fwd_return` (ties trivial — no skill beyond cheap features), `quiet_persist` and `trendiness` (not consumed downstream). The division of labor is the design: the foundation understands **conditions** (volatility, regime, structure, range); the strategy supplies the **edge** (signal selection, direction, sizing). Probe harness: `scripts/probe_context_heads.py`; walk-forward overfit-driven validation: `scripts/eval_context_heads.py`.
+The **structure** head was rewritten 2026-06-18 from a close-max/min label (beat trivial by only +.008) to a **forward break-of-structure / change-of-character** label — continuation vs reversal off a *causal* confirmed-swing reference, lookahead-audited — which lifted its edge ~16× (ChoCH clusters with vol expansion, which the foundation predicts well). Pruned the same day: `fwd_return` (ties trivial), `quiet_persist`, `trendiness` (not consumed downstream). Division of labor: the foundation understands **conditions**; the strategy supplies the **edge**. Probe: `scripts/probe_context_heads.py`.
 
 ### Context Heads — the per-candle market readout (FFM 2.1)
 
@@ -75,7 +75,9 @@ heads = ContextHeads.load('heads_<date>.joblib')        # or $CONTEXT_HEADS_BUND
 ctx = heads.context_at(ohlcv_df, bar_indices, 'ES')     # DataFrame: 4 ctx_* columns
 ```
 
-Certified out-of-sample on bars the heads never saw: calibration is monotone — `ctx_vol_expansion` deciles run 1%→90% realized, `ctx_structure` 10%→92% — and a regime classifier on the `ctx_*` fields beats its majority-class baseline OOS (`scripts/demo_regime_model.py`). Heads are trained once on pre-2023 data (`scripts/train_context_heads.py`), frozen, and leak-guarded (downstream consumers restricted to ≥ 2023). Validated the same overfit-driven, walk-forward way as the strategy heads (`scripts/eval_context_heads.py`).
+Heads are trained once on pre-2023 data (`scripts/train_context_heads.py`), frozen, and leak-guarded (downstream consumers restricted to ≥ 2023). They consume **jointly** — the 4 fields are a regime *vector* (e.g. "high vol + reversal structure + not range-bound"), stronger together than any one head; a regime classifier on the `ctx_*` fields beats its majority-class baseline OOS (`scripts/demo_regime_model.py`).
+
+**Fusing into a strategy.** Enriched heads (`[emb｜ff68]`) now run inside the chronos event-fusion seam: a labeler exposes `ff68_at(keys)` (the canonical 68 features at its decision bars) and `evaluate.run(..., context_heads_path=…, emb_mode='both')` fuses the `ctx_*` fields into the strategy's selection model. The A/B harness `colabs/ctx_ab.py` measures the downstream lift (pre-registered: adopt iff ≥ +0.10R over baseline, controls clean) and now also reports each arm's VAL→TEST generalization.
 
 ### Why this architecture
 
