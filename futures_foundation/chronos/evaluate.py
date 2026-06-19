@@ -312,30 +312,23 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         Ytr, Xtr, Xte, Kte = d['Ytr'], d['Xtr'], d['Xte'], d['Kte']
         Yte_np = d['Yte']
         nc = labeler.n_classes
-        # signal head — binary take/skip. FIT ON TRAIN ONLY.
-        head = head_factory(nc).fit(Xtr, Ytr, seed)
-
-        # ---- overfit DETECT + auto-REGULARIZE (REAL head; default head only) --
-        # If the head memorized train (train meanR ≫ val meanR), step down the
-        # regularization ladder and keep the rung with the best VALIDATION meanR.
-        # Selection uses TRAIN + VAL only — TEST is never consulted.
+        # signal head — binary take/skip. FIT ON TRAIN ONLY. When the default
+        # head is in use, fit it through the shared AUTO-REGULARIZE wheel
+        # (futures_foundation.overfit): fit default → if it overfit train→val,
+        # re-fit the regularization ladder and keep the best-on-VAL rung. Scored
+        # by realized meanR from the keys; selection never sees TEST.
         remediated = None
         if binary and auto_regularize and _default_head:
-            tr_R = labeler.evaluate(d['Ktr'], head.predict(Xtr))
-            vl_R = labeler.evaluate(d['Kval'], head.predict(d['Xval']))
-            tr_m = float(tr_R.mean()) if len(tr_R) else 0.0
-            vl_m = float(vl_R.mean()) if len(vl_R) else 0.0
-            if _overfit_trigger(tr_m, vl_m):            # overfit to train → remediate
-                cands = []                               # (cfg, val_meanR, head)
-                for cfg in REG_LADDER:
-                    h = XGBHead(nc, **cfg).fit(Xtr, Ytr, seed)
-                    vR = labeler.evaluate(d['Kval'], h.predict(d['Xval']))
-                    vm = float(vR.mean()) if len(vR) else -1e9
-                    cands.append((cfg, vm, h))
-                best_cfg = _best_rung(vl_m, [(c, vm) for c, vm, _ in cands])
-                if best_cfg is not None:                 # a rung beat the default
-                    head = next(h for c, vm, h in cands if c is best_cfg)
-                    remediated = best_cfg
+            _mean = lambda R: float(R.mean()) if len(R) else 0.0
+            head, remediated, _ = _of.regularized_fit(
+                fit=lambda cfg: XGBHead(nc, **cfg).fit(Xtr, Ytr, seed),
+                score_train=lambda m: _mean(labeler.evaluate(d['Ktr'],
+                                                             m.predict(Xtr))),
+                score_val=lambda m: _mean(labeler.evaluate(d['Kval'],
+                                                           m.predict(d['Xval']))),
+                reg_candidates=REG_LADDER, overfit_gap=OVERFIT_GAP_R)
+        else:
+            head = head_factory(nc).fit(Xtr, Ytr, seed)
 
         p_real = head.predict(Xte)
         R = labeler.evaluate(Kte, p_real)               # fixed-TP baseline (final head)

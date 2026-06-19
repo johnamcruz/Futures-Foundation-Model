@@ -1,14 +1,9 @@
-"""Run the overfit-driven context-head evaluation (futures_foundation.context_eval).
+"""Walk-forward, overfit-driven evaluation of the foundation CONTEXT heads.
 
-The SAME process the strategy selection heads use, applied to the foundation
-context heads — and crucially the first eval that checks accuracy on the
->= HEADS_CUTOFF period where the heads actually feed downstream strategies:
-
-  3-way train / validate / TEST  →  fit default  →  overfit-detect + auto-
-  regularize  →  VAL→TEST generalization gate  →  beat shuffle + trivial.
-
-Unlike scripts/probe_context_heads.py (pre-cutoff validation only), this builds
-the post-cutoff TEST split too, so a head is judged where it's used.
+The SAME process the strategy selection heads use — reusing walk_forward_folds
+(rolling train/val/test across ALL data) + the shared overfit library — applied
+to the context heads on the production enriched input [emb | 68 features]. Each
+head is judged in EVERY regime, not just a single 2023+ slice.
 
   python3 scripts/eval_context_heads.py --smoke     # ES 3min, minutes
   python3 scripts/eval_context_heads.py             # full 6 tickers x 2 TFs
@@ -27,11 +22,13 @@ sys.path.insert(0, str(ROOT))
 from futures_foundation import foundation as backbone           # noqa: E402
 from futures_foundation import context_eval as CE               # noqa: E402
 from futures_foundation.context import (                        # noqa: E402
-    compute_context_labels, HEAD_SPECS, HEADS_CUTOFF)
+    compute_context_labels, HEAD_SPECS, MAX_LABEL_HORIZON)
+from futures_foundation.features import (                       # noqa: E402
+    derive_features, get_model_feature_columns)
 
 CTX = 128
 EMBED_CHUNK = 20000
-VAL_START = pd.Timestamp('2022-11-01', tz='UTC')     # mirror the probe split
+TFS = ['3min', '5min']
 
 
 def trivial_features(close: pd.Series) -> pd.DataFrame:
@@ -54,17 +51,17 @@ def trivial_features(close: pd.Series) -> pd.DataFrame:
     return f
 
 
-def build_3way(tickers, tfs, stride):
-    """Decision bars across the FULL span (pre- AND post-cutoff) so we get a
-    real TEST split. Per-head label finiteness is filtered in run_context_eval."""
-    ctxs, labs, trivs, tss = [], [], [], []
+def build_dataset(tickers, tfs, stride):
+    """Decision bars across the FULL span (all regimes). Returns contexts,
+    labels, trivial features, ff68 features, ts, label-close ts, item ids."""
+    ctxs, labs, trivs, ffs, tss, tends, items = [], [], [], [], [], [], []
     for tk in tickers:
         for tf in tfs:
             path = ROOT / 'data' / f'{tk}_{tf}.csv'
             if not path.exists():
                 print(f"  [skip] {path.name} not found")
                 continue
-            df = pd.read_csv(path, usecols=['datetime', 'close'])
+            df = pd.read_csv(path)
             df['ts'] = pd.to_datetime(df['datetime'], utc=True)
             df = df.sort_values('ts').reset_index(drop=True)
             close = df['close'].astype(float)
@@ -72,24 +69,32 @@ def build_3way(tickers, tfs, stride):
             lab = compute_context_labels(close)
             triv = trivial_features(close)
             lp = np.log(close.to_numpy(np.float64))
-            ts20 = ts.shift(-20)
-            ok = (np.arange(len(df)) >= max(CTX, 200)) & ts20.notna().to_numpy()
+            t0 = time.time()
+            fdf = derive_features(df, tk)
+            cols = [c for c in get_model_feature_columns() if c in fdf.columns]
+            ts_end = ts.shift(-MAX_LABEL_HORIZON)
+            ok = (np.arange(len(df)) >= max(CTX, 200)) & ts_end.notna().to_numpy()
             idx = np.flatnonzero(ok)[::stride]
             if not len(idx):
                 continue
-            ctxs.append(np.stack([lp[i - CTX + 1:i + 1] for i in idx])
-                        .astype(np.float32))
+            ctxs.append(np.stack([lp[i - CTX + 1:i + 1] for i in idx]).astype(np.float32))
             labs.append(lab.iloc[idx].reset_index(drop=True))
             trivs.append(triv.iloc[idx].reset_index(drop=True))
+            ffs.append(fdf[cols].iloc[idx].reset_index(drop=True).to_numpy(np.float32))
             tss.append(ts.iloc[idx].reset_index(drop=True))
-            print(f"  [data] {tk}_{tf}: {len(idx):,} bars "
-                  f"({ts.iloc[idx[0]].date()} -> {ts.iloc[idx[-1]].date()})")
+            tends.append(ts_end.iloc[idx].reset_index(drop=True))
+            items += [f'{tk}_{tf}'] * len(idx)
+            print(f"  [data] {tk}_{tf}: {len(idx):,} bars ({cols and len(cols)} ff68, "
+                  f"{time.time() - t0:.0f}s)")
     if not ctxs:
         raise SystemExit("no data — nothing to evaluate")
     return (np.concatenate(ctxs),
             pd.concat(labs, ignore_index=True),
             pd.concat(trivs, ignore_index=True).to_numpy(np.float32),
-            pd.concat(tss, ignore_index=True))
+            np.concatenate(ffs),
+            pd.concat(tss, ignore_index=True),
+            pd.concat(tends, ignore_index=True),
+            np.asarray(items))
 
 
 def embed_chunked(contexts):
@@ -106,36 +111,40 @@ def embed_chunked(contexts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--smoke', action='store_true', help='ES 3min only, big stride')
-    ap.add_argument('--stride', type=int, default=3)
+    ap.add_argument('--stride', type=int, default=4)
+    ap.add_argument('--train-m', type=int, default=6)
+    ap.add_argument('--val-m', type=int, default=2)
+    ap.add_argument('--test-m', type=int, default=2)
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
 
     backbone.stamp_active_source(context='context-head eval')
     tickers = ['ES'] if a.smoke else ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI']
-    tfs = ['3min'] if a.smoke else ['3min', '5min']
+    tfs = ['3min'] if a.smoke else TFS
     stride = 20 if a.smoke else a.stride
 
-    print(f"[eval] tickers={tickers} tfs={tfs} stride={stride} "
-          f"cutoff={HEADS_CUTOFF.date()}")
-    C, labels, T, ts = build_3way(tickers, tfs, stride)
-    print(f"[eval] {len(C):,} decision bars; embedding...")
+    print(f"[eval] tickers={tickers} tfs={tfs} stride={stride}")
+    C, labels, T, F, ts, ts_end, items = build_dataset(tickers, tfs, stride)
+    print(f"[eval] {len(C):,} decision bars; ff68={F.shape[1]}; embedding...")
     E = embed_chunked(C)
+    X = np.hstack([E, F])                          # enriched [emb | ff68], production recipe
 
-    print(f"\n{'=' * 70}\n  CONTEXT-HEAD OVERFIT-DRIVEN EVAL "
-          f"(3-way; TEST = >= {HEADS_CUTOFF.date()}, the used-period)\n{'=' * 70}")
-    res = CE.run_context_eval(E, labels, ts, VAL_START, HEADS_CUTOFF,
-                              seed=a.seed, T=T, specs=HEAD_SPECS)
+    print(f"\n{'=' * 70}\n  CONTEXT-HEAD WALK-FORWARD OVERFIT-DRIVEN EVAL "
+          f"(enriched [emb|ff68])\n{'=' * 70}")
+    res = CE.run_context_eval(X, labels, ts, ts_end, items, train_m=a.train_m,
+                              val_m=a.val_m, test_m=a.test_m, seed=a.seed,
+                              T=T, specs=HEAD_SPECS)
 
-    acc = [n for n, v in res.items() if v['accurate']]
+    acc = [n for n, v in res.items() if v.get('accurate')]
     print(f"\n{'=' * 70}\n  ACCURATE + GENERALIZING (usable as model context): "
           f"{len(acc)}/{len(res)}\n   {acc or 'NONE'}\n{'=' * 70}")
     for n, v in res.items():
-        if not v['accurate']:
+        if not v.get('accurate') and v.get('n_folds'):
             why = []
             if not v['has_skill']:
-                why.append('below floor')
-            if not v['generalizes']:
-                why.append('does not generalize (val→test)')
+                why.append(f"below floor (mean_test {v['mean_test']:+.3f})")
+            if v['gen_frac'] < CE.MIN_GENERALIZE_FRAC:
+                why.append(f"generalizes only {v['gen_frac']:.0%} of folds")
             if not v['beats_trivial']:
                 why.append('<= trivial')
             if not v['beats_shuffle']:

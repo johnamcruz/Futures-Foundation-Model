@@ -71,3 +71,46 @@ def test_best_config_accept_margin():
 def test_best_config_empty_and_none_metrics():
     assert O.best_config(0.30, []) is None
     assert O.best_config(0.30, [({'i': 1}, None)]) is None
+
+
+# ---- regularized_fit (the extracted auto-regularize wheel) ------------------
+def test_regularized_fit_keeps_default_when_not_overfit():
+    fits = []
+    def fit(cfg):
+        fits.append(cfg); return cfg
+    m, rem, va = O.regularized_fit(fit, lambda m: 0.50, lambda m: 0.50,
+                                   reg_candidates=[{'id': 'A'}], overfit_gap=0.30)
+    assert rem is None and m == {} and va == 0.50
+    assert fits == [{}]                     # candidates NOT fit when no overfit
+
+
+def test_regularized_fit_swaps_to_best_val_candidate():
+    A, B = {'id': 'A'}, {'id': 'B'}
+    def fit(cfg):
+        return cfg
+    def score_train(m):
+        return 0.90 if m == {} else 0.60
+    def score_val(m):
+        return {'': 0.40, 'A': 0.50, 'B': 0.58}[m.get('id', '') if m else '']
+    m, rem, va = O.regularized_fit(fit, score_train, score_val,
+                                   reg_candidates=[A, B], overfit_gap=0.30)
+    assert rem is B and m is B and va == 0.58
+
+
+def test_regularized_fit_falls_back_when_no_candidate_beats_default():
+    A = {'id': 'A'}
+    def fit(cfg):
+        return cfg
+    m, rem, va = O.regularized_fit(
+        fit, lambda m: 0.90, lambda m: 0.50 if m == {} else 0.45,
+        reg_candidates=[A], overfit_gap=0.30)
+    assert rem is None and m == {} and va == 0.50
+
+
+def test_regularized_fit_no_candidates_keeps_default_even_if_overfit():
+    fits = []
+    def fit(cfg):
+        fits.append(cfg); return cfg
+    m, rem, va = O.regularized_fit(fit, lambda m: 0.90, lambda m: 0.40,
+                                   reg_candidates=(), overfit_gap=0.30)
+    assert rem is None and m == {} and fits == [{}]

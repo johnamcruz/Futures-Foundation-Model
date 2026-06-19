@@ -61,3 +61,34 @@ def best_config(default_val_metric, candidates, accept_margin=0.0):
         if m is not None and m > best_m:
             best_m, best_cfg = m, cfg
     return best_cfg
+
+
+def regularized_fit(fit, score_train, score_val, reg_candidates=(),
+                    overfit_gap=0.0):
+    """The reusable AUTO-REGULARIZE wheel, extracted from the chronos strategy
+    evaluator so the context heads reuse the identical logic:
+
+      fit the DEFAULT → if it overfit train→val (> overfit_gap), re-fit each
+      regularization candidate and keep the one with the best VALIDATION metric
+      (auto-fall-back to the default if none beats it). Selection sees train+val
+      only — never test.
+
+    Closure-based so fit-target and score-target can differ (strategy heads fit
+    on labels but score by realized-R from keys; context heads fit + score on the
+    same labels):
+      fit(cfg) -> fitted model            (cfg={} = the shipped defaults)
+      score_train(model) / score_val(model) -> metric (higher = better)
+
+    Returns (model, remediated_cfg_or_None, val_metric).
+    """
+    model = fit({})
+    tr, va = score_train(model), score_val(model)
+    remediated = None
+    if reg_candidates and overfit_trigger(tr, va, overfit_gap):
+        scored = [(cfg, fit(cfg)) for cfg in reg_candidates]
+        scored = [(cfg, m, score_val(m)) for cfg, m in scored]
+        best = best_config(va, [(cfg, s) for cfg, _, s in scored])
+        if best is not None:
+            model = next(m for cfg, m, _ in scored if cfg is best)
+            remediated, va = best, score_val(model)
+    return model, remediated, va

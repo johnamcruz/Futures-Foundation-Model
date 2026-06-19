@@ -1,7 +1,8 @@
-"""Tests for the context-head overfit-driven evaluation (context_eval).
+"""Tests for the walk-forward context-head evaluation (context_eval).
 
-head_verdict is the pure decision core; run_context_eval is exercised on small
-synthetic embeddings + labels (real tiny XGBoost, no foundation embedding).
+head_verdict (one fold) + aggregate_verdict (across folds) are the pure decision
+cores; run_context_eval is exercised on small synthetic inputs (real tiny
+XGBoost, no foundation embedding) over real walk-forward folds.
 """
 import numpy as np
 import pandas as pd
@@ -9,90 +10,102 @@ import pandas as pd
 from futures_foundation import context_eval as CE
 
 
-# ---- head_verdict (pure) ---------------------------------------------------
+# ---- head_verdict (one fold, pure) -----------------------------------------
 def test_reg_head_accurate():
-    v = CE.head_verdict('reg', train_m=0.60, val_m=0.55, test_m=0.52,
-                        trivial_m=0.20, shuffle_m=0.00)
+    v = CE.head_verdict('reg', 0.60, 0.55, 0.52, trivial_m=0.20, shuffle_m=0.00)
     assert v['generalizes'] and v['has_skill']
-    assert v['beats_trivial'] and v['beats_shuffle']
-    assert v['accurate'] is True
+    assert v['beats_trivial'] and v['beats_shuffle'] and v['accurate']
 
 
 def test_reg_head_fails_when_not_generalizing():
-    # val 0.55 → test 0.40 = 0.15 decay > REG_GEN_GAP 0.10
     v = CE.head_verdict('reg', 0.60, 0.55, 0.40, trivial_m=0.20, shuffle_m=0.0)
-    assert v['generalizes'] is False
-    assert v['accurate'] is False
+    assert v['generalizes'] is False and v['accurate'] is False
 
 
 def test_reg_head_fails_below_skill_floor():
     v = CE.head_verdict('reg', 0.06, 0.05, 0.03, trivial_m=0.0, shuffle_m=0.0)
-    assert v['has_skill'] is False        # 0.03 < GATE_REG_PEARSON 0.05
-    assert v['accurate'] is False
-
-
-def test_reg_head_fails_when_not_beating_trivial():
-    v = CE.head_verdict('reg', 0.60, 0.55, 0.52, trivial_m=0.60, shuffle_m=0.0)
-    assert v['beats_trivial'] is False
-    assert v['accurate'] is False
+    assert v['has_skill'] is False and v['accurate'] is False
 
 
 def test_clf_head_accurate_and_overfit_flag():
-    v = CE.head_verdict('clf', train_m=0.95, val_m=0.78, test_m=0.76,
-                        trivial_m=0.60, shuffle_m=0.50)
+    v = CE.head_verdict('clf', 0.95, 0.78, 0.76, trivial_m=0.60, shuffle_m=0.50)
     assert v['generalizes'] and v['has_skill'] and v['accurate']
-    assert v['overfit'] is True           # 0.95−0.78 = 0.17 > CLF_OVERFIT_GAP
+    assert v['overfit'] is True
 
 
 def test_clf_head_not_generalizing():
     v = CE.head_verdict('clf', 0.80, 0.78, 0.70, trivial_m=0.6, shuffle_m=0.5)
-    assert v['generalizes'] is False      # 0.08 AUC decay > 0.05
-    assert v['accurate'] is False
+    assert v['generalizes'] is False and v['accurate'] is False
 
 
-def test_verdict_controls_optional():
-    # no controls given → not penalized for them
-    v = CE.head_verdict('reg', 0.60, 0.55, 0.52)
-    assert v['beats_trivial'] and v['beats_shuffle'] and v['accurate']
+# ---- aggregate_verdict (across folds, pure) --------------------------------
+def _fv(val, test, gen, triv=0.2, shuf=0.0):
+    return dict(val=val, test=test, generalizes=gen, trivial=triv, shuffle=shuf)
 
 
-# ---- run_context_eval (synthetic end-to-end) -------------------------------
-def _synth(n=2000, seed=0):
+def test_aggregate_accurate_when_generalizes_most_folds():
+    folds = [_fv(0.5, 0.5, True) for _ in range(5)]
+    v = CE.aggregate_verdict('reg', folds, min_generalize_frac=0.6)
+    assert v['gen_frac'] == 1.0 and v['accurate'] is True
+    assert v['n_folds'] == 5 and v['mean_test'] == 0.5
+
+
+def test_aggregate_fails_when_too_few_folds_generalize():
+    folds = [_fv(0.5, 0.5, i < 2) for i in range(5)]      # 2/5 generalize
+    v = CE.aggregate_verdict('reg', folds, min_generalize_frac=0.6)
+    assert v['gen_frac'] == 0.4 and v['accurate'] is False
+
+
+def test_aggregate_fails_below_floor():
+    folds = [_fv(0.04, 0.03, True, triv=None, shuf=None) for _ in range(3)]
+    v = CE.aggregate_verdict('reg', folds, 0.6)
+    assert v['has_skill'] is False and v['accurate'] is False
+
+
+def test_aggregate_fails_when_not_beating_trivial():
+    folds = [_fv(0.5, 0.30, True, triv=0.40) for _ in range(4)]  # test < trivial
+    v = CE.aggregate_verdict('reg', folds, 0.6)
+    assert v['beats_trivial'] is False and v['accurate'] is False
+
+
+def test_aggregate_empty():
+    v = CE.aggregate_verdict('reg', [])
+    assert v['n_folds'] == 0 and v['accurate'] is False
+
+
+# ---- run_context_eval (synthetic walk-forward, end-to-end) -----------------
+def _synth(n=4000, seed=0):
     rng = np.random.default_rng(seed)
-    E = rng.normal(size=(n, 8)).astype(np.float32)
+    X = rng.normal(size=(n, 8)).astype(np.float32)
     ts = pd.Series(pd.date_range('2019-01-01', '2024-06-01', periods=n, tz='UTC'))
-    # learnable: volatility (reg) from E[:,0]; vol_expansion (clf) from E[:,1]
-    y_reg = (3.0 * E[:, 0] + 0.2 * rng.normal(size=n)).astype(np.float32)
-    y_clf = (E[:, 1] + 0.2 * rng.normal(size=n) > 0).astype(np.float32)
+    y_reg = (3.0 * X[:, 0] + 0.2 * rng.normal(size=n)).astype(np.float32)
+    y_clf = (X[:, 1] + 0.2 * rng.normal(size=n) > 0).astype(np.float32)
     labels = pd.DataFrame({'volatility': y_reg, 'vol_expansion': y_clf})
-    T = E[:, 5:7].copy()                  # trivial baseline = unrelated columns
-    return E, labels, ts, T
+    T = X[:, 5:7].copy()                          # trivial baseline = unrelated cols
+    items = np.array(['SYN'] * n)
+    return X, labels, ts, T, items
 
 
-def test_run_context_eval_learnable_heads_generalize():
-    E, labels, ts, T = _synth()
+def test_run_context_eval_walkforward_learnable_heads():
+    X, labels, ts, T, items = _synth()
     res = CE.run_context_eval(
-        E, labels, ts,
-        val_start=pd.Timestamp('2022-11-01', tz='UTC'),
-        cutoff=pd.Timestamp('2023-01-01', tz='UTC'),
-        T=T, specs=[('volatility', 'reg'), ('vol_expansion', 'clf')],
-        verbose=False)
+        X, labels, ts, ts_end=ts, item_ids=items,
+        train_m=6, val_m=2, test_m=2, T=T,
+        specs=[('volatility', 'reg'), ('vol_expansion', 'clf')], verbose=False)
     assert set(res) == {'volatility', 'vol_expansion'}
     for name, v in res.items():
-        assert v['test'] is not None and v['n_test'] >= 30
-        assert v['has_skill'] is True          # learnable → clears the floor
-        assert v['generalizes'] is True        # signal holds val→test
-        assert v['beats_shuffle'] is True      # real signal beats permuted labels
+        assert v['n_folds'] >= 2
+        assert v['has_skill'] is True            # learnable → clears the floor
+        assert v['gen_frac'] >= 0.5              # holds across most folds
+        assert v['accurate'] is True
 
 
-def test_run_context_eval_skips_thin_heads():
-    E, labels, ts, T = _synth(n=2000)
-    labels['empty_head'] = np.nan              # no finite rows → skipped
+def test_run_context_eval_skips_unlabeled_head():
+    X, labels, ts, T, items = _synth()
+    labels['empty_head'] = np.nan
     res = CE.run_context_eval(
-        E, labels, ts,
-        val_start=pd.Timestamp('2022-11-01', tz='UTC'),
-        cutoff=pd.Timestamp('2023-01-01', tz='UTC'),
-        T=T, specs=[('empty_head', 'reg'), ('volatility', 'reg')],
-        verbose=False)
-    assert 'empty_head' not in res
-    assert 'volatility' in res
+        X, labels, ts, ts_end=ts, item_ids=items,
+        train_m=6, val_m=2, test_m=2, T=T,
+        specs=[('empty_head', 'reg'), ('volatility', 'reg')], verbose=False)
+    assert res['empty_head']['n_folds'] == 0 and res['empty_head']['accurate'] is False
+    assert res['volatility']['accurate'] is True
