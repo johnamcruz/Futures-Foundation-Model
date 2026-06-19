@@ -58,6 +58,38 @@ def test_fuse_no_heads_is_legacy_identical(heads):
     np.testing.assert_array_equal(cf.fuse(E, None, None, 'heads'), E)
 
 
+def _enriched_heads(n=1500, k_ff=8):
+    """A heads bundle trained on [emb | ff68] (meta inputs='emb+ff68')."""
+    emb = RNG.normal(0, 1, (n, D)).astype(np.float32)
+    ff = RNG.normal(0, 1, (n, k_ff)).astype(np.float32)
+    X = np.hstack([emb, ff])
+    lab = pd.DataFrame({
+        'vol_expansion': (X[:, 1] > 0).astype(float),
+        'volatility': 1 / (1 + np.exp(-X[:, 2])),
+        'structure': np.sign(X[:, 3]),
+        'range_bound': (X[:, 0] < 0).astype(float)})
+    cut = int(n * .8)
+    h = ContextHeads(seed=0, n_estimators=40).fit(
+        X[:cut], lab.iloc[:cut], X[cut:], lab.iloc[cut:], verbose=False)
+    h.meta = {'inputs': 'emb+ff68'}
+    return h, emb, ff
+
+
+def test_fuse_enriched_needs_ff68_and_runs_with_it():
+    h, emb, ff = _enriched_heads()
+    nc = len(h.active_names)
+    # with ff68 → [emb | ctx], heads run on [emb|ff68]
+    out = cf.fuse(emb[:6], None, h, 'both', ff68=ff[:6])
+    assert out.shape == (6, D + nc)
+    # ctx-only arm
+    assert cf.fuse(emb[:6], None, h, 'heads', ff68=ff[:6]).shape == (6, nc)
+    # emb arm needs no ff68 (no ctx emitted)
+    assert cf.fuse(emb[:6], None, h, 'emb').shape == (6, D)
+    # emitting ctx without ff68 → raises
+    with pytest.raises(ValueError, match='ff68'):
+        cf.fuse(emb[:6], None, h, 'both')
+
+
 def test_fuse_arm_dims(heads):
     E = RNG.normal(0, 1, (10, D)).astype(np.float32)
     F = RNG.normal(0, 1, (10, 3)).astype(np.float32)

@@ -47,11 +47,10 @@ def resolve_heads(path=None, verbose=True):
         print(f"  source: {p}")
         print(f"  emits : {heads.active_names or '(none passed gate!)'}")
         if heads.meta.get('inputs') == 'emb+ff68':
-            print(f"  ⚠️  ENRICHED BUNDLE (inputs=emb+ff68): NOT usable in "
-                  f"this event-fusion seam")
-            print(f"  ⚠️  (only embeddings exist here) — fuse() will raise. "
-                  f"Use ContextHeads.context_at,")
-            print(f"  ⚠️  or train an emb-only bundle for fusion.")
+            print(f"  ENRICHED bundle (inputs=emb+ff68): needs the 68-feature "
+                  f"library at decision bars")
+            print(f"  via the labeler's ff68_at(keys) hook (fuse ff68=...). "
+                  f"emb-only bundles need no hook.")
         if heads.meta:
             for k in ('cutoff', 'train_span', 'tickers', 'tfs', 'git_sha'):
                 if k in heads.meta:
@@ -60,25 +59,34 @@ def resolve_heads(path=None, verbose=True):
     return heads
 
 
-def fuse(E, extra=None, heads=None, emb_mode='both'):
+def fuse(E, extra=None, heads=None, emb_mode='both', ff68=None):
     """Build the feature matrix: [embedding?] + [ctx_* heads?] + [strategy
     features?]. heads=None -> byte-identical legacy behavior regardless of
-    emb_mode. -> float32 [N, feat_dim]."""
+    emb_mode. -> float32 [N, feat_dim].
+
+    ENRICHED bundles (inputs='emb+ff68') need the 68-feature library AT the
+    decision bars: pass `ff68` ([N, 68], canonical order). The heads then run on
+    [embedding | ff68]. ff68 is only required when ctx_* are actually emitted
+    (emb_mode in {'both','heads'}); for 'emb' (baseline) it is ignored.
+    """
     if emb_mode not in EMB_MODES:
         raise ValueError(f"emb_mode must be one of {EMB_MODES}, "
                          f"got {emb_mode!r}")
-    if heads is not None and heads.meta.get('inputs') == 'emb+ff68':
-        raise ValueError(
-            "context-heads bundle was trained on inputs='emb+ff68' — the "
-            "chronos event-fusion seam only has embeddings, so enriched "
-            "heads cannot run here. Use ContextHeads.context_at for the "
-            "per-candle readout, or train an emb-only bundle for fusion.")
     E = np.asarray(E, np.float32)
+    enriched = heads is not None and heads.meta.get('inputs') == 'emb+ff68'
+    emit_ctx = heads is not None and emb_mode in ('heads', 'both')
+    if enriched and emit_ctx and ff68 is None:
+        raise ValueError(
+            "enriched context bundle (inputs='emb+ff68') needs the 68-feature "
+            "library at the decision bars — pass ff68=[N,68] (e.g. via the "
+            "labeler's ff68_at(keys) hook), or use an emb-only bundle.")
     parts = []
     if heads is None or emb_mode in ('emb', 'both'):
         parts.append(E)
-    if heads is not None and emb_mode in ('heads', 'both'):
-        parts.append(heads.transform(E))
+    if emit_ctx:
+        head_in = (np.hstack([E, np.asarray(ff68, np.float32)])
+                   if enriched else E)
+        parts.append(heads.transform(head_in))
     if extra is not None:
         extra = np.asarray(extra, np.float32)
         if extra.size:

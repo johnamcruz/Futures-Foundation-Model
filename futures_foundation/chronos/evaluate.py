@@ -280,10 +280,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     o = 0
     feats_fn = getattr(labeler, 'features', None)
 
+    _enriched = (heads is not None
+                 and heads.meta.get('inputs') == 'emb+ff68')
+    _ff68_hook = getattr(labeler, 'ff68_at', None)
+    if _enriched and emb_mode in ('both', 'heads') and _ff68_hook is None:
+        raise ValueError(
+            "enriched context bundle needs the 68-feature library at decision "
+            "bars — the labeler must implement ff68_at(keys) -> [N,68] "
+            "(canonical get_model_feature_columns order). Or use an emb-only "
+            "bundle / emb_mode='emb'.")
+
     def _fuse(keys, E):
         extra = (np.asarray(feats_fn(keys), np.float32)
                  if feats_fn is not None else None)
-        return context_fusion.fuse(E, extra, heads, emb_mode)
+        ff68 = (np.asarray(_ff68_hook(keys), np.float32)
+                if (_enriched and _ff68_hook is not None) else None)
+        return context_fusion.fuse(E, extra, heads, emb_mode, ff68=ff68)
 
     for d in fold_data:
         ntr, nva, nte = len(d['Ctr']), len(d['Cval']), len(d['Cte'])
