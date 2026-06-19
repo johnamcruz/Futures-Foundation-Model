@@ -81,8 +81,27 @@ def _best_rung(default_val_meanR, rung_val_means):
     return best_cfg
 
 
+def _pooled_auc(proba_records):
+    """Pooled TEST ROC-AUC of the selection head's P(take) vs the realized
+    take/skip label, across all (fold,seed) records. Measures discrimination
+    (ranking quality) independent of the operating threshold. None if
+    degenerate (one class) or sklearn unavailable. proba_records entries are
+    (Kte, proba, Yte, risk_pred)."""
+    if not proba_records:
+        return None
+    ys = np.concatenate([y for _, _, y, _ in proba_records])
+    ps = np.concatenate([p for _, p, _, _ in proba_records])
+    if len(np.unique(ys)) < 2:
+        return None
+    try:
+        from sklearn.metrics import roc_auc_score
+        return float(roc_auc_score(ys, ps))
+    except Exception:
+        return None
+
+
 def _operating_verdict(v_at, t_at, gap, real_m, shuf_m, rand_m, naive_m,
-                       thr=None, records=None):
+                       thr=None, records=None, auc=None):
     """Build the pre-registered operating-point verdict (pure; unit-tested).
     Returns (checks, all_pass, verdict_dict). checks: list of (ok, msg). The
     VAL→TEST gap is a HARD generalization criterion — fake edge fails here."""
@@ -112,7 +131,7 @@ def _operating_verdict(v_at, t_at, gap, real_m, shuf_m, rand_m, naive_m,
         test_n=(t_at['n'] if t_at else 0),
         val_meanR=(v_at['meanR'] if v_at else None),
         edge_shuffle=real_m - shuf_m, edge_random=real_m - rand_m,
-        edge_naive=real_m - naive_m, records=records)
+        edge_naive=real_m - naive_m, auc=auc, records=records)
     return checks, all_pass, verdict
 
 
@@ -597,9 +616,13 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
                   if pool['RANDOM'][0] else 0.0)
         naive_m = (float(np.concatenate(pool['NAIVE'][0]).mean())
                    if pool.get('NAIVE', ([], []))[0] else 0.0)
+        auc = _pooled_auc(proba_records)        # threshold-free discrimination
+        if auc is not None:
+            print(f"   TEST ROC-AUC: {auc:.3f}  "
+                  f"(0.5=no skill; ranks winners vs losers, threshold-free)")
         checks, all_pass, verdict = _operating_verdict(
             v_at, t_at, gap, real_m, shuf_m, rand_m, naive_m,
-            thr=thr_star, records=out)
+            thr=thr_star, records=out, auc=auc)
         print(f"\n   {'✅ PASS' if all_pass else '❌ FAIL'} — operating point:")
         for ok, msg in checks:
             print(f"     {'✓' if ok else '✗'} {msg}")

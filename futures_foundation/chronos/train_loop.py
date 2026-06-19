@@ -114,7 +114,8 @@ def train_loop(labeler, *, max_iters=3, loop_max_folds=12, final_max_folds=None,
     print(f"#  chosen params : {source} → {params or 'shipped defaults'}")
     if final:
         print(f"#  final OOS     : generalizes={final.get('generalizes')}  "
-              f"gap={final.get('gap')}  all_pass={final.get('all_pass')}")
+              f"gap={final.get('gap')}  all_pass={final.get('all_pass')}  "
+              f"AUC={final.get('auc')}")
         print(f"#  final TEST    : meanR={final.get('test_meanR')}  "
               f"n={final.get('test_n')}  edge(REAL−SHUF)={final.get('edge_shuffle')}")
     print(f"{'#'*64}", flush=True)

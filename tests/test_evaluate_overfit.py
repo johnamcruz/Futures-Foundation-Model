@@ -81,6 +81,42 @@ def test_verdict_fails_when_edge_too_weak():
     assert all_pass is False
 
 
+# ---- _pooled_auc -----------------------------------------------------------
+def _rec(proba, y):
+    import numpy as np
+    return (None, np.asarray(proba, np.float32), np.asarray(y, np.int8), None)
+
+
+def test_pooled_auc_perfect_ranking():
+    # winners all scored above losers → AUC 1.0
+    r = _rec([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0])
+    assert ev._pooled_auc([r]) == 1.0
+
+
+def test_pooled_auc_random_is_half():
+    r = _rec([0.5, 0.5, 0.5, 0.5], [1, 0, 1, 0])
+    assert ev._pooled_auc([r]) == 0.5
+
+
+def test_pooled_auc_pools_across_records():
+    a = _rec([0.9, 0.1], [1, 0])
+    b = _rec([0.8, 0.2], [1, 0])
+    assert ev._pooled_auc([a, b]) == 1.0
+
+
+def test_pooled_auc_degenerate_single_class_none():
+    assert ev._pooled_auc([_rec([0.7, 0.3], [1, 1])]) is None
+    assert ev._pooled_auc([]) is None
+
+
+def test_verdict_carries_auc():
+    e = _strong_edges()
+    _, _, v = ev._operating_verdict(
+        _at(), _at(), gap=-0.05, real_m=e['real_m'], shuf_m=e['shuf_m'],
+        rand_m=e['rand_m'], naive_m=e['naive_m'], thr=0.6, auc=0.61)
+    assert v['auc'] == 0.61
+
+
 def test_verdict_gap_none_does_not_generalize():
     e = _strong_edges()
     checks, all_pass, v = ev._operating_verdict(
