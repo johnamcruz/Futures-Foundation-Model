@@ -53,7 +53,7 @@ GATE_CLF_AUC = 0.55
 #: for context). range_pos/trend_start were removed earlier (never beat trivial).
 HEAD_SPECS = [
     ('vol_expansion', 'clf'),    # market regime: fwd 20-bar vol > 1.5x median
-    ('structure', 'clf'),        # market structure: HH/HL vs LL/LH
+    ('structure', 'reg'),        # market structure: fwd BOS in {-1,0,+1}
     ('range_bound', 'clf'),      # range: fwd 10-bar closes stay in range
     ('volatility', 'reg'),       # volatility: fwd 10-bar realized-vol percentile
 ]
@@ -68,6 +68,69 @@ HEAD_SPECS = [
 CANDIDATE_HEAD_SPECS = []
 
 
+def _forward_structure(close: pd.Series, lookback: int = 10,
+                       horizon: int = 30) -> pd.Series:
+    """Forward structure event in {-1, 0, +1} — CONTINUATION vs REVERSAL,
+    lookahead-safe. Captures both BOS (continuation) and ChoCH (reversal):
+
+      +1  BOS continuation  — price breaks the swing level IN the direction of
+                              the current (causal) trend first
+      -1  ChoCH reversal    — price breaks the swing level AGAINST the current
+                              trend first (change of character)
+       0  neither breaks in (i, i+horizon], or no established trend
+
+    Everything used to decide bar i is causal-or-forward: the current structure
+    STATE and the swing reference levels come only from swings CONFIRMED at or
+    before i (centered close-pivots published at confirmation = shift(+lookback));
+    the break OUTCOME reads only close[i+1 .. i+horizon]. No bar > i+horizon ever
+    enters out[i]. The last `horizon` bars are NaN.
+    """
+    c = close.to_numpy(float)
+    n = len(c)
+    out = np.full(n, np.nan)
+    if n <= horizon + 1:
+        return pd.Series(out, index=close.index)
+    w = 2 * lookback + 1
+    s = pd.Series(c)
+    rmax = s.rolling(w, center=True).max()
+    rmin = s.rolling(w, center=True).min()
+    sh = s.where(s == rmax).shift(lookback)         # confirmed swing-high close
+    sl = s.where(s == rmin).shift(lookback)         # confirmed swing-low close
+    ref_hi = sh.ffill().to_numpy()
+    ref_lo = sl.ffill().to_numpy()
+    # causal current structure STATE: HH&HL = +1 (up), LH&LL = -1 (down), else 0
+    def _ffill_bool(cond):                          # float ffill (no object dtype)
+        return (cond.astype(float).reindex(range(n)).ffill().fillna(0.0)
+                .to_numpy() > 0)
+    shd, sld = sh.dropna(), sl.dropna()
+    hh = _ffill_bool(shd.diff() > 0)
+    lh = _ffill_bool(shd.diff() < 0)
+    hl = _ffill_bool(sld.diff() > 0)
+    ll = _ffill_bool(sld.diff() < 0)
+    state = np.zeros(n)
+    state[hh & hl] = 1.0
+    state[lh & ll] = -1.0
+
+    m = n - horizon
+    fw = np.lib.stride_tricks.sliding_window_view(c[1:], horizon)[:m]
+    up, dn = fw > ref_hi[:m, None], fw < ref_lo[:m, None]
+    any_up, any_dn = up.any(1), dn.any(1)
+    first_up = np.where(any_up, up.argmax(1), horizon)   # bar of FIRST up-break
+    first_dn = np.where(any_dn, dn.argmax(1), horizon)
+    broke_up = any_up & (first_up <= first_dn)           # up-break came first
+    broke_dn = any_dn & (first_dn < first_up)
+    st = state[:m]
+    lab = np.zeros(m)
+    # continuation = break in the trend direction; reversal (ChoCH) = against it
+    lab[(st == 1) & broke_up] = 1.0      # uptrend breaks higher  → BOS
+    lab[(st == 1) & broke_dn] = -1.0     # uptrend breaks lower   → ChoCH
+    lab[(st == -1) & broke_dn] = 1.0     # downtrend breaks lower → BOS
+    lab[(st == -1) & broke_up] = -1.0    # downtrend breaks higher→ ChoCH
+    lab[~(np.isfinite(ref_hi[:m]) & np.isfinite(ref_lo[:m]))] = np.nan
+    out[:m] = lab
+    return pd.Series(out, index=close.index)
+
+
 def compute_context_labels(close: pd.Series) -> pd.DataFrame:
     """All seven forward-looking labels from a close series. NaN where a
     trailing or forward window is unavailable — never filled.
@@ -75,9 +138,9 @@ def compute_context_labels(close: pd.Series) -> pd.DataFrame:
     The four shipped context concepts (HEAD_SPECS):
       vol_expansion  clf  MARKET REGIME: fwd 20-bar realized vol > 1.5x
                           trailing 200-bar median of 20-bar realized vol
-      structure      clf  MARKET STRUCTURE: fwd 20-bar close max/min vs
-                          trailing 12-bar: both higher = 1, both lower = 0,
-                          mixed NaN
+      structure      reg  MARKET STRUCTURE in {-1,0,+1}: forward continuation
+                          (+1 BOS, break with trend) vs reversal (-1 ChoCH,
+                          break against the causal current trend), 0 neither
       range_bound    clf  RANGE: fwd 10-bar closes stay in trailing 20-bar range
       volatility     reg  VOLATILITY: fwd 10-bar realized-vol percentile vs
                           trailing 100 bars' 10-bar vols, continuous [0,1]
@@ -111,15 +174,10 @@ def compute_context_labels(close: pd.Series) -> pd.DataFrame:
         pct[W - 1:] = ranks
     out['volatility'] = pct
 
-    ref_hi = close.rolling(12).max()
-    ref_lo = close.rolling(12).min()
-    fwd_hi = close.rolling(20).max().shift(-20)   # covers t+1..t+20
-    fwd_lo = close.rolling(20).min().shift(-20)
-    st = pd.Series(np.nan, index=close.index)
-    valid = ref_hi.notna() & ref_lo.notna() & fwd_hi.notna() & fwd_lo.notna()
-    st[valid & (fwd_hi > ref_hi) & (fwd_lo > ref_lo)] = 1.0
-    st[valid & (fwd_hi < ref_hi) & (fwd_lo < ref_lo)] = 0.0
-    out['structure'] = st                          # mixed = NaN sentinel
+    # MARKET STRUCTURE: forward continuation (+1 BOS) vs reversal (-1 ChoCH),
+    # off a CAUSAL confirmed-swing reference (lookahead-safe — see
+    # _forward_structure).
+    out['structure'] = _forward_structure(close)
 
     rh = close.rolling(20).max()
     rl = close.rolling(20).min()

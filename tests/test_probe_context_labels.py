@@ -41,7 +41,7 @@ def test_all_heads_present_and_tail_nan(random_close):
     # forward-looking: the last `horizon` rows must be NaN, never filled
     assert lab['vol_expansion'].iloc[-20:].isna().all()
     assert lab['volatility'].iloc[-10:].isna().all()
-    assert lab['structure'].iloc[-20:].isna().all()
+    assert lab['structure'].iloc[-30:].isna().all()      # BOS horizon = 30
     assert lab['range_bound'].iloc[-10:].isna().all()
     # and there IS a populated middle
     mid = lab.iloc[250:350]
@@ -60,15 +60,32 @@ def test_vol_expansion_known_answer():
     assert (ve.iloc[490:520].dropna() == 1).all()        # fwd window in burst
 
 
-def test_structure_known_answer():
-    """Monotonic rise -> structure 1 (bull); monotonic fall -> 0 (bear);
-    a flat series -> mixed/NaN (neither leg extends)."""
-    up = probe.compute_labels(_series(np.arange(100, 100 + N)))['structure']
-    assert (up.dropna() == 1.0).all()
-    dn = probe.compute_labels(_series(np.arange(100 + N, 100, -1)))['structure']
-    assert (dn.dropna() == 0.0).all()
-    flat = probe.compute_labels(_series(np.full(N, 100.0)))['structure']
-    assert flat.isna().all()                              # mixed = sentinel
+def test_structure_continuation_and_choch():
+    """structure = continuation (+1 BOS) vs reversal (-1 ChoCH). A STEADY
+    oscillating trend keeps breaking WITH the trend → continuation dominates
+    (+1). A trend that flips produces ChoCH (-1) breaks against the prior
+    trend. Values are exactly {-1,0,+1}."""
+    t = np.arange(N)
+    up = probe.compute_labels(_series(100 + 0.3 * t + 2 * np.sin(t / 5)))['structure']
+    assert set(up.dropna().unique()) <= {-1.0, 0.0, 1.0}
+    assert up.dropna().mean() > 0.2                       # continuation dominates
+    # uptrend then sharp reversal → at least some ChoCH (-1)
+    h = N // 2
+    flip = np.concatenate([100 + 0.3 * np.arange(h),
+                           100 + 0.3 * h - 0.5 * np.arange(N - h)])
+    rev = probe.compute_labels(_series(flip + 2 * np.sin(t / 5)))['structure']
+    assert (rev.dropna() == -1.0).sum() > 0              # ChoCH reversals appear
+
+
+def test_structure_no_lookahead():
+    """structure[i] must NOT change when bars > i+horizon change (forward BOS
+    reads only the causal swing reference + the [i+1, i+horizon] window)."""
+    base = 100 + 0.2 * np.arange(N) + 2 * np.sin(np.arange(N) / 5)
+    a = probe.compute_labels(_series(base))['structure']
+    mod = base.copy()
+    mod[450:] *= 1.5                                      # mutate far future only
+    b = probe.compute_labels(_series(mod))['structure']
+    pd.testing.assert_series_equal(a.iloc[:400], b.iloc[:400])  # 400+30 < 450
 
 
 def test_volatility_percentile_bounds_and_response(random_close):

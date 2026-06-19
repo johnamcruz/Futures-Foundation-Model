@@ -111,6 +111,8 @@ def embed_chunked(contexts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--smoke', action='store_true', help='ES 3min only, big stride')
+    ap.add_argument('--tfs', nargs='*', default=None,
+                    help='timeframes (default: 3min 5min; e.g. --tfs 3min)')
     ap.add_argument('--stride', type=int, default=4)
     ap.add_argument('--train-m', type=int, default=6)
     ap.add_argument('--val-m', type=int, default=2)
@@ -120,7 +122,7 @@ def main():
 
     backbone.stamp_active_source(context='context-head eval')
     tickers = ['ES'] if a.smoke else ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI']
-    tfs = ['3min'] if a.smoke else TFS
+    tfs = a.tfs or (['3min'] if a.smoke else TFS)
     stride = 20 if a.smoke else a.stride
 
     print(f"[eval] tickers={tickers} tfs={tfs} stride={stride}")
