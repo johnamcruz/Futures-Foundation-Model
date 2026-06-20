@@ -181,7 +181,8 @@ def _agg_stats(name, R, tks=None):
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, context_heads_path=None, emb_mode='both',
         min_train_start=None, auto_regularize=True, return_verdict=False,
-        loop=False, ctx_provider=None, embed_cache=None):
+        loop=False, ctx_provider=None, embed_cache=None,
+        pool_mode='mean', use_loc_scale=False):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
     (XGBoost-pipeline convention). Prints REAL/SHUFFLE/RANDOM per
@@ -277,16 +278,24 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         flat_contexts.extend(d['Cte'])
         flat_keys.extend(d['Ktr']); flat_keys.extend(d['Kval'])
         flat_keys.extend(d['Kte'])
+    flat_ls = None
     if embed_cache is not None:
         # positional cache: look up each bar's embedding by key (tk, i) — no
         # re-embedding (the bars were embedded once globally).
+        if pool_mode != 'mean' or use_loc_scale:
+            raise ValueError("embed_cache holds mean-pooled embeddings without "
+                             "loc_scale; cannot combine with pool_mode/use_loc_scale")
         print(f"\n[embed-cache] {len(flat_keys):,} embeddings via positional "
               f"cache ({len(fold_data)} folds, no re-embed)")
         flat_embed = np.stack([embed_cache[k[0]][k[1]] for k in flat_keys])
     else:
         print(f"\n[batch-embed] {len(flat_contexts):,} contexts across "
-              f"{len(fold_data)} folds in ONE Chronos call...")
-        flat_embed = backbone.embed(flat_contexts)
+              f"{len(fold_data)} folds (pool={pool_mode}, loc_scale={use_loc_scale})...")
+        if use_loc_scale:
+            flat_embed, flat_ls = backbone.embed(flat_contexts, pool=pool_mode,
+                                                 return_loc_scale=True)
+        else:
+            flat_embed = backbone.embed(flat_contexts, pool=pool_mode)
     # slice back per fold + fuse with labeler features
     o = 0
     feats_fn = getattr(labeler, 'features', None)
@@ -308,7 +317,7 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             "ctx_provider (walk-forward ctx fusion) needs the labeler's "
             "ff68_at(keys) hook to build the [emb|ff68] head input.")
 
-    def _fuse(keys, E):
+    def _fuse(keys, E, L=None):
         extra = (np.asarray(feats_fn(keys), np.float32)
                  if feats_fn is not None else None)
         ff68 = (np.asarray(_ff68_hook(keys), np.float32)
@@ -318,20 +327,30 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             # per-fold ctx_* (heads trained on THIS fold's train window only)
             ctx = np.asarray(ctx_provider.transform(E, ff68), np.float32)
             X = np.hstack([X, ctx]).astype(np.float32)
+        if L is not None:
+            # Tier-1: append log(window std) — the volatility magnitude
+            # instance_norm strips from the embedding (Chronos's blind spot).
+            X = np.hstack([X, np.log(np.clip(L[:, 1:2], 1e-6, None))]).astype(np.float32)
         return X
 
     for d in fold_data:
         ntr, nva, nte = len(d['Ctr']), len(d['Cval']), len(d['Cte'])
-        Etr = flat_embed[o:o + ntr]; o += ntr
-        Eva = flat_embed[o:o + nva]; o += nva
-        Ete = flat_embed[o:o + nte]; o += nte
+        Etr = flat_embed[o:o + ntr]
+        Eva = flat_embed[o + ntr:o + ntr + nva]
+        Ete = flat_embed[o + ntr + nva:o + ntr + nva + nte]
+        Ltr = Lva = Lte = None
+        if flat_ls is not None:
+            Ltr = flat_ls[o:o + ntr]
+            Lva = flat_ls[o + ntr:o + ntr + nva]
+            Lte = flat_ls[o + ntr + nva:o + ntr + nva + nte]
+        o += ntr + nva + nte
         if ctx_provider is not None:
             # retrain ctx heads on THIS fold's TRAIN window (dense bars, purged
             # before val) — the nested walk-forward; never sees val/test.
             ctx_provider.fit(d['tr_lo'], d['tr_hi'], d['val0'])
-        d['Xtr'] = _fuse(d['Ktr'], Etr)
-        d['Xval'] = _fuse(d['Kval'], Eva)
-        d['Xte'] = _fuse(d['Kte'], Ete)
+        d['Xtr'] = _fuse(d['Ktr'], Etr, Ltr)
+        d['Xval'] = _fuse(d['Kval'], Eva, Lva)
+        d['Xte'] = _fuse(d['Kte'], Ete, Lte)
     mode_note = (f" (emb_mode={emb_mode}, ctx heads: "
                  f"{len(heads.active_names)})" if heads is not None else "")
     print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}"
