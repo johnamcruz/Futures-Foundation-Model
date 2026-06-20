@@ -17,15 +17,23 @@ RNG = np.random.default_rng(3)
 D = backbone.D_MODEL
 
 
-def _fake_embed(contexts, batch=64):
+def _fake_embed(contexts, batch=64, pool='mean', return_loc_scale=False):
     """Deterministic embedding stub: first dims carry the window's tail
-    stats so heads/labels are learnable; rest zeros."""
+    stats so heads/labels are learnable; rest zeros. Accepts the Tier-1
+    pool/return_loc_scale kwargs (real foundation.embed signature)."""
     X = np.asarray(contexts, np.float32)
-    out = np.zeros((len(X), D), np.float32)
+    dim = 2 * D if pool == 'meanreg' else D
+    out = np.zeros((len(X), dim), np.float32)
     if len(X):
         out[:, 0] = X[:, -1] - X[:, 0]
         out[:, 1] = X.std(axis=1)
         out[:, 2] = X[:, -1] - X[:, -20:].mean(axis=1)
+    if return_loc_scale:
+        ls = np.zeros((len(X), 2), np.float32)
+        if len(X):
+            ls[:, 0] = X.mean(axis=1)
+            ls[:, 1] = np.clip(X.std(axis=1), 1e-6, None)
+        return out, ls
     return out
 
 
