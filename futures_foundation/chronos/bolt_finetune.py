@@ -8,11 +8,9 @@ Chronos+XGBoost selection model. The deliverable is an A/B: the fine-tuned Bolt
 vs vanilla Bolt on the honest-ruler walk-forward, to settle whether domain
 adaptation improves embedding quality.
 
-Distinct from the two sibling fine-tune paths in this package:
+Distinct from the sibling fine-tune path in this package:
   - `finetune.py`      — SUPERVISED: backbone + classification head, CE on
                           strategy labels (task fine-tune).
-  - `_ft/` (run_ft.py) — T5 forecasting domain-adapt (tokenizer/seq2seq path);
-                          its `bolt.yaml` is scaffold-only, `--bolt` errors out.
   - THIS module        — BOLT forecasting domain-adapt. Bolt is patch-based and
                           tokenizer-FREE, so it needs a simpler sliding-window
                           collator, not the T5 data path. The model is already
