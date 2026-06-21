@@ -124,6 +124,32 @@ def compute_adx(h, l, c, period=14):
     return _rma(dx, period)
 
 
+def ehlers_decycler(c, period=60):
+    """Ehlers Decycler — closing price minus a 2-pole high-pass filter, leaving
+    the smooth, low-lag TREND (cycles shorter than `period` removed). Pure numpy,
+    strictly causal (value at bar i uses only bars <= i). Returns float64[n].
+
+    Its SLOPE (rising/falling) is a low-lag trend-direction filter — less laggy
+    than ADX/EMA-slope, which is why it's a cleaner cross gate. Ref: J. Ehlers,
+    "Cycle Analytics for Traders" (2013)."""
+    c = np.asarray(c, np.float64)
+    n = len(c)
+    if n < 3 or period < 2:
+        return c.copy()
+    w = 0.707 * 2.0 * np.pi / period
+    a = (np.cos(w) + np.sin(w) - 1.0) / np.cos(w)
+    c1 = (1.0 - a / 2.0) ** 2
+    c2 = 2.0 * (1.0 - a)
+    c3 = (1.0 - a) ** 2
+    hp = np.zeros(n)
+    dec = c.copy()
+    for i in range(2, n):
+        hp[i] = (c1 * (c[i] - 2.0 * c[i - 1] + c[i - 2])
+                 + c2 * hp[i - 1] - c3 * hp[i - 2])
+        dec[i] = c[i] - hp[i]
+    return dec
+
+
 def max_favorable_rr(h, l, entry_idx, is_long, entry_price, sl_price,
                      lookahead=None):
     """Maximum favorable excursion (MFE) in R-units before stop / lookahead.
