@@ -6,7 +6,9 @@ import numpy as np, pandas as pd
 from futures_foundation.chronos._primitives import compute_atr
 TICKERS = ['ES','NQ','RTY','YM','GC','SI','CL','ZB','ZN']
 TFS = ['1min','3min','5min','15min']
-CTX, ATR_P, K, H, STRIDE = 128, 20, 1.0, 60, 16
+CTX = int(os.environ.get('CHRONOS_CTX', '128'))   # CHRONOS_CTX overrides (e.g. 256)
+ATR_P, K, H, STRIDE = 20, 1.0, 60, 16
+OUT = os.environ.get('TB_CORPUS_DIR', 'temp/tb_corpus')   # separate dir per ctx
 Xs, ys, tss = [], [], []
 t0 = time.time()
 for tk in TICKERS:
@@ -29,7 +31,7 @@ for tk in TICKERS:
             Xs.append(lp[i-CTX+1:i+1].astype(np.float32)); ys.append(y); tss.append(ts[i]); cnt += 1
         print(f'  {tk}_{tf}: {cnt:,} windows', flush=True)
 X = np.asarray(Xs, np.float32); y = np.asarray(ys, np.int8); ts_all = np.asarray(tss, np.int64)
-os.makedirs('temp/tb_corpus', exist_ok=True)
-np.save('temp/tb_corpus/X.npy', X); np.save('temp/tb_corpus/y.npy', y)
-np.save('temp/tb_corpus/ts.npy', ts_all)
-print(f'\nCORPUS: X={X.shape}  y dist (UP/DOWN/NEITHER)={np.bincount(y, minlength=3)}  ({time.time()-t0:.0f}s)', flush=True)
+os.makedirs(OUT, exist_ok=True)
+np.save(f'{OUT}/X.npy', X); np.save(f'{OUT}/y.npy', y)
+np.save(f'{OUT}/ts.npy', ts_all)
+print(f'\nCORPUS[ctx={CTX}]: X={X.shape}  y dist (UP/DOWN/NEITHER)={np.bincount(y, minlength=3)}  -> {OUT}  ({time.time()-t0:.0f}s)', flush=True)

@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 MODEL_ID = 'amazon/chronos-bolt-tiny'
 D_MODEL, N_CLS = 256, 3
-CORPUS = 'temp/tb_corpus'
+CORPUS = os.environ.get('TB_CORPUS_DIR', 'temp/tb_corpus')   # TB_CORPUS_DIR overrides (e.g. temp/tb_corpus_256)
 
 
 def _locscale_on():

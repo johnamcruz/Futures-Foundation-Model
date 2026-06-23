@@ -26,7 +26,7 @@ import numpy as np
 
 MODEL = 'amazon/chronos-bolt-tiny'
 D_MODEL = 256                          # bolt-tiny (torch-free constant)
-CTX = 128                              # canonical context bars (log-close)
+CTX = int(os.environ.get('CHRONOS_CTX', '128'))   # context bars (log-close); CHRONOS_CTX overrides for longer-context checkpoints
 _PIPE = None
 _PRISTINE = None                       # cloned pretrained state_dict
 
