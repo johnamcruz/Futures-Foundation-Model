@@ -41,11 +41,57 @@ def pooled_dim(pool: str = 'mean') -> int:
     return base + (2 if os.environ.get('CHRONOS_POOL_LOCSCALE') == '1' else 0)
 
 
+def resolve_ckpt(spec):
+    """Resolve a checkpoint spec like HuggingFace from_pretrained:
+      - an existing path (absolute/relative)        -> used as-is
+      - a bare NAME (e.g. 'chronos_bolt_ft_locscale') -> checkpoints/<name>
+      - anything else                               -> passed through (HF hub)
+    Returns None for an empty spec."""
+    if not spec:
+        return None
+    if os.path.exists(spec):
+        return spec
+    cand = os.path.join(str(_ROOT), 'checkpoints', spec)
+    return cand if os.path.exists(cand) else spec
+
+
+def _apply_ckpt_config():
+    """Self-describing checkpoints: if the resolved CHRONOS_FT_CKPT dir has a
+    PROVENANCE.json with config.locscale, auto-enable CHRONOS_POOL_LOCSCALE so
+    callers only pass the checkpoint (eliminates the FT==inference mismatch).
+    An explicit CHRONOS_POOL_LOCSCALE always wins. Idempotent; safe in parent
+    and worker (worker inherits via dict(os.environ))."""
+    src = resolve_ckpt(os.environ.get('CHRONOS_FT_CKPT'))
+    if not src or not os.path.isdir(src):
+        return
+    p = os.path.join(src, 'PROVENANCE.json')
+    if not os.path.exists(p):
+        return
+    try:
+        import json
+        cfg = json.load(open(p)).get('config', {})
+    except Exception:
+        return
+    if cfg.get('locscale') and 'CHRONOS_POOL_LOCSCALE' not in os.environ:
+        os.environ['CHRONOS_POOL_LOCSCALE'] = '1'
+
+
 def active_source() -> str:
     """Resolve which Chronos checkpoint embed() will load. Parent-safe
-    (no torch import). Returns the explicit CHRONOS_FT_CKPT path if set,
-    else the frozen HF model name."""
-    return os.environ.get('CHRONOS_FT_CKPT') or MODEL
+    (no torch import). CHRONOS_FT_CKPT accepts:
+      unset / 'vanilla' / 'frozen' / 'base' -> the frozen HF base model
+      a bare NAME                           -> checkpoints/<name> (HF-style)
+      a path                                -> used as-is."""
+    spec = os.environ.get('CHRONOS_FT_CKPT')
+    if not spec or spec.lower() in ('vanilla', 'frozen', 'base'):
+        return MODEL
+    _apply_ckpt_config()
+    return resolve_ckpt(spec) or MODEL
+
+
+# Apply the checkpoint's self-described config at import, so pooled_dim()/dim
+# and the worker env reflect its required loc_scale before first use.
+_apply_ckpt_config()
 
 
 def _find_unused_finetunes(root: Path) -> list:

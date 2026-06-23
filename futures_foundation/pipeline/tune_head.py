@@ -30,7 +30,7 @@ VAL->TEST gate is the final independent generalization check.
 
 CLI:
     python -m futures_foundation.pipeline.tune_head \
-        --labeler colabs.kalman_nw_chronos2:KalmanNWChronos2 \
+        --labeler colabs.your_strategy:YourStrategy \
         --trials 80 --max-folds 14
 """
 import argparse
@@ -241,8 +241,7 @@ def _load_labeler(spec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--labeler', required=True,
-                    help='module:Class, e.g. colabs.kalman_nw_chronos2:'
-                         'KalmanNWChronos2')
+                    help='module:Class, e.g. colabs.your_strategy:YourStrategy')
     ap.add_argument('--trials', type=int, default=80)
     ap.add_argument('--max-folds', type=int, default=14)
     ap.add_argument('--holdout-frac', type=float, default=0.3)

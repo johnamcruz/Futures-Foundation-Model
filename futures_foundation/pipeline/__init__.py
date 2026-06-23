@@ -32,7 +32,7 @@ import sys as _sys
 # LEGACY-PICKLE + RENAME COMPAT: production joblib bundles reference pipeline
 # classes under OLD module paths — 'pipelines.chronos.*' (pre-consolidation
 # bundles) and 'futures_foundation.pipeline.*' (post-consolidation, pre-rename
-# bundles, e.g. kalman_nw_chronos.joblib / supertrend_chronos.joblib). This
+# bundles, e.g. <strategy>_chronos.joblib). This
 # package was renamed chronos -> pipeline; aliasing BOTH old names to it lets
 # Python resolve those submodules through OUR __path__, so existing bundles keep
 # unpickling unmodified. The 'futures_foundation.chronos' alias also bridges any

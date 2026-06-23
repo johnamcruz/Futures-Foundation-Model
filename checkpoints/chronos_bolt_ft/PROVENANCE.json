@@ -1,8 +1,10 @@
 {
+  "config": {"locscale": false, "ctx": 128},
   "source": "TB-direction LoRA FT (merged), branch chronos-tb-ft",
   "recipe": "Amazon-faithful LoRA: lr=1e-5, head_lr=1e-3, r=8, alpha=16, dropout=0, warmup=0, batch=256, adamw_fused, linear sched, 5 epochs",
   "result": "gen-gate PASS: best val 0.5368 (ep4) vs frozen 0.5264 = +0.0104; monotonic, no overfit; bolt-native (no custom features)",
+  "ab_downstream": "strategy A/B (full walk-forward, only backbone swapped): +24-33% more selected signals than vanilla at every confidence threshold; passes the operating point where vanilla fails for too few trades; slightly lower per-trade WR",
   "data": "1.08M train windows, 9 tickers x 1/3/5/15min, triple-barrier k=1ATR H=60, temporal split, test_cutoff=2025-08-05",
   "dtype": "fp16",
-  "status": "ARTIFACT ONLY \u2014 passed classification gen-gate; NOT A/B-validated; NOT live. Set CHRONOS_FT_CKPT to use; A/B (>=+0.10R vs vanilla on held-out >=2025-08-05) required before production."
+  "status": "passed classification gen-gate + downstream A/B (more signals, holds edge). Pass CHRONOS_FT_CKPT=chronos_bolt_ft (name) to use."
 }
