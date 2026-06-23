@@ -3,7 +3,7 @@ Strategy labeling, reporting, and realized-R economics.
 
 The torch walk-forward trainer was retired with the from-scratch FFM
 backbone (see git tag `ffm-transformer-final`). Walk-forward training now
-lives in `futures_foundation.chronos` (frozen Chronos-Bolt embeddings + XGBoost).
+lives in `futures_foundation.pipeline` (frozen Chronos-Bolt embeddings + XGBoost).
 This package keeps the torch-free layers that any strategy pipeline reuses.
 
 IMPORT CONTRACT: fully torch-free — safe to import eagerly from the

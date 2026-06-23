@@ -254,16 +254,7 @@ def test_evaluate_run_tier1_meanreg_loc_scale():
     assert isinstance(res[0]['REAL'], np.ndarray)
 
 
-def test_legacy_pipelines_chronos_pickle_compat(tmp_path):
-    """Production bundles trained pre-consolidation reference classes under
-    'pipelines.chronos.*'. Importing futures_foundation.chronos installs a
-    sys.modules alias so those pickles keep loading — pin that contract."""
-    import importlib
-    import joblib
-    import futures_foundation.chronos  # noqa: F401 — installs the alias
-    legacy = importlib.import_module('pipelines.chronos.head_xgb')
-    assert hasattr(legacy, 'XGBHead') and hasattr(legacy, 'XGBRiskHead')
-    # round-trip a class reference exactly as pickle's find_class resolves it
-    p = tmp_path / 'legacy.joblib'
-    joblib.dump({'cls': legacy.XGBHead}, p)
-    assert joblib.load(p)['cls'] is legacy.XGBHead
+# Legacy 'pipelines.chronos' / 'futures_foundation.chronos' pickle-compat test
+# REMOVED (2026-06-23): those sys.modules shims were deleted (they shadowed
+# consumers' own pipelines.chronos, e.g. algoTraderAI). The canonical package
+# is futures_foundation.pipeline; old bundles must be re-saved against it.

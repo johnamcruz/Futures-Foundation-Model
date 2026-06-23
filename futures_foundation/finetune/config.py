@@ -11,7 +11,7 @@ class TrainingConfig:
     fields (freeze_ratio, warm_start_mode, backbone_lr_multiplier,
     focal-loss knobs, checkpoint-tier patience, ...) were removed with it.
     What remains parameterizes labeling/eval only; walk-forward *training*
-    now lives in futures_foundation.chronos (Chronos-Bolt embeddings + XGBoost).
+    now lives in futures_foundation.pipeline (Chronos-Bolt embeddings + XGBoost).
     """
 
     # ── Sequence ──

@@ -25,7 +25,7 @@ def test_package_import_is_torch_free():
     can't mask a leak."""
     code = (
         "import sys; import futures_foundation; "
-        "import futures_foundation.chronos; "
+        "import futures_foundation.pipeline; "
         "leaked = [m for m in ('torch', 'transformers', 'chronos') "
         "if m in sys.modules]; "
         "sys.exit(1 if leaked else 0)"

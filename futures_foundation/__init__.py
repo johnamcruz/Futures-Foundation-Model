@@ -8,8 +8,8 @@ feature/label/primitive libraries and a strategy labeling/eval framework.
 The from-scratch FFM transformer (model/dataset/pretrain/torch fine-tune
 trainer) was retired in favor of Chronos-Bolt (see git tag
 `ffm-transformer-final` for the last version with the full torch backbone
-stack). Walk-forward training now lives in `futures_foundation.chronos`
-(Bolt embeddings + XGBoost; training now in `futures_foundation.chronos`
+stack). Walk-forward training now lives in `futures_foundation.pipeline`
+(Bolt embeddings + XGBoost; training now in `futures_foundation.pipeline`
 shims). The foundation surface is `futures_foundation.foundation`:
 
     from futures_foundation.extractors.chronos import backbone as foundation

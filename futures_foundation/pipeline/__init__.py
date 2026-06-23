@@ -29,13 +29,9 @@ performance number believed until it clears shuffle + random + cost.
 """
 import sys as _sys
 
-# LEGACY-PICKLE + RENAME COMPAT: production joblib bundles reference pipeline
-# classes under OLD module paths — 'pipelines.chronos.*' (pre-consolidation
-# bundles) and 'futures_foundation.pipeline.*' (post-consolidation, pre-rename
-# bundles, e.g. <strategy>_chronos.joblib). This
-# package was renamed chronos -> pipeline; aliasing BOTH old names to it lets
-# Python resolve those submodules through OUR __path__, so existing bundles keep
-# unpickling unmodified. The 'futures_foundation.chronos' alias also bridges any
-# code still importing the old package path during the colabs migration.
-_sys.modules.setdefault('pipelines.chronos', _sys.modules[__name__])
-_sys.modules.setdefault('futures_foundation.chronos', _sys.modules[__name__])
+# Legacy module-path aliases REMOVED (2026-06-23): both 'pipelines.chronos'
+# and 'futures_foundation.chronos' are deprecated — the package is now
+# 'futures_foundation.pipeline'. The old setdefault shims shadowed consumers'
+# own 'pipelines.chronos' package (e.g. algoTraderAI) and kept stale pickle
+# paths alive; removed to prevent future breakage. Old bundles must be re-saved
+# against futures_foundation.pipeline.* (or the consumer's own vendored path).

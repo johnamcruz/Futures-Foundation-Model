@@ -18,7 +18,7 @@ pip install chronos-forecasting "xgboost>=2.0"      # foundation embed + heads
 A strategy is a small **labeler** (event candidates + features) that rides the frozen foundation embedding. Two calls take it from idea to deployable bundle:
 
 ```python
-from futures_foundation.chronos import evaluate as ev, produce
+from futures_foundation.pipeline import evaluate as ev, produce
 
 # 1) VALIDATE — the overfit-driven training loop (one call does it all):
 #    default walk-forward → VAL→TEST generalization gate → Optuna ONLY if it
@@ -133,7 +133,7 @@ Two guardrails make this honest: the **VAL→TEST generalization gate** (thresho
 ### Add a strategy
 
 ```python
-from futures_foundation.chronos.strategy import StrategyLabeler
+from futures_foundation.pipeline.strategy import StrategyLabeler
 
 class MyLabeler:
     n_classes = 2     # binary selection (take / skip)
@@ -148,7 +148,7 @@ class MyLabeler:
 ```
 
 ```python
-from futures_foundation.chronos import evaluate as ev, produce
+from futures_foundation.pipeline import evaluate as ev, produce
 
 verdict = ev.run(MyLabeler(), loop=True, return_verdict=True)   # overfit-driven training loop
 if verdict['final']['generalizes']:
@@ -187,7 +187,7 @@ All deps are in `requirements.txt`, including the ONNX-export stack (`onnxmltool
 
 ## Strategy Labeling & Evaluation Framework
 
-**`futures_foundation.finetune` — the torch-free survivors of the v0.3–v1.3 fine-tuning framework: labeling, health monitoring, reporting, realized-R economics.** The torch walk-forward trainer was retired with the from-scratch backbone (training now happens in `futures_foundation.chronos`); the layers every pipeline still leans on remain:
+**`futures_foundation.finetune` — the torch-free survivors of the v0.3–v1.3 fine-tuning framework: labeling, health monitoring, reporting, realized-R economics.** The torch walk-forward trainer was retired with the from-scratch backbone (training now happens in `futures_foundation.pipeline`); the layers every pipeline still leans on remain:
 
 | Component | Description |
 |---|---|
