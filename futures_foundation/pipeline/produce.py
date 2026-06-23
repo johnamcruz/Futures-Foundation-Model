@@ -44,7 +44,8 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
           n_estimators: int = 600, max_depth: int = 5,
           output_path: Optional[str | Path] = None,
           context_heads_path: Optional[str] = None, emb_mode: str = 'both',
-          export_onnx: bool = False, verbose: bool = True) -> dict:
+          export_onnx: bool = False, calibrate: bool = False,
+          verbose: bool = True) -> dict:
     """Fit on all signals strictly before `cal_max - holdout_months`
     (with the same leak-purge the walk-forward uses), evaluate on the
     unseen holdout, save bundle. Returns metadata dict.
@@ -143,6 +144,20 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         print(f"\n[signal-head] fit XGBHead({nc}-class) on {len(Ytr)} rows  "
               f"(n_est={n_estimators}, depth={max_depth})  "
               f"({time.time()-t0:.1f}s)")
+
+    # ---- Stage 4b: calibrate signal-head proba (Platt, OUT-OF-FOLD) ----
+    # Maps raw XGB proba -> P(win). Binary heads only. Off by default so the
+    # generic pipeline / live bundles are byte-unchanged unless opted in.
+    if calibrate and nc == 2:
+        t0 = time.time()
+        signal_head.fit_calibration(Xtr, Ytr, seed=seed)
+        if verbose:
+            A, B = signal_head._platt
+            print(f"[calibrate] Platt OOF fit: A={A:+.4f} B={B:+.4f}  "
+                  f"({time.time()-t0:.1f}s)  "
+                  f"⚠ proba scale changed (≈P(win)) — re-tune sizing thresholds")
+    elif calibrate and verbose:
+        print(f"[calibrate] skipped — head is {nc}-class (binary only)")
 
     # ---- Stage 5: fit risk head (binary labelers only) ----
     risk_head = None
@@ -275,6 +290,8 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         'ctx_window': len(Ctr[0]) if len(Ctr) else None,
         'd_model': backbone.D_MODEL,
         'chronos_ckpt': ckpt,
+        'calibrated': signal_head._platt is not None,
+        'platt': signal_head._platt,            # (A, B) or None — for transparency
         'labeler_name': type(labeler).__name__,
         'labeler_config': (labeler.config_dict()
                            if hasattr(labeler, 'config_dict') else {}),

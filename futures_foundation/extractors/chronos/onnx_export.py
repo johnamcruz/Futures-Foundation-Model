@@ -30,6 +30,52 @@ def _extract_proba(outs, ncols):
     return None
 
 
+def _bake_platt_calibration(model, platt):
+    """Rewrite a convert_xgboost ONNX so its [N,2] 'probabilities' output is
+    Platt-calibrated: col1 = sigmoid(A·logit(clip(p1))+B), col0 = 1-col1.
+    Mirrors XGBHead._apply_platt exactly (same clip, same logit) so the ONNX
+    stays parity-identical to the calibrated joblib. Binary heads only."""
+    from onnx import helper, numpy_helper
+    A, B = platt
+    eps = 1e-6
+    g = model.graph
+    OLD, RAW = 'probabilities', 'cal_raw_probabilities'
+    if not any(o == OLD for nd in g.node for o in nd.output):
+        raise RuntimeError("signal-head ONNX has no 'probabilities' output to calibrate")
+    for nd in g.node:                                  # producer: OLD -> RAW
+        for i, o in enumerate(nd.output):
+            if o == OLD:
+                nd.output[i] = RAW
+    old_vi = next((vi for vi in g.output if vi.name == OLD), None)
+    keep = [vi for vi in g.output if vi.name != OLD]
+    del g.output[:]; g.output.extend(keep)
+
+    def c(name, arr):
+        return helper.make_node('Constant', [], [name],
+                                value=numpy_helper.from_array(np.asarray(arr, np.float32), name + '_v'))
+    def ci(name, arr):
+        return helper.make_node('Constant', [], [name],
+                                value=numpy_helper.from_array(np.asarray(arr, np.int64), name + '_v'))
+    N = helper.make_node
+    g.node.extend([
+        ci('cal_i1', [1]), c('cal_eps', eps), c('cal_1me', 1 - eps),
+        c('cal_A', [[A]]), c('cal_B', [[B]]), c('cal_one', [[1.0]]),
+        N('Gather', [RAW, 'cal_i1'], ['cal_p1'], axis=1),         # [N,1]
+        N('Clip', ['cal_p1', 'cal_eps', 'cal_1me'], ['cal_p1c']),
+        N('Sub', ['cal_one', 'cal_p1c'], ['cal_om']),            # 1 - p1
+        N('Log', ['cal_p1c'], ['cal_lp']), N('Log', ['cal_om'], ['cal_lom']),
+        N('Sub', ['cal_lp', 'cal_lom'], ['cal_logit']),
+        N('Mul', ['cal_logit', 'cal_A'], ['cal_az']),
+        N('Add', ['cal_az', 'cal_B'], ['cal_z']),
+        N('Sigmoid', ['cal_z'], ['cal_c1']),
+        N('Sub', ['cal_one', 'cal_c1'], ['cal_c0']),
+        N('Concat', ['cal_c0', 'cal_c1'], [OLD], axis=1),         # [N,2]
+    ])
+    g.output.append(old_vi if old_vi is not None else
+                    helper.make_tensor_value_info(OLD, 1, [None, 2]))
+    return model
+
+
 def export_bundle_onnx(bundle, output_path, *, verbose=True, samples=50, seed=42):
     """Export the bundle's heads + encoder to ONNX next to output_path,
     each parity-checked vs the joblib. Returns {name: (path, delta_or_msg, ok)}."""
@@ -48,8 +94,11 @@ def export_bundle_onnx(bundle, output_path, *, verbose=True, samples=50, seed=42
     onx = convert_xgboost(bundle['signal_head']._clf,
                           initial_types=[('input', FloatTensorType([None, n]))],
                           target_opset=15)
+    platt = getattr(bundle['signal_head'], '_platt', None)
+    if platt is not None:                              # bake calibration in
+        onx = _bake_platt_calibration(onx, platt)
     sig.write_bytes(onx.SerializeToString())
-    ref = bundle['signal_head'].predict_proba(X)
+    ref = bundle['signal_head'].predict_proba(X)       # already calibrated
     proba = _extract_proba(
         ort.InferenceSession(str(sig), providers=['CPUExecutionProvider'])
         .run(None, {'input': X}), ref.shape[1])
