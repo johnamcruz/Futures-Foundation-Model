@@ -160,6 +160,7 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
           export_onnx: bool = False, calibrate: bool = False,
           use_regime: bool = False, regime_states: int = 4,
           use_changepoint: bool = False,
+          use_volume_embed: bool = False, volume_pool: str = 'meanreg',
           verbose: bool = True) -> dict:
     """Fit on all signals strictly before `cal_max - holdout_months`
     (with the same leak-purge the walk-forward uses), evaluate on the
@@ -185,6 +186,9 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
     # run-START prevents the 2026-05-19 wiring gap (fine-tuned ckpt
     # silently ignored because CHRONOS_FT_CKPT was unset).
     backbone.stamp_active_source(context='production training')
+    if use_volume_embed and not hasattr(labeler, 'volume_contexts'):
+        raise ValueError("use_volume_embed=True but labeler has no "
+                         "volume_contexts(keys) method")
     cal = labeler.calendar()
     cal_min = pd.Timestamp(cal['timestamp'].min())
     cal_max = pd.Timestamp(cal['timestamp'].max())
@@ -249,6 +253,19 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         print(f"\n[features] X_train: {Xtr.shape}  "
               f"({int(Etr.shape[1])} embed + "
               f"{0 if Ftr is None else Ftr.reshape(len(Etr), -1).shape[1]} hand-craft)")
+
+    # ---- Stage 3-vol (opt-in): volume embed APPENDED (2nd frozen-backbone pass) --
+    # A second bolt pass over the volume context (pool=volume_pool), concatenated.
+    # Default off -> byte-identical. CPU-pinned for ONNX/live parity (same as price).
+    vol_embed_dim = None
+    if use_volume_embed:
+        Cvol_tr = list(labeler.volume_contexts(Ktr))
+        Evol_tr = backbone.embed(Cvol_tr, device='cpu', pool=volume_pool)
+        Xtr = np.hstack([Xtr, Evol_tr]).astype(np.float32)
+        vol_embed_dim = int(Evol_tr.shape[1])
+        if verbose:
+            print(f"[volume] +{vol_embed_dim} volume-embed (pool={volume_pool}) -> "
+                  f"X_train {Xtr.shape}")
 
     # ---- Stage 3b (opt-in): regime HMM posteriors APPENDED (additive) ----
     # Fits a market-regime HMM on the EXISTING volatility features (selected by
@@ -359,6 +376,10 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
                    if feats_fn is not None else None)
             Xte = (np.hstack([Ete, Fte.reshape(len(Ete), -1)]).astype(np.float32)
                    if Fte is not None and Fte.size else np.asarray(Ete, np.float32))
+            if use_volume_embed:                        # append holdout volume embed
+                Evol_te = backbone.embed(list(labeler.volume_contexts(Kte)),
+                                         device='cpu', pool=volume_pool)
+                Xte = np.hstack([Xte, Evol_te]).astype(np.float32)
             if regime_hmm is not None:                  # append holdout posteriors
                 from .. import regime as _regime
                 obs_te, _ = _regime.select_regime_observations(
@@ -490,6 +511,12 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
             'features': regime_names,
             'params': regime_hmm.params_dict(),
         } if regime_hmm is not None else None),
+        # volume embed (opt-in, additive): a 2nd frozen-backbone pass over the
+        # volume channel, concatenated after embed+features. None when off.
+        'volume_embed': ({
+            'pool': volume_pool,
+            'embed_dim': vol_embed_dim,
+        } if use_volume_embed else None),
         'training_metadata': {
             'train_span': (str(cal_min), str(holdout_start)),
             'holdout_span': ((str(holdout_start), str(cal_max))

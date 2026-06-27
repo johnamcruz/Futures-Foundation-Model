@@ -133,6 +133,21 @@ def export_bundle_onnx(bundle, output_path, *, verbose=True, samples=50, seed=42
     msg = (r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-400:])
     results['encoder'] = (str(enc), msg, enc_ok)
 
+    # ── volume encoder (opt-in): a 2nd encoder ONNX with the volume pool. The
+    # bot runs it on the volume window and concatenates, same as the price
+    # encoder. Kept SEPARATE (the bot chains the two), parity-checked like price.
+    ve = bundle.get('volume_embed')
+    if ve:
+        venc = Path(f"{stem}_volume_encoder.onnx")
+        rv = subprocess.run(
+            [sys.executable, '-m', 'futures_foundation.extractors.chronos.onnx_encoder',
+             ck, str(ctx), str(venc), ve.get('pool', 'meanreg')],
+            cwd=root, env=env, capture_output=True, text=True)
+        venc_ok = rv.returncode == 0
+        vmsg = (rv.stdout.strip().splitlines()[-1] if rv.stdout.strip()
+                else rv.stderr[-400:])
+        results['volume_encoder'] = (str(venc), vmsg, venc_ok)
+
     if verbose:
         print("\n[onnx] export + parity (vs joblib):")
         for k, (p, d, ok) in results.items():

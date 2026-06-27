@@ -52,6 +52,18 @@ def test_risk_head_onnx_parity(tmp_path, _mock_encoder):
     assert (tmp_path / 'm_risk_head.onnx').exists()
 
 
+def test_volume_encoder_exported_when_bundle_has_volume_embed(tmp_path, _mock_encoder):
+    """A bundle with volume_embed config triggers a 2nd (volume) encoder export,
+    parity-checked like the price encoder. Absent the config, no volume encoder."""
+    b = _tiny_bundle()
+    res_none = onnx_export.export_bundle_onnx(b, tmp_path / 'a.joblib', verbose=False)
+    assert 'volume_encoder' not in res_none           # default: no volume encoder
+    b2 = _tiny_bundle()
+    b2['volume_embed'] = {'pool': 'meanreg', 'embed_dim': 512}
+    res = onnx_export.export_bundle_onnx(b2, tmp_path / 'b.joblib', verbose=False)
+    assert res['volume_encoder'][2] is True           # exported (mocked subprocess)
+
+
 def test_encoder_failure_surfaces(tmp_path, monkeypatch):
     import subprocess
 

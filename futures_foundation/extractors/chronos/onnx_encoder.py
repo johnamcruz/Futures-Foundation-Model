@@ -17,23 +17,30 @@ import numpy as np
 PARITY_TOL_EMBED = 1e-4
 
 
-def _wrapper(src):
-    """torch.nn.Module: Chronos encode() + mean-pool over tokens -> [B, d]."""
+def _wrapper(src, pool='mean'):
+    """torch.nn.Module: Chronos encode() + pool over tokens -> [B, d].
+    pool matches backbone/_worker exactly: 'mean' (mean over patches), 'reg' (the
+    [REG] token at the last position), 'meanreg' (concat → 2*d)."""
     import torch.nn as nn
     import torch
     from chronos import BaseChronosPipeline
     pipe = BaseChronosPipeline.from_pretrained(src, device_map='cpu', dtype=torch.float32)
 
     class _W(nn.Module):
-        def __init__(self, m):
+        def __init__(self, m, pool):
             super().__init__()
             self.m = m
+            self.pool = pool
 
         def forward(self, context):
             e, _ls, *_ = self.m.encode(context=context)   # (B, n_patches+1, d)
-            return e.mean(1)                               # mean-pool -> (B, d)
+            if self.pool == 'mean':
+                return e.mean(1)
+            if self.pool == 'reg':
+                return e[:, -1, :]
+            return torch.cat([e.mean(1), e[:, -1, :]], dim=-1)  # meanreg -> 2*d
 
-    return _W(pipe.model).eval()
+    return _W(pipe.model, pool).eval()
 
 
 def _patch_gather_int64(onnx_path):
@@ -61,13 +68,13 @@ def _patch_gather_int64(onnx_path):
     return patched
 
 
-def export(src, ctx_window, out_path):
+def export(src, ctx_window, out_path, pool='mean'):
     import torch
     _ofn, _omt = torch.nanmean, torch.Tensor.nanmean
     torch.nanmean = lambda x, *a, **k: torch.mean(x, *a, **k)
     torch.Tensor.nanmean = lambda self, *a, **k: torch.mean(self, *a, **k)
     try:
-        w = _wrapper(src)
+        w = _wrapper(src, pool)
         dummy = torch.zeros((2, ctx_window), dtype=torch.float32)
         batch = torch.export.Dim('batch')
         out = Path(out_path)
@@ -81,7 +88,7 @@ def export(src, ctx_window, out_path):
     return _patch_gather_int64(str(out))
 
 
-def parity(src, ctx_window, out_path, n=20, seed=42):
+def parity(src, ctx_window, out_path, n=20, seed=42, pool='mean'):
     import onnxruntime as ort
     import torch
     sess = ort.InferenceSession(str(out_path), providers=['CPUExecutionProvider'])
@@ -89,7 +96,7 @@ def parity(src, ctx_window, out_path, n=20, seed=42):
     rng = np.random.default_rng(seed)
     prices = 100 * np.exp(np.cumsum(rng.standard_normal((n, ctx_window)) * 0.01, axis=1))
     lc = np.log(prices).astype(np.float32)
-    w = _wrapper(src)
+    w = _wrapper(src, pool)
     with torch.no_grad():
         ref = w(torch.tensor(lc)).numpy()
     got = sess.run(None, {name: lc})[0]
@@ -99,10 +106,12 @@ def parity(src, ctx_window, out_path, n=20, seed=42):
 def main():
     from . import backbone
     ck, ctx, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    pool = sys.argv[4] if len(sys.argv) > 4 else 'mean'
     src = backbone.resolve_ckpt(ck) or ck
-    print(f"[onnx-encoder] export {ck!r} (resolved {src}) ctx={ctx} -> {out}", flush=True)
-    patched = export(src, ctx, out)
-    d = parity(src, ctx, out)
+    print(f"[onnx-encoder] export {ck!r} (resolved {src}) ctx={ctx} pool={pool} "
+          f"-> {out}", flush=True)
+    patched = export(src, ctx, out, pool)
+    d = parity(src, ctx, out, pool=pool)
     ok = d < PARITY_TOL_EMBED
     print(f"[onnx-encoder] parity max|Δ|={d:.2e} (tol {PARITY_TOL_EMBED:.0e}) "
           f"{'✓' if ok else '✗'}  (patched {patched} Gather node(s))", flush=True)
