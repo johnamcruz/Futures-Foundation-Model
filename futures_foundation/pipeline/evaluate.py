@@ -16,7 +16,6 @@ import pandas as pd
 from .data import walk_forward_folds
 from futures_foundation.extractors.chronos import backbone
 from futures_foundation import overfit as _of
-from . import context_fusion
 from .head_xgb import XGBHead, XGBRiskHead
 
 # ===========================================================================
@@ -180,9 +179,8 @@ def _agg_stats(name, R, tks=None):
 
 
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
-        max_folds=None, context_heads_path=None, emb_mode='both',
-        min_train_start=None, auto_regularize=True, return_verdict=False,
-        loop=False, ctx_provider=None, embed_cache=None,
+        max_folds=None, min_train_start=None, auto_regularize=True,
+        return_verdict=False, loop=False, embed_cache=None,
         pool_mode='mean', use_loc_scale=False, holdout_start=None):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
@@ -192,23 +190,13 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     — the entry-signal calibration test for downstream RL/account
     management. Returns the per-(fold,seed) records.
 
-    Context-heads fusion (additive, default-off): `context_heads_path`
-    (or $CONTEXT_HEADS_BUNDLE) loads a frozen ContextHeads bundle whose
-    ctx_* outputs are fused per `emb_mode` ('both'|'emb'|'heads' — the
-    pre-registered A/B arms). With heads active, folds whose train window
-    starts before HEADS_CUTOFF are EXCLUDED (leak guard: the heads
-    trained on those bars). `min_train_start` filters folds in any mode —
-    set it identically across A/B arms so all arms see the same folds."""
+    `min_train_start` filters folds (skip folds whose train window starts
+    before it) — set it identically across A/B arms so all arms see the
+    same folds."""
     # Stamp the active backbone BEFORE any work — surfaces a wiring
     # gap (fine-tuned ckpt sitting unused, CHRONOS_FT_CKPT not exported)
     # at run-START, not after we've burnt 15 min on the wrong backbone.
     backbone.stamp_active_source(context='walk-forward eval')
-    heads = context_fusion.resolve_heads(context_heads_path)
-    if heads is not None and min_train_start is None:
-        from futures_foundation.context import HEADS_CUTOFF
-        min_train_start = HEADS_CUTOFF
-        print(f"[context-heads] leak guard: folds restricted to train "
-              f"windows starting >= {min_train_start.date()}")
     _default_head = head_factory is None      # auto-regularize only the default head
     binary = labeler.n_classes == 2
 
@@ -244,9 +232,6 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
                 and tr['timestamp'].min() < pd.Timestamp(min_train_start):
             n_excluded += 1
             continue
-        if heads is not None:
-            context_fusion.enforce_cutoff(
-                heads, tr['timestamp'].min(), what=f'fold {fold} train')
         val0 = val['timestamp'].min()
         te0 = te['timestamp'].min()
         # TRAIN purged so its outcome window can't reach VAL; VAL purged so its
@@ -298,37 +283,15 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
                                                  return_loc_scale=True)
         else:
             flat_embed = backbone.embed(flat_contexts, pool=pool_mode)
-    # slice back per fold + fuse with labeler features
+    # slice back per fold + concat labeler features
     o = 0
     feats_fn = getattr(labeler, 'features', None)
-
-    _enriched = (heads is not None
-                 and heads.meta.get('inputs') == 'emb+ff68')
-    _ff68_hook = getattr(labeler, 'ff68_at', None)
-    if _enriched and emb_mode in ('both', 'heads') and _ff68_hook is None:
-        raise ValueError(
-            "enriched context bundle needs the 68-feature library at decision "
-            "bars — the labeler must implement ff68_at(keys) -> [N,68] "
-            "(canonical get_model_feature_columns order). Or use an emb-only "
-            "bundle / emb_mode='emb'.")
-
-    _ctx_need_ff68 = (ctx_provider is not None or
-                      (_enriched and _ff68_hook is not None))
-    if ctx_provider is not None and _ff68_hook is None:
-        raise ValueError(
-            "ctx_provider (walk-forward ctx fusion) needs the labeler's "
-            "ff68_at(keys) hook to build the [emb|ff68] head input.")
 
     def _fuse(keys, E, L=None):
         extra = (np.asarray(feats_fn(keys), np.float32)
                  if feats_fn is not None else None)
-        ff68 = (np.asarray(_ff68_hook(keys), np.float32)
-                if _ctx_need_ff68 else None)
-        X = context_fusion.fuse(E, extra, heads, emb_mode, ff68=ff68)
-        if ctx_provider is not None:
-            # per-fold ctx_* (heads trained on THIS fold's train window only)
-            ctx = np.asarray(ctx_provider.transform(E, ff68), np.float32)
-            X = np.hstack([X, ctx]).astype(np.float32)
+        X = (np.hstack([E, extra.reshape(len(E), -1)]).astype(np.float32)
+             if extra is not None and extra.size else np.asarray(E, np.float32))
         if L is not None:
             # Tier-1: append log(window std) — the volatility magnitude
             # instance_norm strips from the embedding (Chronos's blind spot).
@@ -346,17 +309,10 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             Lva = flat_ls[o + ntr:o + ntr + nva]
             Lte = flat_ls[o + ntr + nva:o + ntr + nva + nte]
         o += ntr + nva + nte
-        if ctx_provider is not None:
-            # retrain ctx heads on THIS fold's TRAIN window (dense bars, purged
-            # before val) — the nested walk-forward; never sees val/test.
-            ctx_provider.fit(d['tr_lo'], d['tr_hi'], d['val0'])
         d['Xtr'] = _fuse(d['Ktr'], Etr, Ltr)
         d['Xval'] = _fuse(d['Kval'], Eva, Lva)
         d['Xte'] = _fuse(d['Kte'], Ete, Lte)
-    mode_note = (f" (emb_mode={emb_mode}, ctx heads: "
-                 f"{len(heads.active_names)})" if heads is not None else "")
-    print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}"
-          f"{mode_note}\n")
+    print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}\n")
 
     # Phase 3 — per-(fold, seed) XGBoost work, parallelized via threads.
     # XGBoost releases the GIL in its C tree-builder + numpy ops, so a

@@ -42,7 +42,6 @@ import pandas as pd
 from .data import walk_forward_folds
 from futures_foundation.extractors.chronos import backbone
 from futures_foundation import overfit as _of
-from . import context_fusion
 from .head_xgb import XGBHead
 
 # Tight anti-overfit search space (ported from the original XGBoost pipeline's
@@ -122,9 +121,11 @@ def _build_folds(labeler, train_m, test_m, max_folds):
                if feats_fn is not None else None)
         xte = (np.asarray(feats_fn(d['Kte']), np.float32)
                if feats_fn is not None else None)
-        # fuse (heads=None) — embed + labeler features, same as evaluate
-        d['Xtr'] = context_fusion.fuse(Etr, xtr, None, 'both')
-        d['Xte'] = context_fusion.fuse(Ete, xte, None, 'both')
+        # embed + labeler features
+        d['Xtr'] = (np.hstack([Etr, xtr.reshape(len(Etr), -1)]).astype(np.float32)
+                    if xtr is not None and xtr.size else np.asarray(Etr, np.float32))
+        d['Xte'] = (np.hstack([Ete, xte.reshape(len(Ete), -1)]).astype(np.float32)
+                    if xte is not None and xte.size else np.asarray(Ete, np.float32))
         del d['Ctr'], d['Cte']                       # free raw contexts
     print(f"[tune] feat_dim={fold_data[0]['Xtr'].shape[1]}")
     return fold_data

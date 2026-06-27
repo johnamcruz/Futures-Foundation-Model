@@ -19,9 +19,8 @@ class _Lab:
 
 
 def _stub_env(monkeypatch):
-    # keep ev.run out of any heavy backbone / context-heads work
+    # keep ev.run out of any heavy backbone work
     monkeypatch.setattr(ev.backbone, 'stamp_active_source', lambda **k: None)
-    monkeypatch.setattr(ev.context_fusion, 'resolve_heads', lambda p: None)
 
 
 def test_loop_true_delegates_and_returns_records(monkeypatch):

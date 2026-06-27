@@ -43,9 +43,6 @@ from .labels import (
 )
 from . import primitives
 from .prepare import prepare_data
-from .context import (
-    ContextHeads, compute_context_labels, HEADS_CUTOFF, HEAD_SPECS,
-)
 
 # finetune is torch-free (labeling / reporting / realized-R economics) —
 # imported eagerly.
@@ -66,8 +63,6 @@ __all__ = [
     "generate_structure_labels", "generate_range_labels", "print_label_distribution",
     "REGIME_LABELS", "VOLATILITY_LABELS", "STRUCTURE_LABELS", "RANGE_LABELS",
     "LABEL_CONFIDENCE_SENTINEL", "primitives", "prepare_data",
-    # context heads (named handles on the foundation)
-    "ContextHeads", "compute_context_labels", "HEADS_CUTOFF", "HEAD_SPECS",
     # finetune (labeling / reporting / economics — torch-free)
     "StrategyLabeler", "TrainingConfig", "FoldHealthMonitor",
     "run_labeling", "print_eval_summary", "print_fold_progression",

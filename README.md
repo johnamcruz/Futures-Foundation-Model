@@ -49,34 +49,7 @@ Just as BERT learns language structure before being fine-tuned for sentiment or 
 
 This architecture is **proven live**: a production selection model (frozen Bolt embedding + XGBoost head) runs in production, certified on the honest-ruler walk-forward with pre-registered controls.
 
-### Context heads — what they measure
-
-Four context heads. Each is an XGBoost model on the input **`[Bolt embedding (256) | 68-feature library]`**, predicting a forward market condition. Validated **walk-forward** — rolling train/validate/test across all regimes, generalization gate (VAL→TEST), shuffle + trivial-baseline controls (`scripts/eval_context_heads.py`). All four beat the **trivial baseline** (8 trailing summary stats), generalize in **100% of folds**; the regression heads show **shuffle ≈ 0** (no leak).
-
-| Head | Forward target | Metric | Trivial | Foundation `[emb｜ff68]` | Margin |
-|---|---|---|---|---|---|
-| **volatility** | realized-vol percentile, 10-bar | Pearson r | .38 | **.59** | +.21 |
-| **market regime** | vol expansion > 1.5× median, 20-bar | ROC-AUC | .70 | **.82** | +.12 |
-| **market structure** | BOS/ChoCH — continuation (+1) vs reversal (−1), {−1,0,+1} | Pearson r | .32 | **.44** | +.13 |
-| **range** | range-bound: closes stay in band, 10-bar | ROC-AUC | .67 | **.69** | +.02 |
-
-Walk-forward corpus: 6 tickers × 3-min bars, 27 folds (6mo train / 2mo val / 2mo test). Labels are forward-looking and lookahead-audited; the `structure` head's swing reference is causal (confirmed swings only), the break outcome forward. Probe harness: `scripts/probe_context_heads.py`.
-
-### Using the context heads
-
-`futures_foundation.context.ContextHeads` exposes the four heads as named `ctx_*` fields at any bar:
-
-```python
-from futures_foundation.context import ContextHeads
-
-heads = ContextHeads.load('heads_<date>.joblib')        # or $CONTEXT_HEADS_BUNDLE
-ctx = heads.context_at(ohlcv_df, bar_indices, 'ES')     # DataFrame: 4 ctx_* columns
-```
-
-- **Train/freeze:** trained once on pre-2023 data (`scripts/train_context_heads.py`), then frozen. Input `[emb｜ff68]`, `input_dim` 324.
-- **Leak guard:** downstream training that consumes `ctx_*` is restricted to ≥ 2023 (the heads' training cutoff), enforced by `context_fusion.enforce_cutoff`.
-- **Joint use:** the 4 fields form a regime vector; a regime classifier over them scores above its majority-class baseline OOS (`scripts/demo_regime_model.py`).
-- **Strategy fusion:** when the labeler exposes `ff68_at(keys)` (canonical 68 features at its decision bars), `evaluate.run(..., context_heads_path=…, emb_mode='both')` fuses the `ctx_*` fields into the selection model. `colabs/ctx_ab.py` measures downstream lift (adopt iff ≥ +0.10R over baseline, controls clean) and reports per-arm VAL→TEST generalization.
+The pipeline is deliberately two stages: **frozen Chronos-Bolt embedding (feature extractor) → XGBoost (classifier)**, concatenated with strategy-specific hand-crafted features. No intermediate market-context prediction layer — the embedding *is* the market-state representation, and the downstream head learns whatever of it the task needs.
 
 ### Why this architecture
 
@@ -264,7 +237,7 @@ data/
 
 ### Labels
 
-Two label sets live in the library. `futures_foundation.labels` — the original 4-task self-supervised generators (regime / volatility / structure / range), still produced by `prepare_data` for the XGBoost pipeline's parquet cache. `futures_foundation.context.compute_context_labels` — the forward-looking context-head targets; the shipped FFM 2.1 heads are the four downstream concepts: market regime (vol-expansion), market structure, range-bound, volatility.
+`futures_foundation.labels` provides the 4-task self-supervised generators (regime / volatility / structure / range), produced by `prepare_data` for the XGBoost pipeline's parquet cache.
 
 ---
 
@@ -280,7 +253,6 @@ Futures-Foundation-Model/
 │   ├── labels.py                 # Legacy forward-looking label generation
 │   ├── prepare.py                # prepare_data: raw CSVs → features+labels parquet
 │   ├── primitives/               # Indicators, barriers, rolling, session, detection
-│   ├── context.py                # ★ ContextHeads — 4 calibrated ctx_* fields per candle (FFM 2.1)
 │   ├── chronos/                  # ★ Foundation training/eval/deploy harness (see above)
 │   └── finetune/                 # Torch-free framework survivors
 │       ├── base.py               # StrategyLabeler ABC (final run() = TP≥SL triple barrier)
@@ -292,9 +264,8 @@ Futures-Foundation-Model/
 │   ├── xgboost/                  # Standalone direction classifier on 68 features
 │   └── rl/                       # Generic PPO walk-forward pipeline
 ├── scripts/
-│   ├── probe_context_heads.py    # Capability probe (labels × input arms × gates/controls)
-│   ├── train_context_heads.py    # Trains the production enriched heads bundle
-│   └── demo_regime_model.py      # OOS certification: calibration + regime model
+│   ├── build_tb_corpus.py        # Triple-barrier direction corpus builder
+│   └── finetune_tb_direction.py  # TB-direction backbone fine-tune (research)
 ├── docs/                         # Build specs + runbooks
 ├── tests/                        # 487 unit tests (pre-commit gated; torch-free by contract)
 └── data/                         # Raw OHLCV CSVs (gitignored)
@@ -307,10 +278,7 @@ Futures-Foundation-Model/
 - [x] Chronos-Bolt as the foundation (seam promoted, torch stack retired, torch-free import contract)
 - [x] Capability probes — measured what the foundation knows, per input recipe (5 arms, gates + shuffle + trivial adversary)
 - [x] Bolt domain-adaptation fine-tune + A/B harness (verdict: vanilla wins for selection — stay frozen)
-- [x] **Context heads (FFM 2.1)** — 4 calibrated `ctx_*` fields per candle on the enriched `[emb | 68-feature]` recipe, OOS-certified
-- [ ] First ctx consumers, pre-registered A/Bs: RL exit observations; new strategies built with context from day one
-- [ ] Enriched HTF readout (1h/4h ctx for enriched bundles — emb-only bundles cover it today)
-- [ ] Single-file ONNX export (foundation + heads in one graph) for the bot
+- [ ] Single-file ONNX export (frozen embedding + XGBoost head in one graph) for the bot
 - [ ] Multivariate context / Chronos-2 (next information rung beyond bars+features)
 
 ---
