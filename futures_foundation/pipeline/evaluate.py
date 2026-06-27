@@ -436,7 +436,10 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
 
     import concurrent.futures as cf
     import os
-    n_workers = min(os.cpu_count() or 4, 8)
+    # cap concurrent fold×seed fits to bound RAM (each holds a big feature
+    # matrix) — 8-wide froze machines; 4 is the safe default, override with
+    # FFM_EVAL_WORKERS for beefier boxes.
+    n_workers = int(os.environ.get('FFM_EVAL_WORKERS', min(os.cpu_count() or 4, 4)))
     print(f"[parallel] running {len(fold_data) * len(seeds)} (fold, seed) "
           f"work units across {n_workers} threads...")
     work_units = [(d, s) for d in fold_data for s in seeds]
