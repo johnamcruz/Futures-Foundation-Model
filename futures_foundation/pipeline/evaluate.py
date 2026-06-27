@@ -51,11 +51,35 @@ OVERFIT_GAP_R = 0.30
 # edge). A HARD verdict failure — we want real OOS generalization, not a number
 # that only looks good on the data the threshold was tuned on.
 GEN_GAP_TOL = 0.30
+# Operating point: trade a FIXED top-percentile of the proba distribution rather
+# than the val-meanR-maximizing threshold. Selecting the threshold by max val
+# meanR overfits to validation noise (high-threshold meanR is tiny-n, high
+# variance → optimistic outlier that regresses on test). A fixed percentile has
+# no cherry-picking, matches how the bot trades a fixed cutoff, and makes the
+# VAL→TEST gap reflect real generalization. Verdict uses OP_PERCENTILE.
+# top 50% of signals by proba — a USABLE operating volume (the bot is signal-
+# deprived; top-5% is too few). Prior work: top-50% catches ~66% of big trends and
+# the edge survives. Sweep reports several; verdict uses OP_PERCENTILE.
+OP_PERCENTILE = 0.50
+# Sweep emphasizes the USABLE volume range (top 40-60%) the signal-deprived bot
+# needs, plus a couple tighter cuts for the precision/volume frontier.
+OP_PERCENTILE_SWEEP = (0.60, 0.50, 0.40, 0.25, 0.10)
 REG_LADDER = [
     dict(max_depth=3, min_child_weight=20, reg_lambda=5.0),
     dict(max_depth=3, min_child_weight=50, reg_lambda=10.0, subsample=0.6),
     dict(max_depth=2, min_child_weight=80, reg_lambda=15.0, n_estimators=150),
 ]
+
+
+def _pct_threshold(proba, top_pct):
+    """Proba cutoff selecting the top `top_pct` fraction of `proba` (e.g.
+    top_pct=0.50 -> the median = top 50%). Pure/unit-testable. Returns a cutoff
+    above the max (→ no trades) for empty input."""
+    import numpy as _np
+    proba = _np.asarray(proba, float)
+    if proba.size == 0:
+        return 1.0
+    return float(_np.quantile(proba, 1.0 - top_pct))
 
 
 def _should_loop(loop, binary, default_head):
@@ -674,29 +698,34 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
                         pf=(w / loss if loss > 0 else float('inf')))
 
         test_recs = [(k, p) for k, p, _, _ in proba_records]
-        grid = (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
-        thr_star, best = 0.50, None                         # selected on VAL
-        for thr in grid:
-            mv = _fixedtp(val_records, thr)
-            if mv and mv['n'] >= 30 and (best is None or mv['meanR'] > best):
-                best, thr_star = mv['meanR'], thr
-        v_at = _fixedtp(val_records, thr_star)
-        t_at = _fixedtp(test_recs, thr_star)
+        # FIXED-percentile operating point: trade the top-X% of signals by proba
+        # (cutoff = X-th percentile of VAL proba), reported on test. No val-meanR
+        # cherry-picking -> the VAL→TEST gap reflects real generalization, not
+        # threshold-selection noise. Matches how the bot trades a fixed cutoff.
+        val_p = (np.concatenate([p for _, p in val_records])
+                 if val_records else np.array([], float))
         bar = "═" * 60
-        print(f"\n{bar}\n🚦 OPERATING POINT — thr {thr_star:.2f} SELECTED ON "
-              f"VALIDATION → reported on TEST\n{bar}")
-        if v_at:
-            pfv = f"{v_at['pf']:.2f}" if v_at['pf'] < 999 else "inf"
-            print(f"   VAL  @{thr_star:.2f}:  n={v_at['n']:5d}  "
-                  f"WR={100*v_at['wr']:.1f}%  meanR={v_at['meanR']:+.3f}  PF={pfv}")
-        if t_at:
-            pft = f"{t_at['pf']:.2f}" if t_at['pf'] < 999 else "inf"
-            print(f"   TEST @{thr_star:.2f}:  n={t_at['n']:5d}  "
-                  f"WR={100*t_at['wr']:.1f}%  meanR={t_at['meanR']:+.3f}  "
-                  f"PF={pft}   ← honest OOS")
-        gap = None
-        if v_at and t_at:
-            gap = v_at['meanR'] - t_at['meanR']
+        print(f"\n{bar}\n🚦 OPERATING POINT — FIXED val-proba percentile "
+              f"(no threshold cherry-pick)\n{bar}")
+        print(f"   {'top%':>5} {'thr':>6} {'VALn':>6} {'VALmR':>7} "
+              f"{'TESTn':>6} {'TESTwr':>7} {'TESTmR':>7} {'PF':>6} {'gap':>7}")
+        _op = {}
+        for pct in OP_PERCENTILE_SWEEP:
+            thr = _pct_threshold(val_p, pct)
+            vv = _fixedtp(val_records, thr)
+            tt = _fixedtp(test_recs, thr)
+            g = (vv['meanR'] - tt['meanR']) if (vv and tt) else None
+            _op[pct] = (thr, vv, tt, g)
+            pf = f"{tt['pf']:.1f}" if (tt and tt['pf'] < 999) else ("inf" if tt else "—")
+            print(f"   {int(pct*100):>4}% {thr:>6.3f} "
+                  f"{(vv['n'] if vv else 0):>6} {(vv['meanR'] if vv else 0):>+7.2f} "
+                  f"{(tt['n'] if tt else 0):>6} {(100*tt['wr'] if tt else 0):>6.1f}% "
+                  f"{(tt['meanR'] if tt else 0):>+7.2f} {pf:>6} "
+                  f"{(g if g is not None else 0):>+7.3f}")
+        thr_star, v_at, t_at, gap = _op[OP_PERCENTILE]
+        print(f"   → verdict at top {int(OP_PERCENTILE*100)}% (thr {thr_star:.3f}, "
+              f"TEST n={t_at['n'] if t_at else 0}) ← honest OOS")
+        if gap is not None:
             print(f"   VAL→TEST gap: {gap:+.3f}R  "
                   f"{'⚠️ OVERFIT to val (does NOT generalize)' if gap > GEN_GAP_TOL else '✓ generalizes'}")
 
