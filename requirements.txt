@@ -15,4 +15,5 @@ onnx>=1.16
 onnxscript>=0.1
 optuna>=3.0
 joblib>=1.3
+hmmlearn>=0.3              # regime HMM (futures_foundation.regime): market-state posteriors as head features
 chronos-forecasting>=1.4   # pipelines/chronos: Chronos-Bolt backbone (Route C)

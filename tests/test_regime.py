@@ -13,6 +13,17 @@ from futures_foundation.regime import (
     select_regime_observations, REGIME_FEATURE_NAMES,
 )
 
+# hmmlearn is an OPTIONAL dep (lazy-imported inside RegimeHMM.fit). Tests that
+# actually fit/transform an HMM skip cleanly when it isn't installed; the pure
+# helpers (context_observations / select_regime_observations / pre-fit guards)
+# always run.
+try:
+    import hmmlearn  # noqa: F401
+    _HAS_HMM = True
+except Exception:
+    _HAS_HMM = False
+requires_hmm = pytest.mark.skipif(not _HAS_HMM, reason='hmmlearn not installed')
+
 
 # ---- select_regime_observations (existing-feature column picker) -----------
 def test_select_regime_observations_picks_existing_vol_cols():
@@ -67,6 +78,7 @@ def _stream(n_bars, n_states_signal=2, seed=0):
 
 
 # ---- RegimeHMM mechanics --------------------------------------------------
+@requires_hmm
 def test_fit_transform_shapes_and_simplex():
     keys, obs = _stream(60)
     m = np.ones(len(keys), bool)
@@ -77,6 +89,7 @@ def test_fit_transform_shapes_and_simplex():
     np.testing.assert_allclose(post.sum(1), 1.0, atol=1e-5)
 
 
+@requires_hmm
 def test_both_directions_of_a_bar_share_posterior():
     keys, obs = _stream(40)
     hmm = RegimeHMM(n_states=2, seed=0).fit(keys, obs, np.ones(len(keys), bool))
@@ -86,6 +99,7 @@ def test_both_directions_of_a_bar_share_posterior():
     np.testing.assert_array_equal(post[2], post[3])
 
 
+@requires_hmm
 def test_transform_is_causal_no_future_peek():
     """A bar's filtered posterior must NOT change when a LATER bar's obs change
     (forward filtering). Bars at/after the change MAY move."""
@@ -102,6 +116,7 @@ def test_transform_is_causal_no_future_peek():
     assert not np.allclose(post1[80], post2[80])
 
 
+@requires_hmm
 def test_fit_is_leak_safe_to_train_mask():
     """Changing TEST-mask rows must not change the fitted HMM params."""
     keys, obs = _stream(60)
@@ -114,6 +129,7 @@ def test_fit_is_leak_safe_to_train_mask():
     np.testing.assert_allclose(a._transmat, b._transmat, atol=1e-6)
 
 
+@requires_hmm
 def test_save_load_roundtrip(tmp_path):
     keys, obs = _stream(60)
     hmm = RegimeHMM(n_states=2, seed=0).fit(keys, obs, np.ones(len(keys), bool))
@@ -124,6 +140,7 @@ def test_save_load_roundtrip(tmp_path):
                                loaded.transform(keys, obs), atol=1e-6)
 
 
+@requires_hmm
 def test_params_dict_serializable():
     import json
     keys, obs = _stream(60)
@@ -139,12 +156,14 @@ def test_transform_before_fit_raises():
         RegimeHMM(n_states=2).transform(keys, obs)
 
 
+@requires_hmm
 def test_too_few_train_bars_raises():
     keys, obs = _stream(5)                            # 5 bars, n_states=2 -> <20
     with pytest.raises(ValueError):
         RegimeHMM(n_states=2).fit(keys, obs, np.ones(len(keys), bool))
 
 
+@requires_hmm
 def test_pca_path_for_highdim_obs():
     """obs dim > pca_dim triggers PCA before the HMM; posteriors still valid."""
     rng = np.random.default_rng(1)

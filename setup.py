@@ -21,7 +21,8 @@ setup(
     extras_require={
         "foundation": ["torch>=2.0", "chronos-forecasting"],
         "heads": ["xgboost>=2.0", "joblib>=1.3"],
+        "regime": ["hmmlearn>=0.3"],   # futures_foundation.regime market-state HMM
         "onnx": ["onnxmltools", "skl2onnx"],
-        "dev": ["pytest>=7.0", "black", "ruff"],
+        "dev": ["pytest>=7.0", "black", "ruff", "hmmlearn>=0.3"],
     },
 )
