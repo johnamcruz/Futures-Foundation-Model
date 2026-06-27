@@ -49,8 +49,16 @@ def select_regime_observations(feat, feat_names):
     """Pick the EXISTING volatility/regime columns (by canonical name) out of a
     labeler's feature matrix -> (obs [N, d], names). No new properties: this is
     a column selection on features the labeler already computed. Returns the
-    columns in REGIME_FEATURE_NAMES order, skipping any the labeler lacks."""
+    columns in REGIME_FEATURE_NAMES order, skipping any the labeler lacks.
+
+    NaN/inf in the selected columns are zeroed here — labelers may leave NaNs in
+    their feature matrix, and the HMM (scaler/EM) would otherwise propagate them
+    to NaN posteriors and silently null the regime signal."""
     feat = np.asarray(feat, np.float32)
+    if len(feat_names) != feat.shape[1]:
+        raise ValueError(
+            f"feature_names ({len(feat_names)}) != feature matrix width "
+            f"({feat.shape[1]}) — features() and feature_names() are out of sync")
     idx = {n: i for i, n in enumerate(feat_names)}
     cols, names = [], []
     for n in REGIME_FEATURE_NAMES:
@@ -60,7 +68,8 @@ def select_regime_observations(feat, feat_names):
         raise ValueError("no regime feature columns found in labeler features — "
                          "labeler.feature_names() must expose some of "
                          f"{REGIME_FEATURE_NAMES}")
-    return feat[:, cols], names
+    obs = np.nan_to_num(feat[:, cols], nan=0.0, posinf=0.0, neginf=0.0)
+    return obs, names
 
 
 # number of auto-derived context observations (see context_observations)
@@ -100,48 +109,63 @@ def context_observations(contexts):
 # guarantees FILTERING, not smoothing)
 # ---------------------------------------------------------------------------
 def _diag_logprob(X, means, covars_diag):
-    """Diagonal-Gaussian emission log-prob -> [T, K]."""
-    T = X.shape[0]
+    """Diagonal-Gaussian emission log-prob -> [T, K]. covars floored for safety."""
+    cov = np.maximum(covars_diag, 1e-6)
     K = means.shape[0]
-    out = np.empty((T, K), float)
+    out = np.empty((X.shape[0], K), float)
+    const = np.log(2 * np.pi * cov).sum(1)          # [K]
     for k in range(K):
-        d2 = ((X - means[k]) ** 2 / covars_diag[k]).sum(1)
-        out[:, k] = -0.5 * (d2 + np.log(2 * np.pi * covars_diag[k]).sum())
+        d2 = ((X - means[k]) ** 2 / cov[k]).sum(1)
+        out[:, k] = -0.5 * (d2 + const[k])
     return out
 
 
 def _forward_filter(framelogprob, startprob, transmat):
-    """Causal forward filtering -> P(s_t | o_1..t), [T, K]. No future peek."""
-    from scipy.special import logsumexp
+    """Causal forward filtering -> P(s_t | o_1..t), [T, K]. No future peek.
+    Inlined log-sum-exp (no per-step scipy call) — the recurrence is inherently
+    sequential, so this Python loop over T is unavoidable, but cheap per step."""
     T, K = framelogprob.shape
     lt = np.log(transmat + 1e-300)
-    la = np.empty((T, K))
-    la[0] = np.log(startprob + 1e-300) + framelogprob[0]
-    la[0] -= logsumexp(la[0])
+    out = np.empty((T, K))
+    a = np.log(startprob + 1e-300) + framelogprob[0]
+    a -= a.max() + np.log(np.exp(a - a.max()).sum())     # normalize (filtered)
+    out[0] = a
     for t in range(1, T):
-        pred = logsumexp(la[t - 1][:, None] + lt, axis=0)
-        la[t] = pred + framelogprob[t]
-        la[t] -= logsumexp(la[t])
-    return np.exp(la)
+        x = a[:, None] + lt                              # [K(from), K(to)]
+        mx = x.max(0)
+        pred = mx + np.log(np.exp(x - mx).sum(0))        # logsumexp over `from`
+        a = pred + framelogprob[t]
+        a -= a.max() + np.log(np.exp(a - a.max()).sum())
+        out[t] = a
+    return np.exp(out)
 
 
 # ---------------------------------------------------------------------------
-def _stream_order(keys):
-    """Group signals into per-stream ordered UNIQUE bars.
-    Returns: streams = {stream_id: [(bar_index, first_signal_row), ...] sorted},
-    and bar_rows = {(stream_id, bar_index): [all signal rows on that bar]}."""
-    first = {}
-    bar_rows = {}
+def _stream_index(keys):
+    """Group signals per stream with a VECTORIZED scatter map (computed once).
+    Returns {sid: dict(uniq_rows, rows, pos)}:
+      uniq_rows  int[T]  first signal-row of each UNIQUE bar, in time order
+      rows       int[M]  every signal row in the stream
+      pos        int[M]  the bar-position (0..T-1) of each row in `rows`
+    so a stream's posteriors scatter in ONE numpy op: post[rows] = f[pos]."""
+    order, rows = {}, {}
     for n, k in enumerate(keys):
         sid, bar = k[0], int(k[1])
-        bar_rows.setdefault((sid, bar), []).append(n)
-        first.setdefault((sid, bar), n)
-    streams = {}
-    for (sid, bar), n in first.items():
-        streams.setdefault(sid, []).append((bar, n))
-    for sid in streams:
-        streams[sid].sort()
-    return streams, bar_rows
+        rows.setdefault(sid, []).append((n, bar))
+        d = order.setdefault(sid, {})
+        if bar not in d:
+            d[bar] = n
+    out = {}
+    for sid, bar2row in order.items():
+        bars_sorted = sorted(bar2row)
+        barpos = {b: i for i, b in enumerate(bars_sorted)}
+        rr = rows[sid]
+        out[sid] = dict(
+            uniq_rows=np.fromiter((bar2row[b] for b in bars_sorted), int,
+                                  len(bars_sorted)),
+            rows=np.fromiter((n for n, _b in rr), int, len(rr)),
+            pos=np.fromiter((barpos[b] for _n, b in rr), int, len(rr)))
+    return out
 
 
 class RegimeHMM:
@@ -173,91 +197,90 @@ class RegimeHMM:
             Z = self._pca.transform(Z)
         return np.asarray(Z, float)
 
-    def fit(self, keys, obs, train_mask):
+    def fit(self, keys, obs, train_mask, index=None):
         """Fit scaler(+PCA)+HMM on TRAIN unique bars (train_mask True rows),
-        using per-stream contiguous sequences. obs: [N, D]."""
+        per-stream contiguous sequences. obs: [N, D]. `index` (from
+        _stream_index) may be passed to avoid recomputing the grouping."""
         from sklearn.preprocessing import StandardScaler
         from sklearn.decomposition import PCA
         from hmmlearn.hmm import GaussianHMM
 
-        obs = np.asarray(obs, float)
+        obs = np.nan_to_num(np.asarray(obs, float), nan=0.0, posinf=0.0, neginf=0.0)
         train_mask = np.asarray(train_mask, bool)
-        streams, _ = _stream_order(keys)
-        tr_rows = [n for sid in streams for (bar, n) in streams[sid]
-                   if train_mask[n]]
-        if len(tr_rows) < self.n_states * 10:
-            raise ValueError(f"too few train bars ({len(tr_rows)}) for "
+        idx = index if index is not None else _stream_index(keys)
+        # train UNIQUE bars per stream (a bar belongs entirely to one split, so
+        # filtering uniq_rows by the mask gives the train unique bars in order)
+        tr_uniq = [d['uniq_rows'][train_mask[d['uniq_rows']]] for d in idx.values()]
+        n_tr = int(sum(len(u) for u in tr_uniq))
+        if n_tr < self.n_states * 10:
+            raise ValueError(f"too few train bars ({n_tr}) for "
                              f"{self.n_states} states")
+        tr_rows = np.concatenate([u for u in tr_uniq if len(u)])
         self._scaler = StandardScaler().fit(obs[tr_rows])
         Zt = self._scaler.transform(obs[tr_rows])
         if obs.shape[1] > self.pca_dim:
             self._pca = PCA(n_components=self.pca_dim,
                             random_state=self.seed).fit(Zt)
-            Zt = self._pca.transform(Zt)
         else:
             self._pca = None
-        # per-stream TRAIN sequences (HMM needs contiguous lengths)
         Zall = self._project(obs)
         seqs, lengths = [], []
-        for sid in streams:
-            rows = [n for (bar, n) in streams[sid] if train_mask[n]]
-            if len(rows) > 5:
-                seqs.append(Zall[rows]); lengths.append(len(rows))
+        for u in tr_uniq:
+            if len(u) > 5:
+                seqs.append(Zall[u]); lengths.append(len(u))
         hmm = GaussianHMM(n_components=self.n_states, covariance_type='diag',
                           n_iter=self.n_iter, random_state=self.seed, tol=1e-3)
         hmm.fit(np.vstack(seqs), lengths)
         self._startprob = np.asarray(hmm.startprob_, float)
         self._transmat = np.asarray(hmm.transmat_, float)
         self._means = np.asarray(hmm.means_, float)
-        self._covars = np.array([np.diag(c) if np.ndim(c) == 2 else np.asarray(c)
-                                 for c in hmm.covars_], float)
+        self._covars = np.maximum(
+            np.array([np.diag(c) if np.ndim(c) == 2 else np.asarray(c)
+                      for c in hmm.covars_], float), 1e-6)
         self._fitted = True
         return self
 
-    def transform(self, keys, obs):
-        """Causal filtered posteriors for EVERY signal -> [N, n_states].
-        Each stream is filtered over its full ordered unique-bar sequence; the
-        bar's posterior is scattered to all signals on that bar."""
+    def transform(self, keys, obs, index=None):
+        """Causal filtered posteriors for EVERY signal -> [N, n_states]. Each
+        stream is filtered over its FULL ordered unique-bar sequence (so when
+        keys span train+val+test the filter is warm-started from train history —
+        pass all splits together and slice), then scattered VECTORIZED to every
+        signal on each bar. `index` reuses a precomputed _stream_index."""
         if not self._fitted:
             raise RuntimeError("RegimeHMM.transform before fit")
-        obs = np.asarray(obs, float)
+        obs = np.nan_to_num(np.asarray(obs, float), nan=0.0, posinf=0.0, neginf=0.0)
         Zall = self._project(obs)
-        streams, bar_rows = _stream_order(keys)
+        idx = index if index is not None else _stream_index(keys)
         post = np.zeros((len(keys), self.n_states), np.float32)
-        for sid, order in streams.items():
-            rows = [n for (bar, n) in order]
-            flp = _diag_logprob(Zall[rows], self._means, self._covars)
+        for d in idx.values():
+            flp = _diag_logprob(Zall[d['uniq_rows']], self._means, self._covars)
             f = _forward_filter(flp, self._startprob, self._transmat)
-            for r, (bar, _n) in enumerate(order):
-                for n in bar_rows[(sid, bar)]:
-                    post[n] = f[r]
+            post[d['rows']] = f[d['pos']]                # vectorized scatter
         return post
 
-    def viterbi(self, keys, obs):
-        """Most-likely state per signal (DIAGNOSTIC ONLY — uses hmmlearn's
-        Viterbi, which is a full-sequence decode; do not use as a live feature).
-        -> [N] int."""
+    def viterbi(self, keys, obs, index=None):
+        """Most-likely state per signal (DIAGNOSTIC ONLY — hmmlearn Viterbi is a
+        full-sequence decode; never use as a live feature). -> [N] int."""
         if not self._fitted:
             raise RuntimeError("RegimeHMM.viterbi before fit")
         from hmmlearn.hmm import GaussianHMM
         m = GaussianHMM(n_components=self.n_states, covariance_type='diag')
         m.startprob_, m.transmat_ = self._startprob, self._transmat
         m.means_, m.covars_ = self._means, self._covars
-        obs = np.asarray(obs, float)
+        obs = np.nan_to_num(np.asarray(obs, float), nan=0.0, posinf=0.0, neginf=0.0)
         Zall = self._project(obs)
-        streams, bar_rows = _stream_order(keys)
+        idx = index if index is not None else _stream_index(keys)
         vit = np.full(len(keys), -1, int)
-        for sid, order in streams.items():
-            rows = [n for (bar, n) in order]
-            v = m.predict(Zall[rows])
-            for r, (bar, _n) in enumerate(order):
-                for n in bar_rows[(sid, bar)]:
-                    vit[n] = v[r]
+        for d in idx.values():
+            v = m.predict(Zall[d['uniq_rows']])
+            vit[d['rows']] = v[d['pos']]
         return vit
 
     def state_names(self):
-        """Order states by mean of HMM observation dim 0 — a stable label so
-        bundles/contracts can reference 'regime_0'..'regime_{K-1}' consistently."""
+        """Stable column labels 'regime_0'..'regime_{K-1}'. NOTE: HMM state
+        indices are permutation-arbitrary across fits — these are positional
+        labels, not semantically ordered. The serialized params (params_dict)
+        define the exact mapping the serve path must reproduce."""
         return [f'regime_{i}' for i in range(self.n_states)]
 
     # -- serialization ------------------------------------------------------

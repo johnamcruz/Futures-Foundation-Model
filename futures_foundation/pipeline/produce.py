@@ -254,7 +254,7 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
     # name from the labeler's feature matrix — adds no new properties) over the
     # TRAIN span, and appends the K causal-filtered state posteriors. Default
     # off -> X is byte-identical to the embed+features pipeline.
-    regime_hmm = regime_names = None
+    regime_hmm = regime_names = regime_obs_tr = None
     if use_regime:
         from .. import regime as _regime
         feat_names = (labeler.feature_names()
@@ -262,10 +262,12 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         if feat_names is None or Ftr is None:
             raise ValueError("use_regime needs labeler.feature_names() + "
                              "features() exposing the volatility columns")
-        obs_tr, regime_names = _regime.select_regime_observations(Ftr, feat_names)
+        regime_obs_tr, regime_names = _regime.select_regime_observations(
+            Ftr, feat_names)
+        _tr_idx = _regime._stream_index(Ktr)         # compute grouping once
         regime_hmm = _regime.RegimeHMM(n_states=regime_states, seed=seed).fit(
-            Ktr, obs_tr, np.ones(len(Ktr), bool))
-        post_tr = regime_hmm.transform(Ktr, obs_tr)
+            Ktr, regime_obs_tr, np.ones(len(Ktr), bool), index=_tr_idx)
+        post_tr = regime_hmm.transform(Ktr, regime_obs_tr, index=_tr_idx)
         Xtr = np.hstack([Xtr, post_tr]).astype(np.float32)
         if verbose:
             print(f"[regime] +{regime_states}-state HMM on {regime_names} -> "
@@ -343,7 +345,11 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
                 from .. import regime as _regime
                 obs_te, _ = _regime.select_regime_observations(
                     Fte, labeler.feature_names())
-                Xte = np.hstack([Xte, regime_hmm.transform(Kte, obs_te)]).astype(np.float32)
+                # warm-start the holdout filter from TRAIN history (causal): filter
+                # train+holdout per stream with the already-fit HMM, take holdout.
+                Kall = list(Ktr) + list(Kte)
+                pall = regime_hmm.transform(Kall, np.vstack([regime_obs_tr, obs_te]))
+                Xte = np.hstack([Xte, pall[len(Ktr):]]).astype(np.float32)
             # threshold sweep mirrors the walk-forward dashboard — argmax
             # `predict()` is wrong here because class imbalance (~70/30)
             # parks the model below 0.50 on most signals; what matters in

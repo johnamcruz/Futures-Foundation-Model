@@ -290,9 +290,9 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     o = 0
     feats_fn = getattr(labeler, 'features', None)
 
-    def _fuse(keys, E, L=None):
-        extra = (np.asarray(feats_fn(keys), np.float32)
-                 if feats_fn is not None else None)
+    def _fuse(E, extra, L=None):
+        # extra: PRE-COMPUTED labeler features (computed once per split below and
+        # reused for both X and the regime obs — no double feature compute).
         X = (np.hstack([E, extra.reshape(len(E), -1)]).astype(np.float32)
              if extra is not None and extra.size else np.asarray(E, np.float32))
         if L is not None:
@@ -301,6 +301,10 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             X = np.hstack([X, np.log(np.clip(L[:, 1:2], 1e-6, None))]).astype(np.float32)
         return X
 
+    _regime = _regime_fn = None
+    if use_regime:
+        from .. import regime as _regime
+        _regime_fn = labeler.feature_names()
     for d in fold_data:
         ntr, nva, nte = len(d['Ctr']), len(d['Cval']), len(d['Cte'])
         Etr = flat_embed[o:o + ntr]
@@ -312,23 +316,34 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             Lva = flat_ls[o + ntr:o + ntr + nva]
             Lte = flat_ls[o + ntr + nva:o + ntr + nva + nte]
         o += ntr + nva + nte
-        d['Xtr'] = _fuse(d['Ktr'], Etr, Ltr)
-        d['Xval'] = _fuse(d['Kval'], Eva, Lva)
-        d['Xte'] = _fuse(d['Kte'], Ete, Lte)
+        # compute labeler features ONCE per split (reused for X + regime obs)
+        Ftr = (np.asarray(feats_fn(d['Ktr']), np.float32) if feats_fn else None)
+        Fva = (np.asarray(feats_fn(d['Kval']), np.float32) if feats_fn else None)
+        Fte = (np.asarray(feats_fn(d['Kte']), np.float32) if feats_fn else None)
+        d['Xtr'] = _fuse(Etr, Ftr, Ltr)
+        d['Xval'] = _fuse(Eva, Fva, Lva)
+        d['Xte'] = _fuse(Ete, Fte, Lte)
         if use_regime:
-            # regime HMM (additive, leak-safe PER FOLD): fit on THIS fold's
-            # TRAIN volatility features (existing cols, selected by name — no new
-            # properties), causal-filter each split, append the K posteriors.
-            from .. import regime as _regime
-            fn = labeler.feature_names()
-            otr, _ = _regime.select_regime_observations(feats_fn(d['Ktr']), fn)
-            ova, _ = _regime.select_regime_observations(feats_fn(d['Kval']), fn)
-            ote, _ = _regime.select_regime_observations(feats_fn(d['Kte']), fn)
+            # regime HMM (additive, leak-safe PER FOLD): fit on THIS fold's TRAIN
+            # volatility features only (existing cols, reusing the already-computed
+            # F* matrices). Then filter the FULL fold sequence (train+val+test) per
+            # stream in ONE pass so val/test are warm-started from train history
+            # (still strictly causal — forward filter, no future peek) and the
+            # per-signal scatter is vectorized. Slice the posteriors back per split.
+            otr, _ = _regime.select_regime_observations(Ftr, _regime_fn)
+            ova, _ = _regime.select_regime_observations(Fva, _regime_fn)
+            ote, _ = _regime.select_regime_observations(Fte, _regime_fn)
+            Kall = list(d['Ktr']) + list(d['Kval']) + list(d['Kte'])
+            oall = np.vstack([otr, ova, ote])
+            tmask = np.zeros(len(Kall), bool); tmask[:len(otr)] = True
+            allidx = _regime._stream_index(Kall)
             rh = _regime.RegimeHMM(n_states=regime_states, seed=0).fit(
-                d['Ktr'], otr, np.ones(len(d['Ktr']), bool))
-            d['Xtr'] = np.hstack([d['Xtr'], rh.transform(d['Ktr'], otr)]).astype(np.float32)
-            d['Xval'] = np.hstack([d['Xval'], rh.transform(d['Kval'], ova)]).astype(np.float32)
-            d['Xte'] = np.hstack([d['Xte'], rh.transform(d['Kte'], ote)]).astype(np.float32)
+                Kall, oall, tmask, index=allidx)
+            pall = rh.transform(Kall, oall, index=allidx)
+            n1, n2 = len(otr), len(otr) + len(ova)
+            d['Xtr'] = np.hstack([d['Xtr'], pall[:n1]]).astype(np.float32)
+            d['Xval'] = np.hstack([d['Xval'], pall[n1:n2]]).astype(np.float32)
+            d['Xte'] = np.hstack([d['Xte'], pall[n2:]]).astype(np.float32)
     rnote = f" (+{regime_states}-state regime HMM)" if use_regime else ""
     print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}{rnote}\n")
 
