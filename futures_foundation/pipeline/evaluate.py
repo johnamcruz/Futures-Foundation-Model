@@ -181,7 +181,8 @@ def _agg_stats(name, R, tks=None):
 def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=1,
         max_folds=None, min_train_start=None, auto_regularize=True,
         return_verdict=False, loop=False, embed_cache=None,
-        pool_mode='mean', use_loc_scale=False, holdout_start=None):
+        pool_mode='mean', use_loc_scale=False, holdout_start=None,
+        use_regime=False, regime_states=4):
     """labeler: a StrategyLabeler. head_factory: nc -> head (default
     XGBHead). max_folds=None -> sweep every available OOS month-pair
     (XGBoost-pipeline convention). Prints REAL/SHUFFLE/RANDOM per
@@ -209,7 +210,9 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
     if _should_loop(loop, binary, _default_head):
         from .train_loop import train_loop
         res = train_loop(labeler, seeds=seeds, loop_max_folds=max_folds,
-                         final_max_folds=max_folds)
+                         final_max_folds=max_folds,
+                         use_regime=use_regime, regime_states=regime_states,
+                         holdout_start=holdout_start)
         final = res.get('final') or {}
         return res if return_verdict else (final.get('records') or [])
 
@@ -312,7 +315,22 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
         d['Xtr'] = _fuse(d['Ktr'], Etr, Ltr)
         d['Xval'] = _fuse(d['Kval'], Eva, Lva)
         d['Xte'] = _fuse(d['Kte'], Ete, Lte)
-    print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}\n")
+        if use_regime:
+            # regime HMM (additive, leak-safe PER FOLD): fit on THIS fold's
+            # TRAIN volatility features (existing cols, selected by name — no new
+            # properties), causal-filter each split, append the K posteriors.
+            from .. import regime as _regime
+            fn = labeler.feature_names()
+            otr, _ = _regime.select_regime_observations(feats_fn(d['Ktr']), fn)
+            ova, _ = _regime.select_regime_observations(feats_fn(d['Kval']), fn)
+            ote, _ = _regime.select_regime_observations(feats_fn(d['Kte']), fn)
+            rh = _regime.RegimeHMM(n_states=regime_states, seed=0).fit(
+                d['Ktr'], otr, np.ones(len(d['Ktr']), bool))
+            d['Xtr'] = np.hstack([d['Xtr'], rh.transform(d['Ktr'], otr)]).astype(np.float32)
+            d['Xval'] = np.hstack([d['Xval'], rh.transform(d['Kval'], ova)]).astype(np.float32)
+            d['Xte'] = np.hstack([d['Xte'], rh.transform(d['Kte'], ote)]).astype(np.float32)
+    rnote = f" (+{regime_states}-state regime HMM)" if use_regime else ""
+    print(f"[batch-embed] done. feat_dim={fold_data[0]['Xtr'].shape[1]}{rnote}\n")
 
     # Phase 3 — per-(fold, seed) XGBoost work, parallelized via threads.
     # XGBoost releases the GIL in its C tree-builder + numpy ops, so a

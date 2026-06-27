@@ -158,6 +158,7 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
           holdout_start_date: Optional[str] = None,
           output_path: Optional[str | Path] = None,
           export_onnx: bool = False, calibrate: bool = False,
+          use_regime: bool = False, regime_states: int = 4,
           verbose: bool = True) -> dict:
     """Fit on all signals strictly before `cal_max - holdout_months`
     (with the same leak-purge the walk-forward uses), evaluate on the
@@ -241,11 +242,33 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
            else None)
     Xtr = (np.hstack([Etr, Ftr.reshape(len(Etr), -1)]).astype(np.float32)
            if Ftr is not None and Ftr.size else np.asarray(Etr, np.float32))
-    feat_dim = Xtr.shape[1]
     if verbose:
         print(f"\n[features] X_train: {Xtr.shape}  "
               f"({int(Etr.shape[1])} embed + "
               f"{0 if Ftr is None else Ftr.reshape(len(Etr), -1).shape[1]} hand-craft)")
+
+    # ---- Stage 3b (opt-in): regime HMM posteriors APPENDED (additive) ----
+    # Fits a market-regime HMM on the EXISTING volatility features (selected by
+    # name from the labeler's feature matrix — adds no new properties) over the
+    # TRAIN span, and appends the K causal-filtered state posteriors. Default
+    # off -> X is byte-identical to the embed+features pipeline.
+    regime_hmm = regime_names = None
+    if use_regime:
+        from .. import regime as _regime
+        feat_names = (labeler.feature_names()
+                      if hasattr(labeler, 'feature_names') else None)
+        if feat_names is None or Ftr is None:
+            raise ValueError("use_regime needs labeler.feature_names() + "
+                             "features() exposing the volatility columns")
+        obs_tr, regime_names = _regime.select_regime_observations(Ftr, feat_names)
+        regime_hmm = _regime.RegimeHMM(n_states=regime_states, seed=seed).fit(
+            Ktr, obs_tr, np.ones(len(Ktr), bool))
+        post_tr = regime_hmm.transform(Ktr, obs_tr)
+        Xtr = np.hstack([Xtr, post_tr]).astype(np.float32)
+        if verbose:
+            print(f"[regime] +{regime_states}-state HMM on {regime_names} -> "
+                  f"X_train {Xtr.shape} (posteriors appended)")
+    feat_dim = Xtr.shape[1]
 
     # ---- Stage 4: fit signal head ----
     t0 = time.time()
@@ -314,6 +337,11 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
                    if feats_fn is not None else None)
             Xte = (np.hstack([Ete, Fte.reshape(len(Ete), -1)]).astype(np.float32)
                    if Fte is not None and Fte.size else np.asarray(Ete, np.float32))
+            if regime_hmm is not None:                  # append holdout posteriors
+                from .. import regime as _regime
+                obs_te, _ = _regime.select_regime_observations(
+                    Fte, labeler.feature_names())
+                Xte = np.hstack([Xte, regime_hmm.transform(Kte, obs_te)]).astype(np.float32)
             # threshold sweep mirrors the walk-forward dashboard — argmax
             # `predict()` is wrong here because class imbalance (~70/30)
             # parks the model below 0.50 on most signals; what matters in
@@ -422,6 +450,14 @@ def train(labeler, *, holdout_months: int = 1, seed: int = 0,
         'labeler_config': (labeler.config_dict()
                            if hasattr(labeler, 'config_dict') else {}),
         'n_classes': nc,
+        # regime HMM (opt-in, additive): the fitted model + the K posteriors
+        # appended after the embed+features block. None when use_regime is off.
+        'regime': ({
+            'hmm': regime_hmm,
+            'n_states': int(regime_states),
+            'features': regime_names,
+            'params': regime_hmm.params_dict(),
+        } if regime_hmm is not None else None),
         'training_metadata': {
             'train_span': (str(cal_min), str(holdout_start)),
             'holdout_span': ((str(holdout_start), str(cal_max))

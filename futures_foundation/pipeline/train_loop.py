@@ -35,13 +35,16 @@ from .head_xgb import XGBHead
 from futures_foundation.extractors.chronos import backbone
 
 
-def _walk_forward(labeler, params, *, seeds, max_folds, tag):
+def _walk_forward(labeler, params, *, seeds, max_folds, tag,
+                  use_regime=False, regime_states=4, holdout_start=None):
     bar = "█" * 64
     print(f"\n{bar}\n  WALK-FORWARD [{tag}] — params: "
           f"{params or 'shipped defaults'}\n{bar}", flush=True)
     return ev.run(labeler, head_factory=lambda nc, _p=params: XGBHead(nc, **_p),
                   seeds=seeds, max_folds=max_folds,
-                  auto_regularize=False, return_verdict=True)
+                  auto_regularize=False, return_verdict=True,
+                  use_regime=use_regime, regime_states=regime_states,
+                  holdout_start=holdout_start)
 
 
 def _overfit(v):
@@ -50,7 +53,10 @@ def _overfit(v):
 
 
 def train_loop(labeler, *, max_iters=3, loop_max_folds=12, final_max_folds=None,
-               seeds=(0, 1, 2), scan_trials=40, seed=42):
+               seeds=(0, 1, 2), scan_trials=40, seed=42,
+               use_regime=False, regime_states=4, holdout_start=None):
+    _rk = dict(use_regime=use_regime, regime_states=regime_states,
+               holdout_start=holdout_start)
     backbone.stamp_active_source(context='train-loop')
     name = type(labeler).__name__
     print(f"\n{'#'*64}\n# TRAIN LOOP — {name}\n{'#'*64}")
@@ -58,7 +64,7 @@ def train_loop(labeler, *, max_iters=3, loop_max_folds=12, final_max_folds=None,
     # ---- Step 1: walk-forward with DEFAULT params -----------------------
     params, source = {}, 'default'
     v = _walk_forward(labeler, params, seeds=seeds,
-                      max_folds=loop_max_folds, tag="iter 0 · defaults")
+                      max_folds=loop_max_folds, tag="iter 0 · defaults", **_rk)
 
     history = [dict(iter=0, source='default', params={},
                     generalizes=(v or {}).get('generalizes'),
@@ -86,7 +92,8 @@ def train_loop(labeler, *, max_iters=3, loop_max_folds=12, final_max_folds=None,
                 break                      # tuning can't fix it → stop, flag
             params, source = scan['params'], f'tuned(iter{it})'
             v = _walk_forward(labeler, params, seeds=seeds,
-                              max_folds=loop_max_folds, tag=f"iter {it} · tuned")
+                              max_folds=loop_max_folds, tag=f"iter {it} · tuned",
+                              **_rk)
             history.append(dict(iter=it, source=source, params=params,
                                 generalizes=(v or {}).get('generalizes'),
                                 gap=(v or {}).get('gap'),
@@ -108,7 +115,7 @@ def train_loop(labeler, *, max_iters=3, loop_max_folds=12, final_max_folds=None,
     # ---- Step 6: final FULL walk-forward to confirm on unseen data ------
     print(f"\n{'═'*64}\n  STEP 6 — FINAL FULL walk-forward confirmation\n{'═'*64}")
     final = _walk_forward(labeler, params, seeds=seeds,
-                          max_folds=final_max_folds, tag="FINAL · all folds")
+                          max_folds=final_max_folds, tag="FINAL · all folds", **_rk)
 
     print(f"\n{'#'*64}\n# TRAIN-LOOP RESULT — {name}")
     print(f"#  chosen params : {source} → {params or 'shipped defaults'}")
