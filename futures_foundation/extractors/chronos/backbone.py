@@ -188,6 +188,10 @@ def embed(contexts, batch=64, pool='mean', return_loc_scale=False, device=None):
     import subprocess
     import tempfile
 
+    # batch is a pure THROUGHPUT knob — each window is embedded independently
+    # (Chronos normalizes per-series; no cross-batch interaction), so output is
+    # batch-INVARIANT. Override via CHRONOS_EMBED_BATCH for GPU throughput.
+    batch = int(os.environ.get('CHRONOS_EMBED_BATCH', batch))
     if pool not in ('mean', 'reg', 'meanreg'):
         raise ValueError(f"pool must be 'mean'|'reg'|'meanreg', got {pool!r}")
     dim = pooled_dim(pool)        # full width incl. locscale + return-shape (consistent)
