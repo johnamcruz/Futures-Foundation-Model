@@ -352,6 +352,20 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
             print(f"[batch-embed] volume: {len(flat_vol_ctx):,} contexts "
                   f"(pool={volume_pool})...")
             flat_vol_embed = backbone.embed(flat_vol_ctx, pool=volume_pool)
+    # fp16 embed matrices (OPT-IN, default off): the flat price + volume embeds are
+    # held in RAM simultaneously across ALL folds — at fp32 that's ~17GB on a
+    # 6-fold x 6-ticker walk-forward WITH volume, which OOMs/freezes the machine.
+    # Casting to fp16 halves that peak. _fuse upcasts the per-fold SUBSET back to
+    # fp32 for XGBoost, so trees still train in fp32 (only the held matrix is fp16;
+    # ~3-digit precision is plenty for tree splits). Default OFF preserves byte
+    # parity for the certified non-volume strategies; the fractal run opts in.
+    if os.environ.get('FFM_EMBED_FP16', '0') == '1':
+        flat_embed = np.asarray(flat_embed, np.float16)
+        if flat_vol_embed is not None:
+            flat_vol_embed = np.asarray(flat_vol_embed, np.float16)
+        print(f"[embed-fp16] price{flat_embed.shape}"
+              f"{'+vol'+str(flat_vol_embed.shape) if flat_vol_embed is not None else ''}"
+              f" -> fp16 (halved RAM)")
     # slice back per fold + concat labeler features
     o = 0
     feats_fn = getattr(labeler, 'features', None)
