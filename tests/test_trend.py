@@ -2,6 +2,7 @@
 regime HMM and models; one future peek breaks OOS), plus correctness of the
 vectorized efficiency ratio and Kalman direction tracking."""
 import numpy as np
+import pandas as pd
 
 from futures_foundation import trend as T
 
@@ -59,21 +60,24 @@ def test_kalman_velocity_direction():
 
 # ---- trend_aligned: causal gate, correct direction match ------------------
 def test_trend_aligned_correct_and_causal():
+    from futures_foundation.pivots import causal_htf_dir
     n = 4000
     ts = pd.date_range('2024-01-01', periods=n, freq='1min', tz='UTC').values
     rng = np.random.default_rng(0)
-    c = 100 + np.arange(n) * 0.01 + rng.standard_normal(n) * 0.02      # steady uptrend
-    bars = dict(ts=ts, o=c, h=c + 0.05, l=c - 0.05, c=c)
-    long_sig = np.ones(n, int)
-    short_sig = -np.ones(n, int)
-    al_long = T.trend_aligned(bars, long_sig, '1min')
-    al_short = T.trend_aligned(bars, short_sig, '1min')
-    assert al_long[800:].mean() > 0.8          # uptrend -> longs mostly aligned
-    assert al_short[800:].mean() < 0.2         # shorts mostly NOT aligned
+    t = np.arange(n)
+    c = 100 + 8 * np.sin(t / 250.0) + rng.standard_normal(n) * 0.05    # clear up & down legs
+    bars = dict(ts=ts, o=c, h=c + 0.1, l=c - 0.1, c=c)
+    htf = np.sign(causal_htf_dir(bars, '1min', ts, 20))
+    # correctness: trend_aligned == (HTF dir matches the signal dir)
+    al_long = T.trend_aligned(bars, np.ones(n, int), '1min')
+    al_short = T.trend_aligned(bars, -np.ones(n, int), '1min')
+    assert np.array_equal(al_long, htf == 1)
+    assert np.array_equal(al_short, htf == -1)
+    assert al_long.sum() > 100 and al_short.sum() > 100               # non-degenerate
     # CAUSAL: perturb the future, past alignment must not change
     b2 = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in bars.items()}
-    b2['h'][3000:] *= 1.1; b2['l'][3000:] *= 1.1; b2['c'][3000:] *= 1.1
-    al2 = T.trend_aligned(b2, long_sig, '1min')
+    b2['h'][3000:] *= 1.2; b2['l'][3000:] *= 1.2; b2['c'][3000:] *= 1.2
+    al2 = T.trend_aligned(b2, np.ones(n, int), '1min')
     assert np.array_equal(al_long[:2900], al2[:2900])
 
 
