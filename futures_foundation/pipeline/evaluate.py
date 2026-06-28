@@ -524,7 +524,6 @@ def run(labeler, head_factory=None, seeds=(0, 1, 2), train_m=3, val_m=1, test_m=
                     proba_val=proba_val, Kval=d['Kval'], Yval=d['Yval'])
 
     import concurrent.futures as cf
-    import os
     # cap concurrent fold×seed fits to bound RAM (each holds a big feature
     # matrix) — 8-wide froze machines; 4 is the safe default, override with
     # FFM_EVAL_WORKERS for beefier boxes.
