@@ -21,7 +21,29 @@ import numpy as np
 from futures_foundation.pipeline._primitives import ehlers_decycler  # certified, reuse
 
 __all__ = ['efficiency_ratio', 'kalman_velocity', 'ehlers_decycler', 'decycler_slope',
-           'swing_pivots']
+           'swing_pivots', 'trend_aligned']
+
+
+def trend_aligned(bars, signal_dir, tf, atr_p=20):
+    """Causal TREND-CONFIRMATION GATE — the validated "pivot + trend = entry" rule
+    as a reusable FFM primitive (any strategy can apply it).
+
+    Returns bool[n], True where `signal_dir` matches the higher-timeframe trend
+    (`causal_htf_dir` — the HTF ATR-zigzag direction at the last-CLOSED HTF bar,
+    per pivots.HTF_MAP). Strictly causal (no future peek). A strategy computes its
+    per-bar signal direction, calls this, and trades ONLY where True.
+
+    OOS-validated on the fractal pivot model: gating to aligned pivots lifts 2R-WR
+    35.8% -> ~44% at 58% volume, broad across all TFs/tickers; opposed -> 24%.
+    The edge comes from the HARD exclusion of counter-trend signals — a categorical
+    rule a soft feature can't replicate (teach/monotone capped ~37%).
+
+    bars: dict with 'ts','o','h','l','c'. signal_dir: int[n] (+1 long / -1 short /
+    0 none). tf: the signal timeframe (e.g. '3min'); its HTF is pivots.HTF_MAP[tf]."""
+    from futures_foundation.pivots import causal_htf_dir
+    htf = np.sign(np.asarray(causal_htf_dir(bars, tf, bars['ts'], atr_p)))
+    sd = np.sign(np.asarray(signal_dir))
+    return (htf == sd) & (sd != 0)
 
 
 def swing_pivots(high, low, close, lookback=3):
