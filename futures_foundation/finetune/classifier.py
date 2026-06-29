@@ -1,15 +1,25 @@
-"""Classifier seam — the single pluggable model interface for the fine-tune
-pipeline.
+"""Classifier seam — the single pluggable model interface for the unified
+walk-forward harness (wf.py), overfit loop (loop.py), and Optuna tuner (tune.py).
 
-A Classifier maps multivariate windows X:[N, C, seq] + labels y:[N] to a trained
-model that emits P(class 1). Implementations OWN their training (Mantis fine-tune,
-UniShape, a fresh transformer, ...); the walk-forward honest ruler (`wf.py`) only
-ever calls `fit` / `predict_proba`, so swapping backends is a one-line change.
+ONE harness, any model. A Classifier owns its featurization and its fit/predict,
+so Chronos+XGBoost and Mantis (and logistic, and future backbones) all run through
+the *same* leak-free walk-forward × {REAL, SHUFFLE, RANDOM} × health × overfit-loop
+× Optuna — no per-model duplication.
 
-IMPORT CONTRACT: this module is torch-free at import time — concrete impls (which
-import torch) are lazy-loaded in `get_classifier`, so the torch-free `finetune`
-parent can import the seam eagerly (libomp isolation — torch+xgboost segfault in
-one macOS process).
+Contract:
+  featurize(labeler, keys) -> X            parent-side, numpy (no torch in parent).
+                                           Mantis: mv_contexts [N,C,seq].
+                                           Chronos: embed+features [N,D].
+  fit_predict(Xtr, ytr, Xval, yval, Xeval, seed) -> (p_val, p_eval, best_val_auc)
+                                           in-process (XGBoost/logistic) OR an
+                                           isolated torch subprocess (Mantis).
+  needs_standardize : bool                 harness standardizes featurized X on
+                                           TRAIN stats before fit_predict (Mantis
+                                           yes; Chronos embeddings already scaled).
+
+IMPORT CONTRACT: torch-free at import time. Concrete impls that need torch keep it
+in a subprocess worker; their parent-side adapter stays torch-free so it never
+shares a process with xgboost (libomp segfault).
 """
 from abc import ABC, abstractmethod
 
@@ -17,35 +27,19 @@ import numpy as np
 
 
 class Classifier(ABC):
-    """End-to-end classifier over multivariate windows.
-
-    fit(X, y, X_val, y_val, seed): train (impls SHOULD early-stop on the val
-        split if given; else carve one from train). X:[N,C,seq] float32, y:[N] int.
-    predict_proba(X) -> [N] float  P(class 1).
-    """
-
     n_classes: int = 2
+    needs_standardize: bool = False
 
     @abstractmethod
-    def fit(self, X, y, X_val=None, y_val=None, seed=0):
+    def featurize(self, labeler, keys) -> np.ndarray:
+        """Parent-side featurization (numpy). Returns X aligned 1:1 to keys."""
         ...
 
     @abstractmethod
-    def predict_proba(self, X) -> np.ndarray:
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+        """Fit on (Xtr,ytr) with (Xval,yval) for early-stop/guard, return
+        (p_val, p_eval, best_val_auc) where p_* are P(class 1) for Xval/Xeval."""
         ...
-
-    # optional — override where the backend supports it
-    def pretrain(self, X_unlabeled):
-        """Optional domain-adaptation (e.g. contrastive pretrain on raw OHLCV)
-        BEFORE the supervised fit. No-op by default."""
-        return self
-
-    def save(self, path):
-        raise NotImplementedError
-
-    @classmethod
-    def load(cls, path):
-        raise NotImplementedError
 
 
 _REGISTRY = {}
@@ -59,14 +53,13 @@ def register_classifier(name):
 
 
 def get_classifier(name, **kwargs) -> Classifier:
-    """Instantiate a registered classifier by name. Concrete impls are imported
-    lazily here (keeps this module + the finetune parent torch-free)."""
+    """Instantiate a registered classifier by name (concrete impls imported lazily
+    so this module + the finetune parent stay torch-free)."""
     if name not in _REGISTRY:
         if name == 'mantis':
-            from .classifiers.mantis import MantisClassifier      # noqa: F401
+            from .classifiers.mantis import MantisClassifier        # noqa: F401
         elif name == 'logistic':
-            from .classifiers.logistic import LogisticClassifier  # noqa: F401
+            from .classifiers.logistic import LogisticClassifier    # noqa: F401
         else:
-            raise KeyError(f"unknown classifier '{name}'. "
-                           f"registered: {sorted(_REGISTRY)}")
+            raise KeyError(f"unknown classifier '{name}'. registered: {sorted(_REGISTRY)}")
     return _REGISTRY[name](**kwargs)

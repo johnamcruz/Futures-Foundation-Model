@@ -1,11 +1,10 @@
-"""MantisClassifier (torch-gated).
+"""Mantis classifier — torch-free adapter (non-gated) + torch trainer/worker (gated).
 
-torch + the Mantis backbone load here, so the suite is gated behind
-CHRONOS_TORCH_TESTS=1 (libomp isolation — see tests/conftest.py) and torch is
-imported inside test bodies. Kept tiny (few epochs, small N, CPU) — these check
-WIRING (fit/predict shapes, freeze policy, separability), not production AUC.
+The parent-side MantisClassifier is torch-free (featurize + spawn worker); the actual
+fine-tune lives in _mantis_torch and runs in the subprocess. torch tests are gated
+behind CHRONOS_TORCH_TESTS=1 (libomp isolation) and import torch in-body.
 
-Run: CHRONOS_TORCH_TESTS=1 pytest tests/test_mantis_classifier.py
+Run torch parts: CHRONOS_TORCH_TESTS=1 pytest tests/test_mantis_classifier.py
 """
 import os
 
@@ -17,68 +16,85 @@ torch_test = pytest.mark.skipif(
     reason='torch test — set CHRONOS_TORCH_TESTS=1 (libomp isolation)')
 
 
+class _StubLabeler:
+    def __init__(self, X):
+        self._X = X
+    def mv_contexts(self, keys):
+        return np.stack([self._X[k] for k in keys])
+
+
 def _toy(seed=0, N=120, C=4, T=64):
     rng = np.random.default_rng(seed)
     y = rng.integers(0, 2, N)
     X = rng.standard_normal((N, C, T)).astype(np.float32)
-    X[y == 1, 0, -8:] += 2.0                       # separable signal
+    X[y == 1, 0, -8:] += 2.0
     return X, y
 
 
-@torch_test
-def test_fit_predict_shapes_and_range():
+# ---- torch-free: the adapter ----------------------------------------------
+def test_adapter_featurizes_and_needs_standardize():
     from futures_foundation.finetune.classifier import get_classifier
-    X, y = _toy()
-    clf = get_classifier('mantis', n_channels=4, ft_mode='partial', epochs=2,
-                         batch=32, threads=2, device='cpu', verbose=False)
-    clf.fit(X[:90], y[:90], X[90:], y[90:], seed=0)
-    p = clf.predict_proba(X[90:])
-    assert p.shape == (30,)
-    assert np.all((p >= 0) & (p <= 1))
-    assert np.isfinite(getattr(clf, 'best_val_auc', np.nan))
+    clf = get_classifier('mantis', epochs=2)
+    assert clf.needs_standardize is True
+    X = np.random.default_rng(0).standard_normal((10, 4, 8)).astype(np.float32)
+    out = clf.featurize(_StubLabeler(X), [0, 3, 7])
+    assert out.shape == (3, 4, 8)
 
 
+def test_adapter_module_has_no_top_level_torch_import():
+    # the parent-side adapter must not import torch at module level (libomp isolation)
+    import ast
+    import futures_foundation.finetune.classifiers.mantis as m
+    src = ast.parse(open(m.__file__).read())
+    imported = {n.name.split('.')[0] for node in ast.walk(src)
+                if isinstance(node, ast.Import) for n in node.names}
+    imported |= {node.module.split('.')[0] for node in ast.walk(src)
+                 if isinstance(node, ast.ImportFrom) and node.module}
+    assert 'torch' not in imported
+
+
+# ---- torch-gated: freeze policy on the model ------------------------------
 @torch_test
 def test_partial_mode_freezes_backbone():
-    import torch                                    # noqa: F401
-    from futures_foundation.finetune.classifiers.mantis import MantisClassifier
-    clf = MantisClassifier(n_channels=4, ft_mode='partial', unfreeze_blocks=2,
-                           device='cpu', verbose=False)
-    model = clf._build_model()
+    from futures_foundation.finetune.classifiers._mantis_torch import build_model
+    model, new_c = build_model(4, new_channels=4, ft_mode='partial', unfreeze_blocks=2,
+                               device='cpu')
     layers = model.encoder.vit_unit.transformer.layers
-    # last 2 blocks trainable, an earlier block frozen
     assert all(p.requires_grad for p in layers[-1].parameters())
     assert not any(p.requires_grad for p in layers[0].parameters())
-    # head + adapter always trainable
     assert all(p.requires_grad for p in model.head.parameters())
 
 
 @torch_test
 def test_head_mode_freezes_all_backbone():
-    from futures_foundation.finetune.classifiers.mantis import MantisClassifier
-    clf = MantisClassifier(n_channels=4, ft_mode='head', device='cpu', verbose=False)
-    model = clf._build_model()
+    from futures_foundation.finetune.classifiers._mantis_torch import build_model
+    model, _ = build_model(4, ft_mode='head', device='cpu')
     assert not any(p.requires_grad for p in model.encoder.parameters())
     assert all(p.requires_grad for p in model.head.parameters())
 
 
+# ---- torch-gated: the trainer learns + shapes ----------------------------
 @torch_test
-def test_max_train_subsamples():
-    from futures_foundation.finetune.classifiers.mantis import MantisClassifier
-    X, y = _toy(N=200)
-    clf = MantisClassifier(n_channels=4, ft_mode='head', epochs=1, batch=32,
-                           device='cpu', max_train=50, verbose=False)
-    clf.fit(X, y, seed=0)                           # internal val split + cap to 50
-    assert clf.predict_proba(X[:10]).shape == (10,)
-
-
-@torch_test
-def test_learns_separable_signal():
+def test_fit_predict_torch_shapes_and_learns():
     from sklearn.metrics import roc_auc_score
-    from futures_foundation.finetune.classifier import get_classifier
+    from futures_foundation.finetune.classifiers._mantis_torch import fit_predict_torch
     X, y = _toy(N=300, seed=2)
-    clf = get_classifier('mantis', n_channels=4, ft_mode='partial', epochs=15,
-                         batch=64, threads=2, device='cpu', verbose=False)
-    clf.fit(X[:220], y[:220], X[220:], y[220:], seed=0)
-    auc = roc_auc_score(y[220:], clf.predict_proba(X[220:]))
-    assert auc > 0.7                                # learns the planted signal
+    p_val, p_eval, ba, be = fit_predict_torch(
+        X[:200], y[:200], X[200:250], y[200:250], X[250:],
+        ft_mode='partial', epochs=15, batch=64, threads=2, device='cpu', verbose=False)
+    assert p_val.shape == (50,) and p_eval.shape == (50,)
+    assert np.all((p_eval >= 0) & (p_eval <= 1))
+    assert roc_auc_score(y[250:], p_eval) > 0.7
+    assert 0.0 <= ba <= 1.0 and be >= 0
+
+
+# ---- torch-gated: the adapter end-to-end (spawns the isolated worker) -----
+@torch_test
+def test_adapter_fit_predict_via_worker():
+    from futures_foundation.finetune.classifier import get_classifier
+    X, y = _toy(N=120)
+    clf = get_classifier('mantis', ft_mode='head', epochs=2, batch=32, threads=2,
+                         device='cpu', verbose=False)
+    p_val, p_eval, ba = clf.fit_predict(X[:90], y[:90], X[90:], y[90:], X[90:], seed=0)
+    assert p_val.shape == (30,) and p_eval.shape == (30,)
+    assert np.all((p_eval >= 0) & (p_eval <= 1))

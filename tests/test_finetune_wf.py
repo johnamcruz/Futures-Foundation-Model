@@ -69,10 +69,11 @@ def test_arm_R_selects_top_and_evaluates():
 def test_wf_full_flow_real_beats_controls():
     lab = SyntheticLabeler(n_bars=1600, seed=0)
     v = wf.run(lab, classifier='logistic', clf_kwargs=dict(),
-               seeds=(0,), train_m=12, val_m=3, test_m=3, max_folds=1, verbose=False)
+               seeds=(0,), train_m=12, val_m=3, test_m=3, max_folds=1,
+               holdout_start=None, verbose=False)
     # verdict shape
-    for k in ('all_pass', 'auc', 'real_meanR', 'shuffle_meanR', 'random_meanR',
-              'gap', 'n_folds', 'real_trades'):
+    for k in ('all_pass', 'generalizes', 'auc', 'real_meanR', 'shuffle_meanR',
+              'random_meanR', 'gap', 'n_folds', 'real_trades'):
         assert k in v
     assert v['n_folds'] >= 1
     assert v['real_trades'] > 0
