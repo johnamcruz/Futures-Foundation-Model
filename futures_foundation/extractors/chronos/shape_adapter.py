@@ -1,5 +1,5 @@
 """Shape-aware adapter — UniShape's TransformerEnc mechanism over FROZEN Chronos
-per-patch tokens. Reusable FFM capability (NOT strategy IP): a learnable CLS token
+per-patch tokens. Reusable FFM capability: a learnable CLS token
 attends (with positional encoding) over the token sequence, aggregating the
 discriminative developing shape into a class representation, supervised by CE + a
 prototype (shape-clustering) loss.
@@ -86,15 +86,20 @@ class ShapeAwareAdapter(nn.Module):
         return logits, loss
 
 
-def fit_and_infer(tokens, y, train_mask, *, depth=2, heads=4, mlp=512, epochs=40,
-                  device='cpu', proto=True, lr=1e-3, weight_decay=1e-4,
-                  batch_size=512, seed=0, proj_dim=None):
-    """Train a ShapeAwareAdapter on the train split; return (probs[N], cls[N, work_d]).
-    Backbone-agnostic: tokens [N, T, d] float, y [N] in {0,1}, train_mask [N] bool.
-    proj_dim: if set, project each timestep d -> proj_dim (use for RAW per-bar
-    feature sequences, e.g. all handcraft features over time); None -> tokens are
-    already at the work dim (pretrained tokens). Minority class oversampled."""
+def fit_and_infer(tokens, y, train_mask, *, depth=2, heads=4, mlp=512, epochs=80,
+                  device='cpu', proto=False, lr=2e-3, weight_decay=1e-4,
+                  batch_size=512, seed=0, proj_dim=None, val_frac=0.15, patience=10):
+    """Train a ShapeAwareAdapter with OVERFIT GUARDS; return (probs[N], cls[N,work_d],
+    val_auc). An inner train/val split is carved off train_mask:
+      - EARLY STOPPING on val AUC (patience) + restore best-val weights
+      - LR SCHEDULING (ReduceLROnPlateau on val AUC)
+      - returns best val_auc so the caller can gate the VAL->TEST gap (reject overfit)
+    Backbone-agnostic: tokens [N,T,d], y [N] in {0,1}, train_mask [N] bool. proj_dim
+    projects raw per-bar feature seqs -> work dim. Minority oversampled. Defaults
+    (proto OFF, lr 2e-3) are the diagnosed-best for raw feature sequences."""
+    import copy
     from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+    from sklearn.metrics import roc_auc_score
     torch.manual_seed(seed)
     X = np.asarray(tokens, np.float32)
     Y = np.asarray(y).astype(np.int64)
@@ -103,28 +108,52 @@ def fit_and_infer(tokens, y, train_mask, *, depth=2, heads=4, mlp=512, epochs=40
         'mps' if device == 'mps' and torch.backends.mps.is_available()
         else 'cuda' if device == 'cuda' and torch.cuda.is_available() else 'cpu')
     Xt, Yt = torch.tensor(X), torch.tensor(Y)
-    cnt = np.bincount(Y[tr], minlength=2)
-    w = (1.0 / np.clip(cnt, 1, None))[Y[tr]]
-    sampler = WeightedRandomSampler(torch.tensor(w, dtype=torch.double), len(w),
+    # inner train/val split off train_mask (early stopping + LR scheduling)
+    tr_idx = np.flatnonzero(tr)
+    rs = np.random.default_rng(seed); rs.shuffle(tr_idx)
+    nval = max(64, int(len(tr_idx) * val_frac))
+    val_idx, in_idx = tr_idx[:nval], tr_idx[nval:]
+    cnt = np.bincount(Y[in_idx], minlength=2)
+    wts = (1.0 / np.clip(cnt, 1, None))[Y[in_idx]]
+    sampler = WeightedRandomSampler(torch.tensor(wts, dtype=torch.double), len(wts),
                                     replacement=True)
-    dl = DataLoader(TensorDataset(Xt[tr], Yt[tr]), batch_size=batch_size, sampler=sampler)
+    dl = DataLoader(TensorDataset(Xt[in_idx], Yt[in_idx]), batch_size=batch_size,
+                    sampler=sampler)
     work_d = int(proj_dim) if proj_dim else X.shape[2]
     in_dim = X.shape[2] if proj_dim else None
     model = ShapeAwareAdapter(d=work_d, in_dim=in_dim, n_tokens=X.shape[1], depth=depth,
                               heads=heads, mlp=mlp, n_classes=2, proto=proto).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='max', factor=0.5, patience=max(2, patience // 3))
+    Xval = Xt[val_idx].to(dev)
+    best_auc, best_state, bad, ep = -1.0, None, 0, 0
     for ep in range(int(epochs)):
         model.train()
-        last = 0.0
         for xb, yb in dl:
             xb, yb = xb.to(dev), yb.to(dev)
             _, loss = model(xb, yb)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            last = float(loss.item())
-        if ep % 10 == 0 or ep == int(epochs) - 1:
-            print(f"[shape_adapter] epoch {ep} loss {last:.4f}", file=sys.stderr, flush=True)
+        model.eval()
+        with torch.no_grad():
+            vp = torch.softmax(model.encode(Xval)[1], 1)[:, 1].cpu().numpy()
+        vauc = float(roc_auc_score(Y[val_idx], vp))
+        sched.step(vauc)
+        if vauc > best_auc + 1e-4:
+            best_auc, best_state, bad = vauc, copy.deepcopy(model.state_dict()), 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+        if ep % 10 == 0:
+            print(f"[shape_adapter] ep {ep} val_auc {vauc:.4f} (best {best_auc:.4f})",
+                  file=sys.stderr, flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"[shape_adapter] early-stop @ ep {ep}  best val_auc {best_auc:.4f}",
+          file=sys.stderr, flush=True)
     model.eval()
     probs, cls = [], []
     with torch.no_grad():
@@ -133,7 +162,7 @@ def fit_and_infer(tokens, y, train_mask, *, depth=2, heads=4, mlp=512, epochs=40
             probs.append(torch.softmax(logits, 1)[:, 1].cpu().numpy())
             cls.append(clsf.cpu().numpy())
     return (np.concatenate(probs).astype(np.float32),
-            np.concatenate(cls).astype(np.float32))
+            np.concatenate(cls).astype(np.float32), best_auc)
 
 
 def _main(argv):
@@ -144,14 +173,18 @@ def _main(argv):
     device = argv[4] if len(argv) > 4 else 'cpu'
     epochs = int(argv[5]) if len(argv) > 5 else 40
     proj = int(os.environ.get('ADAPTER_PROJ', '0')) or None    # raw-seq projection dim
-    proto = os.environ.get('ADAPTER_PROTO', '1') == '1'        # prototype loss (off for raw seq)
-    lr = float(os.environ.get('ADAPTER_LR', '1e-3'))
-    probs, cls = fit_and_infer(np.load(tok_p), np.load(y_p), np.load(tr_p),
-                               device=device, epochs=epochs, proj_dim=proj,
-                               proto=proto, lr=lr)
+    proto = os.environ.get('ADAPTER_PROTO', '0') == '1'        # prototype loss (off=diagnosed best)
+    lr = float(os.environ.get('ADAPTER_LR', '2e-3'))
+    patience = int(os.environ.get('ADAPTER_PATIENCE', '10'))
+    val_frac = float(os.environ.get('ADAPTER_VAL_FRAC', '0.15'))
+    probs, cls, val_auc = fit_and_infer(np.load(tok_p), np.load(y_p), np.load(tr_p),
+                                        device=device, epochs=epochs, proj_dim=proj,
+                                        proto=proto, lr=lr, patience=patience,
+                                        val_frac=val_frac)
     np.save(out_prefix + '_probs.npy', probs)
     np.save(out_prefix + '_cls.npy', cls)
-    print(f"[shape_adapter] done: probs {probs.shape} cls {cls.shape}",
+    np.save(out_prefix + '_valauc.npy', np.array([val_auc], np.float32))
+    print(f"[shape_adapter] done: val_auc {val_auc:.4f} probs {probs.shape} cls {cls.shape}",
           file=sys.stderr, flush=True)
 
 

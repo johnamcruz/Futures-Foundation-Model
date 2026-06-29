@@ -84,10 +84,35 @@ def test_in_proj_raw_feature_sequence():
     X = rng.standard_normal((N, T, k)).astype(np.float32)
     X[Y == 1, -1, 0] += 2.0                       # class-1 signal in ONE feature, last bar
     tr = np.zeros(N, bool); tr[:420] = True
-    p, c = fit_and_infer(X, Y, tr, epochs=60, device='cpu', proj_dim=32,
-                         depth=1, heads=2, proto=False, lr=2e-3)
+    p, c, val_auc = fit_and_infer(X, Y, tr, epochs=80, device='cpu', proj_dim=32,
+                                  depth=1, heads=2, proto=False, lr=2e-3)
     assert c.shape == (N, 32)
+    assert 0.0 <= val_auc <= 1.0                  # early-stopping returns best val AUC
     assert roc_auc_score(Y[~tr], p[~tr]) > 0.8
+
+
+# ---- pipeline: OOF-stacked adapter feature (leak-safe) + val/test monitor --
+@torch_test
+def test_oof_adapter_feature():
+    from sklearn.metrics import roc_auc_score
+    from futures_foundation.pipeline.shape_stack import (
+        oof_adapter_feature, val_test_gap)
+    rng = np.random.default_rng(0)
+    N, T, Fdim = 500, 8, 6
+    Y = rng.integers(0, 2, N)
+    S = rng.standard_normal((N, T, Fdim)).astype(np.float32)
+    S[Y == 1, -2:, :] += 1.5                          # easy: all features, last 2 bars
+    tr = np.zeros(N, bool); tr[:340] = True
+    cls, info = oof_adapter_feature(S, Y, tr, n_folds=2, proj_dim=16, epochs=40,
+                                    device='cpu', patience=8)
+    assert cls.shape == (N, 16)
+    assert info['adapter_probs'].shape == (N,)
+    assert 0.0 <= info['mean_val_auc'] <= 1.0
+    # adapter generalizes on the held/test rows (OOF, leak-safe)
+    assert roc_auc_score(Y[~tr], info['adapter_probs'][~tr]) > 0.65
+    gap, overfit = val_test_gap(info['mean_val_auc'],
+                                roc_auc_score(Y[~tr], info['adapter_probs'][~tr]))
+    assert isinstance(bool(overfit), bool)
 
 
 # ---- fit_and_infer LEARNS a separable shape (end-to-end) ------------------
@@ -101,7 +126,8 @@ def test_fit_and_infer_learns_separable_shape():
     X = rng.standard_normal((N, T, d)).astype(np.float32)
     X[Y == 1, -1, :] += 1.5                      # class-1 'shape' = bump in last token
     tr = np.zeros(N, bool); tr[:400] = True
-    probs, cls = fit_and_infer(X, Y, tr, epochs=25, device='cpu', depth=1, heads=2)
+    probs, cls, val_auc = fit_and_infer(X, Y, tr, epochs=60, device='cpu',
+                                        depth=1, heads=2)
     assert probs.shape == (N,) and cls.shape == (N, d)
     assert np.isfinite(probs).all()
     assert roc_auc_score(Y[~tr], probs[~tr]) > 0.7   # learned the shape, OOS
