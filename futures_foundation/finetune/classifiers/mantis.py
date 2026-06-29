@@ -31,16 +31,25 @@ class MantisClassifier(Classifier):
         return np.asarray(labeler.mv_contexts(keys), np.float32)
 
     def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+        cfg = dict(self.cfg)
+        log_path = cfg.pop('log_path', None)        # parent-side only (not a trainer arg)
+        cmd = [sys.executable, '-m', 'futures_foundation.finetune.classifiers._worker']
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             for name, arr in [('Xtr', Xtr), ('ytr', ytr), ('Xval', Xval),
                               ('yval', yval), ('Xeval', Xeval)]:
                 np.save(d / f'{name}.npy', np.asarray(arr))
-            (d / 'cfg.json').write_text(json.dumps(dict(self.cfg, seed=int(seed))))
-            r = subprocess.run(
-                [sys.executable, '-m', 'futures_foundation.finetune.classifiers._worker', str(d)],
-                capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(f"mantis worker failed:\n{r.stderr[-3000:]}")
+            (d / 'cfg.json').write_text(json.dumps(dict(cfg, seed=int(seed))))
+            if log_path:                            # STREAM worker output to a file (watchable)
+                with open(log_path, 'a') as lf:
+                    lf.write(f"\n--- mantis worker (seed={seed}) ---\n"); lf.flush()
+                    r = subprocess.run(cmd + [str(d)], stdout=lf, stderr=subprocess.STDOUT, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError("mantis worker failed:\n"
+                                       + open(log_path).read()[-3000:])
+            else:
+                r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"mantis worker failed:\n{r.stderr[-3000:]}")
             meta = np.load(d / 'meta.npy')
             return np.load(d / 'p_val.npy'), np.load(d / 'p_eval.npy'), float(meta[0])
