@@ -89,7 +89,7 @@ def _chunk_iter(X, rows, chunk_rows, mu, sd):
 
 
 def fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, *, new_channels=10, ft_mode='partial',
-                      unfreeze_blocks=2, epochs=40, batch=512, chunk_rows=65536, amp=False,
+                      unfreeze_blocks=2, epochs=40, batch=64, chunk_rows=65536, amp=False,
                       lr=3e-4, weight_decay=0.05, patience=10, threads=2, device=None,
                       model_id='paris-noah/Mantis-8M', max_train=None, standardize_mu=None,
                       standardize_sd=None, export_onnx_path=None, seed=0, verbose=True):
