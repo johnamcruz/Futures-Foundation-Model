@@ -1,14 +1,21 @@
-"""Mantis torch fine-tune — runs ONLY inside the subprocess worker.
+"""Mantis torch fine-tune — runs ONLY inside the subprocess worker. MPS-optimized.
 
-PER-BATCH + memmap-friendly so we can train on FULL data without holding the feature
-array in RAM/GPU: Xtr/Xval/Xeval may be in-RAM arrays OR disk memmaps; each batch is
-indexed (paged from disk if memmap), standardized with the train mu/sd, and moved to
-the device — so memory = one batch + the model, regardless of N. Standardize stats are
-passed in (computed once on the train memmap) rather than materializing a standardized
-copy. Partial FT (last K blocks + adapter + head), val early-stop, MPS cache clearing,
-thread cap. torch loads here only (parent adapter is torch-free → no xgboost collision).
+Trains on arrays OR disk memmaps without starving the GPU on I/O:
+  * BIG BATCH (512-1024): amortizes MPS per-launch overhead, fills the GPU.
+  * CHUNK-TO-DEVICE + PREFETCH: load a large chunk (chunk_rows) onto the device ONCE
+    and train many batches from it (no per-batch disk read / host->device copy); a
+    background thread prefetches+standardizes the next chunk while the GPU trains the
+    current one (overlap I/O with compute). Small folds (< chunk_rows) become a single
+    chunk = all-on-device (the fast path) for free.
+  * bf16 AUTOCAST (opt-in, amp=True): ~2x throughput + half activation memory on MPS,
+    with fp32 fallback.
+  * No per-batch loss.item() sync; val AUC syncs once/epoch; empty_cache per epoch.
+
+torch loads here only (parent adapter is torch-free -> no xgboost collision).
 """
 import os
+import queue
+import threading
 
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -43,8 +50,8 @@ def build_model(C, *, new_channels=10, ft_mode='partial', unfreeze_blocks=2,
 
 def export_model_onnx(model, C, seq, path, device='cpu'):
     """Export the fitted model to ONNX. Input = standardized window [batch, C, seq];
-    output logits [batch, 2]. Serve path: build window via mv_contexts, standardize
-    with the contract mu/sd, softmax(logits)[:,1]."""
+    output logits [batch, 2]. Serve: mv_contexts -> standardize (contract mu/sd) ->
+    softmax(logits)[:,1]."""
     model.eval()
     dummy = torch.zeros(1, C, seq, device=device)
     torch.onnx.export(model, dummy, path, input_names=['window'], output_names=['logits'],
@@ -53,14 +60,42 @@ def export_model_onnx(model, C, seq, path, device='cpu'):
     return path
 
 
+def _chunk_iter(X, rows, chunk_rows, mu, sd):
+    """Yield (sorted_idx, standardized_chunk_np) — each chunk read from X (memmap/array)
+    + standardized on a BACKGROUND thread (prefetch), so disk I/O overlaps GPU compute.
+    Rows are sorted within a chunk for fast memmap reads; the row PERMUTATION across
+    chunks provides SGD shuffling."""
+    chunks = [np.sort(rows[i:i + chunk_rows]) for i in range(0, len(rows), chunk_rows)]
+
+    def read(idx):
+        xb = np.asarray(X[idx], np.float32)
+        if mu is not None:
+            xb = (xb - mu[None, :, None]) / sd[None, :, None]
+        return idx, xb
+
+    q = queue.Queue(maxsize=2)
+
+    def producer():
+        for ch in chunks:
+            q.put(read(ch))
+        q.put(None)
+
+    threading.Thread(target=producer, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
+
+
 def fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, *, new_channels=10, ft_mode='partial',
-                      unfreeze_blocks=2, epochs=40, batch=64, lr=3e-4, weight_decay=0.05,
-                      patience=10, threads=2, device=None, model_id='paris-noah/Mantis-8M',
-                      max_train=None, standardize_mu=None, standardize_sd=None,
-                      export_onnx_path=None, seed=0, verbose=True):
+                      unfreeze_blocks=2, epochs=40, batch=512, chunk_rows=65536, amp=False,
+                      lr=3e-4, weight_decay=0.05, patience=10, threads=2, device=None,
+                      model_id='paris-noah/Mantis-8M', max_train=None, standardize_mu=None,
+                      standardize_sd=None, export_onnx_path=None, seed=0, verbose=True):
     """Returns (p_val, p_eval, best_val_auc, best_epoch). Xtr/Xval/Xeval: arrays or
-    memmaps. standardize_mu/sd: per-channel arrays applied per-batch (None = input
-    already standardized)."""
+    memmaps. standardize_mu/sd: per-channel arrays applied per-chunk (None = already
+    standardized)."""
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     torch.set_num_threads(int(threads))
     dev = device or ('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -76,15 +111,8 @@ def fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, *, new_channels=10, ft_mode='
     C = int(Xtr.shape[1]); seq = int(Xtr.shape[2])
     mu = None if standardize_mu is None else np.asarray(standardize_mu, np.float32)
     sd = None if standardize_sd is None else np.asarray(standardize_sd, np.float32)
-
-    def std(xb):
-        if mu is None:
-            return xb
-        return (xb - mu[None, :, None]) / sd[None, :, None]
-
-    def to_dev(X, rows):
-        xb = np.asarray(X[rows], np.float32)
-        return torch.tensor(std(xb), device=dev)
+    amp_ctx = (lambda: torch.autocast(device_type=dev, dtype=torch.bfloat16)) if amp \
+        else (lambda: _nullctx())
 
     model, new_c = build_model(C, new_channels=new_channels, ft_mode=ft_mode,
                                unfreeze_blocks=unfreeze_blocks, device=dev, model_id=model_id)
@@ -96,20 +124,26 @@ def fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, *, new_channels=10, ft_mode='
     @torch.no_grad()
     def pred(M, X):
         M.eval(); out = []
-        for s in range(0, len(X), batch):
-            out.append(torch.softmax(M(to_dev(X, np.arange(s, min(s + batch, len(X))))), 1)
-                       [:, 1].float().cpu().numpy())
+        for idx, ch_np in _chunk_iter(X, np.arange(len(X)), chunk_rows, mu, sd):
+            ch = torch.tensor(ch_np, device=dev)
+            for b in range(0, len(ch), batch):
+                with amp_ctx():
+                    out.append(torch.softmax(M(ch[b:b + batch]), 1)[:, 1].float().cpu().numpy())
+            del ch
         return np.concatenate(out) if len(X) else np.array([])
 
     best, best_state, bad, best_epoch = -1.0, None, 0, 0
     for ep in range(epochs):
         model.train()
         perm = tr_rows[rng.permutation(len(tr_rows))]
-        for s in range(0, len(perm), batch):
-            bid = np.sort(perm[s:s + batch])               # sorted: faster memmap reads
-            loss = crit(model(to_dev(Xtr, bid)),
-                        torch.tensor(ytr[bid], dtype=torch.long, device=dev))
-            opt.zero_grad(); loss.backward(); opt.step()
+        for idx, ch_np in _chunk_iter(Xtr, perm, chunk_rows, mu, sd):
+            ch = torch.tensor(ch_np, device=dev)
+            yb_all = torch.tensor(ytr[idx], dtype=torch.long, device=dev)
+            for b in range(0, len(ch), batch):
+                with amp_ctx():
+                    loss = crit(model(ch[b:b + batch]), yb_all[b:b + batch])
+                opt.zero_grad(); loss.backward(); opt.step()
+            del ch, yb_all
         sched.step()
         if dev == 'mps':
             torch.mps.empty_cache()
@@ -128,3 +162,11 @@ def fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, *, new_channels=10, ft_mode='
     if export_onnx_path:
         export_model_onnx(model, C, seq, export_onnx_path, device=dev)
     return pred(model, Xval), pred(model, Xeval), float(best), int(best_epoch)
+
+
+class _nullctx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *a):
+        return False

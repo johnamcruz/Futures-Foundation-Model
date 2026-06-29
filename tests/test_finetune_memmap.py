@@ -139,3 +139,63 @@ def test_produce_stream_end_to_end(tmp_path):
     assert c['input']['channels'] == lab.C and c['channel_names'] == ['ch0', 'ch1', 'ch2', 'ch3']
     # the memmaps were written to the run dir
     assert (tmp_path / '_Xtr.npy').exists()
+
+
+class _WFStreamLabeler:
+    """Per-stream labeler for the streamed walk-forward test: fractal-like keys
+    (sid, bar, R), _b['ts'] for fold-window timestamps, separable signal."""
+    n_classes = 2
+
+    def __init__(self, tk, tf, n_bars=400, seq=32, C=4, seed=0):
+        rng = np.random.default_rng(seed)
+        ts = pd.date_range('2020-01-01', periods=n_bars, freq='1D', tz='UTC')
+        y = rng.integers(0, 2, n_bars)
+        W = rng.standard_normal((n_bars, C, seq)).astype(np.float32)
+        W[y == 1, 0, -6:] += 2.5
+        self.sid = f'{tk}@{tf}'; self.ts = ts; self.y = y; self.W = W
+        self.seq, self.C = seq, C
+        self._b = {(tk, tf): {'ts': ts}}
+
+    def calendar(self):
+        return pd.DataFrame({'item_id': self.sid, 'timestamp': self.ts, 'target': self.y})
+
+    def build(self, lo, hi, test_start):
+        i = np.flatnonzero((self.ts >= lo) & (self.ts < hi))
+        K = [(self.sid, int(j), 2.0 if self.y[j] == 1 else -1.0) for j in i]
+        return [None] * len(i), self.y[i], K
+
+    def mv_contexts(self, keys):
+        return (np.stack([self.W[k[1]] for k in keys]) if keys
+                else np.zeros((0, self.C, self.seq)))
+
+    def mv_feature_names(self):
+        return [f'ch{i}' for i in range(self.C)]
+
+    def evaluate(self, keys, preds):
+        return np.array([k[2] for k, p in zip(keys, preds) if p == 1])
+
+
+def _mk(tk, tf):
+    return _WFStreamLabeler(tk, tf, n_bars=400, seed=abs(hash((tk, tf))) % 1000)
+
+
+def test_wf_run_streamed(tmp_path):
+    from futures_foundation.finetune import wf
+    v = wf.run_streamed(_mk, [('A', '3min'), ('B', '3min')], classifier='logistic',
+                        train_m=3, val_m=1, test_m=1, max_folds=4,
+                        output_path=str(tmp_path / 'm'), chunk=200, verbose=False)
+    for k in ('all_pass', 'generalizes', 'auc', 'real_meanR', 'shuffle_meanR',
+              'random_meanR', 'gap', 'n_folds'):
+        assert k in v
+    assert v['n_folds'] >= 1
+    assert v['auc'] is not None and v['auc'] > 0.7      # rolling folds learn the signal
+
+
+def test_wf_loop_streamed_overfit_guard(tmp_path):
+    from futures_foundation.finetune import wf
+    v = wf.loop_streamed(_mk, [('A', '3min'), ('B', '3min')], classifier='logistic',
+                         train_m=3, val_m=1, test_m=1, max_folds=4, max_iters=1, n_trials=2,
+                         output_path=str(tmp_path / 'm'), chunk=200, verbose=False)
+    # the overfit->Optuna loop ran and returned a config + history
+    assert 'history' in v and 'final_config' in v and v['n_folds'] >= 1
+    assert v['history'][0]['source'] == 'default'

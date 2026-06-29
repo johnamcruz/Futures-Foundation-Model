@@ -43,6 +43,22 @@ def concat_memmaps(parts, out_path):
     return out_path, (total, C, seq)
 
 
+def slice_memmap(full_path, rows, out_path, chunk=20000):
+    """Read `rows` from a full memmap into a new small memmap (chunked, bounded RAM).
+    Used by the walk-forward to materialize each fold's 3-month train/val/test slice
+    from the featurize-once full memmap. Returns (out_path, shape)."""
+    rows = np.sort(np.asarray(rows))
+    mm = np.load(full_path, mmap_mode='r')
+    C, seq = int(mm.shape[1]), int(mm.shape[2])
+    out = np.lib.format.open_memmap(out_path, mode='w+', dtype=np.float32,
+                                    shape=(len(rows), C, seq))
+    for s in range(0, len(rows), chunk):
+        out[s:s + chunk] = mm[rows[s:s + chunk]]
+    out.flush()
+    del out, mm
+    return out_path, (len(rows), C, seq)
+
+
 def featurize_to_memmap(clf, labeler, keys, path, chunk=2000):
     """Featurize `keys` in chunks straight to a disk memmap at `path`. Returns
     (path, shape). RAM cost = one chunk of windows + the labeler's bars."""
