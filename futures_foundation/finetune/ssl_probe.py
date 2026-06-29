@@ -19,15 +19,20 @@ _ssl_torch.embed_encoder (lazy torch).
 import numpy as np
 
 _TARGET_KIND = {'vol': 'reg', 'trend_eff': 'reg', 'range_expand': 'reg',
-                'direction': 'bin'}
-# regime/vol/structure targets that define a "useful" representation (direction is
-# reported but excluded from the pass criterion — Mantis is known weak on direction).
-_CORE_TARGETS = ('vol', 'trend_eff', 'range_expand')
+                'fwd_absmove': 'reg', 'direction': 'bin', 'fwd_dir': 'bin'}
+# CORE targets define a "useful for buy/sell classification" representation: regime/vol/
+# structure (descriptive) + fwd_absmove (is there a tradeable move next — buy/sell-relevant
+# and learnable). direction (in-window) and fwd_dir (forward direction) are reported but
+# NOT in the pass criterion — directional prediction is genuinely hard / noisy as a gate.
+_CORE_TARGETS = ('vol', 'trend_eff', 'range_expand', 'fwd_absmove')
 
 
-def targets_from_windows(big, starts, seq):
+def targets_from_windows(big, starts, seq, fwd_k=16):
     """Compute the probe targets for each window [start, start+seq). big: [T, 5]
-    (O,H,L,C,V). Returns dict name -> float array [M]."""
+    (O,H,L,C,V). Descriptive targets come from the window; FORWARD targets (buy/sell-
+    relevant) come from the next `fwd_k` bars AFTER the window — strictly future relative
+    to the embedded window (no leak). Caller keeps fwd_k <= max_jitter so the forward bars
+    stay in-stream. Returns dict name -> float array [M]."""
     big = np.asarray(big, np.float64)
     s = np.asarray(starts, np.int64)
     rows = s[:, None] + np.arange(seq)[None, :]              # [M, seq]
@@ -41,9 +46,16 @@ def targets_from_windows(big, starts, seq):
     r1 = high[:, :h].max(1) - low[:, :h].min(1)
     r2 = high[:, h:].max(1) - low[:, h:].min(1)
     range_expand = np.log((r2 + 1e-9) / (r1 + 1e-9))
+    # FORWARD (buy/sell): log-return over the next fwd_k bars after the window end
+    end = np.clip(s + seq - 1, 0, len(big) - 1)
+    fwd = np.clip(s + seq - 1 + fwd_k, 0, len(big) - 1)
+    fwd_ret = (np.log(np.clip(big[fwd, 3], 1e-9, None))
+               - np.log(np.clip(big[end, 3], 1e-9, None)))
     return {'vol': vol.astype(np.float32), 'trend_eff': trend_eff.astype(np.float32),
             'range_expand': range_expand.astype(np.float32),
-            'direction': (net > 0).astype(np.int32)}
+            'fwd_absmove': np.abs(fwd_ret).astype(np.float32),
+            'direction': (net > 0).astype(np.int32),
+            'fwd_dir': (fwd_ret > 0).astype(np.int32)}
 
 
 def probe_embedding(emb, y, kind, seed=0, test_frac=0.3):
@@ -86,9 +98,10 @@ def compare(emb_ssl, emb_vanilla, targets, seed=0):
 
 
 def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
-              device=None, max_windows=20000, batch=512, seed=0, verbose=True):
+              device=None, max_windows=20000, batch=512, seed=0, fwd_k=16, verbose=True):
     """Extract SSL-adapted vs vanilla encoder embeddings for held-out windows and
-    compare on the probe targets. Returns the compare() dict."""
+    compare on the probe targets (regime/vol/structure + forward buy/sell move). Returns
+    the compare() dict."""
     from . import _ssl_torch
     emb_ssl, used = _ssl_torch.embed_encoder(big, starts, seq, ckpt=ssl_ckpt,
                                              model_id=model_id, device=device,
@@ -96,7 +109,7 @@ def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
     emb_van, _ = _ssl_torch.embed_encoder(big, used, seq, ckpt=None, model_id=model_id,
                                           device=device, batch=batch,
                                           max_windows=len(used), seed=seed)
-    tgt = targets_from_windows(big, used, seq)
+    tgt = targets_from_windows(big, used, seq, fwd_k=fwd_k)
     out = compare(emb_ssl, emb_van, tgt, seed=seed)
     if verbose:
         for name, d in out['per_target'].items():

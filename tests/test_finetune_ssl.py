@@ -83,10 +83,12 @@ def test_targets_from_windows():
         return np.stack([close, close + 0.5, close - 0.5, close,
                          np.full(seq, 500.0)], 1).astype(np.float32)
     big = np.concatenate([stk(ramp), stk(chop)], 0)      # T=16, 5 cols
-    t = ssl_probe.targets_from_windows(big, [0, 8], seq)
+    t = ssl_probe.targets_from_windows(big, [0, 8], seq, fwd_k=4)
     assert t['trend_eff'][0] > 0.9 and t['trend_eff'][1] < 0.3   # trend vs chop
     assert t['direction'][0] == 1                                # net up
-    assert set(t) == {'vol', 'trend_eff', 'range_expand', 'direction'}
+    assert set(t) == {'vol', 'trend_eff', 'range_expand', 'fwd_absmove',
+                      'direction', 'fwd_dir'}                     # + forward buy/sell targets
+    assert (t['fwd_absmove'] >= 0).all()
 
 
 def test_probe_embedding_recovers_signal():
@@ -102,28 +104,27 @@ def test_probe_embedding_recovers_signal():
 
 def test_probe_compare_flags_ssl_better():
     rng = np.random.default_rng(1)
-    tgt = {'vol': rng.standard_normal(300).astype(np.float32),
-           'trend_eff': rng.standard_normal(300).astype(np.float32),
-           'range_expand': rng.standard_normal(300).astype(np.float32),
-           'direction': rng.integers(0, 2, 300)}
-    emb_ssl = np.stack([tgt['vol'], tgt['trend_eff'], tgt['range_expand']], 1) \
-        + rng.standard_normal((300, 3)) * 0.05            # encodes the targets
-    emb_van = rng.standard_normal((300, 3)).astype(np.float32)     # encodes nothing
-    out = ssl_probe.compare(emb_ssl.astype(np.float32), emb_van, tgt, seed=0)
+    core = ['vol', 'trend_eff', 'range_expand', 'fwd_absmove']     # the gate's core targets
+    tgt = {k: rng.standard_normal(300).astype(np.float32) for k in core}
+    tgt['direction'] = rng.integers(0, 2, 300)
+    tgt['fwd_dir'] = rng.integers(0, 2, 300)
+    emb_ssl = (np.stack([tgt[k] for k in core], 1)
+               + rng.standard_normal((300, 4)) * 0.05).astype(np.float32)   # encodes targets
+    emb_van = rng.standard_normal((300, 4)).astype(np.float32)              # encodes nothing
+    out = ssl_probe.compare(emb_ssl, emb_van, tgt, seed=0)
     assert out['learns_regime_vol_structure'] and out['mean_core_delta'] > 0
 
 
-def test_generalizes_gate():
-    good = {'real': {'best_val': 2.0, 'final_std': 0.5, 'val_gap': 0.1},
-            'shuffle': {'best_val': 4.0}, 'random': {'best_val': 5.0}}
-    ok, d = ssl._generalizes(good)
-    assert ok and d['real_beats_controls'] and d['no_collapse'] and d['val_stable']
-    coll = {'real': {'best_val': 2.0, 'final_std': 0.001, 'val_gap': 0.1},
-            'shuffle': {'best_val': 4.0}}
-    assert not ssl._generalizes(coll)[0]
-    notbeat = {'real': {'best_val': 4.5, 'final_std': 0.5, 'val_gap': 0.1},
-               'shuffle': {'best_val': 4.0}}
-    assert not ssl._generalizes(notbeat)[0]
+def test_passes_gate_on_probe_not_loss():
+    # GATE = probe (representation content) vs vanilla, NOT contrastive loss.
+    good = {'mean_core_delta': 0.05, 'learns_regime_vol_structure': True}
+    ok, d = ssl._passes(good, std=0.5)
+    assert ok and d['learns_regime_vol_structure']
+    # probe ties/loses vanilla -> fail even though training "looked fine"
+    bad = {'mean_core_delta': -0.01, 'learns_regime_vol_structure': False}
+    assert not ssl._passes(bad, std=0.5)[0]
+    # collapse -> fail regardless of probe
+    assert not ssl._passes(good, std=0.001)[0]
 
 
 # ------------------------------------------------------------------- torch trainer (gated)
@@ -141,8 +142,32 @@ def test_ssl_network_and_augment_shapes():
     assert v1.shape == (8, 5, 64) and v2.shape == (8, 5, 64)
     loss = S.nt_xent(z, net(x), temp=0.2)
     assert torch.isfinite(loss)
+    sh = S._time_shuffle(x)                                          # temporal hard-neg op
+    assert sh.shape == x.shape
+    assert torch.isfinite(S.nt_xent(z, net(x), temp=0.2, extra_neg=net(sh)))   # hard negatives
     cm = S.collapse_metrics(z, net(x))
     assert set(cm) == {'std', 'align', 'uniformity'}
+
+
+@torch_test
+def test_mask_network_and_trainer(tmp_path):
+    import torch
+    from futures_foundation.finetune import _ssl_torch as S
+    from futures_foundation.finetune.classifiers._mantis_torch import build_model
+    net = S.MaskNetwork(C=5, new_channels=4, seq=64)
+    x = torch.randn(8, 5, 64)
+    assert net(x).shape == (8, 5, 64)                               # reconstruct full window
+    assert net.embed(x).shape[0] == 8
+    rng = np.random.default_rng(0)
+    big = rng.standard_normal((2000, 5)).astype(np.float32)
+    starts = np.arange(0, 1900, 4)
+    state, hist = S.train_ssl_mask(big, starts, starts[-50:], seq=32, new_channels=4,
+                                   mask_ratio=0.4, epochs=2, steps_per_epoch=3, batch=16,
+                                   device='cpu', control='real', verbose=False)
+    assert len(hist) >= 1 and np.isfinite(hist[-1]['val_loss']) and 'std' in hist[-1]
+    ckpt = str(tmp_path / 'enc.pt'); torch.save(state, ckpt)        # encoder ckpt round-trips
+    _, new_c = build_model(5, new_channels=4, device='cpu', backbone_ckpt=ckpt)
+    assert new_c == 4
 
 
 @torch_test

@@ -63,124 +63,144 @@ def _split_cfg(cfg):
     return cfg, aug
 
 
-# --------------------------------------------------------------------------- one config run
-def _run_once(big, tr, va, *, controls, cfg, verbose=True):
-    """Train each control with one config; return per-control summaries + REAL state."""
+# --------------------------------------------------------------------------- train + probe
+def _train(big, tr, va, cfg, control='real'):
+    """Train one config under a control ('real'|'shuffle'|'random'). Dispatches on pretext:
+    'mask' = BERT-style masked modeling (default, shortcut-proof), 'contrastive' = SimCLR."""
     from . import _ssl_torch
     tk, aug = _split_cfg(cfg)
-    by, real_state = {}, None
-    for ctrl in controls:
-        if verbose:
-            print(f"\n=== SSL control={ctrl} ===", flush=True)
-        state, hist = _ssl_torch.train_ssl(big, tr, va, control=ctrl, aug=aug, **tk)
-        best_val = min(h['val_loss'] for h in hist)
-        final_val = hist[-1]['val_loss']
-        by[ctrl] = {'best_val': best_val, 'final_std': hist[-1]['std'],
-                    'val_gap': final_val - best_val, 'n_epochs': len(hist)}
-        if ctrl == 'real':
-            real_state = state
-    return by, real_state
+    pretext = tk.pop('pretext', 'mask')
+    if pretext == 'mask':
+        return _ssl_torch.train_ssl_mask(big, tr, va, control=control, **tk)
+    return _ssl_torch.train_ssl(big, tr, va, control=control, aug=aug, **tk)
 
 
-def _generalizes(by, gap_tol=0.5):
-    """REAL beats controls + no collapse + val did not diverge -> generalizes."""
-    real = by['real']
-    shuf = by.get('shuffle', {}).get('best_val')
-    rand = by.get('random', {}).get('best_val')
-    beats = ((shuf is None or real['best_val'] < shuf - 1e-3)
-             and (rand is None or real['best_val'] < rand - 1e-3))
-    no_collapse = real['final_std'] > 0.01
-    stable = real['val_gap'] <= gap_tol
-    return bool(beats and no_collapse and stable), {
-        'real_beats_controls': bool(beats), 'no_collapse': bool(no_collapse),
-        'val_stable': bool(stable), 'val_gap': float(real['val_gap'])}
+def _probe_state(big, va, seq, state, *, model_id, device, seed, verbose=True):
+    """Probe a trained encoder state vs vanilla -> the probe dict (regime/vol/structure).
+    Saves to a temp ckpt so ssl_probe can load it through the normal path."""
+    import tempfile
+    import torch
+    from . import ssl_probe
+    fd, tmp = tempfile.mkstemp(suffix='.pt'); os.close(fd)
+    torch.save(state, tmp)
+    try:
+        return ssl_probe.run_probe(big, va, seq, tmp, model_id=model_id, device=device,
+                                   seed=seed, verbose=verbose)
+    finally:
+        os.remove(tmp)
+
+
+def _passes(probe_res, std, margin=0.0):
+    """GATE on the PROBE (representation content), NOT the contrastive loss.
+
+    The loss-based REAL/SHUFFLE/RANDOM control is BLIND for instance-discrimination
+    contrastive — pure noise scores as low as (or lower than) real, because the loss
+    measures distinguishability, not useful structure. So we gate on the probe: REAL must
+    encode regime/vol/structure BETTER than the vanilla backbone (mean_core_delta > margin)
+    and not collapse. The loss controls are reported only as diagnostics.
+    """
+    no_collapse = bool(std > 0.01)
+    if probe_res is None:
+        return no_collapse, {'no_collapse': no_collapse, 'probe': None}
+    ok = bool(probe_res['mean_core_delta'] > margin and no_collapse)
+    return ok, {'no_collapse': no_collapse,
+                'mean_core_delta': float(probe_res['mean_core_delta']),
+                'learns_regime_vol_structure': bool(probe_res['learns_regime_vol_structure'])}
 
 
 # ------------------------------------------------------------------------------- optuna
-def _suggest_ssl(trial):
-    """Search the knobs that govern contrastive generalization: optimizer, temperature,
-    regularization, and augmentation strength (too weak -> trivial/collapse; too strong
-    -> can't align positives)."""
-    return dict(
-        lr=trial.suggest_float('lr', 3e-5, 5e-4, log=True),
-        temp=trial.suggest_float('temp', 0.07, 0.5, log=True),
-        weight_decay=trial.suggest_float('weight_decay', 0.01, 0.3, log=True),
-        new_channels=trial.suggest_int('new_channels', 4, 12),
-        jitter=trial.suggest_float('jitter', 0.0, 0.15),
-        warp=trial.suggest_float('warp', 0.0, 0.2),
-        resize=(trial.suggest_float('resize_lo', 0.5, 0.9), 1.0),
-    )
+def _suggest_ssl(trial, pretext='mask'):
+    """Search the knobs that govern generalization (maximizing the probe delta). Common:
+    optimizer + capacity. Pretext-specific: mask_ratio (mask) or temperature/augmentation
+    strength (contrastive)."""
+    d = dict(lr=trial.suggest_float('lr', 3e-5, 5e-4, log=True),
+             weight_decay=trial.suggest_float('weight_decay', 0.01, 0.3, log=True),
+             new_channels=trial.suggest_int('new_channels', 4, 12))
+    if pretext == 'mask':
+        d['mask_ratio'] = trial.suggest_float('mask_ratio', 0.2, 0.6)
+    else:
+        d.update(temp=trial.suggest_float('temp', 0.07, 0.5, log=True),
+                 jitter=trial.suggest_float('jitter', 0.0, 0.15),
+                 warp=trial.suggest_float('warp', 0.0, 0.2),
+                 resize=(trial.suggest_float('resize_lo', 0.5, 0.9), 1.0))
+    return d
 
 
 def _tune_ssl(big, tr, va, base_cfg, *, n_trials=10, tune_epochs=8, tune_steps=80,
               seed=0, verbose=True):
-    """Optuna: short REAL-only runs minimizing val NT-Xent (collapse-safe — a collapsed
-    encoder cannot lower NT-Xent). Returns the best config merged onto base_cfg if it
-    beats the base val, else base_cfg (mirrors tune.tune)."""
+    """Optuna MAXIMIZING the probe delta (regime/vol/structure vs vanilla) on short REAL
+    runs — searching for a config that yields a more USEFUL representation, NOT a lower
+    contrastive loss (loss is blind: noise scores as well as real). Returns best config if
+    it beats the base probe delta, else base."""
     import optuna
-    from . import _ssl_torch
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    pretext = base_cfg.get('pretext', 'mask')
 
-    def val_of(cfg):
-        tk, aug = _split_cfg(dict(cfg, epochs=tune_epochs, steps_per_epoch=tune_steps,
-                                  verbose=False))
-        _, hist = _ssl_torch.train_ssl(big, tr, va, control='real', aug=aug, **tk)
-        return min(h['val_loss'] for h in hist)
+    def delta_of(cfg):
+        st, _ = _train(big, tr, va, dict(cfg, epochs=tune_epochs,
+                                         steps_per_epoch=tune_steps, verbose=False), 'real')
+        r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
+                         device=cfg['device'], seed=seed, verbose=False)
+        return float(r['mean_core_delta'])
 
-    base_val = val_of(base_cfg)
+    base = delta_of(base_cfg)
 
     def objective(trial):
-        return val_of(dict(base_cfg, **_suggest_ssl(trial)))
+        return delta_of(dict(base_cfg, **_suggest_ssl(trial, pretext)))
 
-    study = optuna.create_study(direction='minimize',
+    study = optuna.create_study(direction='maximize',
                                 sampler=optuna.samplers.TPESampler(seed=seed))
     study.optimize(objective, n_trials=n_trials)
-    improved = study.best_value < base_val - 1e-3
-    best = dict(base_cfg, **study.best_params) if improved else dict(base_cfg)
-    best.pop('resize_lo', None)
-    if 'resize_lo' in study.best_params and improved:
-        best['resize'] = (study.best_params['resize_lo'], 1.0)
+    improved = study.best_value > base + 1e-4
+    bp = dict(study.best_params)
+    if 'resize_lo' in bp:
+        bp['resize'] = (bp.pop('resize_lo'), 1.0)
+    best = dict(base_cfg, **bp) if improved else dict(base_cfg)
     if verbose:
-        print(f"  [optuna ssl] base_val={base_val:.4f} best={study.best_value:.4f} "
+        print(f"  [optuna ssl] base_probe={base:+.4f} best_probe={study.best_value:+.4f} "
               f"{'-> use tuned' if improved else '-> keep defaults'}", flush=True)
-    return best, {'base_val': base_val, 'best_val': study.best_value, 'improved': improved}
+    return best, {'base_delta': base, 'best_delta': study.best_value, 'improved': improved}
 
 
 # ------------------------------------------------------------------------------- save/probe
-def _finalize(big, va, real_state, by, cfg, gen_detail, *, out_path, probe, holdout_start,
-              val_frac, streams, model_id, device, seed, verbose):
+def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout_start,
+              val_frac, streams, history, verbose):
+    """Save the chosen encoder + report. Controls are PROBE-BASED diagnostics: train
+    shuffle/random with the chosen cfg and probe EACH vs vanilla -> real_delta vs
+    control_delta (real - shuffle > 0 => temporal order contributed to the useful
+    representation). The contrastive loss is not used for the verdict."""
     import torch
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
-    torch.save(real_state, out_path)                     # adapted ENCODER state_dict
+    torch.save(state, out_path)                          # adapted ENCODER state_dict
 
-    probe_res = None
-    if probe:
-        from . import ssl_probe
+    ctrl_delta = {}
+    for ctrl in controls:
+        if ctrl == 'real':
+            continue
         if verbose:
-            print("\n=== FINAL CHECK: linear probe (regime / vol / structure) ===", flush=True)
-        probe_res = ssl_probe.run_probe(big, va, cfg['seq'], out_path, model_id=model_id,
-                                        device=device, seed=seed, verbose=verbose)
+            print(f"\n=== control={ctrl} (probe-based diagnostic) ===", flush=True)
+        st, _ = _train(big, tr, va, cfg, ctrl)
+        r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
+                         device=cfg['device'], seed=cfg['seed'], verbose=verbose)
+        ctrl_delta[ctrl] = float(r['mean_core_delta'])
 
+    real_delta = (None if probe_res is None else float(probe_res['mean_core_delta']))
+    temporal = (None if (real_delta is None or 'shuffle' not in ctrl_delta)
+                else real_delta - ctrl_delta['shuffle'])
     verdict = {
-        **gen_detail,
-        'real_best_val': float(by['real']['best_val']),
-        'shuffle_best_val': by.get('shuffle', {}).get('best_val'),
-        'random_best_val': by.get('random', {}).get('best_val'),
-        'final_std': float(by['real']['final_std']),
+        'all_pass': bool(probe_res is not None and probe_res['learns_regime_vol_structure']),
         'learns_regime_vol_structure': (None if probe_res is None
-                                        else probe_res['learns_regime_vol_structure']),
-        'probe_mean_core_delta': (None if probe_res is None
-                                  else probe_res['mean_core_delta']),
+                                        else bool(probe_res['learns_regime_vol_structure'])),
+        'real_delta': real_delta,
+        'control_delta': ctrl_delta,
+        'temporal_signal': temporal,        # real - shuffle (>0 => order contributed)
     }
-    verdict['all_pass'] = bool(gen_detail['generalizes']
-                               and (probe_res is None
-                                    or probe_res['learns_regime_vol_structure']))
-    report = {'verdict': verdict, 'config': {k: cfg[k] for k in cfg if k not in
-              ('verbose', 'device', 'model_id', 'compile_model')},
-              'controls': by, 'probe': probe_res, 'holdout_start': holdout_start,
-              'val_frac': val_frac, 'bars': int(len(big)),
+    report = {'verdict': verdict, 'probe': probe_res, 'control_delta': ctrl_delta,
+              'config': {k: cfg[k] for k in cfg if k not in
+                         ('verbose', 'device', 'model_id', 'compile_model')},
+              'holdout_start': holdout_start, 'val_frac': val_frac, 'bars': int(len(big)),
               'tickers': sorted({s['ticker'] for s in streams}),
-              'tfs': sorted({s['tf'] for s in streams}), 'ckpt': out_path}
+              'tfs': sorted({s['tf'] for s in streams}), 'history': history, 'ckpt': out_path}
     with open(out_path + '.report.json', 'w') as f:
         json.dump(report, f, indent=2, default=float)
     if verbose:
@@ -202,57 +222,65 @@ def _load_assemble(data_dir, tickers, tfs, seq, max_jitter, val_frac, holdout_st
 
 
 def _base_cfg(**kw):
-    """Default training config (one place; loop_ssl tunes a subset)."""
-    d = dict(seq=64, max_jitter=8, new_channels=8, proj_dim=128, temp=0.2, epochs=60,
-             steps_per_epoch=200, batch=1024, lr=1e-4, weight_decay=0.05, patience=8,
-             model_id='paris-noah/Mantis-8M', compile_model=False, device=None,
-             seed=0, verbose=True, resize=(0.7, 1.0), jitter=0.05, scale=0.1, warp=0.1)
+    """Default training config (one place; loop_ssl tunes a subset). pretext='mask' is the
+    BERT-style default; 'contrastive' is the fallback. max_jitter=16 reserves a forward
+    horizon for the buy/sell probe targets (in-stream)."""
+    d = dict(pretext='mask', seq=64, max_jitter=16, new_channels=8, proj_dim=128, temp=0.2,
+             mask_ratio=0.4, epochs=60, steps_per_epoch=200, batch=1024, lr=1e-4,
+             weight_decay=0.05, patience=8, model_id='paris-noah/Mantis-8M',
+             compile_model=False, device=None, seed=0, verbose=True,
+             resize=(0.7, 1.0), jitter=0.05, scale=0.1, warp=0.1)
     d.update({k: v for k, v in kw.items() if v is not None})
     return d
 
 
-def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('real', 'shuffle', 'random'),
+def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'random'),
              out_path='mantis_ssl_ohlcv.pt', probe=True, n_trials=10, max_iters=2,
-             gap_tol=0.5, holdout_start='2026-01-01', val_frac=0.1, **cfg_over):
-    """Overfit-gated, Optuna-tuned SSL: run default -> if it doesn't generalize, tune a
-    config that does -> re-run -> final probe -> save the generalized encoder. Returns
-    the verdict dict (+ writes <out_path> and <out_path>.report.json)."""
+             probe_margin=0.0, holdout_start='2026-01-01', val_frac=0.1, **cfg_over):
+    """Probe-GATED, Optuna-tuned SSL. Each iter: train REAL -> PROBE vs vanilla -> gate on
+    the PROBE (does it encode regime/vol/structure better than vanilla), NOT on the
+    contrastive loss (which is blind — noise scores as well as real). If it doesn't pass,
+    Optuna MAXIMIZES the probe delta and we re-run. Saves the best-probe encoder + report
+    (with probe-based shuffle/random controls as the temporal diagnostic)."""
     cfg = _base_cfg(**cfg_over)
     verbose = cfg['verbose']
     streams, big, tr, va = _load_assemble(data_dir, tickers, tfs, cfg['seq'],
                                           cfg['max_jitter'], val_frac, holdout_start, verbose)
-    history = []
+    history, best = [], None
     for it in range(max_iters):
         src = 'default' if it == 0 else 'optuna-tuned'
         if verbose:
             print(f"\n[ssl-loop] iter {it} · {src} config", flush=True)
-        by, real_state = _run_once(big, tr, va, controls=controls, cfg=cfg, verbose=verbose)
-        gen, detail = _generalizes(by, gap_tol)
-        detail['generalizes'] = gen
-        history.append({'iter': it, 'source': src, 'real_best_val': by['real']['best_val'],
-                        **detail})
-        if gen or it == max_iters - 1:
+        state, hist = _train(big, tr, va, cfg, 'real')
+        std = float(hist[-1]['std']); best_val = float(min(h['val_loss'] for h in hist))
+        probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
+                                  device=cfg['device'], seed=cfg['seed'], verbose=verbose)
+                     if probe else None)
+        ok, detail = _passes(probe_res, std, probe_margin)
+        history.append({'iter': it, 'source': src, 'best_val': best_val, 'std': std, **detail})
+        delta = (probe_res['mean_core_delta'] if probe_res else -1e9)
+        if best is None or delta > best['delta']:
+            best = {'state': state, 'probe': probe_res, 'cfg': dict(cfg), 'delta': delta}
+        if ok or it == max_iters - 1:
             break
         if verbose:
-            print(f"[ssl-loop] does NOT generalize ({detail}) -> Optuna", flush=True)
-        cfg, _ = _tune_ssl(big, tr, va, cfg, n_trials=n_trials, seed=cfg['seed'],
-                           verbose=verbose)
+            print(f"[ssl-loop] probe delta={delta:+.4f} <= {probe_margin} -> Optuna "
+                  f"(maximize probe)", flush=True)
+        cfg, _ = _tune_ssl(big, tr, va, cfg, n_trials=n_trials, seed=cfg['seed'], verbose=verbose)
         cfg = _base_cfg(**cfg)                            # re-fill any popped defaults
 
-    detail['generalizes'] = gen
-    verdict = _finalize(big, va, real_state, by, cfg, detail, out_path=out_path, probe=probe,
-                        holdout_start=holdout_start, val_frac=val_frac, streams=streams,
-                        model_id=cfg['model_id'], device=cfg['device'], seed=cfg['seed'],
-                        verbose=verbose)
+    verdict = _finalize(big, tr, va, best['state'], best['probe'], best['cfg'],
+                        out_path=out_path, controls=controls, holdout_start=holdout_start,
+                        val_frac=val_frac, streams=streams, history=history, verbose=verbose)
     verdict['history'] = history
     return verdict
 
 
-def run_ssl(data_dir=None, *, controls=('real', 'shuffle', 'random'),
+def run_ssl(data_dir=None, *, controls=('shuffle', 'random'),
             out_path='mantis_ssl_ohlcv.pt', probe=True, holdout_start='2026-01-01',
             val_frac=0.1, tickers=None, tfs=None, **cfg_over):
     """Single-config SSL run (no Optuna). Thin wrapper used for simple/fast runs and by
-    tests; loop_ssl is the full generalization process."""
+    tests; loop_ssl is the full probe-gated process."""
     return loop_ssl(data_dir, tickers=tickers, tfs=tfs, controls=controls,
                     out_path=out_path, probe=probe, n_trials=0, max_iters=1,
                     holdout_start=holdout_start, val_frac=val_frac, **cfg_over)

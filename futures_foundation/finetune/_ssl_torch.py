@@ -19,11 +19,24 @@ as the init for supervised finetuning (build_model(..., backbone_ckpt=...)).
 
 torch imports live here only (kept out of the torch-free orchestrator + tests).
 """
+import os
+
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _enc(encoder, x1):
+    """Encode one channel [B,1,L] -> [B, hidden], interpolating the window to Mantis's
+    native seq_len (512) first so it ALWAYS sees its pretrained patch size (patch_size =
+    seq_len/num_patches = 16). Without this, a short window gives tiny patches (e.g. seq=64
+    -> patch 2, off-distribution; seq=32 -> patch 1 -> per-patch std=0 -> NaN)."""
+    L = int(getattr(encoder, 'seq_len', 512))
+    if x1.shape[-1] != L:
+        x1 = F.interpolate(x1, size=L, mode='linear', align_corners=False)
+    return encoder(x1)
 
 
 # ----------------------------------------------------------------------------- model
@@ -46,7 +59,7 @@ class SSLNetwork(nn.Module):
 
     def embed(self, x):                                   # [B, C, seq] -> [B, new_c*hidden]
         a = self.adapter(x)
-        return torch.cat([self.encoder(a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
+        return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
 
     def forward(self, x):
         return F.normalize(self.proj(self.embed(x)), dim=1)
@@ -84,7 +97,7 @@ def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M
     for b in range(0, len(s_t), batch):
         win = _gather_batch(big_t, s_t, torch.arange(b, min(b + batch, len(s_t)), device=dev), seq)
         win = _standardize(win)                          # [B, C, seq]
-        emb = torch.cat([enc(win[:, [i], :]) for i in range(win.shape[1])], dim=-1)
+        emb = torch.cat([_enc(enc, win[:, [i], :]) for i in range(win.shape[1])], dim=-1)
         out.append(emb.float().cpu().numpy())
     return np.concatenate(out) if out else np.zeros((0, 0), np.float32), s
 
@@ -136,14 +149,24 @@ def _standardize(x):                                     # per-window per-channe
 
 
 # --------------------------------------------------------------------------- loss/metrics
-def nt_xent(z1, z2, temp=0.2):
-    """SimCLR NT-Xent over a batch. z1,z2: [B, D] L2-normalized."""
+def _time_shuffle(x):
+    """Permute the time axis independently per sample -> destroys temporal order, keeps the
+    exact value set. Used for the SHUFFLE control AND for temporal HARD NEGATIVES."""
+    B, C, T = x.shape
+    perm = torch.argsort(torch.rand(B, T, device=x.device), 1)
+    return torch.gather(x, 2, perm[:, None, :].expand(B, C, T))
+
+
+def nt_xent(z1, z2, temp=0.2, extra_neg=None):
+    """SimCLR NT-Xent over a batch. z1,z2: [B, D] L2-normalized. extra_neg [M, D] are
+    EXTRA negatives shared by all anchors (e.g. time-shuffled hard negatives) — they are
+    never anyone's positive, so the model must push them away => it must encode order."""
     B = z1.shape[0]
-    z = torch.cat([z1, z2], 0)                           # [2B, D]
+    z = torch.cat([z1, z2] + ([extra_neg] if extra_neg is not None else []), 0)
     sim = (z @ z.t()).float() / temp                     # fp32: stable + no fp16 overflow
     sim.fill_diagonal_(-1e9)                             # mask self (fits fp32)
     targets = torch.cat([torch.arange(B, 2 * B), torch.arange(0, B)]).to(z.device)
-    return F.cross_entropy(sim, targets)
+    return F.cross_entropy(sim[:2 * B], targets)         # anchors' rows; extra_neg = cols only
 
 
 @torch.no_grad()
@@ -172,8 +195,8 @@ def train_ssl(big, train_starts, val_starts, *, seq=64, max_jitter=8, new_channe
               proj_dim=128, temp=0.2, epochs=50, steps_per_epoch=200, batch=512, lr=1e-4,
               weight_decay=0.05, patience=8, device=None, model_id='paris-noah/Mantis-8M',
               backbone_ckpt=None, compile_model=False, control='real', seed=0,
-              aug=None, verbose=True):
-    """Contrastive-pretrain the Mantis encoder on OHLCV windows.
+              aug=None, verbose=True, **_ignore):
+    """Contrastive-pretrain the Mantis encoder on OHLCV windows (pretext='contrastive').
 
     big: float32 [T, C] all bars concatenated. train_starts/val_starts: int parent-window
     start positions. control: 'real' | 'shuffle' (shuffle time within each window ->
@@ -255,6 +278,127 @@ def train_ssl(big, train_starts, val_starts, *, seq=64, max_jitter=8, new_channe
             print(f"  ep{ep:>3} train={tr_tot / steps_per_epoch:.4f} val={vloss:.4f} "
                   f"std={cm['std']:.4f} align={cm['align']:.3f} unif={cm['uniformity']:.3f}"
                   f"{'  *' if improved else ''}", flush=True)
+        if bad >= patience:
+            break
+    return best_state, history
+
+
+# ============================================================ MASKED MODELING (BERT pretext)
+class MaskNetwork(nn.Module):
+    """Mantis encoder + channel adapter + a light reconstruction decoder. Masked OHLCV bars
+    go in; the decoder reconstructs the full (standardized) window from the pooled embedding.
+    To reconstruct a masked bar the encoder MUST model regime/vol (bar size), temporal
+    dynamics (trend continuation) and cross-channel coupling — i.e. the market-context the
+    downstream classifier needs. Not gameable by the contrastive distributional shortcut."""
+
+    def __init__(self, C=5, new_channels=8, seq=64, model_id='paris-noah/Mantis-8M'):
+        super().__init__()
+        from mantis.architecture import Mantis8M
+        from mantis.adapters import LinearChannelCombiner
+        self.encoder = Mantis8M.from_pretrained(model_id)
+        hidden = getattr(self.encoder, 'hidden_dim', 256)
+        self.new_c = min(new_channels, C)
+        self.adapter = LinearChannelCombiner(num_channels=C, new_num_channels=self.new_c)
+        self.C, self.seq = C, seq
+        emb = hidden * self.new_c
+        self.decoder = nn.Sequential(nn.Linear(emb, emb), nn.GELU(), nn.Linear(emb, C * seq))
+
+    def embed(self, x):                                   # [B, C, seq] -> [B, new_c*hidden]
+        a = self.adapter(x)
+        return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
+
+    def forward(self, x):                                 # masked [B,C,seq] -> recon [B,C,seq]
+        return self.decoder(self.embed(x)).view(-1, self.C, self.seq)
+
+
+def train_ssl_mask(big, train_starts, val_starts, *, seq=64, new_channels=8, mask_ratio=0.4,
+                   epochs=60, steps_per_epoch=200, batch=512, lr=1e-4, weight_decay=0.05,
+                   patience=8, device=None, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
+                   compile_model=False, control='real', seed=0, amp_dtype='fp16',
+                   verbose=True, **_ignore):
+    """BERT-style masked modeling (pretext='mask'): mask a fraction of bars, reconstruct
+    them from context (MSE on masked positions). Returns (best_encoder_state, history).
+
+    The REAL/SHUFFLE/RANDOM controls are MEANINGFUL here (unlike contrastive loss): REAL
+    reconstructs from temporal context, SHUFFLE (time-scrambled) and RANDOM (noise) have no
+    predictable context -> their val MSE should be clearly WORSE. history carries 'val_loss'
+    (recon MSE) + 'std' (embedding std, for the collapse guard)."""
+    os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+    dev = device or ('cuda' if torch.cuda.is_available()
+                     else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    torch.manual_seed(seed); gen = torch.Generator(device=dev); gen.manual_seed(seed)
+    C = int(big.shape[1])
+    use_amp = (dev == 'cuda')
+    _adt = torch.float16 if str(amp_dtype).lower() in ('fp16', 'float16') else torch.bfloat16
+    amp_ctx = (lambda: torch.autocast('cuda', dtype=_adt)) if use_amp else (lambda: _nullctx())
+
+    big_t = torch.as_tensor(np.asarray(big, np.float32), device=dev)
+    tr = torch.as_tensor(np.asarray(train_starts, np.int64), device=dev)
+    va = torch.as_tensor(np.asarray(val_starts, np.int64), device=dev)
+
+    net = MaskNetwork(C=C, new_channels=new_channels, seq=seq, model_id=model_id).to(dev)
+    if backbone_ckpt:
+        net.encoder.load_state_dict(torch.load(backbone_ckpt, map_location='cpu'))
+    if compile_model and hasattr(torch, 'compile'):
+        net = torch.compile(net)
+    opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad],
+                            lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    def _win(starts):
+        b_idx = torch.randint(0, len(starts), (batch,), device=dev, generator=gen)
+        w = _gather_batch(big_t, starts, b_idx, seq)         # [B,C,seq] raw
+        if control == 'shuffle':
+            w = _time_shuffle(w)
+        elif control == 'random':
+            w = torch.randn_like(w)
+        return _standardize(w)                               # per-window z-score
+
+    def _recon_loss(w):
+        m = torch.rand(w.shape[0], seq, device=dev, generator=gen) < mask_ratio   # [B,seq]
+        none = ~m.any(1); m[none, 0] = True                  # >=1 masked bar per sample
+        me = m[:, None, :].expand_as(w)
+        corrupted = torch.where(me, torch.randn_like(w), w)  # fill masked bars w/ noise so
+        recon = net(corrupted)                               # patches keep variance (Mantis
+        diff = (recon - w) ** 2                              # instance-norm would /0 on zeros)
+        return diff[me].mean()                               # MSE on masked positions only
+
+    @torch.no_grad()
+    def val_eval():
+        net.eval(); tot = 0.0; nb = min(20, max(1, len(va) // batch))
+        for _ in range(nb):
+            with amp_ctx():
+                tot += float(_recon_loss(_win(va)))
+        estd = float(net.embed(_win(va)).std(0).mean())
+        net.train()
+        return tot / nb, estd
+
+    best, best_state, bad, history = 1e18, None, 0, []
+    for ep in range(epochs):
+        net.train(); tr_tot = 0.0
+        for _ in range(steps_per_epoch):
+            opt.zero_grad(set_to_none=True)
+            with amp_ctx():
+                loss = _recon_loss(_win(tr))
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            tr_tot += float(loss.detach())
+        sched.step()
+        if dev == 'cuda':
+            torch.cuda.empty_cache()
+        vloss, estd = val_eval()
+        history.append({'epoch': ep, 'train_loss': tr_tot / steps_per_epoch,
+                        'val_loss': vloss, 'std': estd})
+        improved = vloss < best - 1e-5
+        if improved:
+            best, bad = vloss, 0
+            enc = net.encoder if not hasattr(net, '_orig_mod') else net._orig_mod.encoder
+            best_state = {k: v.detach().cpu().clone() for k, v in enc.state_dict().items()}
+        else:
+            bad += 1
+        if verbose:
+            print(f"  ep{ep:>3} train={tr_tot / steps_per_epoch:.4f} val={vloss:.4f} "
+                  f"emb_std={estd:.4f}{'  *' if improved else ''}", flush=True)
         if bad >= patience:
             break
     return best_state, history

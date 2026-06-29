@@ -1,22 +1,24 @@
 # ==============================================================================
-# MANTIS SSL PRETRAIN — Temporal Contrastive Learning on raw OHLCV (Colab GPU)
+# MANTIS SSL PRETRAIN — Masked Modeling ("BERT for futures") on raw OHLCV (Colab GPU)
 # ==============================================================================
 #
-# Generic self-supervised domain-adaptation of the Mantis-8M backbone on our
-# futures corpus (9 tickers x {1,3,5,15}min raw OHLCV). Two augmented views of
-# the SAME window (slight time shifts, different window sizes, jitter, scale,
-# magnitude-warp) are pulled together with an NT-Xent contrastive loss; all other
-# windows in the (large) batch are pushed apart. The backbone learns futures
-# price-action structure — momentum / volume / volatility shifts.
+# Self-supervised domain-adaptation of the Mantis-8M backbone on our futures
+# corpus (9 tickers x {1,3,5,15}min raw OHLCV). BERT-style MASKED MODELING: mask a
+# fraction of bars and reconstruct them from context. To reconstruct a masked bar the
+# encoder MUST model regime/volatility (bar size), temporal dynamics (trend
+# continuation) and cross-channel coupling — the market-context the downstream buy/sell
+# classifier needs. Unlike contrastive, it is NOT gameable by a distributional shortcut.
+# (pretext='contrastive' is kept as a fallback.)
 #
 # OUTPUT: an adapted ENCODER checkpoint saved to Drive. Downstream classifier
 # finetuning starts from it:  build_model(..., backbone_ckpt=<this .pt>)  (and
 # the WF/produce driver via BACKBONE_CKPT=<this .pt>).
 #
-# Validity gates (the SSL translation of the WF/produce overfit checks):
-#   * TIME-SPLIT val NT-Xent early-stop  (generalize forward; 2026 EXCLUDED)
-#   * REAL vs SHUFFLE vs RANDOM controls (REAL must reach a lower val loss)
-#   * representation-COLLAPSE guard      (embed std / alignment / uniformity)
+# Validity gates:
+#   * TIME-SPLIT val reconstruction early-stop   (generalize forward; 2026 EXCLUDED)
+#   * PROBE vs vanilla = the GATE: frozen embedding must predict regime/vol/structure +
+#     forward buy/sell move BETTER than the un-adapted backbone (learns_regime_vol_structure)
+#   * REAL vs SHUFFLE vs RANDOM = probe-based diagnostic (did temporal order contribute)
 #
 # GPU-maximized: all bars resident on GPU, vectorized GPU augmentations, large
 # batch, CUDA AMP (fp16 + GradScaler).
@@ -72,27 +74,31 @@ TFS     = ['1min', '3min', '5min', '15min']
 HOLDOUT_START = '2026-01-01'          # EXCLUDED from SSL (downstream OOS stays clean)
 VAL_FRAC      = 0.1                    # last 10% of each stream's pre-2026 bars = val
 
-# ── MODEL / VIEWS ──
+# ── PRETEXT ──
+PRETEXT      = 'mask'  # 'mask' = BERT masked modeling (default); 'contrastive' = SimCLR fallback
+MASK_RATIO   = 0.4     # fraction of bars masked per window (mask pretext)
+
+# ── MODEL ──
 SEQ          = 64      # model input length (bars)
-MAX_JITTER   = 8       # max time-shift between the two views (parent_len = SEQ+MAX_JITTER)
+MAX_JITTER   = 16      # forward horizon reserved for the buy/sell probe (in-stream)
 NEW_CHANNELS = 8       # channel-combiner output (OHLCV=5 -> NEW_CHANNELS)
-PROJ_DIM     = 128     # contrastive projection dim
-TEMP         = 0.2     # NT-Xent temperature
+PROJ_DIM     = 128     # contrastive projection dim (contrastive pretext only)
+TEMP         = 0.2     # NT-Xent temperature (contrastive pretext only)
 
 # ── TRAINING (GPU-max) ──
-BATCH        = 1024    # large batch = more negatives. Drop if OOM (512 / 768).
+BATCH        = 1024    # drop if OOM (512 / 768).
 EPOCHS       = 60
-STEPS        = 200     # contrastive steps per epoch
+STEPS        = 200     # steps per epoch
 LR           = 1e-4
 PATIENCE     = 8
-CONTROLS     = ['real', 'shuffle', 'random']   # set ['real'] to skip the controls (faster)
+CONTROLS     = ['shuffle', 'random']   # probe-based diagnostics (did temporal order help)
 COMPILE      = False   # torch.compile(encoder) — try True on A100/L4 for extra speed
 SEED         = 0
 
-# ── GENERALIZATION (overfit gate -> Optuna, like WF/produce) ──
-N_TRIALS     = 10      # Optuna trials if the default config doesn't generalize
+# ── GENERALIZATION (probe gate -> Optuna, like WF/produce) ──
+N_TRIALS     = 10      # Optuna trials (MAXIMIZE probe delta) if the default doesn't pass
 MAX_ITERS    = 2       # default run, then (if needed) one Optuna-tuned re-run
-PROBE        = True    # FINAL check: probe regime/vol/structure vs vanilla Mantis
+PROBE        = True    # GATE: probe regime/vol/structure + forward buy/sell move vs vanilla
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -113,17 +119,17 @@ if not found:
         f'Expected e.g. {DATA_DIR}/ES_3min.csv with columns '
         f'datetime,open,high,low,close,volume.')
 print(f'✅ PRE-FLIGHT: found {len(found)}/{len(TICKERS)*len(TFS)} CSVs under {DATA_DIR}')
-print(f'   SSL corpus: {TICKERS} x {TFS} | SEQ={SEQ} BATCH={BATCH} EPOCHS={EPOCHS} '
-      f'controls={CONTROLS}')
+print(f'   pretext={PRETEXT} | corpus {TICKERS} x {TFS} | SEQ={SEQ} BATCH={BATCH} '
+      f'EPOCHS={EPOCHS} controls={CONTROLS}')
 print(f'   OUTPUT -> {OUT_PATH}')
 
 
 # ==============================================================================
-# CELL 3 — RUN SSL PRETRAIN  (gated + Optuna; saves encoder ckpt + .report.json)
+# CELL 3 — RUN SSL PRETRAIN  (probe-gated + Optuna; saves encoder ckpt + .report.json)
 # ==============================================================================
 verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH,
-    tickers=TICKERS, tfs=TFS,
+    tickers=TICKERS, tfs=TFS, pretext=PRETEXT, mask_ratio=MASK_RATIO,
     seq=SEQ, max_jitter=MAX_JITTER, new_channels=NEW_CHANNELS, proj_dim=PROJ_DIM,
     temp=TEMP, batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
     patience=PATIENCE, val_frac=VAL_FRAC, holdout_start=HOLDOUT_START,
