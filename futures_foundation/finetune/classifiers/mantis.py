@@ -36,9 +36,16 @@ class MantisClassifier(Classifier):
         cmd = [sys.executable, '-m', 'futures_foundation.finetune.classifiers._worker']
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            for name, arr in [('Xtr', Xtr), ('ytr', ytr), ('Xval', Xval),
-                              ('yval', yval), ('Xeval', Xeval)]:
-                np.save(d / f'{name}.npy', np.asarray(arr))
+            np.save(d / 'ytr.npy', np.asarray(ytr))      # small: always to tempdir
+            np.save(d / 'yval.npy', np.asarray(yval))
+            paths = {}                                   # X: memmap path passthrough OR save
+            for name, arr in [('Xtr', Xtr), ('Xval', Xval), ('Xeval', Xeval)]:
+                if isinstance(arr, str):
+                    paths[name] = arr                    # full-data memmap on disk — no copy
+                else:
+                    np.save(d / f'{name}.npy', np.asarray(arr))
+                    paths[name] = str(d / f'{name}.npy')
+            cfg['_paths'] = paths
             (d / 'cfg.json').write_text(json.dumps(dict(cfg, seed=int(seed))))
             if log_path:                            # STREAM worker output to a file (watchable)
                 with open(log_path, 'a') as lf:

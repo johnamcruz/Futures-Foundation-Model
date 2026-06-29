@@ -88,6 +88,24 @@ def test_fit_predict_torch_shapes_and_learns():
     assert 0.0 <= ba <= 1.0 and be >= 0
 
 
+# ---- torch-gated: memmap input + per-batch standardize (the full-data path) ----
+@torch_test
+def test_fit_predict_torch_memmap_and_standardize(tmp_path):
+    from sklearn.metrics import roc_auc_score
+    from futures_foundation.finetune.classifiers._mantis_torch import fit_predict_torch
+    X, y = _toy(N=300, seed=3)                      # raw (unstandardized)
+    p = str(tmp_path / 'Xtr.npy'); np.save(p, X[:200])
+    Xtr_mm = np.load(p, mmap_mode='r')              # disk-backed train
+    flat = X[:200].transpose(0, 2, 1).reshape(-1, X.shape[1])
+    mu, sd = flat.mean(0), flat.std(0) + 1e-6
+    p_val, p_eval, ba, be = fit_predict_torch(
+        Xtr_mm, y[:200], X[200:250], y[200:250], X[250:], ft_mode='partial', epochs=12,
+        batch=64, device='cpu', standardize_mu=mu.tolist(), standardize_sd=sd.tolist(),
+        verbose=False)
+    assert p_eval.shape == (50,) and np.all((p_eval >= 0) & (p_eval <= 1))
+    assert roc_auc_score(y[250:], p_eval) > 0.65    # learns from a memmap w/ per-batch std
+
+
 # ---- torch-gated: the adapter end-to-end (spawns the isolated worker) -----
 @torch_test
 def test_adapter_fit_predict_via_worker():

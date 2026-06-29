@@ -1,11 +1,12 @@
 """Subprocess worker — runs the Mantis torch fine-tune in ISOLATION.
 
 Run as: python -m futures_foundation.finetune.classifiers._worker <workdir>
-Reads  : Xtr/ytr/Xval/yval/Xeval.npy + cfg.json
+Reads  : cfg.json (incl _paths to the X memmaps/npys + ft params + standardize mu/sd
+         + seed), ytr.npy, yval.npy
 Writes : p_val.npy, p_eval.npy, meta.npy = [best_val_auc, best_epoch]
 
-Loads ONLY torch + the Mantis backbone (never xgboost). Fresh process per call →
-MPS/RAM released on exit.
+X arrays are opened mmap_mode='r' so a full-data feature memmap never loads into RAM;
+the trainer pages batches on demand. Loads only torch + Mantis (never xgboost).
 """
 import json
 import sys
@@ -17,9 +18,12 @@ import numpy as np
 def main(wd):
     wd = Path(wd)
     cfg = json.loads((wd / 'cfg.json').read_text())
-    Xtr, ytr = np.load(wd / 'Xtr.npy'), np.load(wd / 'ytr.npy')
-    Xval, yval = np.load(wd / 'Xval.npy'), np.load(wd / 'yval.npy')
-    Xeval = np.load(wd / 'Xeval.npy')
+    paths = cfg.pop('_paths')
+    Xtr = np.load(paths['Xtr'], mmap_mode='r')
+    Xval = np.load(paths['Xval'], mmap_mode='r')
+    Xeval = np.load(paths['Xeval'], mmap_mode='r')
+    ytr = np.load(wd / 'ytr.npy')
+    yval = np.load(wd / 'yval.npy')
     from futures_foundation.finetune.classifiers._mantis_torch import fit_predict_torch
     p_val, p_eval, ba, be = fit_predict_torch(Xtr, ytr, Xval, yval, Xeval, **cfg)
     np.save(wd / 'p_val.npy', p_val)

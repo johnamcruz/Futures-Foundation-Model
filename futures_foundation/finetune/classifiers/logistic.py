@@ -25,6 +25,8 @@ class LogisticClassifier(Classifier):
         from sklearn.metrics import roc_auc_score
 
         def flat(A):
+            if isinstance(A, str):                  # memmap path (stream mode) -> load
+                A = np.load(A, mmap_mode='r')
             A = np.asarray(A, np.float32)
             return A.reshape(len(A), -1)
 

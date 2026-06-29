@@ -1,0 +1,94 @@
+"""Memmap streaming (full-data path) — torch-free.
+
+Verifies featurize_to_memmap writes a correct disk-backed array in chunks, the
+streaming standardize stats are sane, and produce.train_final(stream=True) runs the
+ENTIRE memmap path end-to-end (featurize-to-disk -> per-sample load -> metrics ->
+contract) via the torch-free 'logistic' classifier (which loads memmap paths).
+"""
+import json
+
+import numpy as np
+import pandas as pd
+
+from futures_foundation.finetune import produce
+from futures_foundation.finetune._memmap import (featurize_to_memmap,
+                                                 memmap_standardize_stats)
+from futures_foundation.finetune.classifier import get_classifier
+
+
+class _StubLabeler:
+    def __init__(self, X):
+        self._X = X
+    def mv_contexts(self, keys):
+        return np.stack([self._X[k] for k in keys])
+
+
+def test_featurize_to_memmap_chunked_matches(tmp_path):
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((50, 4, 16)).astype(np.float32)
+    lab = _StubLabeler(X)
+    clf = get_classifier('logistic')
+    path = str(tmp_path / 'X.npy')
+    p, shape = featurize_to_memmap(clf, lab, list(range(50)), path, chunk=7)
+    assert shape == (50, 4, 16)
+    mm = np.load(path, mmap_mode='r')
+    assert mm.shape == (50, 4, 16)
+    assert np.allclose(np.asarray(mm), X, atol=1e-5)   # chunked write == direct featurize
+
+
+def test_memmap_standardize_stats(tmp_path):
+    rng = np.random.default_rng(1)
+    X = (rng.standard_normal((200, 3, 8)).astype(np.float32) * 5 + 2)
+    path = str(tmp_path / 'X.npy')
+    featurize_to_memmap(get_classifier('logistic'), _StubLabeler(X),
+                        list(range(200)), path, chunk=32)
+    mu, sd = memmap_standardize_stats(path, sample=200)
+    assert mu.shape == (3,) and sd.shape == (3,)
+    # per-channel mean ~2, std ~5 (the planted distribution)
+    assert np.allclose(mu, 2.0, atol=0.6) and np.allclose(sd, 5.0, atol=1.0)
+
+
+class _StreamLabeler:
+    """Daily-bar synthetic with mv_contexts (separable signal) for the full produce
+    stream path via logistic."""
+    n_classes = 2
+
+    def __init__(self, n_bars=1600, seq=32, C=4, seed=0):
+        rng = np.random.default_rng(seed)
+        self.ts = pd.date_range('2020-01-01', periods=n_bars, freq='1D', tz='UTC')
+        self.y = rng.integers(0, 2, n_bars)
+        self.W = rng.standard_normal((n_bars, C, seq)).astype(np.float32)
+        self.W[self.y == 1, 0, -6:] += 2.5
+        self.seq, self.C = seq, C
+
+    def calendar(self):
+        return pd.DataFrame({'item_id': 'SYN', 'timestamp': self.ts, 'target': self.y})
+
+    def build(self, lo, hi, test_start):
+        i = np.flatnonzero((self.ts >= lo) & (self.ts < hi))
+        return [None] * len(i), self.y[i], [(int(j),) for j in i]
+
+    def mv_contexts(self, keys):
+        return (np.stack([self.W[k[0]] for k in keys]) if keys
+                else np.zeros((0, self.C, self.seq)))
+
+    def mv_feature_names(self):
+        return [f'ch{i}' for i in range(self.C)]
+
+    def evaluate(self, keys, preds):
+        return np.array([(2.0 if self.y[k[0]] == 1 else -1.0)
+                         for k, p in zip(keys, preds) if p == 1])
+
+
+def test_produce_stream_end_to_end(tmp_path):
+    lab = _StreamLabeler(n_bars=1600, seed=0)
+    out = produce.train_final(lab, classifier='logistic', holdout_start='2023-06-01',
+                              seed=0, stream=True, chunk=500, export_onnx=True,
+                              output_path=str(tmp_path / 'm'), verbose=False)
+    # the stream path (featurize-to-memmap -> per-sample load) produced metrics + contract
+    assert out['n_oos'] > 0 and out['oos_trades'] > 0
+    assert out['oos_auc'] is not None and out['oos_auc'] > 0.8   # learnable signal holds
+    c = json.loads(open(out['artifacts']['contract']).read())
+    assert c['input']['channels'] == lab.C and c['channel_names'] == ['ch0', 'ch1', 'ch2', 'ch3']
+    # the memmaps were written to the run dir
+    assert (tmp_path / '_Xtr.npy').exists()
