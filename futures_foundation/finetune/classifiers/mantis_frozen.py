@@ -26,6 +26,7 @@ _EMBED_KEYS = ('model_id', 'device', 'batch')
 @register_classifier('mantis_frozen')
 class MantisFrozenClassifier(Classifier):
     needs_standardize = True            # harness standardizes the cached embeddings on train
+    embed_once = True                   # featurize the whole stream in ONE call (load Mantis once)
 
     def __init__(self, **cfg):
         self.cfg = cfg

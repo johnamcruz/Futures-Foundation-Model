@@ -61,10 +61,19 @@ def slice_memmap(full_path, rows, out_path, chunk=20000):
 
 def featurize_to_memmap(clf, labeler, keys, path, chunk=2000):
     """Featurize `keys` in chunks straight to a disk memmap at `path`. Returns
-    (path, shape). RAM cost = one chunk of windows + the labeler's bars."""
+    (path, shape). RAM cost = one chunk of windows + the labeler's bars.
+
+    Classifiers with `embed_once=True` (e.g. the frozen Mantis embedder, where each
+    featurize call loads a model) are featurized in a SINGLE call over all keys — so the
+    backbone loads ONCE per stream, not once per chunk."""
     n = len(keys)
     if n == 0:
         raise ValueError("no keys to featurize")
+    if getattr(clf, 'embed_once', False):
+        X = np.asarray(clf.featurize(labeler, keys), np.float32)    # one pass, model loads once
+        mm = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=X.shape)
+        mm[:] = X; mm.flush(); del mm
+        return path, X.shape
     x0 = np.asarray(clf.featurize(labeler, keys[:1]), np.float32)   # learn (C, seq)
     C, seq = int(x0.shape[1]), int(x0.shape[2])
     mm = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(n, C, seq))
