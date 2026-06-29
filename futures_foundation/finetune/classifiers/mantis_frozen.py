@@ -43,7 +43,10 @@ class MantisFrozenClassifier(Classifier):
             r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"embed worker failed:\n{r.stderr[-2000:]}")
-            return np.load(d / 'emb.npy')
+            emb = np.load(d / 'emb.npy')                  # [N, emb_dim]
+            return emb[:, :, None]                        # -> [N, emb_dim, 1] for the WF memmap
+            # (the harness standardizes per-"channel" = per embedding dim, seq=1; fit_predict
+            #  flattens back to [N, emb_dim] for the head)
 
     def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
         from sklearn.linear_model import LogisticRegression
@@ -51,7 +54,8 @@ class MantisFrozenClassifier(Classifier):
         from sklearn.metrics import roc_auc_score
 
         def arr(a):
-            return np.asarray(np.load(a, mmap_mode='r') if isinstance(a, str) else a)
+            x = np.asarray(np.load(a, mmap_mode='r') if isinstance(a, str) else a, np.float32)
+            return x.reshape(len(x), -1)                  # [N, emb_dim, 1] -> [N, emb_dim]
         Xtr, Xval, Xeval = arr(Xtr), arr(Xval), arr(Xeval)
         ytr = np.asarray(ytr).astype(int); yval = np.asarray(yval).astype(int)
         if len(np.unique(ytr)) < 2:
