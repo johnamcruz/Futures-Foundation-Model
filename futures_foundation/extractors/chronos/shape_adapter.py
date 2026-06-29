@@ -144,8 +144,11 @@ def _main(argv):
     device = argv[4] if len(argv) > 4 else 'cpu'
     epochs = int(argv[5]) if len(argv) > 5 else 40
     proj = int(os.environ.get('ADAPTER_PROJ', '0')) or None    # raw-seq projection dim
+    proto = os.environ.get('ADAPTER_PROTO', '1') == '1'        # prototype loss (off for raw seq)
+    lr = float(os.environ.get('ADAPTER_LR', '1e-3'))
     probs, cls = fit_and_infer(np.load(tok_p), np.load(y_p), np.load(tr_p),
-                               device=device, epochs=epochs, proj_dim=proj)
+                               device=device, epochs=epochs, proj_dim=proj,
+                               proto=proto, lr=lr)
     np.save(out_prefix + '_probs.npy', probs)
     np.save(out_prefix + '_cls.npy', cls)
     print(f"[shape_adapter] done: probs {probs.shape} cls {cls.shape}",

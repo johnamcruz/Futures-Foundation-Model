@@ -74,18 +74,20 @@ def test_in_proj_raw_feature_sequence():
     m = ShapeAwareAdapter(d=32, in_dim=10, n_tokens=20, depth=1, heads=2)
     logits, _ = m(torch.randn(6, 20, 10))        # raw [B, T, in_dim] -> projected
     assert logits.shape == (6, 2)
-    # fit_and_infer with proj_dim learns a separable raw-feature-seq pattern
+    # fit_and_infer with proj_dim learns a SPARSE feature/bar signal — but only
+    # with the right config: prototype loss OFF (it caps sparse-signal learning)
+    # + adequate proj/lr/epochs. (Diagnosed: proto-on/lr1e-3/20ep -> 0.57; this -> 0.9+.)
     from sklearn.metrics import roc_auc_score
     rng = np.random.default_rng(0)
-    N, T, k = 400, 12, 10
+    N, T, k = 600, 12, 10
     Y = rng.integers(0, 2, N)
     X = rng.standard_normal((N, T, k)).astype(np.float32)
-    X[Y == 1, -1, 0] += 2.0                       # class-1 signal in a feature/bar
-    tr = np.zeros(N, bool); tr[:280] = True
-    p, c = fit_and_infer(X, Y, tr, epochs=20, device='cpu', proj_dim=16,
-                         depth=1, heads=2)
-    assert c.shape == (N, 16)
-    assert roc_auc_score(Y[~tr], p[~tr]) > 0.7
+    X[Y == 1, -1, 0] += 2.0                       # class-1 signal in ONE feature, last bar
+    tr = np.zeros(N, bool); tr[:420] = True
+    p, c = fit_and_infer(X, Y, tr, epochs=60, device='cpu', proj_dim=32,
+                         depth=1, heads=2, proto=False, lr=2e-3)
+    assert c.shape == (N, 32)
+    assert roc_auc_score(Y[~tr], p[~tr]) > 0.8
 
 
 # ---- fit_and_infer LEARNS a separable shape (end-to-end) ------------------
