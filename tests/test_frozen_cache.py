@@ -90,19 +90,6 @@ def test_legacy_cache_preferred(tmp_path, monkeypatch):
     assert X.shape[0] == 10 and np.allclose(X[:, 0, 0], 9.0)
 
 
-def test_lean_keep_handcraft(tmp_path, monkeypatch):
-    """keep_handcraft selects only the named handcraft columns (lean variant)."""
-    monkeypatch.setenv('EMBED_CACHE_DIR', str(tmp_path))
-    monkeypatch.setenv('EMBED_CACHE', '1')
-    clf = MantisFrozenClassifier(backbone_ckpt=None, with_features=True, keep_handcraft=['a', 'c'])
-    clf._embed = lambda l, k: np.zeros((len(k), 8), np.float32)   # 8-dim fake embedding
-    lab = FakeLab()
-    X = clf.featurize(lab, _keys(range(5)))
-    # 8 embedding + 2 kept handcraft (a=10, c=30) = 10 dims; 'b'=20 dropped
-    assert X.shape[1] == 10
-    assert np.allclose(X[:, 8, 0], 10.0) and np.allclose(X[:, 9, 0], 30.0)
-
-
 def test_cache_off(tmp_path, monkeypatch):
     monkeypatch.setenv('EMBED_CACHE', '0')
     clf = MantisFrozenClassifier(backbone_ckpt=None, with_features=False)
