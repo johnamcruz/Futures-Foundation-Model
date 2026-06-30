@@ -238,7 +238,8 @@ def _base_cfg(**kw):
              steps_per_epoch=200, batch=1024, lr=1e-4, weight_decay=0.05, patience=8,
              model_id='paris-noah/Mantis-8M', compile_model=False, device=None,
              seed=0, verbose=True,
-             pretext='mask', horizon=16, backbone_ckpt=None)  # stage-2 seq2seq: forecast + warm-start
+             pretext='mask', horizon=16, backbone_ckpt=None,  # stage-2 seq2seq: forecast + warm-start
+             grad_clip=1.0, clamp=10.0)                       # stage-2 stability (forecast trainer)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
 

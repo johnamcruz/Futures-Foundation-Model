@@ -91,6 +91,12 @@ EPOCHS       = 60
 STEPS        = 200     # steps per epoch
 LR           = 1e-4
 PATIENCE     = 8
+# ── STABILITY (anti-blowup) ──
+# A FLAT/compressed context window has ~0 std, so the forward delta target (fut-last)/ctx_std
+# explodes -> diverging loss (train ~5e4). These bound it: clamp the standardized values, clip
+# the gradient norm. Lower CLAMP (e.g. 6) = more conservative; raise only if losses stay tame.
+CLAMP        = 10.0
+GRAD_CLIP    = 1.0
 CONTROLS     = ['shuffle', 'random']   # probe-based diagnostics (did temporal order help)
 COMPILE      = False   # torch.compile(encoder) — try True on A100/L4 for extra speed
 SEED         = 0
@@ -133,6 +139,7 @@ verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH,
     tickers=TICKERS, tfs=TFS,
     pretext='forecast', horizon=HORIZON, backbone_ckpt=WARM_CKPT,   # <- FT on stage-1 encoder
+    grad_clip=GRAD_CLIP, clamp=CLAMP,                               # <- stability (anti-blowup)
     seq=SEQ, max_jitter=MAX_JITTER, new_channels=NEW_CHANNELS,
     batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
     patience=PATIENCE, val_frac=VAL_FRAC, holdout_start=HOLDOUT_START,
