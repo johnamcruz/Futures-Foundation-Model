@@ -44,10 +44,15 @@ class MantisFrozenClassifier(Classifier):
             r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"embed worker failed:\n{r.stderr[-2000:]}")
-            emb = np.load(d / 'emb.npy')                  # [N, emb_dim]
-            return emb[:, :, None]                        # -> [N, emb_dim, 1] for the WF memmap
-            # (the harness standardizes per-"channel" = per embedding dim, seq=1; fit_predict
-            #  flattens back to [N, emb_dim] for the head)
+            emb = np.load(d / 'emb.npy')                  # [N, emb_dim] (frozen OHLCV embedding)
+        # concat the strategy's handcraft features (HTF dir / session / structure / ... the
+        # market-context the OHLCV window can't express) -> [emb | handcraft], like the old
+        # Chronos fractal (embed + handcraft -> head). Off via with_features=False.
+        if self.cfg.get('with_features', True) and hasattr(labeler, 'features'):
+            feats = np.nan_to_num(np.asarray(labeler.features(keys), np.float32))
+            emb = np.concatenate([emb, feats], axis=1)    # [N, emb_dim + F]
+        return emb[:, :, None]                            # -> [N, D, 1] for the WF memmap
+        # (harness standardizes per-"channel" = per dim, seq=1; fit_predict flattens to [N, D])
 
     def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
         from sklearn.linear_model import LogisticRegression
