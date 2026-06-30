@@ -58,6 +58,48 @@ def _embed_cache_path(cfg, labeler, keys):
     return cache_dir / f"{tk}_{tf}_{h.hexdigest()[:16]}.npy"
 
 
+def _bar_cache_path(cfg, labeler, keys):
+    """Per-stream BAR-INDEXED cache (ohlcv mode): ONE file per (ticker,tf,ckpt,nbars,seq).
+    In ohlcv mode the embedding of a window depends ONLY on its bar index (no direction flip),
+    so ANY keyset that needs bar i reuses it — WF full-stream, produce train/val/oos subsets,
+    and any head (logistic/MLP) all share one embed. None = caching off / non-ohlcv mode."""
+    if os.environ.get('EMBED_CACHE', '1') != '1' or not keys:
+        return None
+    if getattr(labeler, 'MV_MODE', '?') != 'ohlcv':       # only ohlcv: emb independent of dir
+        return None
+    ckpt = cfg.get('backbone_ckpt')
+    if ckpt and Path(ckpt).exists():
+        p = Path(ckpt)
+        ckpt_id = f"{p.name}-{int(p.stat().st_mtime)}-{p.stat().st_size}"
+    else:
+        ckpt_id = (str(ckpt).replace('/', '_') if ckpt else 'vanilla')
+    tk, tf = keys[0][0].split('@')
+    seq = int(getattr(labeler, 'MV_SEQ', 0))
+    try:
+        nbars = int(len(labeler._b[(tk, tf)]['c']))
+    except Exception:
+        nbars = -1
+    cache_dir = Path(os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'))
+    return cache_dir / f"bars_{tk}_{tf}_{ckpt_id}_{nbars}_{seq}.npz"
+
+
+def _load_bar_cache(path):
+    if path is None or not path.exists():
+        return None, None
+    try:
+        d = np.load(path)
+        return d['idx'], d['emb']
+    except Exception:
+        return None, None
+
+
+def _save_bar_cache(path, idx, emb):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f"{path.stem}.{os.getpid()}.tmp.npz"      # atomic write
+    np.savez(tmp, idx=np.asarray(idx, np.int64), emb=np.asarray(emb, np.float32))
+    os.replace(tmp, path)
+
+
 def export_head_onnx(clf, n_features, path):
     """Convert the fitted sklearn head (logistic/MLP) to ONNX: input [N, n_features] standardized
     [emb|handcraft] -> probabilities [N, 2]. zipmap off so the proba output is a plain array."""
@@ -110,41 +152,66 @@ class MantisFrozenClassifier(Classifier):
     def __init__(self, **cfg):
         self.cfg = cfg
 
-    def featurize(self, labeler, keys):
-        cpath = _embed_cache_path(self.cfg, labeler, keys)
-        emb = None
-        if cpath is not None and cpath.exists():
-            cached = np.load(cpath)                        # cross-run HIT -> skip embed entirely
-            if len(cached) == len(keys):
-                emb = cached
-                print(f"[embed-cache] HIT {cpath.name} ({len(emb)}x{emb.shape[1]})", flush=True)
-        if emb is None:                                   # MISS -> embed (frozen) then cache
-            windows = np.asarray(labeler.mv_contexts(keys), np.float32)    # [N, C, seq]
-            ecfg = {k: self.cfg[k] for k in _EMBED_KEYS if k in self.cfg}
-            ecfg['ckpt'] = self.cfg.get('backbone_ckpt')                   # SSL ckpt or None
-            cmd = [sys.executable, '-u', '-m',
-                   'futures_foundation.finetune.classifiers._embed_worker']
-            with tempfile.TemporaryDirectory() as d:
-                d = Path(d)
-                np.save(d / 'w.npy', windows)
-                (d / 'cfg.json').write_text(json.dumps(dict(ecfg, _windows=str(d / 'w.npy'))))
-                r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
-                if r.returncode != 0:
-                    raise RuntimeError(f"embed worker failed:\n{r.stderr[-2000:]}")
-                emb = np.load(d / 'emb.npy')               # [N, emb_dim] (frozen OHLCV embedding)
-            if cpath is not None:                          # persist for future runs (atomic write)
-                cpath.parent.mkdir(parents=True, exist_ok=True)
-                tmp = cpath.parent / f"{cpath.stem}.{os.getpid()}.tmp.npy"   # ends .npy
-                np.save(tmp, emb); os.replace(tmp, cpath)
-                print(f"[embed-cache] WROTE {cpath.name} ({len(emb)}x{emb.shape[1]})", flush=True)
-        # concat the strategy's handcraft features (HTF dir / session / structure / ... the
-        # market-context the OHLCV window can't express) -> [emb | handcraft], like the old
-        # Chronos fractal (embed + handcraft -> head). Off via with_features=False.
+    def _embed(self, labeler, keys):
+        """Frozen-encoder embedding of `keys` via the isolated subprocess worker -> [N, emb]."""
+        windows = np.asarray(labeler.mv_contexts(keys), np.float32)        # [N, C, seq]
+        ecfg = {k: self.cfg[k] for k in _EMBED_KEYS if k in self.cfg}
+        ecfg['ckpt'] = self.cfg.get('backbone_ckpt')                       # SSL ckpt or None
+        cmd = [sys.executable, '-u', '-m',
+               'futures_foundation.finetune.classifiers._embed_worker']
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            np.save(d / 'w.npy', windows)
+            (d / 'cfg.json').write_text(json.dumps(dict(ecfg, _windows=str(d / 'w.npy'))))
+            r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"embed worker failed:\n{r.stderr[-2000:]}")
+            return np.load(d / 'emb.npy')                  # [N, emb_dim]
+
+    def _with_features(self, labeler, keys, emb):
+        # concat the strategy's handcraft features (HTF dir / session / structure / ...) ->
+        # [emb | handcraft], like the old Chronos fractal. Off via with_features=False.
         if self.cfg.get('with_features', True) and hasattr(labeler, 'features'):
             feats = np.nan_to_num(np.asarray(labeler.features(keys), np.float32))
-            emb = np.concatenate([emb, feats], axis=1)    # [N, emb_dim + F]
-        return emb[:, :, None]                            # -> [N, D, 1] for the WF memmap
-        # (harness standardizes per-"channel" = per dim, seq=1; fit_predict flattens to [N, D])
+            emb = np.concatenate([emb, feats], axis=1)     # [N, emb_dim + F]
+        return emb[:, :, None]                             # -> [N, D, 1] for the memmap
+
+    def featurize(self, labeler, keys):
+        # 1) LEGACY per-keyset cache FIRST — preserves existing WF caching byte-for-byte.
+        legacy = _embed_cache_path(self.cfg, labeler, keys)
+        if legacy is not None and legacy.exists():
+            cached = np.load(legacy)
+            if len(cached) == len(keys):
+                print(f"[embed-cache] HIT {legacy.name} ({len(cached)})", flush=True)
+                return self._with_features(labeler, keys, cached)
+        # 2) BAR-INDEXED cache — lets produce's train/val/oos subsets (and any head) share ONE
+        #    embed. Embedding depends only on the bar index (ohlcv), so a subset slices the
+        #    per-stream cache; missing bars are embedded once and appended.
+        bpath = _bar_cache_path(self.cfg, labeler, keys)
+        if bpath is not None:
+            bar_idx = np.asarray([int(k[1]) for k in keys], np.int64)
+            cidx, cemb = _load_bar_cache(bpath)
+            if cemb is not None:
+                pos = {int(b): r for r, b in enumerate(cidx)}
+                sel = np.array([pos.get(int(b), -1) for b in bar_idx])
+                if (sel >= 0).all():                       # full HIT -> slice
+                    print(f"[embed-cache] HIT bars {bpath.name} ({len(sel)})", flush=True)
+                    return self._with_features(labeler, keys, cemb[sel])
+                miss = sel < 0                             # partial -> embed missing, append
+                memb = self._embed(labeler, [keys[i] for i in np.where(miss)[0]])
+                cidx = np.concatenate([cidx, bar_idx[miss]])
+                cemb = np.concatenate([cemb, memb])
+                _save_bar_cache(bpath, cidx, cemb)
+                pos = {int(b): r for r, b in enumerate(cidx)}
+                print(f"[embed-cache] +{int(miss.sum())} bars -> {bpath.name} ({len(cidx)})",
+                      flush=True)
+                return self._with_features(labeler, keys, cemb[[pos[int(b)] for b in bar_idx]])
+            emb = self._embed(labeler, keys)              # first time -> seed the bar cache
+            _save_bar_cache(bpath, bar_idx, emb)
+            print(f"[embed-cache] WROTE bars {bpath.name} ({len(emb)})", flush=True)
+            return self._with_features(labeler, keys, emb)
+        # 3) caching off / non-ohlcv -> embed directly
+        return self._with_features(labeler, keys, self._embed(labeler, keys))
 
     def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
         from sklearn.linear_model import LogisticRegression
