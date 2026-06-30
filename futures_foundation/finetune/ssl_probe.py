@@ -75,7 +75,14 @@ def probe_embedding(emb, y, kind, seed=0, test_frac=0.3):
     if kind == 'bin':
         if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
             return 0.5
-        m = LogisticRegression(max_iter=1000, C=1.0).fit(Xtr, y[tr])
+        # 1280-dim correlated embeddings -> lbfgs hits its iter cap; bump it, and suppress the
+        # (harmless, diagnostic) ConvergenceWarning so it doesn't bury the scan's progress lines.
+        # A probe only needs a stable AUC, not exact convergence — the score is valid regardless.
+        import warnings
+        from sklearn.exceptions import ConvergenceWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', ConvergenceWarning)
+            m = LogisticRegression(max_iter=2000, C=1.0).fit(Xtr, y[tr])
         return float(roc_auc_score(y[te], m.predict_proba(Xte)[:, 1]))
     m = Ridge(alpha=1.0).fit(Xtr, y[tr])
     return float(r2_score(y[te], m.predict(Xte)))

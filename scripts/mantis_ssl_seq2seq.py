@@ -117,6 +117,11 @@ PROBE        = True    # GATE: probe regime/vol/structure + forward buy/sell mov
 # (lr/horizon/capacity), maximizing the forward-predictive score, even if the default passes the
 # gate. This is the "scan to be sure" mode for picking the weighting. False = only tune on gate-fail.
 OPTUNA_SCAN  = True
+# The scan prints a live per-trial line ([ssl-tune i/N] fwd=.. cw=.. vw=.. best=..) AND persists to
+# a SQLite DB on Drive -> queryable live + resumable if the runtime crashes. Single writer, so no
+# sqlite locking issues. Query:  optuna trials --study-name seq2seq_v2_scan --storage sqlite:///<db>
+os.environ['SSL_OPTUNA_DB']    = '/content/drive/MyDrive/AI_Models/seq2seq_v2_scan.db'
+os.environ['SSL_OPTUNA_STUDY'] = 'seq2seq_v2_scan'
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')

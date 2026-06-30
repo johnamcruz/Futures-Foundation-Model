@@ -168,21 +168,55 @@ def _tune_ssl(big, tr, va, base_cfg, *, n_trials=10, tune_epochs=8, tune_steps=8
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     pretext = base_cfg.get('pretext', 'mask')
 
+    def _free_gpu():
+        """Each scan trial builds a fresh net + the probe loads more encoders — free between
+        trials so 20 trials don't accumulate GPU memory into an OOM (silent Colab crash)."""
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def delta_of(cfg):
         st, _ = _train(big, tr, va, dict(cfg, epochs=tune_epochs,
                                          steps_per_epoch=tune_steps, verbose=False), 'real')
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
                          device=cfg['device'], seed=seed, verbose=False)
+        _free_gpu()
         return float(r['forward_score'] if pretext == 'forecast' else r['mean_core_delta'])
 
     base = delta_of(base_cfg)
+    if verbose:
+        print(f"  [ssl-tune] base={base:+.4f} ({'fwd' if pretext == 'forecast' else 'core'}) "
+              f"-> scanning {n_trials} trials", flush=True)
 
     def objective(trial):
         return delta_of(dict(base_cfg, **_suggest_ssl(trial, base_cfg.get('pretext', 'mask'))))
 
+    def _progress(study, trial):                          # live per-trial line (DB + stdout)
+        v = f"{trial.value:+.4f}" if trial.value is not None else 'fail'
+        cw, vw = trial.params.get('close_weight'), trial.params.get('vol_weight')
+        wstr = f" cw={cw:.2f} vw={vw:.2f}" if cw is not None else ''
+        try:
+            bv = f"{study.best_value:+.4f}"
+        except ValueError:
+            bv = 'n/a'
+        print(f"  [ssl-tune {trial.number + 1}/{n_trials}] fwd={v}{wstr} best={bv}", flush=True)
+
+    # PERSISTENT SQLite storage (resume + queryable) when SSL_OPTUNA_DB is set; else in-memory.
+    db, study_name = os.environ.get('SSL_OPTUNA_DB'), os.environ.get('SSL_OPTUNA_STUDY', 'ssl_scan')
+    skw = {}
+    if db:
+        os.makedirs(os.path.dirname(db) or '.', exist_ok=True)
+        skw = dict(study_name=study_name, storage=f'sqlite:///{db}', load_if_exists=True)
+        if verbose:
+            print(f"  [ssl-tune] storage sqlite:///{db} study='{study_name}'", flush=True)
     study = optuna.create_study(direction='maximize',
-                                sampler=optuna.samplers.TPESampler(seed=seed))
-    study.optimize(objective, n_trials=n_trials)
+                                sampler=optuna.samplers.TPESampler(seed=seed), **skw)
+    study.optimize(objective, n_trials=n_trials, catch=(Exception,), callbacks=[_progress])
     improved = study.best_value > base + 1e-4
     # rebuild channel_weights from the raw close/vol suggestions before applying (forecast)
     best = dict(base_cfg, **_rebuild_channel_weights(study.best_params)) if improved else dict(base_cfg)
