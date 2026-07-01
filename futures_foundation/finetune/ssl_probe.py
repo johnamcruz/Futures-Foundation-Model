@@ -58,25 +58,18 @@ def targets_from_windows(big, starts, seq, fwd_k=16):
             'fwd_dir': (fwd_ret > 0).astype(np.int32)}
 
 
-def probe_embedding(emb, y, kind, seed=0, test_frac=0.3):
-    """Fit a linear probe (Ridge for 'reg', Logistic for 'bin') on a train split of
-    `emb`, score on the held-out split. Returns R2 (reg) or AUC (bin)."""
+def _fit_score(emb, y, kind, tr, te):
+    """Fit a linear probe on emb[tr] -> score on emb[te]. R2 (reg) or AUC (bin)."""
     from sklearn.linear_model import Ridge, LogisticRegression
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import r2_score, roc_auc_score
-    emb = np.asarray(emb, np.float32)
-    n = len(emb)
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    nt = int(n * (1 - test_frac))
-    tr, te = idx[:nt], idx[nt:]
     sc = StandardScaler().fit(emb[tr])
     Xtr, Xte = sc.transform(emb[tr]), sc.transform(emb[te])
     if kind == 'bin':
         if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
             return 0.5
         # 1280-dim correlated embeddings -> lbfgs hits its iter cap; bump it, and suppress the
-        # (harmless, diagnostic) ConvergenceWarning so it doesn't bury the scan's progress lines.
+        # (harmless, diagnostic) ConvergenceWarning so it doesn't bury the run's progress lines.
         # A probe only needs a stable AUC, not exact convergence — the score is valid regardless.
         import warnings
         from sklearn.exceptions import ConvergenceWarning
@@ -88,17 +81,35 @@ def probe_embedding(emb, y, kind, seed=0, test_frac=0.3):
     return float(r2_score(y[te], m.predict(Xte)))
 
 
-def compare(emb_ssl, emb_vanilla, targets, seed=0):
+def probe_embedding(emb, y, kind, seed=0, test_frac=0.3, folds=1):
+    """Fit a linear probe and score it. folds<=1 -> a single random train/test split (fast).
+    folds>1 -> k-fold CV, returning the MEAN score over folds -> a robust, low-variance estimate
+    (use this to reliably RANK candidates, e.g. channel-weight configs, where a single split is
+    too noisy to trust the ordering)."""
+    emb = np.asarray(emb, np.float32)
+    n = len(emb)
+    if folds and folds > 1:
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=int(folds), shuffle=True, random_state=seed)
+        return float(np.mean([_fit_score(emb, y, kind, tr, te) for tr, te in kf.split(emb)]))
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
+    nt = int(n * (1 - test_frac))
+    return _fit_score(emb, y, kind, idx[:nt], idx[nt:])
+
+
+def compare(emb_ssl, emb_vanilla, targets, seed=0, folds=1):
     """Probe both embeddings on every target; return per-target {ssl, vanilla, delta} plus
     aggregate deltas that the gate uses. We separate DESCRIPTIVE content (vol/trend_eff/
     range_expand — easy in-window stats) from FORWARD predictive content (fwd_absmove size,
     fwd_dir direction), because a shortcut embedding can lift the easy descriptive stats while
-    the forward (genuinely predictive) targets barely move. The gate keys on the FORWARD ones."""
+    the forward (genuinely predictive) targets barely move. The gate keys on the FORWARD ones.
+    folds>1 -> k-fold CV per probe (robust deltas for ranking candidates)."""
     res, core_deltas, desc_deltas = {}, [], []
     for name, y in targets.items():
         kind = _TARGET_KIND[name]
-        a = probe_embedding(emb_ssl, y, kind, seed)
-        b = probe_embedding(emb_vanilla, y, kind, seed)
+        a = probe_embedding(emb_ssl, y, kind, seed, folds=folds)
+        b = probe_embedding(emb_vanilla, y, kind, seed, folds=folds)
         res[name] = {'ssl': a, 'vanilla': b, 'delta': a - b, 'kind': kind}
         if name in _CORE_TARGETS:
             core_deltas.append(a - b)
@@ -116,10 +127,10 @@ def compare(emb_ssl, emb_vanilla, targets, seed=0):
 
 
 def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
-              device=None, max_windows=20000, batch=512, seed=0, fwd_k=16, verbose=True):
+              device=None, max_windows=20000, batch=512, seed=0, fwd_k=16, folds=1, verbose=True):
     """Extract SSL-adapted vs vanilla encoder embeddings for held-out windows and
     compare on the probe targets (regime/vol/structure + forward buy/sell move). Returns
-    the compare() dict."""
+    the compare() dict. folds>1 -> k-fold CV per probe (robust deltas for ranking candidates)."""
     from . import _ssl_torch
     emb_ssl, used = _ssl_torch.embed_encoder(big, starts, seq, ckpt=ssl_ckpt,
                                              model_id=model_id, device=device,
@@ -128,7 +139,7 @@ def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
                                           device=device, batch=batch,
                                           max_windows=len(used), seed=seed)
     tgt = targets_from_windows(big, used, seq, fwd_k=fwd_k)
-    out = compare(emb_ssl, emb_van, tgt, seed=seed)
+    out = compare(emb_ssl, emb_van, tgt, seed=seed, folds=folds)
     if verbose:
         for name, d in out['per_target'].items():
             print(f"  [probe] {name:>12} ({d['kind']}) ssl={d['ssl']:.4f} "

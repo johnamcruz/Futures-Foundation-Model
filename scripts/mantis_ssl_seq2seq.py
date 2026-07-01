@@ -102,26 +102,19 @@ CONTROLS     = ['shuffle', 'random']   # probe-based diagnostics (did temporal o
 COMPILE      = False   # torch.compile(encoder) — try True on A100/L4 for extra speed
 SEED         = 0
 
-# ── CHANNEL-WEIGHTED LOSS (price-path option) ──
-# Per-channel loss weights (O,H,L,C,V). None = equal (every channel weighted the same).
-# PRICE-PATH hypothesis (emphasize close, ignore near-unpredictable volume) for trend detection:
-#   CHANNEL_WEIGHTS = [1.0, 1.0, 1.0, 2.0, 0.0]
-# Leave None to let the Optuna scan (below) FIND the best weighting instead of guessing.
-CHANNEL_WEIGHTS = None
-
-# ── GENERALIZATION (probe gate -> Optuna, like stage 1 / WF / produce) ──
-N_TRIALS     = 20      # Optuna trials maximizing the FORWARD-predictive probe score
-MAX_ITERS    = 2       # default run, then one Optuna-tuned re-run
-PROBE        = True    # GATE: probe regime/vol/structure + forward buy/sell move vs vanilla
-# OPTUNA_SCAN=True -> deliberately run the Optuna scan to FIND the best channel weights + knobs
-# (lr/horizon/capacity), maximizing the forward-predictive score, even if the default passes the
-# gate. This is the "scan to be sure" mode for picking the weighting. False = only tune on gate-fail.
-OPTUNA_SCAN  = True
-# The scan prints a live per-trial line ([ssl-tune i/N] fwd=.. cw=.. vw=.. best=..) AND persists to
-# a SQLite DB on Drive -> queryable live + resumable if the runtime crashes. Single writer, so no
-# sqlite locking issues. Query:  optuna trials --study-name seq2seq_v2_scan --storage sqlite:///<db>
-os.environ['SSL_OPTUNA_DB']    = '/content/drive/MyDrive/AI_Models/seq2seq_v2_scan.db'
-os.environ['SSL_OPTUNA_STUDY'] = 'seq2seq_v2_scan'
+# ── CHANNEL-WEIGHTED LOSS SWEEP (price-path) ──
+# Loop over per-channel loss weights (O,H,L,C,V) and rank them by the 10-fold FORWARD-predictive
+# probe score. No Optuna — a simple, deterministic, fully-visible sweep. Each candidate trains a
+# full encoder + saves its own checkpoint, so a Colab disconnect only loses the CURRENT candidate.
+# PRICE-PATH hypothesis: emphasize close, de-emphasize near-unpredictable volume, for trend focus.
+CANDIDATES = {
+    'equal':   [1.0, 1.0, 1.0, 1.0, 1.0],   # = v1 baseline
+    'pp_mod':  [1.0, 1.0, 1.0, 2.0, 0.25],  # price-path moderate
+    'pp_novol':[1.0, 1.0, 1.0, 2.0, 0.0],   # price-path, drop volume
+    'close3':  [1.0, 1.0, 1.0, 3.0, 0.0],   # close-heavy
+}
+PROBE_FOLDS  = 10     # k-fold CV per probe -> robust score for RANKING candidates (skip=1)
+PROBE        = True   # probe regime/vol/structure + forward buy/sell move vs vanilla
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -144,35 +137,69 @@ if not found:
         f'datetime,open,high,low,close,volume.')
 print(f'✅ PRE-FLIGHT: found {len(found)}/{len(TICKERS)*len(TFS)} CSVs under {DATA_DIR}')
 print(f'   seq2seq FORECAST | warm-start <- {WARM_CKPT}')
-print(f'   corpus {TICKERS} x {TFS} | SEQ={SEQ} HORIZON={HORIZON} BATCH={BATCH} '
-      f'EPOCHS={EPOCHS} controls={CONTROLS}')
-print(f'   OUTPUT -> {OUT_PATH}')
+print(f'   corpus {TICKERS} x {TFS} | SEQ={SEQ} HORIZON={HORIZON} BATCH={BATCH} EPOCHS={EPOCHS}')
+print(f'   channel-weight SWEEP: {list(CANDIDATES)} | probe_folds={PROBE_FOLDS} | controls on winner only')
+print(f'   OUTPUT base -> {OUT_PATH}  (per-candidate: <base>_<tag>.pt)')
 
 
 # ==============================================================================
-# CELL 3 — RUN SEQ2SEQ FT  (probe-gated + Optuna; saves encoder ckpt + .report.json)
+# CELL 3 — CHANNEL-WEIGHT SWEEP (deterministic, visible) -> rank by 10-fold forward_score
+#   phase 1: each candidate = full forecast FT (NO controls, fast) -> 10-fold probe -> save ckpt
+#   phase 2: run shuffle/random CONTROLS on the WINNER only (validity, 10-fold)
 # ==============================================================================
-verdict = ssl.loop_ssl(
-    data_dir=DATA_DIR, out_path=OUT_PATH,
-    tickers=TICKERS, tfs=TFS,
-    pretext='forecast', horizon=HORIZON, backbone_ckpt=WARM_CKPT,   # <- FT on stage-1 encoder
-    grad_clip=GRAD_CLIP, clamp=CLAMP,                               # <- stability (anti-blowup)
-    channel_weights=CHANNEL_WEIGHTS,                               # <- price-path option (None=equal)
+from pathlib import Path
+
+def _ck(tag):                                            # per-candidate checkpoint path
+    p = Path(OUT_PATH)
+    return str(p.with_name(p.stem + f'_{tag}').with_suffix('.pt'))
+
+_common = dict(
+    data_dir=DATA_DIR, tickers=TICKERS, tfs=TFS,
+    pretext='forecast', horizon=HORIZON, backbone_ckpt=WARM_CKPT,   # FT on stage-1 encoder
+    grad_clip=GRAD_CLIP, clamp=CLAMP,                               # stability
     seq=SEQ, max_jitter=MAX_JITTER, new_channels=NEW_CHANNELS,
     batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
     patience=PATIENCE, val_frac=VAL_FRAC, holdout_start=HOLDOUT_START,
-    controls=tuple(CONTROLS), probe=PROBE, n_trials=N_TRIALS, max_iters=MAX_ITERS,
-    force_tune=OPTUNA_SCAN,                                         # <- scan weights+knobs "to be sure"
-    device=device.type, compile_model=COMPILE, seed=SEED,
-)
+    probe=PROBE, probe_folds=PROBE_FOLDS, n_trials=0, max_iters=1,  # no Optuna
+    device=device.type, compile_model=COMPILE, seed=SEED)
 
-print('\n' + '=' * 60)
-print('  SSL STAGE 2 (SEQ2SEQ FORECAST) VERDICT')
-print('=' * 60)
-for k, v in verdict.items():
-    print(f'  {k:>22}: {v}')
-print('=' * 60)
-print(f'\nadapted encoder  -> {OUT_PATH}')
-print(f'report           -> {OUT_PATH}.report.json')
-print('\nDownstream use:  BACKBONE_CKPT=<this .pt>  in the WF/produce driver, or')
-print('                 build_model(..., backbone_ckpt=<this .pt>)')
+# ---- phase 1: sweep (no controls) ----
+results = {}
+for tag, w in CANDIDATES.items():
+    out = _ck(tag)
+    print(f"\n{'#'*70}\n#  CANDIDATE '{tag}'  weights(O,H,L,C,V)={w}  -> {out}\n{'#'*70}", flush=True)
+    v = ssl.loop_ssl(out_path=out, channel_weights=w, controls=(), **_common)   # NO controls = fast
+    results[tag] = dict(weights=w, ckpt=out, forward_score=v.get('forward_score'),
+                        fwd_absmove_delta=v.get('fwd_absmove_delta'),
+                        fwd_dir_delta=v.get('fwd_dir_delta'),
+                        forecast_skill=v.get('forecast_skill'),
+                        mean_core_delta=v['history'][-1].get('mean_core_delta'))
+
+# ---- ranking table ----
+ranked = sorted(results.items(), key=lambda kv: (kv[1]['forward_score'] or -9), reverse=True)
+print("\n" + "=" * 88)
+print("  CHANNEL-WEIGHT SWEEP — ranked by 10-fold forward_score (fwd move-size + direction vs vanilla)")
+print("=" * 88)
+print(f"  {'cand':<9}{'weights (O,H,L,C,V)':<26}{'fwd_score':>10}{'fwd_size':>10}{'fwd_dir':>9}"
+      f"{'skill':>8}{'core':>9}")
+for tag, r in ranked:
+    print(f"  {tag:<9}{str(r['weights']):<26}{(r['forward_score'] or 0):>+10.4f}"
+          f"{(r['fwd_absmove_delta'] or 0):>+10.4f}{(r['fwd_dir_delta'] or 0):>+9.4f}"
+          f"{(r['forecast_skill'] or 0):>+8.3f}{(r['mean_core_delta'] or 0):>+9.4f}")
+best_tag, best = ranked[0]
+print("=" * 88)
+print(f"  WINNER: '{best_tag}'  weights={best['weights']}  forward_score={best['forward_score']:+.4f}")
+
+# ---- phase 2: controls on the WINNER only (shuffle/random validity, 10-fold) ----
+win_out = _ck(best_tag + '_final')
+print(f"\n{'#'*70}\n#  CONTROLS on winner '{best_tag}' (shuffle/random validity) -> {win_out}\n{'#'*70}",
+      flush=True)
+vv = ssl.loop_ssl(out_path=win_out, channel_weights=best['weights'],
+                  controls=('shuffle', 'random'), **_common)
+print("\n" + "=" * 60 + "\n  WINNER VERDICT (with controls)\n" + "=" * 60)
+for k, val in vv.items():
+    if k != 'history':
+        print(f'  {k:>22}: {val}')
+print(f"\nBEST stage-2 encoder -> {win_out}")
+print(f"All candidate ckpts  -> " + ", ".join(_ck(t) for t in CANDIDATES))
+print("\nDownstream: BACKBONE_CKPT=<best .pt>  (compare vs stage-1 + v1 on the edge ruler)")

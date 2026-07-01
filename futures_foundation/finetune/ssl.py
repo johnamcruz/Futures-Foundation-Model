@@ -70,9 +70,10 @@ def _train(big, tr, va, cfg, control='real'):
     return _ssl_torch.train_ssl_mask(big, tr, va, control=control, **kw)
 
 
-def _probe_state(big, va, seq, state, *, model_id, device, seed, verbose=True):
+def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1, verbose=True):
     """Probe a trained encoder state vs vanilla -> the probe dict (regime/vol/structure).
-    Saves to a temp ckpt so ssl_probe can load it through the normal path."""
+    Saves to a temp ckpt so ssl_probe can load it through the normal path. folds>1 -> k-fold CV
+    per probe (robust deltas for ranking candidates)."""
     import tempfile
     import torch
     from . import ssl_probe
@@ -80,7 +81,7 @@ def _probe_state(big, va, seq, state, *, model_id, device, seed, verbose=True):
     torch.save(state, tmp)
     try:
         return ssl_probe.run_probe(big, va, seq, tmp, model_id=model_id, device=device,
-                                   seed=seed, verbose=verbose)
+                                   seed=seed, folds=folds, verbose=verbose)
     finally:
         os.remove(tmp)
 
@@ -184,7 +185,8 @@ def _tune_ssl(big, tr, va, base_cfg, *, n_trials=10, tune_epochs=8, tune_steps=8
         st, _ = _train(big, tr, va, dict(cfg, epochs=tune_epochs,
                                          steps_per_epoch=tune_steps, verbose=False), 'real')
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
-                         device=cfg['device'], seed=seed, verbose=False)
+                         device=cfg['device'], seed=seed,
+                         folds=cfg.get('probe_folds', 1), verbose=False)
         _free_gpu()
         return float(r['forward_score'] if pretext == 'forecast' else r['mean_core_delta'])
 
@@ -246,7 +248,8 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
             print(f"\n=== control={ctrl} (probe-based diagnostic) ===", flush=True)
         st, _ = _train(big, tr, va, cfg, ctrl)
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
-                         device=cfg['device'], seed=cfg['seed'], verbose=verbose)
+                         device=cfg['device'], seed=cfg['seed'],
+                         folds=cfg.get('probe_folds', 1), verbose=verbose)
         ctrl_delta[ctrl] = float(r['mean_core_delta'])
 
     real_delta = (None if probe_res is None else float(probe_res['mean_core_delta']))
@@ -297,7 +300,8 @@ def _base_cfg(**kw):
              seed=0, verbose=True,
              pretext='mask', horizon=16, backbone_ckpt=None,  # stage-2 seq2seq: forecast + warm-start
              grad_clip=1.0, clamp=10.0,                       # stage-2 stability (forecast trainer)
-             channel_weights=None)                            # stage-2 price-path weighting (None=equal)
+             channel_weights=None,                            # stage-2 price-path weighting (None=equal)
+             probe_folds=1)                                   # k-fold CV per probe (robust ranking)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
 
@@ -331,7 +335,8 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
         best_val = float(best_ep['val_loss'])
         fc_skill = best_ep.get('skill')               # forecast skill vs copy-last-bar (None for mask)
         probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
-                                  device=cfg['device'], seed=cfg['seed'], verbose=verbose)
+                                  device=cfg['device'], seed=cfg['seed'],
+                                  folds=cfg.get('probe_folds', 1), verbose=verbose)
                      if probe else None)
         pretext = cfg.get('pretext', 'mask')
         ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext)

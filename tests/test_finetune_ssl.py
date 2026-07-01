@@ -100,6 +100,9 @@ def test_probe_embedding_recovers_signal():
     assert ssl_probe.probe_embedding(emb, y_bin, 'bin', seed=0) > 0.85
     y_noise = rng.standard_normal(400)                            # unrelated
     assert ssl_probe.probe_embedding(emb, y_noise, 'reg', seed=0) < 0.2
+    # k-fold CV path (folds>1) returns a valid averaged score in the same range
+    assert ssl_probe.probe_embedding(emb, y_reg, 'reg', seed=0, folds=5) > 0.8
+    assert ssl_probe.probe_embedding(emb, y_bin, 'bin', seed=0, folds=5) > 0.85
 
 
 def test_probe_compare_flags_ssl_better():
