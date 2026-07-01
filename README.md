@@ -58,9 +58,9 @@ The flow is a self-supervised pretraining pipeline over one shared backbone, the
 raw OHLCV (multi-ticker × multi-timeframe)
         │
         ▼  SELF-SUPERVISED PRETRAINING — 3 progressive stages  (finetune/ssl.py, GPU/Colab)
-   ① masked modeling      →  regime / structure / volatility
-   ② candle forecasting   →  forward price-action dynamics        ──►  refined backbone checkpoint
-   ③ trend contrastive    →  trend-vs-chop separation
+   1) masked modeling      →  regime / structure / volatility
+   2) candle forecasting   →  forward price-action dynamics       ──►  refined backbone checkpoint
+   3) trend contrastive    →  trend-vs-chop separation
         │   each stage WARM-STARTS from the previous; anti-forgetting + crash-safe resume
         ▼  DOWNSTREAM FINETUNE  (finetune/wf.py → produce.py)
    strategy labeler + light classifier head  ──►  ONNX bundle the bot loads
@@ -76,17 +76,17 @@ raw OHLCV (multi-ticker × multi-timeframe)
 
 **`futures_foundation/finetune/ssl.py` orchestrates a 3-stage self-supervised pipeline that progressively refines the backbone on raw OHLCV.** Each stage **warm-starts from the previous checkpoint**, so the foundation compounds — regime understanding → forward dynamics → trend/chop structure — before any strategy sees it. Pretext tasks are **pluggable** (`finetune/pretext/`): a new pretraining objective is one module (its own reserve / train / gate); the orchestrator never changes.
 
-**① Masked modeling — learn regime / structure / volatility.** A random fraction of bars in each window is **masked**, and the encoder **reconstructs them from context** (MSE on masked positions only). To fill a gap it must know what normally comes next given the local regime → it learns volatility, structure, and compression→expansion. (Masked bars are noise-filled, not zeroed, so the backbone's per-patch instance-norm never divides by zero.)
+**Stage 1 — Masked modeling (learn regime / structure / volatility).** A random fraction of bars in each window is **masked**, and the encoder **reconstructs them from context** (MSE on masked positions only). To fill a gap it must know what normally comes next given the local regime → it learns volatility, structure, and compression→expansion. (Masked bars are noise-filled, not zeroed, so the backbone's per-patch instance-norm never divides by zero.)
 
-**② Candle forecasting — learn forward price-action dynamics.** Warm-started from ①, the encoder predicts the **future candle (OHLCV) at multiple horizons** from variable-length context, expressed as a **move from "now"** (so "copy the last bar" = predict-zero, and is punished). Predicting where price goes across near *and* far horizons forces **multi-scale forward dynamics** into the embedding — the raw material for telling a developing move from noise. Reported per-horizon so the far horizons are visibly learning.
+**Stage 2 — Candle forecasting (learn forward price-action dynamics).** Warm-started from stage 1, the encoder predicts the **future candle (OHLCV) at multiple horizons** from variable-length context, expressed as a **move from "now"** (so "copy the last bar" = predict-zero, and is punished). Predicting where price goes across near *and* far horizons forces **multi-scale forward dynamics** into the embedding — the raw material for telling a developing move from noise. Reported per-horizon so the far horizons are visibly learning.
 
-**③ Trend contrastive — sharpen trend-vs-chop separation.** Warm-started from ②, a **multi-positive InfoNCE** groups windows sharing a **self-supervised, causal trend key** (direction × magnitude of the trailing move), pulling same-trend windows together and pushing chop into its own region of embedding space. Positives are defined by trend *character* (not augmentation identity), so the objective targets trend/chop structure directly. A light projection head is discarded after training.
+**Stage 3 — Trend contrastive (sharpen trend-vs-chop separation).** Warm-started from stage 2, a **multi-positive InfoNCE** groups windows sharing a **self-supervised, causal trend key** (direction × magnitude of the trailing move), pulling same-trend windows together and pushing chop into its own region of embedding space. Positives are defined by trend *character* (not augmentation identity), so the objective targets trend/chop structure directly. A light projection head is discarded after training.
 
 Shared discipline across every stage:
 
 | Guardrail | What it does |
 |---|---|
-| **Warm-start chain** | ② starts from ①, ③ from ② — the foundation compounds rather than restarts |
+| **Warm-start chain** | stage 2 starts from stage 1, stage 3 from stage 2 — the foundation compounds rather than restarts |
 | **Anti-forgetting** | late-stage refines can **freeze the tokenizer + early backbone layers** and use a **gentle LR**, so a new objective sharpens the representation without erasing earlier stages (the same layer-freeze technique used for downstream partial-finetuning) |
 | **Crash-safe save + resume** | the best checkpoint is written progressively (atomic, every val improvement) with a resume path — a disconnected GPU run never loses progress |
 | **Time-split val early-stop** | generalizes forward in time; **2026 is excluded from every stage** (inputs and targets) so the downstream OOS is never contaminated |
