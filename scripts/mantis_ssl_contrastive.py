@@ -80,7 +80,8 @@ NEW_CHANNELS    = 8                             # channel-combiner output (OHLCV
 BATCH   = 512         # Mantis contrastive batch; drop if OOM
 EPOCHS  = 60
 STEPS   = 200         # steps/epoch
-LR      = 2e-3        # Mantis contrastive base LR (AdamW, wd=0.05)
+LR      = 2e-4        # gentle warm-start REFINE (2e-3 = Mantis from-scratch, too hot here: it
+                     # drove the emb_std runaway 6->9 = drift/forgetting of ctx200). AdamW wd=0.05.
 PATIENCE = 8
 CLAMP, GRAD_CLIP = 10.0, 1.0
 CONTROLS = ('shuffle', 'random')               # apples-to-apples diagnostics
