@@ -4,7 +4,7 @@
 
 **A model-agnostic classification foundation for futures markets — any pretrained time-series classification backbone learns market structure from raw OHLCV, then thin per-strategy heads finetune on top, all held to an honest-ruler walk-forward.**
 
-**Contents:** [Quick Start](#quick-start) · [Philosophy](#philosophy--bert-for-futures) · [Overview](#overview) · [Self-Supervised Pretraining](#self-supervised-pretraining-the-bert-stage) · [The Classifier Seam](#the-classifier-seam--model-agnostic) · [Finetuning Pipeline](#finetuning-pipeline--walk-forward--produce) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Data](#data) · [Project Structure](#project-structure)
+**Contents:** [Quick Start](#quick-start) · [Philosophy](#philosophy--bert-for-futures) · [Overview](#overview) · [Self-Supervised Pretraining (3 stages)](#self-supervised-pretraining--3-progressive-stages) · [The Classifier Seam](#the-classifier-seam--model-agnostic) · [Finetuning Pipeline](#finetuning-pipeline--walk-forward--produce) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Data](#data) · [Project Structure](#project-structure)
 
 ---
 
@@ -15,14 +15,14 @@ pip install -e .
 # + the package for your chosen classification backbone
 ```
 
-FFM separates **learning the market** from **deciding a trade**. Stage 1 pretrains a backbone on raw OHLCV (self-supervised); stage 2 finetunes a thin per-strategy classifier on top, validated on the honest ruler.
+FFM separates **learning the market** from **deciding a trade**. A **3-stage self-supervised pipeline** (masked modeling → candle forecasting → trend contrastive) progressively refines the backbone on raw OHLCV; a thin per-strategy classifier then finetunes on top, validated on the honest ruler.
 
 ```python
 from futures_foundation.finetune import ssl, wf, produce
 
-# 1) PRETRAIN (BERT stage) — self-supervised on raw OHLCV, runs on a GPU (Colab).
-#    Output: an adapted backbone checkpoint that downstream classifiers start from.
-ssl.loop_ssl(data_dir='…', out_path='ssl_ohlcv.pt')            # see colab/ runner
+# 1) PRETRAIN — 3-stage self-supervised (mask → forecast → contrastive), GPU/Colab.
+#    Each stage warm-starts the next; output = a refined backbone checkpoint.
+ssl.loop_ssl(data_dir='…', out_path='ssl_ohlcv.pt', pretext='mask')   # then 'forecast', 'contrastive'
 
 # 2) VALIDATE — walk-forward honest ruler with overfit→Optuna; classifier-agnostic.
 verdict = wf.loop_streamed(make_labeler, streams,
@@ -52,15 +52,17 @@ Two principles shape everything below:
 
 ## Overview
 
-The flow is two stages over one shared backbone:
+The flow is a self-supervised pretraining pipeline over one shared backbone, then a thin per-strategy head:
 
 ```
-raw OHLCV (9 tickers × 1/3/5/15min)
+raw OHLCV (multi-ticker × multi-timeframe)
         │
-        ▼  Stage 1 — SELF-SUPERVISED PRETRAIN  (finetune/ssl.py, GPU/Colab)
-   masked modeling: mask bars → reconstruct  ──►  adapted backbone checkpoint
-        │                                          (learns regime / structure / volatility)
-        ▼  Stage 2 — FINETUNE  (finetune/wf.py → produce.py)
+        ▼  SELF-SUPERVISED PRETRAINING — 3 progressive stages  (finetune/ssl.py, GPU/Colab)
+   ① masked modeling      →  regime / structure / volatility
+   ② candle forecasting   →  forward price-action dynamics        ──►  refined backbone checkpoint
+   ③ trend contrastive    →  trend-vs-chop separation
+        │   each stage WARM-STARTS from the previous; anti-forgetting + crash-safe resume
+        ▼  DOWNSTREAM FINETUNE  (finetune/wf.py → produce.py)
    strategy labeler + light classifier head  ──►  ONNX bundle the bot loads
 ```
 
@@ -70,23 +72,28 @@ raw OHLCV (9 tickers × 1/3/5/15min)
 
 ---
 
-## Self-Supervised Pretraining (the BERT stage)
+## Self-Supervised Pretraining — 3 progressive stages
 
-**`futures_foundation/finetune/ssl.py` — generic *masked modeling* on raw OHLCV (literally BERT's pretext), adapting the backbone to our markets with the same generalization discipline as the strategy pipeline.**
+**`futures_foundation/finetune/ssl.py` orchestrates a 3-stage self-supervised pipeline that progressively refines the backbone on raw OHLCV.** Each stage **warm-starts from the previous checkpoint**, so the foundation compounds — regime understanding → forward dynamics → trend/chop structure — before any strategy sees it. Pretext tasks are **pluggable** (`finetune/pretext/`): a new pretraining objective is one module (its own reserve / train / gate); the orchestrator never changes.
 
-A random fraction of bars in each OHLCV window is **masked**, and the encoder must **reconstruct the masked bars from their surrounding context** (MSE on the masked positions only). To fill a gap, the model has to know what *normally* comes next given the local regime — so it learns volatility, structure, and compression→expansion dynamics. (Masked positions are filled with noise rather than zeroed, so the backbone's per-patch instance-norm never divides by zero.) It runs GPU-maximized (data resident on GPU, large batch, AMP).
+**① Masked modeling — learn regime / structure / volatility.** A random fraction of bars in each window is **masked**, and the encoder **reconstructs them from context** (MSE on masked positions only). To fill a gap it must know what normally comes next given the local regime → it learns volatility, structure, and compression→expansion. (Masked bars are noise-filled, not zeroed, so the backbone's per-patch instance-norm never divides by zero.) *Instance-discrimination contrastive was rejected as the base pretext* — it proved **gameable** (shuffled/noise windows scored as well as real), so the loss wasn't certifying temporal structure; masked reconstruction has a clean, shortcut-proof control.
 
-We chose masked modeling over contrastive learning deliberately: contrastive proved **gameable** here — shuffled and noise windows scored as well as real ones, so the loss wasn't certifying that real temporal structure was learned. Masked reconstruction has a clean, shortcut-proof control (below).
+**② Candle forecasting — learn forward price-action dynamics.** Warm-started from ①, the encoder predicts the **future candle (OHLCV) at multiple horizons** from variable-length context, expressed as a **move from "now"** (so "copy the last bar" = predict-zero, and is punished). Predicting where price goes across near *and* far horizons forces **multi-scale forward dynamics** into the embedding — the raw material for telling a developing move from noise. Reported per-horizon so the far horizons are visibly learning.
 
-It is **overfit-gated and Optuna-tuned**, mirroring the strategy pipeline:
+**③ Trend contrastive — sharpen trend-vs-chop separation.** Warm-started from ②, a **multi-positive InfoNCE** groups windows sharing a **self-supervised, causal trend key** (direction × magnitude of the trailing move), pulling same-trend windows together and pushing chop into its own region of embedding space. Unlike the gameable instance-discrimination of ①, positives are defined by trend *character* (not augmentation identity), so the objective targets trend/chop structure directly. A light projection head is discarded after training.
 
-| Gate | What it checks |
+Shared discipline across every stage:
+
+| Guardrail | What it does |
 |---|---|
-| Time-split val early-stop | generalizes forward in time (2026 excluded) |
-| **REAL vs SHUFFLE vs RANDOM reconstruction** | the decisive pretext control: REAL must reach a far lower masked-reconstruction loss than time-shuffled and pure-noise windows. Observed REAL ≈ 0.35 vs SHUFFLE/RANDOM ≈ 0.97/0.98 → the encoder is reconstructing from genuine temporal structure, not a copy trick |
-| NaN / variance guard | masked bars noise-filled so per-patch instance-norm stays finite |
-| Optuna | if it doesn't generalize, tune lr / weight-decay / mask-ratio / channel-adapter width until it does |
-| Linear probe (soft) | a linear probe reads regime / vol / structure off the frozen embedding — *informative but non-discriminating on its own* (generic domain-adaptation can pass it even for a noise-trained backbone). The **reconstruction control above** is the valid temporal test; the **downstream walk-forward A/B** is the decisive one |
+| **Warm-start chain** | ② starts from ①, ③ from ② — the foundation compounds rather than restarts |
+| **Anti-forgetting** | late-stage refines can **freeze the tokenizer + early backbone layers** and use a **gentle LR**, so a new objective sharpens the representation without erasing earlier stages (the same layer-freeze technique used for downstream partial-finetuning) |
+| **Crash-safe save + resume** | the best checkpoint is written progressively (atomic, every val improvement) with a resume path — a disconnected GPU run never loses progress |
+| **Time-split val early-stop** | generalizes forward in time; **2026 is excluded from every stage** (inputs and targets) so the downstream OOS is never contaminated |
+| **Apples-to-apples controls** *(opt-in)* | REAL vs time-SHUFFLE vs RANDOM **input** with the target held fixed — REAL must beat both, certifying the stage learned from genuine temporal order, not a shortcut |
+| **Linear probe** *(soft)* | reads regime / vol / structure off the frozen embedding — informative but non-discriminating alone (generic domain-adaptation can pass it); the **downstream walk-forward A/B is the decisive judge** |
+
+Runs GPU-maximized (data resident on GPU, large batch, AMP where applicable). Every stage outputs an adapted backbone checkpoint consumed downstream via `backbone_ckpt`.
 
 ---
 
@@ -117,7 +124,7 @@ Two ways to attach the backbone — both initialize from the SSL checkpoint via 
 
 **`futures_foundation/finetune/` — the strategy-pluggable harness: streamed walk-forward evaluator with honest-ruler controls, production trainer, ONNX export.** Every strategy goes through it; nothing about it is tied to a specific backbone.
 
-**What it does:** a strategy labeler defines event candidates (e.g., a trend-pivot); for each event a multivariate context window → the classifier predicts `P(take)`, scored on **realized R** via the strategy's own evaluator. Validation runs the **overfit-driven training loop** on a rolling **train / validate / test** walk-forward with **REAL / SHUFFLE / RANDOM** controls and a pre-registered PASS/FAIL auto-verdict. The production trainer then fits one head on the full corpus minus the holdout and saves a single bundle + ONNX the bot loads.
+**What it does:** a strategy labeler defines event candidates (any rule-based setup); for each event a multivariate context window → the classifier predicts `P(take)`, scored on **realized R** via the strategy's own evaluator. Validation runs the **overfit-driven training loop** on a rolling **train / validate / test** walk-forward with **REAL / SHUFFLE / RANDOM** controls and a pre-registered PASS/FAIL auto-verdict. The production trainer then fits one head on the full corpus minus the holdout and saves a single bundle + ONNX the bot loads.
 
 | Component | Role |
 |---|---|
@@ -198,8 +205,11 @@ Raw OHLCV is the backbone's input. For strategies that fuse hand-crafted geometr
 Futures-Foundation-Model/
 ├── futures_foundation/                # Foundation package (torch-free to import)
 │   ├── finetune/                      # ★ The model-agnostic classification pipeline
-│   │   ├── ssl.py / ssl_data.py       #   SSL masked-modeling pretraining (BERT stage)
-│   │   ├── _ssl_torch.py              #   GPU-max masked trainer + frozen embed_windows (subprocess/Colab)
+│   │   ├── ssl.py / ssl_data.py       #   SSL orchestrator (3-stage pretraining) + data assembly
+│   │   ├── pretext/                   #   pluggable pretext tasks: mask / forecast / contrastive
+│   │   │   ├── base.py                #     PretextTask interface (reserve / train / gate)
+│   │   │   └── _torch/                #     per-stage GPU trainers + shared BaseTrainer (save/resume/freeze)
+│   │   ├── _ssl_torch.py              #   back-compat shim → re-exports pretext/_torch (frozen embed, ONNX)
 │   │   ├── ssl_probe.py               #   linear probe: regime / vol / structure (soft signal)
 │   │   ├── classifier.py              #   Classifier ABC + get_classifier registry (the seam)
 │   │   ├── classifiers/               #   end-to-end FT + frozen head-only (cached embeddings) + logistic
