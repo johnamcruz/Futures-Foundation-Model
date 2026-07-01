@@ -223,7 +223,6 @@ Futures-Foundation-Model/
 │   └── prepare.py                     #   raw CSVs → features parquet
 ├── colab/                             # ★ Colab runners: clone → install → Drive paths → run
 ├── databento/                         # Continuous-contract build + incremental update
-├── docs/                              # Build specs + runbooks
 ├── tests/                             # Unit tests (pre-commit gated; torch-free by contract)
 └── data/                              # Raw OHLCV CSVs (gitignored)
 ```
