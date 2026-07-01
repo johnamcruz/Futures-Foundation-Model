@@ -77,7 +77,9 @@ STEPS   = 200         # steps/epoch
 LR      = 1e-4
 PATIENCE = 8
 CLAMP, GRAD_CLIP = 10.0, 1.0                    # stability
-CONTROLS = ('shuffle', 'random')               # apples-to-apples probe diagnostics
+CONTROLS = ()                                  # skip shuffle/random retrains (fast iteration; judge
+                                               # offline). Re-enable ('shuffle','random') for a fresh
+                                               # anti-shortcut check on a NEW pretext/target change.
 PROBE = True                                    # probe vs vanilla (diagnostic, not a gate)
 SEED = 0
 

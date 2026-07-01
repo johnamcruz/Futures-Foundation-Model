@@ -84,7 +84,9 @@ LR      = 2e-4        # gentle warm-start REFINE (2e-3 = Mantis from-scratch, to
                      # drove the emb_std runaway 6->9 = drift/forgetting of ctx200). AdamW wd=0.05.
 PATIENCE = 8
 CLAMP, GRAD_CLIP = 10.0, 1.0
-CONTROLS = ('shuffle', 'random')               # apples-to-apples diagnostics
+CONTROLS = ()                                  # skip shuffle/random retrains (fast iteration; judge
+                                               # offline). Re-enable ('shuffle','random') for a fresh
+                                               # anti-shortcut check on a NEW pretext/target change.
 PROBE = True                                   # probe vs vanilla (diagnostic, not the gate)
 SEED = 0
 
