@@ -29,12 +29,12 @@ import numpy as np
 from . import ssl_data
 
 
-def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, horizon=0, verbose=True):
-    """Concatenate all stream OHLCV into one big [T, 5] array + global parent-window
-    start positions for the (leak-safe, 2026-excluded) train/val split. The parent window
-    reserves room for BOTH the probe's forward horizon (max_jitter) and, for the seq2seq
-    forecast pretext, the forecast horizon — so a window holds context+future in-stream."""
-    parent_len = seq + max(max_jitter, horizon)
+def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0, verbose=True):
+    """Concatenate all stream OHLCV into one big [T, 5] array + global parent-window start
+    positions for the (leak-safe, 2026-excluded) train/val split. Each window reserves enough
+    bars for its consumers: seq+max_jitter (probe/mask) OR forecast_parent (stage-2 = max context
+    length + max horizon), whichever is larger — so context+future stay in-stream."""
+    parent_len = max(seq + max_jitter, int(forecast_parent))
     bigs, tr_starts, va_starts, base = [], [], [], 0
     for s in streams:
         oh = s['ohlcv']
@@ -123,112 +123,6 @@ def _passes(probe_res, std, margin=0.0, dir_margin=0.0, pretext='mask'):
     return ok, detail
 
 
-# ------------------------------------------------------------------------------- optuna
-def _ssl_channel_weights(close_weight, vol_weight):
-    """Assemble per-channel loss weights (O,H,L,C,V): O/H/L fixed at 1, close emphasized,
-    volume down-weighted. This is the 'price-path' lever — concentrate the forecast on the
-    trend-relevant price movement, de-emphasize near-unpredictable volume."""
-    return [1.0, 1.0, 1.0, float(close_weight), float(vol_weight)]
-
-
-def _suggest_ssl(trial, pretext='mask'):
-    """Search the SSL knobs that govern generalization (maximizing the probe delta): optimizer,
-    capacity, and pretext-specific knobs. Forecast (seq2seq) also searches the forecast horizon
-    AND the channel-weighted loss (close_weight up, vol_weight down = price-path) so Optuna finds
-    the weighting that best improves the FORWARD-predictive representation (not raw skill)."""
-    d = dict(lr=trial.suggest_float('lr', 3e-5, 5e-4, log=True),
-             weight_decay=trial.suggest_float('weight_decay', 0.01, 0.3, log=True),
-             new_channels=trial.suggest_int('new_channels', 4, 12))
-    if pretext == 'forecast':
-        d['horizon'] = trial.suggest_int('horizon', 8, 32)
-        cw = trial.suggest_float('close_weight', 1.0, 3.0)    # emphasize the close (trend) channel
-        vw = trial.suggest_float('vol_weight', 0.0, 1.0)      # 0 = ignore volume (pure price path)
-        d['channel_weights'] = _ssl_channel_weights(cw, vw)
-    else:
-        d['mask_ratio'] = trial.suggest_float('mask_ratio', 0.2, 0.6)
-    return d
-
-
-def _rebuild_channel_weights(params):
-    """study.best_params records close_weight/vol_weight (the raw suggestions) — turn them back
-    into the channel_weights vector the trainer consumes (mirrors _suggest_ssl)."""
-    p = dict(params)
-    if 'close_weight' in p and 'vol_weight' in p:
-        p['channel_weights'] = _ssl_channel_weights(p.pop('close_weight'), p.pop('vol_weight'))
-    return p
-
-
-def _tune_ssl(big, tr, va, base_cfg, *, n_trials=10, tune_epochs=8, tune_steps=80,
-              seed=0, verbose=True):
-    """Optuna MAXIMIZING the probe — NOT a lower loss (loss is blind: noise scores as well as
-    real). Objective is pretext-matched: forecast (stage 2) maximizes the FORWARD-predictive
-    score (fwd move size + direction vs vanilla; anti-shortcut — the easy descriptive average
-    can't carry it); mask (stage 1, ORIGINAL) maximizes mean_core_delta as before. Returns the
-    best config if it beats the base, else base."""
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    pretext = base_cfg.get('pretext', 'mask')
-
-    def _free_gpu():
-        """Each scan trial builds a fresh net + the probe loads more encoders — free between
-        trials so 20 trials don't accumulate GPU memory into an OOM (silent Colab crash)."""
-        import gc
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    def delta_of(cfg):
-        st, _ = _train(big, tr, va, dict(cfg, epochs=tune_epochs,
-                                         steps_per_epoch=tune_steps, verbose=False), 'real')
-        r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
-                         device=cfg['device'], seed=seed,
-                         folds=cfg.get('probe_folds', 1), verbose=False)
-        _free_gpu()
-        return float(r['forward_score'] if pretext == 'forecast' else r['mean_core_delta'])
-
-    base = delta_of(base_cfg)
-    if verbose:
-        print(f"  [ssl-tune] base={base:+.4f} ({'fwd' if pretext == 'forecast' else 'core'}) "
-              f"-> scanning {n_trials} trials", flush=True)
-
-    def objective(trial):
-        return delta_of(dict(base_cfg, **_suggest_ssl(trial, base_cfg.get('pretext', 'mask'))))
-
-    def _progress(study, trial):                          # live per-trial line (DB + stdout)
-        v = f"{trial.value:+.4f}" if trial.value is not None else 'fail'
-        cw, vw = trial.params.get('close_weight'), trial.params.get('vol_weight')
-        wstr = f" cw={cw:.2f} vw={vw:.2f}" if cw is not None else ''
-        try:
-            bv = f"{study.best_value:+.4f}"
-        except ValueError:
-            bv = 'n/a'
-        print(f"  [ssl-tune {trial.number + 1}/{n_trials}] fwd={v}{wstr} best={bv}", flush=True)
-
-    # PERSISTENT SQLite storage (resume + queryable) when SSL_OPTUNA_DB is set; else in-memory.
-    db, study_name = os.environ.get('SSL_OPTUNA_DB'), os.environ.get('SSL_OPTUNA_STUDY', 'ssl_scan')
-    skw = {}
-    if db:
-        os.makedirs(os.path.dirname(db) or '.', exist_ok=True)
-        skw = dict(study_name=study_name, storage=f'sqlite:///{db}', load_if_exists=True)
-        if verbose:
-            print(f"  [ssl-tune] storage sqlite:///{db} study='{study_name}'", flush=True)
-    study = optuna.create_study(direction='maximize',
-                                sampler=optuna.samplers.TPESampler(seed=seed), **skw)
-    study.optimize(objective, n_trials=n_trials, catch=(Exception,), callbacks=[_progress])
-    improved = study.best_value > base + 1e-4
-    # rebuild channel_weights from the raw close/vol suggestions before applying (forecast)
-    best = dict(base_cfg, **_rebuild_channel_weights(study.best_params)) if improved else dict(base_cfg)
-    if verbose:
-        print(f"  [optuna ssl] base_fwd={base:+.4f} best_fwd={study.best_value:+.4f} "
-              f"best_params={study.best_params} "
-              f"{'-> use tuned' if improved else '-> keep defaults'}", flush=True)
-    return best, {'base_delta': base, 'best_delta': study.best_value, 'improved': improved}
-
-
 # ------------------------------------------------------------------------------- save/probe
 def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout_start,
               val_frac, streams, history, verbose):
@@ -278,10 +172,10 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
 
 # ------------------------------------------------------------------------------- entrypoints
 def _load_assemble(data_dir, tickers, tfs, seq, max_jitter, val_frac, holdout_start, verbose,
-                   horizon=0):
+                   forecast_parent=0):
     streams = ssl_data.load_ohlcv(data_dir, tickers, tfs, verbose=verbose)
     big, tr, va = assemble(streams, seq=seq, max_jitter=max_jitter, val_frac=val_frac,
-                           holdout_start=holdout_start, horizon=horizon, verbose=verbose)
+                           holdout_start=holdout_start, forecast_parent=forecast_parent, verbose=verbose)
     if verbose:
         print(f"[ssl] bars={len(big)} train_win={len(tr)} val_win={len(va)} "
               f"streams={len(streams)}", flush=True)
@@ -291,111 +185,79 @@ def _load_assemble(data_dir, tickers, tfs, seq, max_jitter, val_frac, holdout_st
 
 
 def _base_cfg(**kw):
-    """Default masked-modeling config (one place; loop_ssl tunes a subset). max_jitter
-    reserves the forward-probe horizon (in-stream). Only known keys are kept, so stray
-    callers can't inject junk into the trainer."""
+    """Default SSL config (one place). seq = the probe/embed window; max_jitter reserves the
+    probe's forward horizon. Stage-2 forecast knobs: horizons (multi-horizon candle prediction),
+    context_lengths (variable input). Only known keys are kept."""
     d = dict(seq=64, max_jitter=16, new_channels=8, mask_ratio=0.4, epochs=60,
              steps_per_epoch=200, batch=1024, lr=1e-4, weight_decay=0.05, patience=8,
              model_id='paris-noah/Mantis-8M', compile_model=False, device=None,
-             seed=0, verbose=True,
-             pretext='mask', horizon=16, backbone_ckpt=None,  # stage-2 seq2seq: forecast + warm-start
-             grad_clip=1.0, clamp=10.0,                       # stage-2 stability (forecast trainer)
-             channel_weights=None,                            # stage-2 price-path weighting (None=equal)
-             probe_folds=1)                                   # k-fold CV per probe (robust ranking)
+             seed=0, verbose=True, backbone_ckpt=None,
+             pretext='mask',                                  # 'mask' (stage 1) | 'forecast' (stage 2)
+             # stage-2 multi-horizon / variable-context candle forecasting:
+             horizons=(5, 10, 20, 25), context_lengths=(64, 100, 150, 200),
+             grad_clip=1.0, clamp=10.0,
+             probe_folds=1)                                   # k-fold CV per probe (robust)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
 
 
 def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'random'),
-             out_path='mantis_ssl_ohlcv.pt', probe=True, n_trials=10, max_iters=2,
-             probe_margin=0.0, dir_margin=0.0, force_tune=False, holdout_start='2026-01-01',
-             val_frac=0.1, **cfg_over):
-    """Probe-GATED, Optuna-tuned SSL. Each iter: train REAL -> PROBE vs vanilla -> gate on
-    the PROBE (does it encode regime/vol/structure better than vanilla), NOT on the
-    contrastive loss (which is blind — noise scores as well as real). If it doesn't pass,
-    Optuna MAXIMIZES the probe delta and we re-run. Saves the best-probe encoder + report
-    (with probe-based shuffle/random controls as the temporal diagnostic)."""
+             out_path='mantis_ssl_ohlcv.pt', probe=True, probe_margin=0.0, dir_margin=0.0,
+             holdout_start='2026-01-01', val_frac=0.1, **cfg_over):
+    """Train the SSL encoder ONCE and save it (no Optuna). pretext='mask' = stage-1 masked
+    modeling; pretext='forecast' = stage-2 multi-horizon / variable-context candle seq2seq
+    (warm-started from stage-1 via backbone_ckpt). Then PROBE vs vanilla + shuffle/random controls
+    as diagnostics (gate = report-only), and write the encoder + report."""
     cfg = _base_cfg(**cfg_over)
     verbose = cfg['verbose']
-    # forecast pretext: reserve room for the LARGEST horizon Optuna may later pick (suggest_int
-    # upper bound = 32) so a tuned-up horizon never reads past the window into another stream /
-    # the holdout. mask pretext reserves nothing extra (0).
-    fc_reserve = max(int(cfg.get('horizon', 0)), 32) if cfg.get('pretext') == 'forecast' else 0
-    streams, big, tr, va = _load_assemble(data_dir, tickers, tfs, cfg['seq'],
-                                          cfg['max_jitter'], val_frac, holdout_start, verbose,
-                                          horizon=fc_reserve)
-    history, best = [], None
-    for it in range(max_iters):
-        src = 'default' if it == 0 else 'optuna-tuned'
-        if verbose:
-            print(f"\n[ssl-loop] iter {it} · {src} config", flush=True)
-        state, hist = _train(big, tr, va, cfg, 'real')
-        std = float(hist[-1]['std'])
-        best_ep = min(hist, key=lambda h: h['val_loss'])
-        best_val = float(best_ep['val_loss'])
-        fc_skill = best_ep.get('skill')               # forecast skill vs copy-last-bar (None for mask)
-        probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
-                                  device=cfg['device'], seed=cfg['seed'],
-                                  folds=cfg.get('probe_folds', 1), verbose=verbose)
-                     if probe else None)
-        pretext = cfg.get('pretext', 'mask')
-        ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext)
-        history.append({'iter': it, 'source': src, 'best_val': best_val, 'std': std,
-                        'forecast_skill': fc_skill, **detail})
-        # rank iters by the SAME quantity the gate keys on: forecast (stage 2) = FORWARD-
-        # predictive score (anti-shortcut); mask (stage 1, original) = descriptive mean_core.
-        delta = (-1e9 if probe_res is None else
-                 probe_res['forward_score'] if pretext == 'forecast' else probe_res['mean_core_delta'])
-        if best is None or delta > best['delta']:
-            best = {'state': state, 'probe': probe_res, 'cfg': dict(cfg), 'delta': delta,
-                    'skill': fc_skill}
-        # stop when the gate passes (unless force_tune: deliberately Optuna-scan anyway, e.g. to
-        # search channel weights "to be sure"), or when iterations are exhausted.
-        if (ok and not force_tune) or it == max_iters - 1:
-            break
-        if verbose:
-            metric = 'forward_score' if pretext == 'forecast' else 'mean_core_delta'
-            why = 'force_tune: scanning anyway' if ok else 'gate not passed'
-            print(f"[ssl-loop] {metric}={delta:+.4f} ({why}) -> Optuna", flush=True)
-        cfg, _ = _tune_ssl(big, tr, va, cfg, n_trials=n_trials, seed=cfg['seed'], verbose=verbose)
-        cfg = _base_cfg(**cfg)                            # re-fill any popped defaults
-
-    verdict = _finalize(big, tr, va, best['state'], best['probe'], best['cfg'],
-                        out_path=out_path, controls=controls, holdout_start=holdout_start,
-                        val_frac=val_frac, streams=streams, history=history, verbose=verbose)
+    pretext = cfg.get('pretext', 'mask')
+    # forecast reserves context+horizon room per window; mask reserves only the probe horizon.
+    fc_reserve = (max(int(x) for x in cfg['context_lengths']) + max(int(h) for h in cfg['horizons'])
+                  if pretext == 'forecast' else 0)
+    streams, big, tr, va = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
+                                           val_frac, holdout_start, verbose, forecast_parent=fc_reserve)
+    state, hist = _train(big, tr, va, cfg, 'real')
+    std = float(hist[-1]['std'])
+    best_ep = min(hist, key=lambda h: h['val_loss'])
+    fc_skill = best_ep.get('skill')                       # forecast skill vs copy-now (None for mask)
+    probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
+                              device=cfg['device'], seed=cfg['seed'],
+                              folds=cfg.get('probe_folds', 1), verbose=verbose) if probe else None)
+    ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext)
+    history = [{'source': 'default', 'best_val': float(best_ep['val_loss']), 'std': std,
+                'forecast_skill': fc_skill, 'gate_ok': bool(ok), **detail}]
+    verdict = _finalize(big, tr, va, state, probe_res, cfg, out_path=out_path, controls=controls,
+                        holdout_start=holdout_start, val_frac=val_frac, streams=streams,
+                        history=history, verbose=verbose)
     verdict['history'] = history
-    if cfg.get('pretext') == 'forecast':                 # stage-2: forward-predictive diagnostics
-        verdict['forecast_skill'] = best.get('skill')    # >0 => beat copy-last-bar (anti-shortcut)
-        verdict['forward_score'] = best.get('delta')
-        if best.get('probe') is not None:
-            verdict['fwd_absmove_delta'] = float(best['probe'].get('fwd_absmove_delta', 0.0))
-            verdict['fwd_dir_delta'] = float(best['probe'].get('fwd_dir_delta', 0.0))
+    if pretext == 'forecast':
+        verdict['forecast_skill'] = fc_skill
+        if probe_res is not None:
+            verdict['fwd_absmove_delta'] = float(probe_res.get('fwd_absmove_delta', 0.0))
+            verdict['fwd_dir_delta'] = float(probe_res.get('fwd_dir_delta', 0.0))
     return verdict
 
 
 def run_ssl(data_dir=None, *, controls=('shuffle', 'random'),
             out_path='mantis_ssl_ohlcv.pt', probe=True, holdout_start='2026-01-01',
             val_frac=0.1, tickers=None, tfs=None, **cfg_over):
-    """Single-config SSL run (no Optuna). Thin wrapper used for simple/fast runs and by
-    tests; loop_ssl is the full probe-gated process."""
-    return loop_ssl(data_dir, tickers=tickers, tfs=tfs, controls=controls,
-                    out_path=out_path, probe=probe, n_trials=0, max_iters=1,
-                    holdout_start=holdout_start, val_frac=val_frac, **cfg_over)
+    """Thin alias of loop_ssl (kept for callers/tests). loop_ssl trains once and saves."""
+    return loop_ssl(data_dir, tickers=tickers, tfs=tfs, controls=controls, out_path=out_path,
+                    probe=probe, holdout_start=holdout_start, val_frac=val_frac, **cfg_over)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Mantis OHLCV masked-modeling SSL (probe-gated + Optuna)")
+    p = argparse.ArgumentParser(description="Mantis OHLCV SSL — masked (stage 1) or multi-horizon seq2seq (stage 2)")
     p.add_argument('--data-dir', default=os.environ.get('DATA_DIR'))
     p.add_argument('--out', default=os.environ.get('OUT_PATH', 'mantis_ssl_ohlcv.pt'))
     p.add_argument('--tickers', default=os.environ.get('TICKERS'))
     p.add_argument('--tfs', default=os.environ.get('TFS', '1min,3min,5min,15min'))
-    p.add_argument('--pretext', default=os.environ.get('PRETEXT', 'mask'),
-                   choices=['mask', 'forecast'])   # stage 1 = mask (BERT); stage 2 = seq2seq forecast
-    p.add_argument('--horizon', type=int, default=int(os.environ.get('HORIZON', '16')))
+    p.add_argument('--pretext', default=os.environ.get('PRETEXT', 'mask'), choices=['mask', 'forecast'])
     p.add_argument('--backbone-ckpt', default=os.environ.get('BACKBONE_CKPT'))  # warm-start (stage 2)
-    p.add_argument('--dir-margin', type=float, default=float(os.environ.get('DIR_MARGIN', '0.0')))
+    p.add_argument('--horizons', default=os.environ.get('HORIZONS', '5,10,20,25,50'))
+    p.add_argument('--context-lengths', default=os.environ.get('CONTEXT_LENGTHS', '64,100,150,200'))
     p.add_argument('--seq', type=int, default=int(os.environ.get('SEQ', '64')))
-    p.add_argument('--max-jitter', type=int, default=int(os.environ.get('MAX_JITTER', '8')))
+    p.add_argument('--max-jitter', type=int, default=int(os.environ.get('MAX_JITTER', '16')))
     p.add_argument('--new-channels', type=int, default=int(os.environ.get('NEW_C', '8')))
     p.add_argument('--batch', type=int, default=int(os.environ.get('BATCH', '1024')))
     p.add_argument('--epochs', type=int, default=int(os.environ.get('EPOCHS', '60')))
@@ -403,9 +265,7 @@ def main():
     p.add_argument('--lr', type=float, default=float(os.environ.get('LR', '1e-4')))
     p.add_argument('--val-frac', type=float, default=float(os.environ.get('VAL_FRAC', '0.1')))
     p.add_argument('--holdout-start', default=os.environ.get('HOLDOUT_START', '2026-01-01'))
-    p.add_argument('--controls', default=os.environ.get('CONTROLS', 'real,shuffle,random'))
-    p.add_argument('--n-trials', type=int, default=int(os.environ.get('N_TRIALS', '10')))
-    p.add_argument('--max-iters', type=int, default=int(os.environ.get('MAX_ITERS', '2')))
+    p.add_argument('--controls', default=os.environ.get('CONTROLS', 'shuffle,random'))
     p.add_argument('--no-probe', action='store_true', default=os.environ.get('NO_PROBE') == '1')
     p.add_argument('--device', default=os.environ.get('DEVICE'))
     p.add_argument('--compile', action='store_true', default=os.environ.get('COMPILE') == '1')
@@ -414,12 +274,12 @@ def main():
     loop_ssl(data_dir=a.data_dir, out_path=a.out,
              tickers=(a.tickers.split(',') if a.tickers else None), tfs=a.tfs.split(','),
              controls=tuple(a.controls.split(',')), probe=not a.no_probe,
-             n_trials=a.n_trials, max_iters=a.max_iters, holdout_start=a.holdout_start,
-             val_frac=a.val_frac, seq=a.seq, max_jitter=a.max_jitter,
-             new_channels=a.new_channels, batch=a.batch, epochs=a.epochs,
-             steps_per_epoch=a.steps, lr=a.lr, device=a.device, compile_model=a.compile,
-             seed=a.seed, pretext=a.pretext, horizon=a.horizon, backbone_ckpt=a.backbone_ckpt,
-             dir_margin=a.dir_margin)
+             holdout_start=a.holdout_start, val_frac=a.val_frac, seq=a.seq, max_jitter=a.max_jitter,
+             new_channels=a.new_channels, batch=a.batch, epochs=a.epochs, steps_per_epoch=a.steps,
+             lr=a.lr, device=a.device, compile_model=a.compile, seed=a.seed, pretext=a.pretext,
+             backbone_ckpt=a.backbone_ckpt,
+             horizons=tuple(int(x) for x in a.horizons.split(',')),
+             context_lengths=tuple(int(x) for x in a.context_lengths.split(',')))
 
 
 if __name__ == '__main__':

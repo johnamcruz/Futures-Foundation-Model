@@ -283,33 +283,17 @@ def train_ssl_mask(big, train_starts, val_starts, *, seq=64, new_channels=8, mas
     return best_state, history
 
 
-# ====================================== SEQ2SEQ FORECASTING (causal pretext, SSL stage 2)
-def _standardize_ctx(ctx, fut, clamp=10.0):
-    """z-score the CONTEXT window per channel, apply the SAME shift/scale to the future bars.
-    Standardizing the future by its own stats would leak its mean/scale into the target —
-    using the context's stats keeps the forecast target strictly causal.
+# ===== SEQ2SEQ (stage 2): multi-horizon, variable-context CANDLE forecasting =====
+class MultiHorizonForecastNet(nn.Module):
+    """Mantis encoder + channel adapter + a MULTI-HORIZON candle decoder. A variable-length
+    CONTEXT of past bars is encoded (interpolated to Mantis's native length, so short/long context
+    both work); the decoder predicts the future CANDLE (OHLCV) at EACH horizon in `horizons` (e.g.
+    5/10/20/25/50 bars ahead) -> [B, C, n_horizons]. Forecasting near AND far from short AND long
+    context forces the encoder to model price-action dynamics at multiple scales — the trend
+    understanding the downstream catcher needs. Warm-start from the stage-1 masked-SSL ckpt."""
 
-    CLAMP (anti-blowup): a FLAT/compressed context window has near-zero std, so a real future
-    move divided by that tiny std explodes to astronomical standardized values -> exploding
-    gradients -> training diverges (train loss 5e4, val/persist blow up). Compressed windows
-    before a breakout are exactly the setups we care about, so this is the common case, not an
-    edge case. Clamping to +/-clamp bounds it: a big move out of compression saturates at
-    'large move' (direction preserved, magnitude capped) instead of detonating the loss."""
-    m = ctx.mean(dim=2, keepdim=True)
-    s = ctx.std(dim=2, keepdim=True) + 1e-6
-    cs = ((ctx - m) / s).clamp(-clamp, clamp)
-    fs = ((fut - m) / s).clamp(-clamp, clamp)
-    return cs, fs
-
-
-class ForecastNetwork(nn.Module):
-    """Mantis encoder + channel adapter + a forecast decoder. A CONTEXT window of past bars is
-    encoded; the decoder predicts the NEXT `horizon` bars (full OHLCV) from the pooled
-    embedding. To forecast the future the encoder MUST model forward dynamics — trend
-    continuation, momentum, volatility persistence — i.e. the trend-prediction the downstream
-    buy/sell classifier needs. Warm-start the encoder from the masked-SSL ckpt (stage 1)."""
-
-    def __init__(self, C=5, new_channels=8, seq=64, horizon=16, model_id='paris-noah/Mantis-8M'):
+    def __init__(self, C=5, new_channels=8, horizons=(5, 10, 20, 25, 50),
+                 model_id='paris-noah/Mantis-8M'):
         super().__init__()
         from mantis.architecture import Mantis8M
         from mantis.adapters import LinearChannelCombiner
@@ -317,43 +301,51 @@ class ForecastNetwork(nn.Module):
         hidden = getattr(self.encoder, 'hidden_dim', 256)
         self.new_c = min(new_channels, C)
         self.adapter = LinearChannelCombiner(num_channels=C, new_num_channels=self.new_c)
-        self.C, self.seq, self.horizon = C, seq, horizon
+        self.C, self.horizons = C, tuple(int(h) for h in horizons)
+        self.nH = len(self.horizons)
         emb = hidden * self.new_c
-        self.decoder = nn.Sequential(nn.Linear(emb, emb), nn.GELU(), nn.Linear(emb, C * horizon))
+        self.decoder = nn.Sequential(nn.Linear(emb, emb), nn.GELU(), nn.Linear(emb, C * self.nH))
 
-    def embed(self, x):                                   # [B,C,seq] context -> [B, new_c*hidden]
+    def embed(self, x):                                   # [B,C,L] context (all OHLCV) -> [B, new_c*hidden]
         a = self.adapter(x)
         return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
 
-    def forward(self, ctx):                               # [B,C,seq] -> forecast [B,C,horizon]
-        return self.decoder(self.embed(ctx)).view(-1, self.C, self.horizon)
+    def forward(self, ctx):                               # [B,C,L] -> [B, C, n_horizons] (candles)
+        return self.decoder(self.embed(ctx)).view(-1, self.C, self.nH)
 
 
-def train_ssl_forecast(big, train_starts, val_starts, *, seq=64, horizon=16, new_channels=8,
+def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25, 50),
+                       context_lengths=(64, 100, 150, 200), new_channels=8,
                        epochs=60, steps_per_epoch=200, batch=512, lr=1e-4, weight_decay=0.05,
                        patience=8, device=None, model_id='paris-noah/Mantis-8M',
                        backbone_ckpt=None, compile_model=False, control='real', seed=0,
-                       amp_dtype='fp16', grad_clip=1.0, clamp=10.0, channel_weights=None,
-                       verbose=True, **_ignore):
-    """Causal seq2seq forecasting: encode `seq` context bars, predict the next `horizon` bars
-    (MSE, context-standardized). Returns (best_encoder_state, history). Warm-start the encoder
-    from the masked-SSL stage-1 ckpt via backbone_ckpt.
+                       amp_dtype='fp16', grad_clip=1.0, clamp=10.0, verbose=True, **_ignore):
+    """MULTI-HORIZON, VARIABLE-CONTEXT CANDLE forecasting — the stage-2 pretext. Warm-start the
+    encoder from the stage-1 masked-SSL ckpt (backbone_ckpt). Returns (best_encoder_state, history).
 
-    channel_weights: optional length-C per-channel loss weights (O,H,L,C,V order), e.g.
-    [1,1,1,2,0] = price-path (emphasize close, ignore volume). None = equal (default; unchanged).
-    The SAME weights apply to the persistence baseline, so 'skill' stays consistent: with
-    volume zeroed, skill becomes pure PRICE skill. This focuses capacity on the trend-relevant
-    price path instead of diluting it with near-unpredictable volume.
+    Each step: sample a context length L from `context_lengths` (short↔long) + encode it
+    (interpolated to Mantis's native length -> scale-invariance), and predict the future CANDLE
+    (OHLCV) at every horizon in `horizons` (near↔far, e.g. 5/10/20/25/50 bars ahead). The target is
+    the future candle CONTEXT-STANDARDIZED (per-channel z-score by the context's own mean/std — no
+    ATR/R, no cross-instrument leak) as a move FROM 'now'. Forecasting near+far from short+long
+    context forces multi-scale price-action understanding — the trend signal.
 
-    REAL/SHUFFLE/RANDOM controls are MEANINGFUL: only REAL has a future that follows from its
-    past — SHUFFLE (time-scrambled) and RANDOM (noise) have no predictable continuation, so
-    their val MSE should be clearly WORSE. history carries 'val_loss' + 'std' (collapse guard)."""
+    Anti-shortcut: target = move FROM now, so 'copy now' == predict-zero (punished) -> the encoder
+    must learn signed movement. clamp bounds flat-context blow-ups; grad_clip stabilizes.
+    APPLES-TO-APPLES controls: target/persist are ALWAYS real; only the model's INPUT context is
+    corrupted (shuffle=scramble time order, random=noise) -> real>shuffle>random~0 on skill.
+    All channels weighted equally — the model uses/predicts all OHLCV (incl volume)."""
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     dev = device or ('cuda' if torch.cuda.is_available()
                      else 'mps' if torch.backends.mps.is_available() else 'cpu')
     torch.manual_seed(seed); gen = torch.Generator(device=dev); gen.manual_seed(seed)
     C = int(big.shape[1])
-    parent = seq + horizon
+    hlist = [int(h) for h in horizons]
+    clens = [int(x) for x in context_lengths]
+    max_ctx, h_max = max(clens), max(hlist)
+    parent = max_ctx + h_max
+    h_off = torch.as_tensor([h - 1 for h in hlist], dtype=torch.long, device=dev)   # bar offsets in fut
+    clens_t = torch.as_tensor(clens, dtype=torch.long, device=dev)
     use_amp = (dev == 'cuda')
     _adt = torch.float16 if str(amp_dtype).lower() in ('fp16', 'float16') else torch.bfloat16
     amp_ctx = (lambda: torch.autocast('cuda', dtype=_adt)) if use_amp else (lambda: _nullctx())
@@ -362,8 +354,8 @@ def train_ssl_forecast(big, train_starts, val_starts, *, seq=64, horizon=16, new
     tr = torch.as_tensor(np.asarray(train_starts, np.int64), device=dev)
     va = torch.as_tensor(np.asarray(val_starts, np.int64), device=dev)
 
-    net = ForecastNetwork(C=C, new_channels=new_channels, seq=seq, horizon=horizon,
-                          model_id=model_id).to(dev)
+    net = MultiHorizonForecastNet(C=C, new_channels=new_channels, horizons=hlist,
+                                  model_id=model_id).to(dev)
     if backbone_ckpt:                                    # warm-start from stage-1 masked SSL
         net.encoder.load_state_dict(torch.load(backbone_ckpt, map_location='cpu'))
     if compile_model and hasattr(torch, 'compile'):
@@ -372,41 +364,36 @@ def train_ssl_forecast(big, train_starts, val_starts, *, seq=64, horizon=16, new
                             lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    # per-channel loss weights (O,H,L,C,V). None -> equal. Applied to BOTH forecast and persist
-    # so 'skill' stays a like-for-like ratio under any weighting (volume=0 -> pure price skill).
-    w_t = (None if channel_weights is None else
-           torch.as_tensor(np.asarray(channel_weights, np.float32), device=dev).view(1, C, 1))
 
     def _batch(starts):
-        """Return (model_ctx, target) for a batch. APPLES-TO-APPLES controls: the TARGET and the
-        persistence baseline are ALWAYS the REAL forward delta (fut - real last context bar) —
-        only the MODEL'S INPUT context is corrupted per control. So real/shuffle/random solve the
-        identical task against the identical baseline, differing only in whether the model gets
-        real temporal info -> skill is directly comparable (expected: real > shuffle > random~0).
-        The 'real' path (and thus the saved checkpoint) is unchanged by this."""
+        """(model_ctx [B,C,L], target [B,C,nH]) for a batch. Sample ONE context length L this batch
+        (variable context); TARGET = future CANDLE (OHLCV) at each horizon, CONTEXT-STANDARDIZED
+        (per-channel z-score by the context's mean/std) as a move FROM now. Corrupt only the
+        model's INPUT per control (apples-to-apples)."""
         b_idx = torch.randint(0, len(starts), (batch,), device=dev, generator=gen)
-        w = _gather_batch(big_t, starts, b_idx, parent)      # [B,C,seq+horizon] REAL raw
-        cs, fs = _standardize_ctx(w[:, :, :seq], w[:, :, seq:], clamp=clamp)
-        # TARGET = forward PATH relative to 'now' = future minus the REAL last context bar. This
-        # kills the persistence shortcut ('copy last bar' -> 'predict zero', which the loss
-        # punishes) so the encoder must learn signed forward movement. Identical across controls.
-        target = fs - cs[:, :, -1:]                          # [B,C,horizon]
+        w = _gather_batch(big_t, starts, b_idx, parent)      # [B,C,max_ctx+h_max] REAL raw
+        L = int(clens_t[torch.randint(0, len(clens_t), (1,), device=dev, generator=gen)].item())
+        ctx_raw = w[:, :, max_ctx - L:max_ctx]               # [B,C,L] real context ending at 'now'
+        fut_raw = w[:, :, max_ctx:]                          # [B,C,h_max] real future candles
+        # standardize BOTH by the CONTEXT's stats (causal — no future leak, no ATR/R).
+        m = ctx_raw.mean(2, keepdim=True); s = ctx_raw.std(2, keepdim=True) + 1e-6
+        cs = ((ctx_raw - m) / s).clamp(-clamp, clamp)        # standardized context (model input)
+        fs = ((fut_raw - m) / s).clamp(-clamp, clamp)        # standardized future candles
+        # TARGET = future candle at each horizon, as a move FROM 'now' (anti-shortcut: copy-now == 0).
+        target = fs[:, :, h_off] - cs[:, :, -1:]             # [B,C,nH]
         if control == 'shuffle':
             model_ctx = _time_shuffle(cs)                    # scramble ONLY the input's time order
         elif control == 'random':
             model_ctx = torch.randn_like(cs)                 # input carries no real info
         else:
-            model_ctx = cs                                   # real (unchanged)
+            model_ctx = cs                                   # real
         return model_ctx, target
 
-    def _wmean(se):                                          # (weighted) mean of a squared-error tensor
-        return (se * w_t).mean() if w_t is not None else se.mean()
-
     def _fc_loss(model_ctx, target):
-        return _wmean((net(model_ctx) - target) ** 2)        # (weighted) MSE on the forward DELTA path
+        return ((net(model_ctx) - target) ** 2).mean()       # MSE on the multi-horizon candle targets
 
     def _persist_loss(target):
-        return _wmean(target ** 2)                           # predict-zero = copy-last-bar (same baseline)
+        return (target ** 2).mean()                          # predict-zero = 'copy now' (same baseline)
 
     @torch.no_grad()
     def val_eval():

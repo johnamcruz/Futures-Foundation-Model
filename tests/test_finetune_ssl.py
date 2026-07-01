@@ -153,32 +153,6 @@ def test_passes_forecast_gate_is_forward_centric_anti_shortcut():
     assert not ssl._passes(desc_reg, std=0.5, pretext='forecast')[0]
 
 
-def test_suggest_ssl_forecast_searches_channel_weights():
-    """Stage-2 scan searches channel weights (close up / volume down) + forecast knobs; the
-    assembled weights are O,H,L fixed at 1 with close_weight, vol_weight from the trial."""
-    fc = _FakeTrial(); d = ssl._suggest_ssl(fc, 'forecast')
-    assert 'channel_weights' in d and 'horizon' in d
-    assert {'close_weight', 'vol_weight', 'lr', 'weight_decay', 'new_channels'} <= set(fc.asked)
-    cw = d['channel_weights']
-    assert len(cw) == 5 and cw[0] == cw[1] == cw[2] == 1.0     # O,H,L fixed
-    # mask pretext must NOT search channel weights (stage-1 untouched)
-    mk = _FakeTrial(); d2 = ssl._suggest_ssl(mk, 'mask')
-    assert 'channel_weights' not in d2 and 'close_weight' not in mk.asked
-
-
-def test_rebuild_channel_weights_from_best_params():
-    """study.best_params records close_weight/vol_weight -> reassembled into the trainer vector."""
-    p = {'lr': 1e-4, 'horizon': 16, 'close_weight': 2.5, 'vol_weight': 0.0, 'new_channels': 8}
-    out = ssl._rebuild_channel_weights(p)
-    assert out['channel_weights'] == [1.0, 1.0, 1.0, 2.5, 0.0]
-    assert 'close_weight' not in out and 'vol_weight' not in out and out['horizon'] == 16
-
-
-def test_base_cfg_has_channel_weights_key():
-    assert 'channel_weights' in ssl._base_cfg() and ssl._base_cfg()['channel_weights'] is None
-    assert ssl._base_cfg(channel_weights=[1, 1, 1, 2, 0])['channel_weights'] == [1, 1, 1, 2, 0]
-
-
 def test_compare_exposes_forward_and_descriptive_deltas():
     """compare() splits descriptive vs forward content so the stage-2 gate can be anti-shortcut."""
     rng = np.random.default_rng(2)
@@ -206,61 +180,43 @@ def test_mantis_frozen_head_fit_predict():
 
 
 # ---------------------------------------------- seq2seq forecast pretext: orchestration (torch-free)
-def test_assemble_reserves_forecast_horizon(tmp_path):
-    """The forecast pretext needs context+horizon in-stream: assemble reserves
-    seq + max(max_jitter, horizon), and every window stays inside one stream."""
+def test_assemble_reserves_forecast_parent(tmp_path):
+    """Stage-2 forecast needs (max context + max horizon) in-stream: assemble reserves
+    max(seq+max_jitter, forecast_parent), and every window stays inside one stream."""
     _write_csv(tmp_path / 'ES_3min.csv', 400)
     _write_csv(tmp_path / 'NQ_3min.csv', 400)
     streams = ssl_data.load_ohlcv(str(tmp_path), ['ES', 'NQ'], ['3min'], verbose=False)
-    seq, max_jitter, horizon = 32, 8, 24
-    big, tr, va = ssl.assemble(streams, seq=seq, max_jitter=max_jitter, horizon=horizon,
+    seq, max_jitter, forecast_parent = 32, 8, 90            # 90 (=max_ctx+max_h) dominates 40
+    big, tr, va = ssl.assemble(streams, seq=seq, max_jitter=max_jitter,
+                               forecast_parent=forecast_parent,
                                val_frac=0.1, holdout_start=None, verbose=False)
-    parent = seq + max(max_jitter, horizon)               # 32 + 24 = 56 (horizon dominates)
-    assert parent == 56
+    parent = max(seq + max_jitter, forecast_parent)        # 90
+    assert parent == 90
     bounds = [0, 400, 800]
     for s in np.concatenate([tr, va]):
         seg = 0 if s < 400 else 1
         assert bounds[seg] <= s and s + parent <= bounds[seg + 1]   # context+horizon in-stream
 
 
-def test_assemble_horizon_zero_matches_mask(tmp_path):
-    """horizon=0 (mask pretext) reserves only max_jitter — backward-compatible with stage 1."""
+def test_assemble_forecast_parent_zero_matches_mask(tmp_path):
+    """forecast_parent=0 (mask/stage-1) reserves only seq+max_jitter — backward-compatible."""
     _write_csv(tmp_path / 'ES_3min.csv', 400)
     streams = ssl_data.load_ohlcv(str(tmp_path), ['ES'], ['3min'], verbose=False)
-    _, tr0, _ = ssl.assemble(streams, seq=32, max_jitter=8, horizon=0,
+    _, tr0, _ = ssl.assemble(streams, seq=32, max_jitter=8, forecast_parent=0,
                              val_frac=0.1, holdout_start=None, verbose=False)
     _, tr_default, _ = ssl.assemble(streams, seq=32, max_jitter=8,
                                     val_frac=0.1, holdout_start=None, verbose=False)
-    assert np.array_equal(tr0, tr_default)                # default horizon=0
+    assert np.array_equal(tr0, tr_default)
 
 
-def test_base_cfg_has_seq2seq_keys():
+def test_base_cfg_has_multihorizon_keys():
     cfg = ssl._base_cfg()
-    assert cfg['pretext'] == 'mask' and cfg['horizon'] == 16 and cfg['backbone_ckpt'] is None
-    over = ssl._base_cfg(pretext='forecast', horizon=24, backbone_ckpt='/x/enc.pt')
-    assert over['pretext'] == 'forecast' and over['horizon'] == 24
-    assert over['backbone_ckpt'] == '/x/enc.pt'
-
-
-class _FakeTrial:
-    """Records which hyperparameters were requested; returns the low bound deterministically."""
-    def __init__(self):
-        self.asked = []
-
-    def suggest_float(self, name, lo, hi, log=False):
-        self.asked.append(name); return lo
-
-    def suggest_int(self, name, lo, hi):
-        self.asked.append(name); return lo
-
-
-def test_suggest_ssl_is_pretext_aware():
-    fc = _FakeTrial(); d = ssl._suggest_ssl(fc, 'forecast')
-    assert 'horizon' in d and 'mask_ratio' not in d and 'horizon' in fc.asked
-    mk = _FakeTrial(); d2 = ssl._suggest_ssl(mk, 'mask')
-    assert 'mask_ratio' in d2 and 'horizon' not in d2 and 'mask_ratio' in mk.asked
-    # shared knobs present in both
-    assert {'lr', 'weight_decay', 'new_channels'} <= set(d) and {'lr', 'weight_decay'} <= set(d2)
+    assert cfg['pretext'] == 'mask' and cfg['backbone_ckpt'] is None
+    assert cfg['horizons'] == (5, 10, 20, 25) and cfg['context_lengths'] == (64, 100, 150, 200)
+    over = ssl._base_cfg(pretext='forecast', horizons=(5, 10), context_lengths=(64,),
+                         backbone_ckpt='/x/enc.pt')
+    assert over['pretext'] == 'forecast' and over['horizons'] == (5, 10)
+    assert over['context_lengths'] == (64,) and over['backbone_ckpt'] == '/x/enc.pt'
 
 
 def test_train_dispatches_on_pretext(monkeypatch):
@@ -279,10 +235,10 @@ def test_train_dispatches_on_pretext(monkeypatch):
     fake.train_ssl_forecast = _forecast
     monkeypatch.setitem(sys.modules, 'futures_foundation.finetune._ssl_torch', fake)
 
-    cfg = ssl._base_cfg(pretext='forecast', horizon=20)
+    cfg = ssl._base_cfg(pretext='forecast', horizons=(5, 10))
     st, _ = ssl._train(None, None, None, cfg, control='real')
     assert st == 'fc_state' and calls['fn'] == 'forecast'
-    assert 'pretext' not in calls['kw'] and calls['kw']['horizon'] == 20
+    assert 'pretext' not in calls['kw'] and calls['kw']['horizons'] == (5, 10)
 
     cfg2 = ssl._base_cfg(pretext='mask')
     st2, _ = ssl._train(None, None, None, cfg2, control='real')
@@ -318,119 +274,44 @@ def test_mask_network_and_trainer(tmp_path):
     assert new_c == 4
 
 
-# ------------------------------------------------------ seq2seq forecast trainer (gated)
+# --------------------------- multi-horizon / variable-context candle seq2seq trainer (gated)
 @torch_test
-def test_standardize_ctx_is_leak_safe():
-    """Future bars are standardized by the CONTEXT's mean/std (not their own) — so the target
-    carries no future-level/scale leak. Context standardizes to ~0 mean / ~1 std per channel."""
+def test_multihorizon_net_shape():
     import torch
     from futures_foundation.finetune import _ssl_torch as S
-    rng = np.random.default_rng(0)
-    ctx = torch.as_tensor(rng.standard_normal((4, 5, 32)).astype(np.float32) * 3 + 7)
-    fut = ctx[:, :, :8] * 10.0 + 100.0                             # very different level/scale
-    cs, fs = S._standardize_ctx(ctx, fut, clamp=100.0)       # high clamp: no saturation here
-    assert torch.allclose(cs.mean(2), torch.zeros(4, 5), atol=1e-4)
-    assert torch.allclose(cs.std(2, unbiased=True), torch.ones(4, 5), atol=1e-2)  # unbiased: matches code
-    # fut standardized with context stats: recompute and compare (NOT standardized by its own)
-    m = ctx.mean(2, keepdim=True); s = ctx.std(2, keepdim=True) + 1e-6
-    assert torch.allclose(fs, ((fut - m) / s).clamp(-100, 100), atol=1e-5)
-    assert not torch.allclose(fs.mean(2), torch.zeros(4, 5), atol=1e-2)   # fut not self-normalized
+    net = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20))   # out=4 (OHLC)
+    for L in (48, 96):                                              # variable context length works
+        ctx = torch.randn(6, 5, L)                                 # input = 5ch OHLCV (uses volume)
+        assert net(ctx).shape == (6, 5, 3)                         # [B, OHLCV=5, n_horizons]
+        assert net.embed(ctx).shape[0] == 6 and net.embed(ctx).shape[1] > 0
 
 
 @torch_test
-def test_standardize_ctx_clamps_flat_context_blowup():
-    """The bug that detonated stage-2 training: a FLAT context window (near-zero std) divides a
-    real future move by ~0 -> astronomical standardized target. Clamp must bound it."""
-    import torch
-    from futures_foundation.finetune import _ssl_torch as S
-    ctx = torch.full((2, 5, 32), 100.0)                      # perfectly flat -> std ~ 0
-    ctx += torch.randn(2, 5, 32) * 1e-7                       # microscopic jitter (tiny std)
-    fut = torch.full((2, 5, 8), 130.0)                       # a real 30-pt move after compression
-    cs, fs = S._standardize_ctx(ctx, fut, clamp=10.0)
-    assert torch.isfinite(cs).all() and torch.isfinite(fs).all()
-    assert cs.abs().max() <= 10.0 + 1e-4 and fs.abs().max() <= 10.0 + 1e-4   # bounded, no blowup
-
-
-@torch_test
-def test_forecast_network_shape():
-    import torch
-    from futures_foundation.finetune import _ssl_torch as S
-    net = S.ForecastNetwork(C=5, new_channels=4, seq=64, horizon=16)
-    ctx = torch.randn(8, 5, 64)
-    assert net(ctx).shape == (8, 5, 16)                            # predict next horizon bars
-    assert net.embed(ctx).shape[0] == 8 and net.embed(ctx).shape[1] > 0
-
-
-@torch_test
-def test_train_ssl_forecast_runs_and_warmstarts(tmp_path):
-    """Forecast trainer runs, returns finite val MSE + emb std, and its encoder ckpt loads
-    downstream via build_model — AND a warm-start ckpt is accepted (FT on stage-1 encoder)."""
+def test_train_multihorizon_runs_variable_context_and_warmstart(tmp_path):
+    """Multi-horizon / variable-context candle trainer runs, returns finite val loss + skill,
+    saves an encoder ckpt that loads downstream, and accepts a warm-start ckpt (from stage-1)."""
     import torch
     from futures_foundation.finetune import _ssl_torch as S
     from futures_foundation.finetune.classifiers._mantis_torch import build_model
     rng = np.random.default_rng(0)
-    big = rng.standard_normal((2000, 5)).astype(np.float32)
-    starts = np.arange(0, 1880, 4)                                 # room for seq+horizon
-    state, hist = S.train_ssl_forecast(big, starts, starts[-50:], seq=32, horizon=16,
-                                       new_channels=4, epochs=2, steps_per_epoch=3, batch=16,
-                                       device='cpu', control='real', verbose=False)
+    big = (100 + np.cumsum(rng.standard_normal((3000, 5)) * 0.1, 0)).astype(np.float32)
+    big[:, 4] = np.abs(big[:, 4]) * 100 + 500                       # positive-ish volume
+    hz, cl = (5, 10, 20), (32, 48)                                  # parent = 48 + 20 = 68
+    starts = np.arange(0, 3000 - 68 - 1, 4)
+    state, hist = S.train_ssl_forecast(big, starts, starts[-50:], horizons=hz, context_lengths=cl,
+                                       new_channels=4, epochs=2, steps_per_epoch=3,
+                                       batch=16, device='cpu', control='real', verbose=False)
     assert len(hist) >= 1 and np.isfinite(hist[-1]['val_loss']) and hist[-1]['std'] > 0
-    # anti-shortcut readout present: persistence (copy-last-bar) baseline + skill vs it
-    assert 'persist_loss' in hist[-1] and hist[-1]['persist_loss'] > 0
+    assert 'persist_loss' in hist[-1] and hist[-1]['persist_loss'] > 0    # anti-shortcut baseline
     assert 'skill' in hist[-1] and np.isfinite(hist[-1]['skill'])
     ckpt = str(tmp_path / 'enc1.pt'); torch.save(state, ckpt)
     _, new_c = build_model(5, new_channels=4, device='cpu', backbone_ckpt=ckpt)
     assert new_c == 4
-    # warm-start: a second forecast run initialized from the first encoder ckpt
-    state2, hist2 = S.train_ssl_forecast(big, starts, starts[-50:], seq=32, horizon=16,
+    state2, hist2 = S.train_ssl_forecast(big, starts, starts[-50:], horizons=hz, context_lengths=cl,
                                          new_channels=4, epochs=1, steps_per_epoch=2, batch=16,
-                                         device='cpu', control='real', backbone_ckpt=ckpt,
-                                         verbose=False)
+                                         device='cpu', control='real', backbone_ckpt=ckpt, verbose=False)
     assert set(state2.keys()) == set(state.keys()) and np.isfinite(hist2[-1]['val_loss'])
-    # NB: the REAL-vs-SHUFFLE/RANDOM control is a research-time PROBE diagnostic measured at
-    # scale on Colab (see ssl._finalize), NOT a unit-test invariant — an undertrained 8M model
-    # on 16-bar-ahead forecasting does not reliably separate the controls in a CPU smoke run.
 
 
-@torch_test
-def test_forecast_controls_share_real_persistence_baseline():
-    """Apples-to-apples controls: real/shuffle/random must share the SAME persistence baseline
-    (the target = real forward delta is identical; only the model's INPUT context is corrupted).
-    A control whose persist baseline differed from real would make skill non-comparable."""
-    import torch
-    from futures_foundation.finetune import _ssl_torch as S
-    rng = np.random.default_rng(3)
-    big = (100 + np.cumsum(rng.standard_normal((1500, 5)) * 0.1, 0)).astype(np.float32)
-    starts = np.arange(0, 1400, 4)
-    p = {}
-    for ctrl in ('real', 'shuffle', 'random'):
-        _, hist = S.train_ssl_forecast(big, starts, starts[-60:], seq=32, horizon=16,
-                                       new_channels=4, epochs=1, steps_per_epoch=2, batch=32,
-                                       device='cpu', control=ctrl, seed=0, verbose=False)
-        p[ctrl] = np.mean([h['persist_loss'] for h in hist])
-    # same seed -> same val batches -> identical persistence baseline across controls (target is real)
-    assert abs(p['real'] - p['shuffle']) < 1e-4 and abs(p['real'] - p['random']) < 1e-4
-
-
-@torch_test
-def test_train_ssl_forecast_channel_weighted(tmp_path):
-    """Channel-weighted loss (price-path) runs; skill stays finite. With volume zeroed, the
-    loss/skill exclude volume -> pure price skill, and the encoder ckpt still loads downstream."""
-    import torch
-    from futures_foundation.finetune import _ssl_torch as S
-    from futures_foundation.finetune.classifiers._mantis_torch import build_model
-    rng = np.random.default_rng(1)
-    big = rng.standard_normal((2000, 5)).astype(np.float32)
-    big[:, 4] = rng.standard_normal(2000) * 50 + 500           # volume: different scale + noisy
-    starts = np.arange(0, 1880, 4)
-    state, hist = S.train_ssl_forecast(big, starts, starts[-50:], seq=32, horizon=16,
-                                       new_channels=4, epochs=2, steps_per_epoch=3, batch=16,
-                                       device='cpu', control='real',
-                                       channel_weights=[1.0, 1.0, 1.0, 2.0, 0.0],  # price-path
-                                       verbose=False)
-    assert np.isfinite(hist[-1]['val_loss']) and np.isfinite(hist[-1]['skill'])
-    ckpt = str(tmp_path / 'enc_pw.pt'); torch.save(state, ckpt)
-    _, new_c = build_model(5, new_channels=4, device='cpu', backbone_ckpt=ckpt)
-    assert new_c == 4
 
 
