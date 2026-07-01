@@ -131,7 +131,8 @@ def train_ssl_contrastive(big, train_starts, val_starts, *, context_lengths=(64,
                           new_channels=8, proj_dim=128, temperature=0.1, crop_max=0.2, epochs=60,
                           steps_per_epoch=200, batch=512, lr=2e-3, weight_decay=0.05, patience=8,
                           device=None, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
-                          control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True, **_ignore):
+                          control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
+                          ckpt_path=None, resume=False, freeze_encoder_layers=0, **_ignore):
     """Trend contrastive (multi-positive InfoNCE by self-supervised trend key). Warm-start from
     stage-2 (ctx200). Returns (best_encoder_state, history) with 'val_loss' + 'std'."""
     return _ContrastiveTrainer(big, train_starts, val_starts, context_lengths=context_lengths,
@@ -139,4 +140,6 @@ def train_ssl_contrastive(big, train_starts, val_starts, *, context_lengths=(64,
                                crop_max=crop_max, model_id=model_id, backbone_ckpt=backbone_ckpt,
                                clamp=clamp, epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch,
                                lr=lr, weight_decay=weight_decay, patience=patience, device=device,
-                               seed=seed, grad_clip=grad_clip, verbose=verbose, control=control).fit()
+                               seed=seed, grad_clip=grad_clip, verbose=verbose, control=control,
+                               ckpt_path=ckpt_path, resume=resume,
+                               freeze_encoder_layers=freeze_encoder_layers).fit()

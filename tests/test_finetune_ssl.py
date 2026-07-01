@@ -433,3 +433,48 @@ def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
                                         batch=16, device='cpu', control='real', backbone_ckpt=ckpt,
                                         verbose=False)
     assert set(state2.keys()) == set(state.keys())                # warm-start same encoder keys
+
+
+# --------------------------------------------- save/resume + anti-forgetting freeze (all pretexts)
+def test_base_cfg_has_ckpt_resume_freeze_keys():
+    cfg = ssl._base_cfg()
+    assert cfg['ckpt_path'] is None and cfg['resume'] is False and cfg['freeze_encoder_layers'] == 0
+    over = ssl._base_cfg(resume=True, freeze_encoder_layers=4)
+    assert over['resume'] is True and over['freeze_encoder_layers'] == 4
+
+
+@torch_test
+def test_freeze_encoder_layers_anchors_early_leaves_adapter_trainable():
+    from futures_foundation.finetune.pretext._torch.common import _freeze_encoder
+    from futures_foundation.finetune.pretext._torch.contrastive import ContrastiveTrendNet
+    net = ContrastiveTrendNet(C=5, new_channels=4, proj_dim=32).to('cpu')
+    before = sum(p.requires_grad for p in net.parameters())
+    n = _freeze_encoder(net.encoder, 4)
+    after = sum(p.requires_grad for p in net.parameters())
+    assert n == 4 and after < before                          # froze tokenizer + first 4 blocks
+    assert any(p.requires_grad for p in net.adapter.parameters())   # embedding can still adapt
+    assert any(p.requires_grad for p in net.prj.parameters())
+    assert _freeze_encoder(net.encoder, 0) == 0               # n<=0 -> no-op
+
+
+@torch_test
+def test_contrastive_save_resume_and_control_guard(tmp_path):
+    import os
+    from futures_foundation.finetune import _ssl_torch as S
+    rng = np.random.default_rng(0)
+    big = (100 + np.cumsum(rng.standard_normal((3000, 5)) * 0.1, 0)).astype(np.float32)
+    big[:, 4] = np.abs(big[:, 4]) * 100 + 500
+    cl = (32, 48); starts = np.arange(0, 3000 - 48 - 1, 4); ck = str(tmp_path / 'enc.pt')
+    st, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4,
+                                    proj_dim=32, epochs=2, steps_per_epoch=3, batch=16, device='cpu',
+                                    control='real', ckpt_path=ck, verbose=False)
+    assert os.path.exists(ck) and os.path.exists(ck + '.meta.json')     # progressively saved
+    st2, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4,
+                                     proj_dim=32, epochs=1, steps_per_epoch=2, batch=16, device='cpu',
+                                     control='real', ckpt_path=ck, resume=True, verbose=False)
+    assert set(st2.keys()) == set(st.keys())                            # resumed + returned encoder
+    before = os.path.getmtime(ck)                                       # controls must NOT touch ckpt
+    S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4, proj_dim=32,
+                            epochs=1, steps_per_epoch=2, batch=16, device='cpu', control='shuffle',
+                            ckpt_path=ck, verbose=False)
+    assert os.path.getmtime(ck) == before                              # shuffle control didn't save

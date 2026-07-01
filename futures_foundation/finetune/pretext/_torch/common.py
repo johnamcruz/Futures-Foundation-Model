@@ -158,6 +158,57 @@ def export_encoder_onnx(path, *, ckpt=None, C=5, seq=64,
     return path
 
 
+def _atomic_save(obj, path):
+    """Crash-safe save: write to a temp file then os.replace (atomic) -> a Colab disconnect can
+    never leave a half-written checkpoint."""
+    tmp = str(path) + '.tmp'
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _write_meta(path, best_val, epoch):
+    import json
+    tmp = str(path) + '.meta.json.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'best_val': float(best_val), 'epoch': int(epoch)}, f)
+    os.replace(tmp, str(path) + '.meta.json')
+
+
+def _read_meta_best(path):
+    import json
+    mp = str(path) + '.meta.json'
+    if os.path.exists(mp):
+        try:
+            return float(json.load(open(mp)).get('best_val', 1e18))
+        except Exception:
+            return 1e18
+    return 1e18
+
+
+def _freeze_encoder(encoder, n_layers):
+    """Anti-forgetting: freeze the input tokenizer + the first n_layers transformer blocks of a
+    Mantis encoder when REFINING a warm-started encoder, so the bulk of learned structure can't
+    drift. Later blocks + the channel adapter (+ projection) stay trainable, so the embedding can
+    still adapt. n_layers<=0 -> no freeze. Robust to V1 (vit_unit) / V2 (transf_unit) paths."""
+    if not n_layers or int(n_layers) <= 0:
+        return 0
+    n = int(n_layers)
+    tok = getattr(encoder, 'tokgen_unit', None)              # input patch/scalar tokenizer (general)
+    if tok is not None:
+        for p in tok.parameters():
+            p.requires_grad = False
+    unit = getattr(encoder, 'vit_unit', None) or getattr(encoder, 'transf_unit', None)
+    tr = getattr(unit, 'transformer', None) if unit is not None else None
+    layers = getattr(tr, 'layers', None) if tr is not None else None
+    frozen = 0
+    if layers is not None:
+        for blk in list(layers)[:n]:
+            for p in blk.parameters():
+                p.requires_grad = False
+            frozen += 1
+    return frozen
+
+
 # ================================================================= BASE TRAINER (shared loop)
 class BaseTrainer:
     """Shared SSL training loop for every pretext. Subclass and implement:
@@ -170,8 +221,11 @@ class BaseTrainer:
 
     def __init__(self, big, train_starts, val_starts, *, epochs=60, steps_per_epoch=200, batch=512,
                  lr=1e-4, weight_decay=0.05, patience=8, device=None, seed=0, grad_clip=None,
-                 amp=True, amp_dtype='fp16', verbose=True, control='real'):
+                 amp=True, amp_dtype='fp16', verbose=True, control='real',
+                 ckpt_path=None, resume=False, freeze_encoder_layers=0):
         os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+        self.ckpt_path, self.resume = ckpt_path, resume    # progressive best-save + resume (real run only)
+        self.freeze_encoder_layers = freeze_encoder_layers  # anti-forgetting: freeze first N enc layers
         self.dev = device or ('cuda' if torch.cuda.is_available()
                               else 'mps' if torch.backends.mps.is_available() else 'cpu')
         torch.manual_seed(seed)
@@ -218,11 +272,26 @@ class BaseTrainer:
         return [p for p in self.net.parameters() if p.requires_grad]
 
     def fit(self):
-        """Run the shared loop -> (best_encoder_state, history)."""
+        """Run the shared loop -> (best_encoder_state, history). Progressively saves the best
+        ENCODER to ckpt_path (crash-safe) and resumes from it — real run only (controls never
+        touch the checkpoint). freeze_encoder_layers anchors early layers against drift."""
         self.build_net()
+        save_ok = bool(self.ckpt_path) and self.control == 'real'   # controls never touch the ckpt
+        best, best_state = 1e18, None
+        if self.resume and save_ok and os.path.exists(self.ckpt_path):     # resume from saved best
+            self._encoder().load_state_dict(torch.load(self.ckpt_path, map_location='cpu'))
+            best = _read_meta_best(self.ckpt_path)
+            best_state = {k: v.detach().cpu().clone() for k, v in self._encoder().state_dict().items()}
+            if self.verbose:
+                print(f"  [resume] loaded {self.ckpt_path} (best_val={best:.4f})", flush=True)
+        nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)   # anti-forgetting
+        if nfz and self.verbose:
+            ntr = sum(p.requires_grad for p in self.net.parameters())
+            print(f"  [freeze] tokenizer + first {nfz} encoder layers frozen ({ntr} trainable tensors)",
+                  flush=True)
         opt = self.make_optimizer()
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.epochs)
-        best, best_state, bad, history = 1e18, None, 0, []
+        bad, history = 0, []
         for ep in range(self.epochs):
             self.net.train(); tr_tot = 0.0
             for _ in range(self.steps_per_epoch):
@@ -251,6 +320,9 @@ class BaseTrainer:
             if improved:
                 best, bad = vloss, 0
                 best_state = {k: v.detach().cpu().clone() for k, v in self._encoder().state_dict().items()}
+                if save_ok:                                          # progressive best-save (crash-safe)
+                    _atomic_save(best_state, self.ckpt_path)
+                    _write_meta(self.ckpt_path, best, ep)
             else:
                 bad += 1
             self.log_line(ep, tr_tot / self.steps_per_epoch, vloss, extra, improved)

@@ -88,6 +88,13 @@ CONTROLS = ('shuffle', 'random')               # apples-to-apples diagnostics
 PROBE = True                                   # probe vs vanilla (diagnostic, not the gate)
 SEED = 0
 
+# ── CRASH-SAFE + ANTI-FORGETTING (Colab disconnects; ctx200 drift) ──
+RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery). Best is
+                       # saved PROGRESSIVELY every val improvement regardless, so nothing is lost.
+FREEZE_ENCODER_LAYERS = 4   # anti-forgetting: freeze tokenizer + first N of 6 Mantis layers; train
+                            # the rest + adapter + projection. Anchors ctx200 vs the emb_std drift
+                            # we saw. 0 = full fine-tune; raise toward 5 if it still drifts.
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
 if device.type != 'cuda':
@@ -116,6 +123,7 @@ verdict = ssl.loop_ssl(
     proj_dim=PROJ_DIM, new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS,
     steps_per_epoch=STEPS, lr=LR, patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP,
     val_frac=VAL_FRAC, holdout_start=HOLDOUT_START, controls=CONTROLS, probe=PROBE,
+    resume=RESUME, freeze_encoder_layers=FREEZE_ENCODER_LAYERS,
     device=device.type, seed=SEED)
 
 print('\n' + '=' * 60 + '\n  SSL STAGE 3 (trend contrastive) VERDICT\n' + '=' * 60)

@@ -81,6 +81,11 @@ CONTROLS = ('shuffle', 'random')               # apples-to-apples probe diagnost
 PROBE = True                                    # probe vs vanilla (diagnostic, not a gate)
 SEED = 0
 
+# ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
+RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery)
+FREEZE_ENCODER_LAYERS = 0   # 0 = full fine-tune (stage-2 default). Raise (e.g. 3-4) to freeze the
+                            # tokenizer + first N of 6 Mantis layers if stage-1 drift is a concern.
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
 if device.type != 'cuda':
@@ -109,6 +114,7 @@ verdict = ssl.loop_ssl(
     new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
     patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP, val_frac=VAL_FRAC,
     holdout_start=HOLDOUT_START, controls=CONTROLS, probe=PROBE,
+    resume=RESUME, freeze_encoder_layers=FREEZE_ENCODER_LAYERS,
     device=device.type, seed=SEED)
 
 print('\n' + '=' * 60 + '\n  SSL STAGE 2 (multi-horizon seq2seq) VERDICT\n' + '=' * 60)

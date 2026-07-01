@@ -164,6 +164,9 @@ def _base_cfg(**kw):
              grad_clip=1.0, clamp=10.0,
              # stage-3 trend contrastive (experiment): InfoNCE multi-positive by self-supervised trend key
              temperature=0.1, crop_max=0.2, proj_dim=128,
+             # crash-safe progressive best-save + resume + anti-forgetting layer-freeze (ALL pretexts,
+             # real run only; controls never touch the ckpt). ckpt_path is set to out_path by loop_ssl.
+             ckpt_path=None, resume=False, freeze_encoder_layers=0,
              probe_folds=1)                                   # k-fold CV per probe (robust)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
@@ -177,6 +180,7 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     (warm-started from stage-1 via backbone_ckpt). Then PROBE vs vanilla + shuffle/random controls
     as diagnostics (gate = report-only), and write the encoder + report."""
     cfg = _base_cfg(**cfg_over)
+    cfg['ckpt_path'] = out_path              # progressive best-save target (crash-safe); real run only
     verbose = cfg['verbose']
     pretext = cfg.get('pretext', 'mask')
     # each pretext task declares how much window to reserve (forecast: ctx+horizon;

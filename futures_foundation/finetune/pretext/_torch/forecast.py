@@ -108,7 +108,8 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                        steps_per_epoch=200, batch=512, lr=1e-4, weight_decay=0.05, patience=8,
                        device=None, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
                        compile_model=False, control='real', seed=0, amp_dtype='fp16',
-                       grad_clip=1.0, clamp=10.0, verbose=True, **_ignore):
+                       grad_clip=1.0, clamp=10.0, verbose=True,
+                       ckpt_path=None, resume=False, freeze_encoder_layers=0, **_ignore):
     """Multi-horizon / variable-context candle seq2seq. Returns (best_encoder_state, history) with
     'val_loss', 'persist_loss', 'skill', 'skill_per_h', 'std'. Warm-start from stage-1."""
     return _ForecastTrainer(big, train_starts, val_starts, horizons=horizons,
@@ -117,4 +118,5 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                             clamp=clamp, epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch,
                             lr=lr, weight_decay=weight_decay, patience=patience, device=device,
                             seed=seed, grad_clip=grad_clip, amp_dtype=amp_dtype, verbose=verbose,
-                            control=control).fit()
+                            control=control, ckpt_path=ckpt_path, resume=resume,
+                            freeze_encoder_layers=freeze_encoder_layers).fit()
