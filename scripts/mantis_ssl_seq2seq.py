@@ -55,12 +55,13 @@ except ImportError as e:
 import os, torch
 
 # ── PATHS (Drive) ──
-# OPTUNA-SWEEP WINNER config baked in (forecast_wr_sweep_9tk_4tf trial 1, WR@3R 50.3% on pre-2026 val).
-# Writes to a DISTINCT path — do NOT clobber the shipped base until this beats it on the one-shot 2026
-# (then rename over mantis_ssl_seq2seq.pt + repoint BASE_BACKBONE_CKPT).
+# This IS the stage-2 seq2seq encoder — the Optuna sweep (forecast_wr_sweep_9tk_4tf trial 1, WR@3R
+# 50.3% on pre-2026 val) just found its config. The SHIP GATE is the repo checkpoint + BASE_BACKBONE_CKPT
+# pointer: only commit this over checkpoints/mantis_ssl_seq2seq.pt AFTER it beats the current base on
+# the one-shot 2026. (The old Drive copy is overwritten, but the current base stays in the repo until then.)
 DATA_DIR  = '/content/drive/MyDrive/Futures Data'
-WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt'         # stage-1 encoder (warm-start)
-OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq_sweep.pt' # sweep-winner candidate
+WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt'       # stage-1 encoder (warm-start)
+OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'     # stage-2 seq2seq encoder
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
