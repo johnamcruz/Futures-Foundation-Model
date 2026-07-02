@@ -55,9 +55,12 @@ except ImportError as e:
 import os, torch
 
 # ── PATHS (Drive) ──
+# OPTUNA-SWEEP WINNER config baked in (forecast_wr_sweep_9tk_4tf trial 1, WR@3R 50.3% on pre-2026 val).
+# Writes to a DISTINCT path — do NOT clobber the shipped base until this beats it on the one-shot 2026
+# (then rename over mantis_ssl_seq2seq.pt + repoint BASE_BACKBONE_CKPT).
 DATA_DIR  = '/content/drive/MyDrive/Futures Data'
-WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt'      # stage-1 encoder (warm-start)
-OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'    # stage-2 adapted encoder
+WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt'         # stage-1 encoder (warm-start)
+OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq_sweep.pt' # sweep-winner candidate
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
@@ -65,21 +68,19 @@ TFS     = ['1min', '3min', '5min', '15min']                            # all 4 T
 HOLDOUT_START = '2026-01-01'          # EXCLUDED from SSL (downstream OOS stays clean)
 VAL_FRAC      = 0.1
 
-# ── MULTI-HORIZON / VARIABLE-CONTEXT candle forecast ──
+# ── MULTI-HORIZON / VARIABLE-CONTEXT candle forecast (sweep-winner) ──
 HORIZONS        = (5, 10, 20, 25)             # predict the CANDLE at each (near..far), in bars
 CONTEXT_LENGTHS = (64, 100, 150, 200)         # sample a context length per step (short..long)
-NEW_CHANNELS    = 8                            # channel-combiner output (OHLCV=5 -> NEW_CHANNELS)
-DIR_WEIGHT      = 0.5                          # >0 = ADD a DIRECTION-head squeeze: BCE on sign(fwd close
-                                              # move) alongside the candle MSE -> trains the encoder to
-                                              # be DIRECTION-aware (WR is sign-dominated; MSE alone
-                                              # mean-regresses the sign away). Watch val 'dir'>0.5.
-                                              # 0 = original pure-candle stage-2 (backward-compat).
+OBJECTIVE       = 'candle_mse'                # sweep winner: plain candle MSE beat the direction head
+NEW_CHANNELS    = 3                            # sweep: nc=3 (adapter OHLCV=5 -> 3) edged 4/5
+DIR_WEIGHT      = 0.0                          # candle_mse -> no direction head (0)
 
-# ── TRAINING (GPU-max) ──
-BATCH   = 1024        # drop to 512/768 if OOM
-EPOCHS  = 60
+# ── TRAINING (sweep-winner; BATCH MATCHES THE SWEEP so the tuned LR transfers) ──
+BATCH   = 512         # PARITY with the sweep (lr was tuned at 512; 1024 would need a different lr)
+EPOCHS  = 60          # full budget (the sweep used a short 12-epoch proxy to RANK; train to convergence)
 STEPS   = 200         # steps/epoch
-LR      = 1e-4
+LR      = 0.00013623475359251814   # sweep-winner lr (~1.4e-4); do NOT round — paired with BATCH=512
+WEIGHT_DECAY = 0.1    # sweep winner
 PATIENCE = 8
 CLAMP, GRAD_CLIP = 10.0, 1.0                    # stability
 CONTROLS = ()                                  # skip shuffle/random retrains (fast iteration; judge
@@ -90,8 +91,7 @@ SEED = 0
 
 # ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
 RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery)
-FREEZE_ENCODER_LAYERS = 0   # 0 = full fine-tune (stage-2 default). Raise (e.g. 3-4) to freeze the
-                            # tokenizer + first N of 6 Mantis layers if stage-1 drift is a concern.
+FREEZE_ENCODER_LAYERS = 0   # sweep winner: frz=0 (full fine-tune) beat every frozen config
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -109,7 +109,9 @@ found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
 if not found:
     raise FileNotFoundError(f'No {{TICKER}}_{{TF}}.csv files under {DATA_DIR}.')
 print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm-start <- {WARM_CKPT}')
-print(f'   horizons={HORIZONS} context_lengths={CONTEXT_LENGTHS} BATCH={BATCH} EPOCHS={EPOCHS}')
+print(f'   SWEEP-WINNER: obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
+      f'wd={WEIGHT_DECAY} BATCH={BATCH} (parity w/ sweep) EPOCHS={EPOCHS}')
+print(f'   horizons={HORIZONS} context_lengths={CONTEXT_LENGTHS}')
 print(f'   OUTPUT -> {OUT_PATH}')
 
 
@@ -117,9 +119,9 @@ print(f'   OUTPUT -> {OUT_PATH}')
 verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH, tickers=TICKERS, tfs=TFS,
     pretext='forecast', backbone_ckpt=WARM_CKPT,               # <- stage-2 forecast, warm-start stage-1
-    horizons=HORIZONS, context_lengths=CONTEXT_LENGTHS,
+    horizons=HORIZONS, context_lengths=CONTEXT_LENGTHS, objective=OBJECTIVE,
     new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
-    patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP, val_frac=VAL_FRAC,
+    weight_decay=WEIGHT_DECAY, patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP, val_frac=VAL_FRAC,
     holdout_start=HOLDOUT_START, controls=CONTROLS, probe=PROBE,
     resume=RESUME, freeze_encoder_layers=FREEZE_ENCODER_LAYERS, dir_weight=DIR_WEIGHT,
     device=device.type, seed=SEED)
