@@ -42,9 +42,19 @@ def config_signature(*parts):
 
 
 def atomic_replace(tmp_path, final_path):
-    """os.replace with parent-dir creation — the shared atomic-write tail."""
+    """os.replace with parent-dir creation — the shared atomic-write tail. CROSS-DEVICE SAFE:
+    os.replace cannot rename across filesystems (local disk -> Drive FUSE = EXDEV, errno 18);
+    in that case stage a copy NEXT TO the destination (same device) and replace from there —
+    the final swap is still atomic on the destination filesystem."""
+    import shutil
     os.makedirs(os.path.dirname(str(final_path)) or '.', exist_ok=True)
-    os.replace(str(tmp_path), str(final_path))
+    try:
+        os.replace(str(tmp_path), str(final_path))
+    except OSError:                                       # EXDEV: cross-device link
+        staged = str(final_path) + '.staged'
+        shutil.copy(str(tmp_path), staged)
+        os.replace(staged, str(final_path))
+        os.remove(str(tmp_path))
 
 
 class KeyedCheckpoint:

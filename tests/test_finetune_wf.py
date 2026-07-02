@@ -180,3 +180,26 @@ def test_run_folds_disconnect_resume(tmp_path):
     wf._run_folds('_countfit', {'C': 9.0}, Xall, Y, keys, _EvalLab(), tmp_path, folds,
                   seed=0, verbose=False, monitor=None, fold_ckpt=ckpt)
     assert calls['fits'] == 4 * 2                        # config changed -> key changed -> refit
+
+
+def test_resume_atomic_replace_cross_device(tmp_path, monkeypatch):
+    """EXDEV regression (Colab: local tmp -> Drive FUSE): os.replace cannot cross filesystems;
+    atomic_replace must fall back to a destination-side staged copy + replace."""
+    import errno
+    import os as _os
+    from futures_foundation.finetune import resume as R
+    src = tmp_path / 'a.txt'; src.write_text('payload')
+    dst = tmp_path / 'drive' / 'b.txt'
+    real_replace = _os.replace
+    calls = {'n': 0}
+
+    def fake_replace(a, b):
+        calls['n'] += 1
+        if calls['n'] == 1:                                # first attempt = cross-device
+            raise OSError(errno.EXDEV, 'Invalid cross-device link')
+        return real_replace(a, b)
+
+    monkeypatch.setattr(R.os, 'replace', fake_replace)
+    R.atomic_replace(str(src), str(dst))
+    assert dst.read_text() == 'payload' and not src.exists()
+    assert not (tmp_path / 'drive' / 'b.txt.staged').exists()
