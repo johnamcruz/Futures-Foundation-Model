@@ -273,18 +273,36 @@ def featurize_all_streams(make_labeler, streams, clf, rundir, chunk=2000, verbos
             channel_names, eval_lab, C, seq)
 
 
-def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, verbose, monitor):
+def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, verbose, monitor,
+               fold_ckpt=None):
     """Per-fold: slice the full memmap -> fit_predict (REAL/SHUFFLE/RANDOM) -> R + health.
     Given a featurized full set + a config; reused across overfit-loop iterations (no
-    re-featurize)."""
+    re-featurize).
+
+    DISCONNECT-RESUME: fold_ckpt (optional durable path, e.g. on Drive) -> per-fold results are
+    saved atomically after EVERY fold via the shared resume toolkit (finetune/resume.py, the same
+    machinery as the sweep's DB snapshot); on restart, completed folds reload and only the
+    remaining ones run. Keyed on a CONFIG SIGNATURE (classifier + clf_kwargs + fold layout +
+    seed) so a changed config auto-invalidates; the control RNG stream is replayed for skipped
+    folds so a resumed run is byte-identical to a single-session run."""
     import os as _os
     from ._memmap import slice_memmap
+    from .resume import KeyedCheckpoint, config_signature
     clf_run = get_classifier(classifier, **ck)
-    pool = {'REAL': [], 'SHUFFLE': [], 'RANDOM': []}
-    auc_real, val_meanR, test_meanR = [], [], []
+    cfg = {k: v for k, v in (ck or {}).items() if not str(k).startswith('standardize_')}
+    ckpt = KeyedCheckpoint(fold_ckpt, config_signature(
+        classifier, cfg, int(seed), [[len(a), len(b), len(c)] for a, b, c in folds]))
+    res = ckpt.load(dict(real=[], shuf=[], rand=[], yte=[], pte=[], valm=[], testm=[]))
+    if verbose and res['real']:
+        print(f"  [fold-ckpt] resumed {len(res['real'])}/{len(folds)} folds from {fold_ckpt}",
+              flush=True)
     rng = np.random.default_rng(seed)
     for fi, (tr, va, te) in enumerate(folds):
         tr, va, te = np.sort(tr), np.sort(va), np.sort(te)
+        if fi < len(res['real']):                         # done in a previous session ->
+            d = np.empty(len(tr)); rng.shuffle(d)         # replay the control RNG stream so the
+            rng.random(len(te))                           # remaining folds match a 1-session run
+            continue
         ftr, fva, fte = (str(rundir / '_ftr.npy'), str(rundir / '_fva.npy'),
                          str(rundir / '_fte.npy'))
         slice_memmap(Xall, tr, ftr); slice_memmap(Xall, va, fva); slice_memmap(Xall, te, fte)
@@ -293,13 +311,13 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         p_val, p_te, ba = clf_run.fit_predict(ftr, Ytr, fva, Yva, fte, seed)
         thr = _pct_threshold(p_val, OP_PERCENTILE)
         R_te = _arm_R(eval_lab, Kte, p_te, thr)
-        pool['REAL'].append(R_te); auc_real.append((Yte, p_te))
-        val_meanR.append(_meanR(_arm_R(eval_lab, Kva, p_val, thr))); test_meanR.append(_meanR(R_te))
+        res['real'].append(R_te); res['yte'].append(np.asarray(Yte)); res['pte'].append(np.asarray(p_te))
+        res['valm'].append(_meanR(_arm_R(eval_lab, Kva, p_val, thr))); res['testm'].append(_meanR(R_te))
         ysh = Ytr.copy(); rng.shuffle(ysh)
         psv, ps, _ = clf_run.fit_predict(ftr, ysh, fva, Yva, fte, seed)
-        pool['SHUFFLE'].append(_arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
+        res['shuf'].append(_arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
         pr = rng.random(len(Kte))
-        pool['RANDOM'].append(_arm_R(eval_lab, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))
+        res['rand'].append(_arm_R(eval_lab, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))
         if monitor:
             monitor.check(f'F{fi}', _health_metrics(p_te, Yte, p_val, Yva))
         if verbose:
@@ -307,12 +325,15 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
             ta = roc_auc_score(Yte, p_te) if len(np.unique(Yte)) == 2 else float('nan')
             print(f"  fold {fi}: train={len(tr)} test={len(te)} test_auc={ta:.4f} "
                   f"meanR={_meanR(R_te):+.3f}", flush=True)
+        ckpt.save(res)                                    # durable after EVERY fold (atomic)
         for f in (ftr, fva, fte):
             try:
                 _os.remove(f)
             except OSError:
                 pass
-    return _verdict(classifier, pool, auc_real, val_meanR, test_meanR, len(folds), verbose)
+    pool = {'REAL': res['real'], 'SHUFFLE': res['shuf'], 'RANDOM': res['rand']}
+    auc_real = list(zip(res['yte'], res['pte']))
+    return _verdict(classifier, pool, auc_real, res['valm'], res['testm'], len(folds), verbose)
 
 
 def _featurize_and_folds(make_labeler, streams, clf, clf_kwargs, train_m, val_m, test_m,
@@ -339,22 +360,25 @@ def _featurize_and_folds(make_labeler, streams, clf, clf_kwargs, train_m, val_m,
 
 def run_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, train_m=3,
                  val_m=1, test_m=1, max_folds=None, holdout_start='2026-01-01',
-                 output_path=None, chunk=2000, seed=0, verbose=True, health_monitor=None):
+                 output_path=None, chunk=2000, seed=0, verbose=True, health_monitor=None,
+                 fold_ckpt=None):
     """Walk-forward over time on FULL multi-stream data, SINGLE config. Featurize once ->
     rolling folds (holdout_start EXCLUDED = untouched OOS) -> per-fold REAL/SHUFFLE/RANDOM
-    + VAL->TEST gap + health. Overfit guards: per-fold val early-stop + gap + health."""
+    + VAL->TEST gap + health. Overfit guards: per-fold val early-stop + gap + health.
+    fold_ckpt (durable path) -> disconnect-resume (see _run_folds)."""
     clf = get_classifier(classifier, **dict(clf_kwargs or {}))
     rundir, Xall, Y, keys, eval_lab, ck, mu, sd, folds = _featurize_and_folds(
         make_labeler, streams, clf, clf_kwargs, train_m, val_m, test_m, max_folds,
         output_path, chunk, verbose, holdout_start=holdout_start)
     monitor = health_monitor or FoldHealthMonitor()
     return _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed,
-                      verbose, monitor)
+                      verbose, monitor, fold_ckpt=fold_ckpt)
 
 
 def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, train_m=3,
                   val_m=1, test_m=1, max_folds=None, holdout_start='2026-01-01', max_iters=2,
-                  n_trials=8, output_path=None, chunk=2000, seed=0, verbose=True):
+                  n_trials=8, output_path=None, chunk=2000, seed=0, verbose=True,
+                  fold_ckpt=None):
     """Walk-forward + OVERFIT->OPTUNA guard (the full overfit-guarded process). Run folds
     (holdout_start EXCLUDED = untouched OOS) with defaults; if they don't generalize
     (VAL->TEST gap), Optuna-search a generalizing config on fold-0 and re-run; repeat until
@@ -368,7 +392,7 @@ def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, t
     if verbose:
         print("[wf-loop] iter 0 · default config", flush=True)
     v = _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, verbose,
-                   FoldHealthMonitor())
+                   FoldHealthMonitor(), fold_ckpt=fold_ckpt)
     history = [dict(it=0, source='default', generalizes=v['generalizes'], gap=v['gap'])]
 
     if not v['generalizes'] and folds:
@@ -395,7 +419,7 @@ def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, t
             if mu is not None:
                 ck['standardize_mu'] = mu.tolist(); ck['standardize_sd'] = sd.tolist()
             v = _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed,
-                           verbose, FoldHealthMonitor())
+                           verbose, FoldHealthMonitor(), fold_ckpt=fold_ckpt)
             history.append(dict(it=it, source=f'tuned{it}', generalizes=v['generalizes'],
                                 gap=v['gap'], params=scan['params']))
             base = dict(scan['params'])

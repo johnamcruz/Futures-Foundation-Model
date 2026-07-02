@@ -89,3 +89,94 @@ def test_wf_no_productive_folds_returns_zero():
     v = wf.run(lab, classifier='logistic', seeds=(0,), train_m=12, val_m=3,
                test_m=3, max_folds=1, holdout_start='2099-01-01', verbose=False)
     assert v['n_folds'] == 0 and v['real_trades'] == 0
+
+
+# ---- disconnect-resume (shared toolkit: finetune/resume.py) ----------------
+def test_resume_keyed_checkpoint_roundtrip(tmp_path):
+    """KeyedCheckpoint: state survives a 'disconnect' (reload), a changed config key starts
+    fresh, and a missing/corrupt file is treated as absent — never an error."""
+    from futures_foundation.finetune.resume import KeyedCheckpoint, config_signature
+    key = config_signature('logistic', {'C': 1.0}, 0, [[10, 2, 3]])
+    path = tmp_path / 'ck.npz'
+    ck = KeyedCheckpoint(path, key)
+    default = dict(real=[], valm=[])
+    res = ck.load(default)
+    assert res == default and ck.done(res, 'real') == 0
+    res['real'].append(np.array([1.0, -1.0])); res['valm'].append(0.5)
+    ck.save(res)
+    res2 = KeyedCheckpoint(path, key).load(default)                 # reload = resume
+    assert ck.done(res2, 'real') == 1 and float(res2['valm'][0]) == 0.5
+    assert np.allclose(res2['real'][0], [1.0, -1.0])
+    other = config_signature('logistic', {'C': 2.0}, 0, [[10, 2, 3]])   # config changed
+    assert KeyedCheckpoint(path, other).load(default) == default        # -> fresh start
+    path.write_bytes(b'garbage')                                        # corrupt file
+    assert KeyedCheckpoint(path, key).load(default) == default          # -> fresh, no raise
+    KeyedCheckpoint(None, key).save(res)                                # no path = no-op
+
+
+def test_resume_sqlite_snapshot_restore(tmp_path):
+    """sqlite_snapshot -> consistent durable copy; sqlite_restore only fills an ABSENT local DB
+    (an existing local DB is newer by construction)."""
+    import sqlite3
+    from futures_foundation.finetune.resume import sqlite_snapshot, sqlite_restore
+    db, bak = str(tmp_path / 'study.db'), str(tmp_path / 'drive' / 'study.db')
+    con = sqlite3.connect(db)
+    con.execute('CREATE TABLE t (x INTEGER)'); con.execute('INSERT INTO t VALUES (42)')
+    con.commit(); con.close()
+    assert sqlite_snapshot(db, bak) is True
+    import os
+    os.remove(db)                                        # the 'disconnect' (local disk lost)
+    assert sqlite_restore(bak, db) is True
+    con = sqlite3.connect(db)
+    assert con.execute('SELECT x FROM t').fetchone()[0] == 42
+    con.close()
+    assert sqlite_restore(bak, db) is False              # local exists -> no clobber
+    assert sqlite_snapshot(str(tmp_path / 'nope.db'), bak) is False   # missing DB -> no-op
+
+
+def test_run_folds_disconnect_resume(tmp_path):
+    """_run_folds with fold_ckpt: a rerun after a 'disconnect' refits NOTHING (all folds
+    resume from the checkpoint) and returns the identical verdict; a changed config refits."""
+    from futures_foundation.finetune.classifier import register_classifier, Classifier
+
+    calls = {'fits': 0}
+
+    @register_classifier('_countfit')
+    class _CountFit(Classifier):
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def featurize(self, labeler, keys):              # not used by _run_folds
+            raise NotImplementedError
+
+        def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+            calls['fits'] += 1
+            n_v = len(np.load(Xval, mmap_mode='r')) if isinstance(Xval, str) else len(Xval)
+            n_e = len(np.load(Xeval, mmap_mode='r')) if isinstance(Xeval, str) else len(Xeval)
+            return np.linspace(0, 1, n_v), np.linspace(0, 1, n_e), 0.5
+
+    class _EvalLab:
+        def evaluate(self, keys, preds):
+            return np.array([2.0 if int(k[1]) % 2 else -1.0
+                             for k, p in zip(keys, preds) if p == 1])
+
+    N = 60
+    Xall = str(tmp_path / 'X.npy')
+    np.save(Xall, np.random.default_rng(0).standard_normal((N, 2, 3)).astype(np.float32))
+    Y = (np.arange(N) % 2).astype(int)
+    keys = [('S@1', int(i), 1) for i in range(N)]
+    folds = [(np.arange(0, 20), np.arange(20, 30), np.arange(30, 40)),
+             (np.arange(10, 30), np.arange(30, 40), np.arange(40, 50))]
+    ckpt = str(tmp_path / 'folds.npz')
+
+    v1 = wf._run_folds('_countfit', {}, Xall, Y, keys, _EvalLab(), tmp_path, folds,
+                       seed=0, verbose=False, monitor=None, fold_ckpt=ckpt)
+    assert calls['fits'] == 2 * 2                        # 2 folds x (REAL + SHUFFLE)
+    v2 = wf._run_folds('_countfit', {}, Xall, Y, keys, _EvalLab(), tmp_path, folds,
+                       seed=0, verbose=False, monitor=None, fold_ckpt=ckpt)
+    assert calls['fits'] == 2 * 2                        # resumed: ZERO new fits
+    for k in ('real_meanR', 'shuffle_meanR', 'random_meanR', 'gap', 'real_trades'):
+        assert v1[k] == v2[k], k                         # byte-identical verdict
+    wf._run_folds('_countfit', {'C': 9.0}, Xall, Y, keys, _EvalLab(), tmp_path, folds,
+                  seed=0, verbose=False, monitor=None, fold_ckpt=ckpt)
+    assert calls['fits'] == 4 * 2                        # config changed -> key changed -> refit
