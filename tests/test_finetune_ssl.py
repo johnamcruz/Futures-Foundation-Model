@@ -261,14 +261,17 @@ def test_pretext_reserve_per_task():
     cfg = ssl._base_cfg(context_lengths=(64, 200), horizons=(5, 25))
     assert ssl.get_pretext('mask').reserve(cfg) == 0                 # stage-1: none
     assert ssl.get_pretext('forecast').reserve(cfg) == 200 + 25      # stage-2: ctx + horizon
-    assert ssl.get_pretext('contrastive').reserve(cfg) == 200        # stage-3: ctx only
+    # stage-3 v2: ctx + the FUTURE key horizon (the key reads the next contrast_horizon bars)
+    assert ssl.get_pretext('contrastive').reserve(cfg) == 200 + cfg['contrast_horizon']
 
 
 def test_base_cfg_has_contrastive_keys():
     cfg = ssl._base_cfg()
     assert cfg['temperature'] == 0.1 and cfg['crop_max'] == 0.2 and cfg['proj_dim'] == 128
-    over = ssl._base_cfg(pretext='contrastive', temperature=0.07, crop_max=0.1)
+    assert cfg['contrast_horizon'] == 25 and cfg['pos_cap'] == 64    # v2 forward-key knobs
+    over = ssl._base_cfg(pretext='contrastive', temperature=0.07, crop_max=0.1, contrast_horizon=10)
     assert over['pretext'] == 'contrastive' and over['temperature'] == 0.07 and over['crop_max'] == 0.1
+    assert over['contrast_horizon'] == 10
 
 
 def test_passes_contrastive_gate_report_only():
@@ -399,27 +402,48 @@ def test_train_multihorizon_runs_variable_context_and_warmstart(tmp_path):
 
 
 
-# ----------------------------------------------- stage-3 trend contrastive: torch components (gated)
+# ------------------------------------ stage-3 v2 forward trend-vs-chop contrastive (torch, gated)
 @torch_test
-def test_trend_key_separates_up_down_chop():
-    """Self-supervised CAUSAL trend key buckets by direction: up-trends, down-trends and chop land
-    in DIFFERENT direction buckets (key // 3 = 0 down / 1 flat / 2 up) — the trend-vs-chop signal."""
+def test_future_key_separates_trend_vs_chop():
+    """The FORWARD key buckets windows by their FUTURE's character: future up/down drifts land in
+    different direction buckets (key//3 = 0 down/1 flat/2 up) and a whipsaw future lands in the
+    CHOP efficiency bucket (key%3 == 0) regardless of its net sign — the trend-vs-chop signal."""
     import torch
     from futures_foundation.finetune import _ssl_torch as S
-    L = 64
-    t = torch.linspace(0, 1, L)
-    up = torch.stack([t * 5 for _ in range(5)])                    # strong up on all channels (close=ch3)
-    dn = torch.stack([-t * 5 for _ in range(5)])
-    flat = torch.randn(5, L) * 0.01
+    torch.manual_seed(0)
+    L, h = 64, 16
+    cs = torch.randn(24, 5, L) * 0.1                               # IDENTICAL-character context (noise)
+    t = torch.linspace(0, 1, h)
+    up = (t * 4).expand(8, h)                                      # future: clean up-drift (high eff)
+    dn = (-t * 4).expand(8, h)                                     # future: clean down-drift
+    alt = torch.tensor([1.0, 0.0]).repeat(h // 2) * 1.5            # future: whipsaw (net~0, low eff)
+    chop = alt.expand(8, h)
+    fs = torch.zeros(24, 5, h)
+    fs[:, 3, :] = torch.cat([up, dn, chop], 0) + torch.randn(24, h) * 0.02   # close channel = 3
+    key = S._future_key(cs, fs, dz=0.5, e1=0.30, e2=0.60)          # FIXED edges (candle-sigma units)
+    dir_b, eff_b = key // 3, key % 3
+    assert (dir_b[:8] == 2).float().mean() > 0.7                   # future up-trend -> up bucket
+    assert (dir_b[8:16] == 0).float().mean() > 0.7                 # future down-trend -> down bucket
+    assert (eff_b[16:] == 0).float().mean() > 0.7                  # future whipsaw -> CHOP (low eff)
+    assert (eff_b[:16] == 2).float().mean() > 0.7                  # clean drifts -> directional bucket
 
-    def mk(base):
-        return base.unsqueeze(0).repeat(8, 1, 1) + torch.randn(8, 5, L) * 0.05
 
-    x = torch.cat([mk(up), mk(dn), mk(flat)], 0)                   # [24,5,L]: 8 up, 8 down, 8 flat
-    dir_b = S._trend_key(x) // 3                                   # 0 down / 1 flat / 2 up
-    assert (dir_b[:8] == 2).float().mean() > 0.7                   # up-trends -> up bucket
-    assert (dir_b[8:16] == 0).float().mean() > 0.7                # down-trends -> down bucket
-    assert (dir_b[16:] == 1).float().mean() > 0.7                 # chop -> flat bucket
+@torch_test
+def test_future_key_groups_by_future_not_past():
+    """THE anti-shortcut property v1 lacked: two windows with the SAME context (past) but different
+    FUTURES get DIFFERENT keys — so the key cannot be computed from the input, and the encoder must
+    learn causal precursors of the future character (trend detection), not restate the past."""
+    import torch
+    from futures_foundation.finetune import _ssl_torch as S
+    torch.manual_seed(1)
+    L, h = 64, 16
+    ctx = torch.randn(1, 5, L).repeat(2, 1, 1)                     # EXACT same past for both
+    t = torch.linspace(0, 1, h)
+    fs = torch.zeros(2, 5, h)
+    fs[0, 3, :] = t * 4                                            # window A future: trends up
+    fs[1, 3, :] = torch.tensor([1.0, 0.0]).repeat(h // 2) * 1.5    # window B future: chops
+    key = S._future_key(ctx, fs, dz=0.5, e1=0.30, e2=0.60)
+    assert int(key[0]) != int(key[1])                              # same past, different key
 
 
 @torch_test
@@ -439,8 +463,9 @@ def test_multi_positive_infonce_rewards_trend_grouping():
 
 @torch_test
 def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
-    """ContrastiveTrendNet -> L2-normalized [B, proj_dim]; the trainer runs, returns an encoder
-    state loadable downstream + finite val loss, and accepts a warm-start ckpt (from stage-2)."""
+    """ContrastiveTrendNet -> L2-normalized [B, proj_dim]; the v2 trainer runs (fixed key edges
+    calibrated, key_gap reported), returns an encoder state loadable downstream + finite val loss,
+    and accepts a warm-start ckpt (from the stage-2 winner)."""
     import torch
     from futures_foundation.finetune import _ssl_torch as S
     from futures_foundation.finetune.classifiers._mantis_torch import build_model
@@ -450,18 +475,20 @@ def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
     rng = np.random.default_rng(0)
     big = (100 + np.cumsum(rng.standard_normal((3000, 5)) * 0.1, 0)).astype(np.float32)
     big[:, 4] = np.abs(big[:, 4]) * 100 + 500                      # positive-ish volume
-    cl = (32, 48); starts = np.arange(0, 3000 - 48 - 1, 4)         # parent = max_ctx = 48
+    cl, h = (32, 48), 8; starts = np.arange(0, 3000 - (48 + 8) - 1, 4)   # parent = ctx + horizon
     state, hist = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl,
-                                          new_channels=4, proj_dim=64, epochs=2, steps_per_epoch=3,
-                                          batch=16, device='cpu', control='real', verbose=False)
+                                          contrast_horizon=h, new_channels=4, proj_dim=64,
+                                          epochs=2, steps_per_epoch=3, batch=16, device='cpu',
+                                          control='real', verbose=False)
     assert len(hist) >= 1 and np.isfinite(hist[-1]['val_loss']) and hist[-1]['std'] > 0
+    assert 'key_gap' in hist[-1] and np.isfinite(hist[-1]['key_gap'])   # separation diagnostic
     ckpt = str(tmp_path / 'enc.pt'); torch.save(state, ckpt)
     _, new_c = build_model(5, new_channels=4, device='cpu', backbone_ckpt=ckpt)
     assert new_c == 4                                              # encoder ckpt loads downstream
     state2, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl,
-                                        new_channels=4, proj_dim=64, epochs=1, steps_per_epoch=2,
-                                        batch=16, device='cpu', control='real', backbone_ckpt=ckpt,
-                                        verbose=False)
+                                        contrast_horizon=h, new_channels=4, proj_dim=64, epochs=1,
+                                        steps_per_epoch=2, batch=16, device='cpu', control='real',
+                                        backbone_ckpt=ckpt, verbose=False)
     assert set(state2.keys()) == set(state.keys())                # warm-start same encoder keys
 
 
@@ -494,19 +521,21 @@ def test_contrastive_save_resume_and_control_guard(tmp_path):
     rng = np.random.default_rng(0)
     big = (100 + np.cumsum(rng.standard_normal((3000, 5)) * 0.1, 0)).astype(np.float32)
     big[:, 4] = np.abs(big[:, 4]) * 100 + 500
-    cl = (32, 48); starts = np.arange(0, 3000 - 48 - 1, 4); ck = str(tmp_path / 'enc.pt')
-    st, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4,
-                                    proj_dim=32, epochs=2, steps_per_epoch=3, batch=16, device='cpu',
-                                    control='real', ckpt_path=ck, verbose=False)
+    cl, h = (32, 48), 8                                                # parent = ctx + FUTURE horizon
+    starts = np.arange(0, 3000 - (48 + 8) - 1, 4); ck = str(tmp_path / 'enc.pt')
+    st, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, contrast_horizon=h,
+                                    new_channels=4, proj_dim=32, epochs=2, steps_per_epoch=3,
+                                    batch=16, device='cpu', control='real', ckpt_path=ck, verbose=False)
     assert os.path.exists(ck) and os.path.exists(ck + '.meta.json')     # progressively saved
-    st2, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4,
-                                     proj_dim=32, epochs=1, steps_per_epoch=2, batch=16, device='cpu',
-                                     control='real', ckpt_path=ck, resume=True, verbose=False)
+    st2, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, contrast_horizon=h,
+                                     new_channels=4, proj_dim=32, epochs=1, steps_per_epoch=2,
+                                     batch=16, device='cpu', control='real', ckpt_path=ck,
+                                     resume=True, verbose=False)
     assert set(st2.keys()) == set(st.keys())                            # resumed + returned encoder
     before = os.path.getmtime(ck)                                       # controls must NOT touch ckpt
-    S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, new_channels=4, proj_dim=32,
-                            epochs=1, steps_per_epoch=2, batch=16, device='cpu', control='shuffle',
-                            ckpt_path=ck, verbose=False)
+    S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, contrast_horizon=h,
+                            new_channels=4, proj_dim=32, epochs=1, steps_per_epoch=2, batch=16,
+                            device='cpu', control='shuffle', ckpt_path=ck, verbose=False)
     assert os.path.getmtime(ck) == before                              # shuffle control didn't save
 
 

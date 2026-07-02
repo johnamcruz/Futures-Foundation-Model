@@ -1,13 +1,36 @@
-"""Stage-3 (EXPERIMENT) trainer: TREND CONTRASTIVE. Reuses Mantis's InfoNCE machinery
-(normalized-sim + temperature + projection head + RandomCropResize) but ADAPTS single-positive
-instance-discrimination -> MULTI-POSITIVE (SupCon mechanics) grouped by a SELF-SUPERVISED CAUSAL
-trend key. Same-trend windows become POSITIVES (pulled together) -> groups trends / separates chop.
-Runs fp32 (amp=False) — the normalized-similarity InfoNCE is fp16-sensitive."""
+"""Stage-3 trainer v2: FORWARD TREND-vs-CHOP CONTRASTIVE. Reuses Mantis's own InfoNCE machinery
+(normalized-sim + temperature + projection head + RandomCropResize) adapted multi-positive (SupCon
+mechanics) — the ONLY thing that changed vs v1 is the POSITIVE-PAIR DEFINITION, the lever that
+makes or breaks contrastive trend detection.
+
+WHY v1 WASHED (benchmarked 2026-07: WR@3R 42.3 vs 42.8, spread 14.2 vs 14.8): its key was the
+TRAILING slope of the input — a statistic the encoder can compute directly from the window, so the
+pretext was solvable by a shortcut and taught nothing forward-looking. Worse, grouping by PAST
+character pulls together windows whose futures differ (a compression coil about to break out vs
+dead whipsaw look identical by trailing slope) — collapsing exactly the micro-structure that
+predicts which pivots run.
+
+THE v2 KEY IS FORWARD: windows are grouped by the NEXT `horizon` bars' trend-vs-chop character —
+direction x path EFFICIENCY (|net| / sum|steps|; low efficiency = chop regardless of net sign).
+The key is computed from the FUTURE segment (target-side, exactly like the stage-2 forecast
+target — never model input), so it is NOT computable from the input -> no shortcut: to group by
+what happens NEXT the encoder must encode the causal PRECURSORS of trending vs chopping. Coils
+separate from dead chop automatically (different futures); windows with the same past but
+different futures become in-batch HARD NEGATIVES — the "looks like a trend, chops out" confusions
+that cap WR. Still fully self-supervised (future candles are data, not labels; standardized-candle
+space, NO R/ATR; same leak discipline as the forecast pretext: reserve ctx+horizon, holdout
+excluded upstream).
+
+Bucket edges are FIXED (calibrated once from a seeded sample of train windows) — v1's
+batch-relative quantiles gave the same window different keys in different batches. Runs fp32
+(amp=False) — the normalized-similarity InfoNCE is fp16-sensitive. Val runs on FIXED batches
+(seeded, RNG state save/restored) so early-stop/best-save track a stable signal.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import _enc, _standardize, _apply_control, _gather_batch, BaseTrainer
+from .common import _enc, _apply_control, _gather_batch, BaseTrainer
 
 
 def _random_crop_resize(x, crop_max=0.2):
@@ -20,34 +43,48 @@ def _random_crop_resize(x, crop_max=0.2):
     return F.interpolate(x[:, :, start:start + cl], size=L, mode='linear', align_corners=False)
 
 
-def _trend_key(ctx, close_ch=3):
-    """SELF-SUPERVISED, CAUSAL trend key per window from PAST bars ONLY (no future, no label).
-    Signature = (direction bucket, magnitude bucket) of the trailing least-squares slope on the
-    CLOSE channel. Windows sharing a key = 'same trend character' = POSITIVES."""
-    B, C, L = ctx.shape
-    close = ctx[:, min(close_ch, C - 1), :]                # [B, L] standardized close
-    t = torch.linspace(-1, 1, L, device=ctx.device); tc = t - t.mean()
-    slope = (close * tc).sum(1) / (tc * tc).sum().clamp_min(1e-6)     # [B] causal trailing slope
-    dz = slope.abs().median().clamp_min(1e-6) * 0.5        # deadzone -> a flat/chop bucket
-    dir_b = (torch.sign(slope) * (slope.abs() > dz)).long() + 1       # 0/1/2 = down/flat/up
-    mag = slope.abs()
-    q1 = torch.quantile(mag, 0.5); q2 = torch.quantile(mag, 0.85)
-    mag_b = (mag > q1).long() + (mag > q2).long()          # 0/1/2 = weak/med/strong
-    return (dir_b * 3 + mag_b).long()                      # [B] key in [0,9)
+def _future_path_stats(cs, fs, close_ch=3):
+    """(net, efficiency) of the FUTURE close path, in context-standardized units. Path = last
+    context close -> the `horizon` future closes; net = end-start; efficiency = |net| / sum|steps|
+    (1 = perfectly directional, ~0 = whipsaw). Both scale-free across TFs/tickers."""
+    cch = min(close_ch, cs.shape[1] - 1)
+    p = torch.cat([cs[:, cch, -1:], fs[:, cch, :]], dim=1)          # [B, h+1] close path from 'now'
+    steps = p[:, 1:] - p[:, :-1]                                    # [B, h]
+    net = p[:, -1] - p[:, 0]
+    eff = net.abs() / steps.abs().sum(1).clamp_min(1e-9)
+    return net, eff
 
 
-def _multi_positive_infonce(z, key, inst, temperature):
+def _future_key(cs, fs, dz, e1, e2, close_ch=3):
+    """SELF-SUPERVISED FORWARD trend-vs-chop key: direction bucket (net vs FIXED deadzone dz) x
+    path-efficiency bucket (FIXED edges e1<e2). key = dir*3 + eff in [0,9); eff bucket 0 = future
+    CHOP (any direction). Same-key windows = 'same future character' = POSITIVES. NOT computable
+    from the model input (the future is target-side) — the anti-shortcut property v1 lacked."""
+    net, eff = _future_path_stats(cs, fs, close_ch)
+    dir_b = (torch.sign(net) * (net.abs() > dz)).long() + 1         # 0/1/2 = down/flat/up
+    eff_b = (eff > e1).long() + (eff > e2).long()                   # 0/1/2 = chop/mixed/directional
+    return dir_b * 3 + eff_b                                        # [B] in [0, 9)
+
+
+def _multi_positive_infonce(z, key, inst, temperature, pos_cap=None):
     """SupCon-style multi-positive InfoNCE over a 2-view batch. z:[N,D] L2-normalized. Positive(i) =
-    {j!=i : key[j]==key[i] OR inst[j]==inst[i]}. Trend-key positives PULL same-trend windows
-    together (fixes false-negatives); instance positives keep crop-invariance."""
+    {j!=i : key[j]==key[i] OR inst[j]==inst[i]}. Key positives PULL same-future-character windows
+    together; instance positives keep crop-invariance. pos_cap (optional) randomly subsamples the
+    KEY positives per anchor (instance positives always kept) so a few huge buckets can't reduce
+    the loss to bucket-centroid averaging."""
     N = z.shape[0]
     sim = (z @ z.t()) / temperature
     eye = torch.eye(N, dtype=torch.bool, device=z.device)
     sim = sim.masked_fill(eye, -1e9)                       # drop self-similarity
-    logp = sim - torch.logsumexp(sim, dim=1, keepdim=True) # log-softmax over the N-1 others
-    pos = ((key[:, None] == key[None, :]) | (inst[:, None] == inst[None, :])) & ~eye
+    logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)  # log-softmax over the N-1 others
+    key_pos = (key[:, None] == key[None, :]) & ~eye
+    if pos_cap is not None:
+        kcnt = key_pos.sum(1, keepdim=True).clamp_min(1)
+        keep = torch.rand(key_pos.shape, device=z.device) < (float(pos_cap) / kcnt)
+        key_pos = key_pos & keep                            # expected <= pos_cap key-positives/anchor
+    pos = key_pos | ((inst[:, None] == inst[None, :]) & ~eye)
     cnt = pos.sum(1)
-    loss = -(logp * pos).sum(1) / cnt.clamp_min(1)         # avg positive log-prob per anchor
+    loss = -(logp * pos).sum(1) / cnt.clamp_min(1)          # avg positive log-prob per anchor
     valid = cnt > 0
     return loss[valid].mean() if valid.any() else (z.sum() * 0.0)
 
@@ -79,33 +116,65 @@ class ContrastiveTrendNet(nn.Module):
 
 
 class _ContrastiveTrainer(BaseTrainer):
-    def __init__(self, big, tr, va, *, context_lengths=(64, 100, 150, 200), new_channels=8,
-                 proj_dim=128, temperature=0.1, crop_max=0.2, model_id='paris-noah/Mantis-8M',
-                 backbone_ckpt=None, clamp=10.0, **base):
+    def __init__(self, big, tr, va, *, context_lengths=(64, 100, 150, 200), contrast_horizon=25,
+                 new_channels=8, proj_dim=128, temperature=0.1, crop_max=0.2, pos_cap=64,
+                 model_id='paris-noah/Mantis-8M', backbone_ckpt=None, clamp=10.0, **base):
         super().__init__(big, tr, va, amp=False, **base)             # InfoNCE runs fp32
         self.clens = [int(x) for x in context_lengths]
-        self.max_ctx = max(self.clens)
+        self.max_ctx, self.h = max(self.clens), int(contrast_horizon)
+        self.parent = self.max_ctx + self.h                          # context + FUTURE (key source)
         self.clens_t = torch.as_tensor(self.clens, dtype=torch.long, device=self.dev)
         self.new_channels, self.proj_dim = new_channels, proj_dim
         self.temperature, self.crop_max, self.clamp = temperature, crop_max, clamp
+        self.pos_cap = int(pos_cap) if pos_cap else None
         self.model_id, self.backbone_ckpt = model_id, backbone_ckpt
         self.C = int(self.big_t.shape[1])
+        self.dz, self.e1, self.e2 = self._calibrate_edges()          # FIXED key edges (stable keys)
+
+    def _calibrate_edges(self, n=4096, seed_off=1):
+        """FIXED bucket edges from a seeded sample of TRAIN windows: dz = |net| tercile (direction
+        deadzone -> ~1/3 of futures 'flat'); e1/e2 = efficiency terciles (chop/mixed/directional).
+        v1 bucketed per batch -> the same window keyed differently across batches (noisy positives)."""
+        g = torch.Generator(device=self.dev); g.manual_seed(int(self.gen.initial_seed()) + seed_off)
+        b_idx = torch.randint(0, len(self.tr), (min(n, len(self.tr)),), device=self.dev, generator=g)
+        cs, fs = self._split_standardize(_gather_batch(self.big_t, self.tr, b_idx, self.parent),
+                                         self.max_ctx)
+        net, eff = _future_path_stats(cs, fs)
+        net_c, eff_c = net.abs().float().cpu(), eff.float().cpu()    # quantiles on CPU (MPS-safe)
+        dz = float(torch.quantile(net_c, 1 / 3))
+        e1, e2 = float(torch.quantile(eff_c, 1 / 3)), float(torch.quantile(eff_c, 2 / 3))
+        if self.verbose:
+            print(f"  [key-edges] dz={dz:.3f} eff=({e1:.3f},{e2:.3f}) from {len(net_c)} windows",
+                  flush=True)
+        return dz, e1, e2
+
+    def _split_standardize(self, w, ctx_end, L=None):
+        """Parent window [B,C,parent] -> (cs [B,C,L], fs [B,C,h]) both standardized by the CONTEXT's
+        per-channel stats (the forecast pretext's convention: future in context-sigma units)."""
+        L = L or self.max_ctx
+        ctx_raw = w[:, :, ctx_end - L:ctx_end]
+        fut_raw = w[:, :, ctx_end:]
+        m = ctx_raw.mean(2, keepdim=True); s = ctx_raw.std(2, keepdim=True) + 1e-6
+        cs = ((ctx_raw - m) / s).clamp(-self.clamp, self.clamp)
+        fs = ((fut_raw - m) / s).clamp(-self.clamp, self.clamp)
+        return cs, fs
 
     def build_net(self):
         net = ContrastiveTrendNet(C=self.C, new_channels=self.new_channels, proj_dim=self.proj_dim,
                                   model_id=self.model_id).to(self.dev)
-        if self.backbone_ckpt:                                       # warm-start from stage-2 (ctx200)
+        if self.backbone_ckpt:                                       # warm-start from the stage-2 winner
             net.encoder.load_state_dict(torch.load(self.backbone_ckpt, map_location='cpu'))
         self.net = net
 
-    def make_batch(self, starts):
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+    def make_batch(self, starts, gen=None):
+        gen = gen or self.gen
+        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=gen)
         L = int(self.clens_t[torch.randint(0, len(self.clens_t), (1,), device=self.dev,
-                                           generator=self.gen)].item())
-        w = _gather_batch(self.big_t, starts, b_idx, self.max_ctx)   # [B,C,max_ctx] real, ends at 'now'
-        cs = _standardize(w[:, :, self.max_ctx - L:]).clamp(-self.clamp, self.clamp)   # [B,C,L] z-score
-        key = _trend_key(cs)                                        # SS causal trend key from REAL context
-        return _apply_control(cs, self.control), key                # corrupt ONLY the input
+                                           generator=gen)].item())
+        w = _gather_batch(self.big_t, starts, b_idx, self.parent)    # [B,C,ctx+h]; ctx ends at 'now'
+        cs, fs = self._split_standardize(w, self.max_ctx, L)
+        key = _future_key(cs, fs, self.dz, self.e1, self.e2)         # key from the REAL future
+        return _apply_control(cs, self.control), key                 # corrupt ONLY the input
 
     def compute_loss(self, batch):
         model_in, key = batch
@@ -114,32 +183,62 @@ class _ContrastiveTrainer(BaseTrainer):
         z = torch.cat([z1, z2], 0)
         key2 = torch.cat([key, key], 0)
         ids = torch.arange(len(key), device=self.dev)
-        inst = torch.cat([ids, ids], 0)                             # crop-pair shares instance id
-        return _multi_positive_infonce(z, key2, inst, self.temperature)
+        inst = torch.cat([ids, ids], 0)                              # crop-pair shares instance id
+        return _multi_positive_infonce(z, key2, inst, self.temperature, self.pos_cap)
 
     @torch.no_grad()
     def val_eval(self):
-        self.net.eval(); tot = 0.0; nb = min(10, max(1, len(self.va) // self.batch))
-        for _ in range(nb):
-            tot += float(self.compute_loss(self.make_batch(self.va)))
-        estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
+        """FIXED-batch val (seeded generator + global-RNG save/restore, so crops/pos_cap noise is
+        identical every epoch) -> a stable early-stop/best-save signal. Also reports 'key_gap' =
+        mean same-key minus diff-key cosine sim in projection space — the trend/chop separation
+        actually forming (the quantity v1 optimized blindly via its loss)."""
+        self.net.eval()
+        cpu_state = torch.random.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        torch.manual_seed(20260701)
+        vgen = torch.Generator(device=self.dev); vgen.manual_seed(20260701)
+        try:
+            tot = 0.0; nb = min(10, max(1, len(self.va) // self.batch))
+            for _ in range(nb):
+                tot += float(self.compute_loss(self.make_batch(self.va, gen=vgen)))
+            ctx, key = self.make_batch(self.va, gen=vgen)            # one batch for diagnostics
+            z = self.net(ctx)
+            sim = z @ z.t()
+            eye = torch.eye(len(z), dtype=torch.bool, device=z.device)
+            same = (key[:, None] == key[None, :]) & ~eye
+            diff = ~same & ~eye
+            gap = float(sim[same].mean() - sim[diff].mean()) if same.any() and diff.any() else 0.0
+            estd = float(self.net.embed(ctx).std(0).mean())
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
         self.net.train()
-        return tot / nb, {'std': estd}
+        return tot / nb, {'std': estd, 'key_gap': gap}
+
+    def log_line(self, ep, tr_loss, vloss, extra, improved):
+        if self.verbose:
+            print(f"  ep{ep:>3} train={tr_loss:.4f} val={vloss:.4f} "
+                  f"key_gap={extra['key_gap']:+.4f} emb_std={extra['std']:.4f}"
+                  f"{'  *' if improved else ''}", flush=True)
 
 
 def train_ssl_contrastive(big, train_starts, val_starts, *, context_lengths=(64, 100, 150, 200),
-                          new_channels=8, proj_dim=128, temperature=0.1, crop_max=0.2, epochs=60,
-                          steps_per_epoch=200, batch=512, lr=2e-3, weight_decay=0.05, patience=8,
-                          device=None, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
-                          control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
-                          ckpt_path=None, resume=False, freeze_encoder_layers=0, **_ignore):
-    """Trend contrastive (multi-positive InfoNCE by self-supervised trend key). Warm-start from
-    stage-2 (ctx200). Returns (best_encoder_state, history) with 'val_loss' + 'std'."""
+                          contrast_horizon=25, new_channels=8, proj_dim=128, temperature=0.1,
+                          crop_max=0.2, pos_cap=64, epochs=60, steps_per_epoch=200, batch=512,
+                          lr=2e-4, weight_decay=0.05, patience=8, device=None,
+                          model_id='paris-noah/Mantis-8M', backbone_ckpt=None, control='real',
+                          seed=0, clamp=10.0, grad_clip=1.0, verbose=True, ckpt_path=None,
+                          resume=False, freeze_encoder_layers=0, **_ignore):
+    """Forward trend-vs-chop contrastive (multi-positive InfoNCE keyed by the FUTURE window's
+    direction x path-efficiency — self-supervised, anti-shortcut). Warm-start from the best stage-2
+    checkpoint. Returns (best_encoder_state, history) with 'val_loss' + 'std' + 'key_gap'."""
     return _ContrastiveTrainer(big, train_starts, val_starts, context_lengths=context_lengths,
-                               new_channels=new_channels, proj_dim=proj_dim, temperature=temperature,
-                               crop_max=crop_max, model_id=model_id, backbone_ckpt=backbone_ckpt,
-                               clamp=clamp, epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch,
-                               lr=lr, weight_decay=weight_decay, patience=patience, device=device,
-                               seed=seed, grad_clip=grad_clip, verbose=verbose, control=control,
-                               ckpt_path=ckpt_path, resume=resume,
+                               contrast_horizon=contrast_horizon, new_channels=new_channels,
+                               proj_dim=proj_dim, temperature=temperature, crop_max=crop_max,
+                               pos_cap=pos_cap, model_id=model_id, backbone_ckpt=backbone_ckpt,
+                               clamp=clamp, epochs=epochs, steps_per_epoch=steps_per_epoch,
+                               batch=batch, lr=lr, weight_decay=weight_decay, patience=patience,
+                               device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
+                               control=control, ckpt_path=ckpt_path, resume=resume,
                                freeze_encoder_layers=freeze_encoder_layers).fit()

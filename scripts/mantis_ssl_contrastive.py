@@ -1,26 +1,31 @@
 # ==============================================================================
-# MANTIS SSL STAGE 3 (EXPERIMENT) — TREND CONTRASTIVE (multi-positive InfoNCE) — Colab GPU
+# MANTIS SSL STAGE 3 v2 — FORWARD TREND-vs-CHOP CONTRASTIVE (multi-positive InfoNCE) — Colab GPU
 # ==============================================================================
 #
-# Sharpen the encoder's TREND-vs-CHOP separation with contrastive learning. Warm-starts from
-# the stage-2 candle seq2seq encoder (mantis_ssl_seq2seq.pt = ctx200) and continues training
-# with a contrastive objective ADAPTED for trend detection:
+# Sharpen the encoder's TREND-vs-CHOP separation. Warm-starts from the BEST stage-2 forecast
+# encoder (the Optuna-sweep winner) and refines with Mantis's own contrastive machinery —
+# normalized-similarity InfoNCE + temperature(0.1) + projection head + RandomCropResize —
+# adapted MULTI-POSITIVE (SupCon mechanics). Only the POSITIVE-PAIR DEFINITION differs from v1:
 #
-#   * REUSES Mantis's InfoNCE machinery — normalized-similarity + temperature(0.1) + a
-#     projection head + RandomCropResize augmentation (crop 0-20%, resize back).
-#   * ADAPTS the objective: single-positive instance-discrimination -> MULTI-POSITIVE
-#     (SupCon mechanics) grouped by a SELF-SUPERVISED, CAUSAL TREND KEY (direction x magnitude
-#     of the trailing slope, from PAST bars only). Same-trend windows become POSITIVES (pulled
-#     together) instead of negatives -> the embedding GROUPS trends and separates chop.
-#     Trend vs chop now; trend CONTINUATION is a future stage.
+#   * v1 (WASHED, 42.3 vs 42.8 WR@3R): key = TRAILING slope of the input — computable from the
+#     window (shortcut; taught nothing forward) and past-tense (pulled together windows whose
+#     futures differ — coils about to break out vs dead whipsaw — erasing the tell).
+#   * v2: key = the FUTURE window's character — direction x path EFFICIENCY (|net|/sum|steps|)
+#     of the NEXT `HORIZON` bars, in context-standardized CANDLE units (raw OHLCV only; NO
+#     R/ATR/derived fields). Low efficiency = future CHOP regardless of net sign. The key is
+#     target-side (like the stage-2 forecast target) -> NOT computable from the input -> the
+#     encoder must learn the causal PRECURSORS of trending vs chopping. Same-past/different-
+#     future windows become in-batch HARD NEGATIVES ("looks like a trend, chops out").
+#     Bucket edges are FIXED (calibrated once from train windows), not per-batch.
 #
-# Self-supervised (no labels -> no leak). 2026 EXCLUDED from SSL. Apples-to-apples shuffle/random
-# controls (trend key always from real context; only the model INPUT is corrupted).
+# Self-supervised (future candles are data, not labels -> no leak). 2026 EXCLUDED from SSL.
+# Controls: key always from the REAL future; only the model INPUT is corrupted.
 #
-# EXPERIMENT: FALLBACK = stage-2 (ctx200). Judge OFFLINE on the SAME baseline as ctx200 —
-# trend-AUC + decile spread (scratchpad/trend_learn_analysis.py) and OHLCV-only WR@3R at each
-# per-ticker/day operating point (scratchpad/ridgeR_2026_wr_lean.py). SHIP only if it beats
-# ctx200 (AUC-3R 0.554 / spread +14.8 / WR@3R) WITHOUT cratering signal COUNT (keep good entries).
+# EXPERIMENT: FALLBACK = stage-2 (sweep winner). Judge OFFLINE on the same ruler —
+# trend-AUC + decile spread (watch the BOTTOM decile = chop-filter quality) + OHLCV-only WR@3R
+# (scratchpad/trend_learn_analysis.py + wr3r_logistic_bench.py). SHIP only if it beats the
+# stage-2 winner WITHOUT cratering signal COUNT. Watch 'key_gap' in the log = the trend/chop
+# separation forming in embedding space (val is FIXED-batch, so it's comparable across epochs).
 #
 # OUTPUT: an adapted ENCODER checkpoint, consumed downstream exactly like stage-1/2:
 #   BACKBONE_CKPT=<this .pt>  (embed / benchmark), or build_model(..., backbone_ckpt=<this>).
@@ -69,8 +74,13 @@ TFS     = ['1min', '3min', '5min', '15min']                            # all 4 T
 HOLDOUT_START = '2026-01-01'          # EXCLUDED from SSL (downstream OOS stays clean)
 VAL_FRAC      = 0.1
 
-# ── TREND CONTRASTIVE (variable-context, self-supervised trend key) ──
+# ── FORWARD TREND-vs-CHOP CONTRASTIVE (variable context; key = future dir x path efficiency) ──
 CONTEXT_LENGTHS = (64, 100, 150, 200)          # same variable context as stage-2
+HORIZON         = 25                            # FUTURE bars the key reads (matches stage-2's far
+                                               # horizon = the ~2R/3R trade timescale). Key = dir x
+                                               # efficiency of these bars; NOT computable from input.
+POS_CAP         = 64                            # max key-positives per anchor (huge buckets -> the
+                                               # loss degenerates to bucket-centroid averaging)
 TEMPERATURE     = 0.1                           # Mantis InfoNCE temperature
 CROP_MAX        = 0.2                            # RandomCropResize: crop up to 20%
 PROJ_DIM        = 128                            # projection-head output (discarded after)
@@ -120,8 +130,9 @@ print(f'   OUTPUT -> {OUT_PATH}')
 # ======================================= CELL 3 — TRAIN (single run, no Optuna) ================
 verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH, tickers=TICKERS, tfs=TFS,
-    pretext='contrastive', backbone_ckpt=WARM_CKPT,           # <- stage-3 contrastive, warm-start stage-2
-    context_lengths=CONTEXT_LENGTHS, temperature=TEMPERATURE, crop_max=CROP_MAX,
+    pretext='contrastive', backbone_ckpt=WARM_CKPT,           # <- stage-3 v2, warm-start stage-2 winner
+    context_lengths=CONTEXT_LENGTHS, contrast_horizon=HORIZON, pos_cap=POS_CAP,
+    temperature=TEMPERATURE, crop_max=CROP_MAX,
     proj_dim=PROJ_DIM, new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS,
     steps_per_epoch=STEPS, lr=LR, patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP,
     val_frac=VAL_FRAC, holdout_start=HOLDOUT_START, controls=CONTROLS, probe=PROBE,
