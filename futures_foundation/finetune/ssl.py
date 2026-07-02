@@ -162,6 +162,10 @@ def _base_cfg(**kw):
              # stage-2 multi-horizon / variable-context candle forecasting:
              horizons=(5, 10, 20, 25), context_lengths=(64, 100, 150, 200),
              grad_clip=1.0, clamp=10.0,
+             # forecast supervision OBJECTIVE (pluggable, no if-chains): 'candle_mse' (original) |
+             # 'candle_direction' (candle MSE + BCE on sign(fwd close move) via dir_weight). The Optuna
+             # sweep searches this + the knobs below to maximize downstream WR.
+             objective='candle_mse',
              # OPTIONAL forecast direction-head squeeze (0 = off / backward-compat; >0 adds BCE on
              # sign of the forward close move -> trains the encoder to be direction-aware for WR):
              dir_weight=0.0, dir_close_ch=3,

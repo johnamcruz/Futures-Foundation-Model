@@ -333,9 +333,39 @@ def test_multihorizon_net_shape():
     from futures_foundation.finetune import _ssl_torch as S
     net = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20))   # out=4 (OHLC)
     for L in (48, 96):                                              # variable context length works
-        ctx = torch.randn(6, 5, L)                                 # input = 5ch OHLCV (uses volume)
-        assert net(ctx).shape == (6, 5, 3)                         # [B, OHLCV=5, n_horizons]
+        candles, aux = net(ctx := torch.randn(6, 5, L))            # net ALWAYS returns (candles, aux)
+        assert candles.shape == (6, 5, 3)                          # [B, OHLCV=5, n_horizons]
+        assert aux is None                                         # candle-only objective -> no aux head
         assert net.embed(ctx).shape[0] == 6 and net.embed(ctx).shape[1] > 0
+
+
+def test_forecast_objective_registry_is_pluggable():
+    """Torch-free: the forecast OBJECTIVE registry resolves by name (no if-chains), each declares its
+    own aux_dim, and unknown names fail fast. candle_mse = candle-only; candle_direction = +nH logits."""
+    from futures_foundation.finetune.pretext._torch.forecast_objectives import get_forecast_objective
+    assert get_forecast_objective(None).name == 'candle_mse'       # default / backward-compat
+    assert get_forecast_objective('candle_mse').aux_dim(4) == 0    # candle-only -> no aux head
+    assert get_forecast_objective('candle_direction').aux_dim(4) == 4   # one direction logit / horizon
+    try:
+        get_forecast_objective('nope'); assert False, 'unknown objective must raise'
+    except KeyError:
+        pass
+
+
+@torch_test
+def test_forecast_direction_objective_aux_head_and_loss():
+    """candle_direction adds a LINEAR aux head (nH logits) that shapes the encoder via BCE on sign(fwd
+    close move); candle_mse keeps aux=None. Loss is finite for both -> the objective is wired end-to-end."""
+    import torch
+    from futures_foundation.finetune import _ssl_torch as S
+    from futures_foundation.finetune.pretext._torch.forecast_objectives import get_forecast_objective
+    net = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20), aux_dim=3)
+    candles, aux = net(torch.randn(6, 5, 48))
+    assert candles.shape == (6, 5, 3) and aux.shape == (6, 3)      # aux = per-horizon direction logits
+    target = torch.randn(6, 5, 3)
+    obj = get_forecast_objective('candle_direction')
+    loss = obj.loss(candles, aux, target, close_ch=3, weight=0.5)
+    assert torch.isfinite(loss) and loss.item() > 0
 
 
 @torch_test
@@ -489,25 +519,25 @@ def test_base_cfg_has_direction_keys():
 
 @torch_test
 def test_forecast_direction_head_optional_and_backcompat():
-    """dir_weight=0 -> net returns candles only (backward-compat); use_direction=True -> net returns
-    (candles, dir_logits [B,nH]); trainer with dir_weight>0 reports a val 'dir_acc'."""
+    """Net ALWAYS returns (candles, aux) (no forward if-chain): candle-only objective -> aux=None
+    (backward-compat); candle_direction (aux_dim=nH) -> aux = per-horizon dir logits; the trainer with
+    objective='candle_direction' + dir_weight>0 reports a val 'dir_acc'."""
     import torch
     from futures_foundation.finetune import _ssl_torch as S
-    # backward-compat: default net returns candles ONLY
-    net0 = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20)).to('cpu')
-    out0 = net0(torch.randn(6, 5, 64))
-    assert isinstance(out0, torch.Tensor) and out0.shape == (6, 5, 3)
-    # direction on: net returns (candles, dir_logits)
-    netd = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20), use_direction=True).to('cpu')
+    # backward-compat: default objective is candle-only -> aux is None
+    candles0, aux0 = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20))(torch.randn(6, 5, 64))
+    assert candles0.shape == (6, 5, 3) and aux0 is None
+    # direction objective: aux head sized to nH -> (candles, dir_logits)
+    netd = S.MultiHorizonForecastNet(C=5, new_channels=4, horizons=(5, 10, 20), aux_dim=3).to('cpu')
     candles, dir_logits = netd(torch.randn(6, 5, 64))
     assert candles.shape == (6, 5, 3) and dir_logits.shape == (6, 3)
-    # trainer with dir_weight>0 runs + reports dir_acc in history
+    # trainer with the direction objective runs + reports dir_acc in history
     rng = np.random.default_rng(0)
     big = (100 + np.cumsum(rng.standard_normal((3000, 5)) * 0.1, 0)).astype(np.float32)
     big[:, 4] = np.abs(big[:, 4]) * 100 + 500
     hz, cl = (5, 10, 20), (32, 48); starts = np.arange(0, 3000 - 68 - 1, 4)
     _, hist = S.train_ssl_forecast(big, starts, starts[-50:], horizons=hz, context_lengths=cl,
                                    new_channels=4, epochs=2, steps_per_epoch=3, batch=16, device='cpu',
-                                   control='real', dir_weight=0.5, verbose=False)
+                                   control='real', objective='candle_direction', dir_weight=0.5, verbose=False)
     assert 'dir_acc' in hist[-1] and 0.0 <= hist[-1]['dir_acc'] <= 1.0
     assert np.isfinite(hist[-1]['val_loss']) and 'skill' in hist[-1]    # candle metrics still there

@@ -13,7 +13,7 @@ class MultiHorizonForecastNet(nn.Module):
     is encoded; the decoder predicts the future CANDLE (OHLCV) at EACH horizon -> [B, C, n_horizons]."""
 
     def __init__(self, C=5, new_channels=8, horizons=(5, 10, 20, 25),
-                 model_id='paris-noah/Mantis-8M', use_direction=False):
+                 model_id='paris-noah/Mantis-8M', aux_dim=0):
         super().__init__()
         from mantis.architecture import Mantis8M
         from mantis.adapters import LinearChannelCombiner
@@ -25,28 +25,26 @@ class MultiHorizonForecastNet(nn.Module):
         self.nH = len(self.horizons)
         emb = hidden * self.new_c
         self.decoder = nn.Sequential(nn.Linear(emb, emb), nn.GELU(), nn.Linear(emb, C * self.nH))
-        # OPTIONAL aux direction head (LINEAR on purpose) — predicts sign(forward close move) per
-        # horizon. Forces the ENCODER to encode direction linearly (BCE-on-sign has no mean-regression
-        # to wash out the sign, unlike the candle MSE). Discarded after training. None (default) =
-        # backward-compatible pure-candle-MSE forecast.
-        self.dir_head = nn.Linear(emb, self.nH) if use_direction else None
+        # OPTIONAL aux head sized by the forecast OBJECTIVE (e.g. direction logits) — a LINEAR readout
+        # off the same embedding, so the objective's gradient shapes the ENCODER. Discarded after
+        # training. aux_dim=0 = candle-only (original stage-2).
+        self.aux_head = nn.Linear(emb, aux_dim) if aux_dim > 0 else None
 
     def embed(self, x):                                   # [B,C,L] -> [B, new_c*hidden]
         a = self.adapter(x)
         return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
 
-    def forward(self, ctx):                               # -> candles [B,C,nH]  (+ dir logits [B,nH] if on)
+    def forward(self, ctx):                               # -> (candles [B,C,nH], aux [B,aux_dim] or None)
         e = self.embed(ctx)
         candles = self.decoder(e).view(-1, self.C, self.nH)
-        if self.dir_head is None:
-            return candles                                # backward-compat: candles only
-        return candles, self.dir_head(e)                  # direction enabled: (candles, dir_logits)
+        return candles, (self.aux_head(e) if self.aux_head is not None else None)
 
 
 class _ForecastTrainer(BaseTrainer):
     def __init__(self, big, tr, va, *, horizons=(5, 10, 20, 25), context_lengths=(64, 100, 150, 200),
                  new_channels=8, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
-                 compile_model=False, clamp=10.0, dir_weight=0.0, dir_close_ch=3, **base):
+                 compile_model=False, clamp=10.0, objective='candle_mse', dir_weight=0.0,
+                 dir_close_ch=3, **base):
         super().__init__(big, tr, va, **base)
         self.hlist = [int(h) for h in horizons]
         self.clens = [int(x) for x in context_lengths]
@@ -57,13 +55,15 @@ class _ForecastTrainer(BaseTrainer):
         self.new_channels, self.model_id = new_channels, model_id
         self.backbone_ckpt, self.compile_model, self.clamp = backbone_ckpt, compile_model, clamp
         self.C = int(self.big_t.shape[1])
-        # optional direction-head squeeze (backward-compat: dir_weight=0 -> off, pure candle MSE)
-        self.dir_weight = float(dir_weight); self.use_direction = self.dir_weight > 0
-        self.close_ch = min(int(dir_close_ch), self.C - 1)           # OHLCV close = index 3
+        from .forecast_objectives import get_forecast_objective
+        self.obj = get_forecast_objective(objective)                # pluggable forecast supervision
+        self.dir_weight = float(dir_weight)                         # aux-head loss weight (0 = candle-only)
+        self.close_ch = min(int(dir_close_ch), self.C - 1)          # OHLCV close = index 3
 
     def build_net(self):
         net = MultiHorizonForecastNet(C=self.C, new_channels=self.new_channels, horizons=self.hlist,
-                                      model_id=self.model_id, use_direction=self.use_direction).to(self.dev)
+                                      model_id=self.model_id,
+                                      aux_dim=self.obj.aux_dim(len(self.hlist))).to(self.dev)
         if self.backbone_ckpt:
             net.encoder.load_state_dict(torch.load(self.backbone_ckpt, map_location='cpu'))
         if self.compile_model and hasattr(torch, 'compile'):
@@ -85,53 +85,43 @@ class _ForecastTrainer(BaseTrainer):
 
     def compute_loss(self, batch):
         model_ctx, target = batch
-        out = self.net(model_ctx)
-        if not self.use_direction:
-            return ((out - target) ** 2).mean()                     # backward-compat: pure candle MSE
-        candles, dir_logits = out
-        mse = ((candles - target) ** 2).mean()                      # "how far" (magnitude)
-        dir_tgt = (target[:, self.close_ch, :] > 0).float()         # "which way": sign of fwd close move
-        dir_loss = F.binary_cross_entropy_with_logits(dir_logits, dir_tgt)
-        return mse + self.dir_weight * dir_loss
+        candles, aux = self.net(model_ctx)
+        return self.obj.loss(candles, aux, target, self.close_ch, self.dir_weight)
 
     @torch.no_grad()
     def val_eval(self):
+        from .forecast_objectives import dir_acc as _dir_acc
         self.net.eval(); tot = 0.0; ptot = 0.0
         toth = torch.zeros(len(self.hlist), device=self.dev)        # per-horizon: is 20/25 learning?
         ptoth = torch.zeros(len(self.hlist), device=self.dev)
-        dhits = torch.zeros(len(self.hlist), device=self.dev); dn = 0   # per-horizon direction hits
+        dacc = torch.zeros(len(self.hlist), device=self.dev)        # per-horizon directional accuracy
         nb = min(20, max(1, len(self.va) // self.batch))
         for _ in range(nb):
             mc, tg = self.make_batch(self.va)
             with self.amp_ctx():
-                out = self.net(mc)                                  # candles [B,C,nH] (+ dir if enabled)
-            candles = out[0] if self.use_direction else out
+                candles, _aux = self.net(mc)                        # net ALWAYS returns (candles, aux)
             se = (candles.float() - tg) ** 2
             tot += float(se.mean()); ptot += float((tg ** 2).mean())
             toth += se.mean(dim=(0, 1)); ptoth += (tg ** 2).mean(dim=(0, 1))
-            if self.use_direction:                                  # per-horizon directional ACCURACY
-                dtgt = tg[:, self.close_ch, :] > 0
-                dhits += ((out[1] > 0) == dtgt).float().sum(0); dn += dtgt.shape[0]
+            dacc += _dir_acc(candles, tg, self.close_ch)            # universal (comparable across objectives)
         estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
         self.net.train()
         vloss, ploss = tot / nb, ptot / nb
         skill = float(1.0 - vloss / ploss) if ploss > 1e-12 else 0.0
         skill_h = (1.0 - toth / ptoth.clamp_min(1e-12)).cpu().tolist()
-        extra = {'persist_loss': ploss, 'skill': skill,
-                 'skill_per_h': dict(zip(self.hlist, skill_h)), 'std': estd}
-        if self.use_direction:                                     # dir_acc>0.5 = learning direction
-            dir_h = (dhits / max(dn, 1)).cpu().tolist()
-            extra['dir_acc'] = float(sum(dir_h) / len(dir_h))
-            extra['dir_acc_per_h'] = dict(zip(self.hlist, dir_h))
-        return vloss, extra
+        dir_h = (dacc / nb).cpu().tolist()                          # dir_acc>0.5 = learning direction
+        return vloss, {'persist_loss': ploss, 'skill': skill,
+                       'skill_per_h': dict(zip(self.hlist, skill_h)),
+                       'dir_acc': float(sum(dir_h) / len(dir_h)),
+                       'dir_acc_per_h': dict(zip(self.hlist, dir_h)), 'std': estd}
 
     def log_line(self, ep, tr_loss, vloss, extra, improved):
         if self.verbose:
             ph = ' '.join(f"h{h}={s:+.2f}" for h, s in extra['skill_per_h'].items())
-            da = f" dir={extra['dir_acc']:.3f}" if 'dir_acc' in extra else ''
             print(f"  ep{ep:>3} train={tr_loss:.4f} val={vloss:.4f} "
-                  f"persist={extra['persist_loss']:.4f} skill={extra['skill']:+.3f} [{ph}]{da} "
-                  f"emb_std={extra['std']:.4f}{'  *' if improved else ''}", flush=True)
+                  f"persist={extra['persist_loss']:.4f} skill={extra['skill']:+.3f} [{ph}] "
+                  f"dir={extra['dir_acc']:.3f} emb_std={extra['std']:.4f}{'  *' if improved else ''}",
+                  flush=True)
 
 
 def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25),
@@ -141,7 +131,7 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                        compile_model=False, control='real', seed=0, amp_dtype='fp16',
                        grad_clip=1.0, clamp=10.0, verbose=True,
                        ckpt_path=None, resume=False, freeze_encoder_layers=0,
-                       dir_weight=0.0, dir_close_ch=3, **_ignore):
+                       objective='candle_mse', dir_weight=0.0, dir_close_ch=3, **_ignore):
     """Multi-horizon / variable-context candle seq2seq. Returns (best_encoder_state, history) with
     'val_loss', 'persist_loss', 'skill', 'skill_per_h', 'std' (+ 'dir_acc' if dir_weight>0). Warm-start
     from stage-1. OPTIONAL: dir_weight>0 adds a direction-head BCE term (sign of the fwd close move) to
@@ -153,5 +143,5 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                             lr=lr, weight_decay=weight_decay, patience=patience, device=device,
                             seed=seed, grad_clip=grad_clip, amp_dtype=amp_dtype, verbose=verbose,
                             control=control, ckpt_path=ckpt_path, resume=resume,
-                            freeze_encoder_layers=freeze_encoder_layers,
+                            freeze_encoder_layers=freeze_encoder_layers, objective=objective,
                             dir_weight=dir_weight, dir_close_ch=dir_close_ch).fit()
