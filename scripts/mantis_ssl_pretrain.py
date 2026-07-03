@@ -26,7 +26,7 @@
 
 
 # ==============================================================================
-# CELL 1 — SETUP  (clone FFM @ mantis branch, install, mantis-tsfm)
+# CELL 1 — SETUP  (clone FFM @ main branch, install, mantis-tsfm)
 # ==============================================================================
 import os, subprocess
 os.chdir('/content')
@@ -37,7 +37,7 @@ drive.mount('/content/drive', force_remount=True)
 print('Cloning FFM repo (mantis branch)...')
 os.system('rm -rf /content/Futures-Foundation-Model')
 r = subprocess.run(
-    ['git', 'clone', '--branch', 'mantis',
+    ['git', 'clone', '--branch', 'main',
      'https://github.com/johnamcruz/Futures-Foundation-Model.git',
      '/content/Futures-Foundation-Model'],
     capture_output=True, text=True)
