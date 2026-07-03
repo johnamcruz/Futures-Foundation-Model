@@ -286,8 +286,16 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     seed) so a changed config auto-invalidates; the control RNG stream is replayed for skipped
     folds so a resumed run is byte-identical to a single-session run."""
     import os as _os
+    import warnings
     from ._memmap import slice_memmap
     from .resume import KeyedCheckpoint, config_signature
+    # Silence the per-fold logistic's lbfgs ConvergenceWarning (iter cap on the ~1300-dim embedding).
+    # Cosmetic: the ranking is stable and identical across folds, so the WF comparison stays fair.
+    try:
+        from sklearn.exceptions import ConvergenceWarning
+        warnings.filterwarnings('ignore', category=ConvergenceWarning)
+    except Exception:
+        pass
     clf_run = get_classifier(classifier, **ck)
     cfg = {k: v for k, v in (ck or {}).items() if not str(k).startswith('standardize_')}
     ckpt = KeyedCheckpoint(fold_ckpt, config_signature(
@@ -318,13 +326,21 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         res['shuf'].append(_arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
         pr = rng.random(len(Kte))
         res['rand'].append(_arm_R(eval_lab, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))
-        if monitor:
-            monitor.check(f'F{fi}', _health_metrics(p_te, Yte, p_val, Yva))
+        if monitor:                                       # legacy P@80 monitor (opt-in; callers
+            monitor.check(f'F{fi}', _health_metrics(p_te, Yte, p_val, Yva))   # pass None to skip)
         if verbose:
             from sklearn.metrics import roc_auc_score
             ta = roc_auc_score(Yte, p_te) if len(np.unique(Yte)) == 2 else float('nan')
-            print(f"  fold {fi}: train={len(tr)} test={len(te)} test_auc={ta:.4f} "
-                  f"meanR={_meanR(R_te):+.3f}", flush=True)
+            # Per-fold OVERFIT read, epoch-style: VAL is the tuning proxy, TEST is this fold's OOS.
+            # A big VAL->TEST drop = overfit. gap = val meanR - test meanR (same metric + tolerance
+            # as the GENERALIZES verdict, so a fold flagged OVERFIT is what fails the honest ruler).
+            vmR, tmR = res['valm'][-1], res['testm'][-1]
+            gap = vmR - tmR
+            flag = 'OVERFIT' if gap > GEN_GAP_TOL else 'ok'
+            print(f"  fold {fi:>2} | n train={len(tr)} val={len(va)} test={len(te)}"
+                  f"  good={Ytr.mean():.2f} | AUC val={ba:.3f} test={ta:.3f}"
+                  f" | meanR val={vmR:+.3f} test={tmR:+.3f} | val->test gap={gap:+.3f} [{flag}]",
+                  flush=True)
         ckpt.save(res)                                    # durable after EVERY fold (atomic)
         for f in (ftr, fva, fte):
             try:
@@ -370,9 +386,8 @@ def run_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, tr
     rundir, Xall, Y, keys, eval_lab, ck, mu, sd, folds = _featurize_and_folds(
         make_labeler, streams, clf, clf_kwargs, train_m, val_m, test_m, max_folds,
         output_path, chunk, verbose, holdout_start=holdout_start)
-    monitor = health_monitor or FoldHealthMonitor()
     return _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed,
-                      verbose, monitor, fold_ckpt=fold_ckpt)
+                      verbose, health_monitor, fold_ckpt=fold_ckpt)   # None default = no P@80
 
 
 def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, train_m=3,
@@ -392,7 +407,8 @@ def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, t
     if verbose:
         print("[wf-loop] iter 0 · default config", flush=True)
     v = _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, verbose,
-                   FoldHealthMonitor(), fold_ckpt=fold_ckpt)
+                   None, fold_ckpt=fold_ckpt)          # None = no legacy P@80 monitor; the
+    #                                     per-fold val/test/overfit readout replaces it
     history = [dict(it=0, source='default', generalizes=v['generalizes'], gap=v['gap'])]
 
     if not v['generalizes'] and folds:
@@ -419,7 +435,7 @@ def loop_streamed(make_labeler, streams, classifier='mantis', clf_kwargs=None, t
             if mu is not None:
                 ck['standardize_mu'] = mu.tolist(); ck['standardize_sd'] = sd.tolist()
             v = _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed,
-                           verbose, FoldHealthMonitor(), fold_ckpt=fold_ckpt)
+                           verbose, None, fold_ckpt=fold_ckpt)
             history.append(dict(it=it, source=f'tuned{it}', generalizes=v['generalizes'],
                                 gap=v['gap'], params=scan['params']))
             base = dict(scan['params'])
