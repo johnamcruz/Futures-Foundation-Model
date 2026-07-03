@@ -24,6 +24,27 @@ from ..classifier import Classifier, register_classifier
 
 _EMBED_KEYS = ('model_id', 'device', 'batch')
 
+_CKPT_FP_CACHE: dict = {}
+
+
+def _ckpt_fingerprint(p: Path) -> str:
+    """Short CONTENT hash of the checkpoint file — the embed-cache identity. STABLE across
+    re-clones: identical weights -> identical fingerprint -> the cache is REUSED. Replaces the
+    file MTIME, which changes on every git re-clone / re-download and churns a whole new ~30GB
+    cache set for byte-identical embeddings (the Colab-disk / Drive-quota pain). Memoized per
+    (path, size) so the 32MB file is hashed once per process, not per stream."""
+    st = p.stat()
+    key = (str(p), st.st_size)
+    fp = _CKPT_FP_CACHE.get(key)
+    if fp is None:
+        h = hashlib.sha1()
+        with open(p, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        fp = h.hexdigest()[:16]
+        _CKPT_FP_CACHE[key] = fp
+    return fp
+
 
 def _embed_cache_path(cfg, labeler, keys):
     """Cross-run cache path for ONE stream's frozen embedding (None = caching off).
@@ -38,7 +59,7 @@ def _embed_cache_path(cfg, labeler, keys):
     ckpt = cfg.get('backbone_ckpt')
     if ckpt and Path(ckpt).exists():
         p = Path(ckpt)
-        ckpt_id = f"{p.name}:{int(p.stat().st_mtime)}:{p.stat().st_size}"
+        ckpt_id = f"{p.name}:{_ckpt_fingerprint(p)}:{p.stat().st_size}"   # content hash, not mtime
     else:
         ckpt_id = str(ckpt) if ckpt else 'vanilla'
     sid = keys[0][0]                                   # "TK@TF" (one stream per call)
@@ -70,7 +91,7 @@ def _bar_cache_path(cfg, labeler, keys):
     ckpt = cfg.get('backbone_ckpt')
     if ckpt and Path(ckpt).exists():
         p = Path(ckpt)
-        ckpt_id = f"{p.name}-{int(p.stat().st_mtime)}-{p.stat().st_size}"
+        ckpt_id = f"{p.name}-{_ckpt_fingerprint(p)}-{p.stat().st_size}"   # content hash, not mtime
     else:
         ckpt_id = (str(ckpt).replace('/', '_') if ckpt else 'vanilla')
     tk, tf = keys[0][0].split('@')
