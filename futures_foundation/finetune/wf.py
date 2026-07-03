@@ -289,8 +289,9 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     import warnings
     from ._memmap import slice_memmap
     from .resume import KeyedCheckpoint, config_signature
-    # Silence the per-fold logistic's lbfgs ConvergenceWarning (iter cap on the ~1300-dim embedding).
-    # Cosmetic: the ranking is stable and identical across folds, so the WF comparison stays fair.
+    # Silence any residual lbfgs ConvergenceWarning. With train-stat standardize applied at fit
+    # (mantis_frozen.fit_predict) the head converges well inside the iter cap; a rare fold that
+    # still warns is a stable-ranking edge case, and the arms stay comparable either way.
     try:
         from sklearn.exceptions import ConvergenceWarning
         warnings.filterwarnings('ignore', category=ConvergenceWarning)
@@ -298,6 +299,9 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         pass
     clf_run = get_classifier(classifier, **ck)
     cfg = {k: v for k, v in (ck or {}).items() if not str(k).startswith('standardize_')}
+    if 'standardize_mu' in (ck or {}):
+        cfg['_fit_std'] = 1      # heads now FIT on standardized features -> invalidate any
+        #                          partial fold-ckpt written under the old raw-fit regime
     ckpt = KeyedCheckpoint(fold_ckpt, config_signature(
         classifier, cfg, int(seed), [[len(a), len(b), len(c)] for a, b, c in folds]))
     res = ckpt.load(dict(real=[], shuf=[], rand=[], yte=[], pte=[], valm=[], testm=[]))

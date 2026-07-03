@@ -265,9 +265,20 @@ class MantisFrozenClassifier(Classifier):
         from sklearn.linear_model import LogisticRegression
         from sklearn.neural_network import MLPClassifier
         from sklearn.metrics import roc_auc_score
+        # Train-stat standardize (streamed harness passes mu/sd in cfg; the in-RAM harness
+        # pre-standardizes the arrays and passes NO stats — never double-applied). CRITICAL for
+        # both fit quality (raw 1300-dim embeddings stall lbfgs at the iter cap) and the ONNX
+        # serve contract: the bot standardizes with the contract mu/sd before the head, so the
+        # head MUST be fit on standardized features or serving is a train/serve mismatch.
+        mu, sd = self.cfg.get('standardize_mu'), self.cfg.get('standardize_sd')
+        mu = None if mu is None else np.asarray(mu, np.float32).reshape(1, -1, 1)
+        sd = None if sd is None else np.asarray(sd, np.float32).reshape(1, -1, 1)
 
         def arr(a):
             x = np.asarray(np.load(a, mmap_mode='r') if isinstance(a, str) else a, np.float32)
+            if mu is not None:
+                x = x - mu                                # new array (x may be a read-only mmap)
+                x /= sd
             return x.reshape(len(x), -1)                  # [N, emb_dim, 1] -> [N, emb_dim]
         Xtr, Xval, Xeval = arr(Xtr), arr(Xval), arr(Xeval)
         ytr = np.asarray(ytr).astype(int); yval = np.asarray(yval).astype(int)
@@ -278,7 +289,8 @@ class MantisFrozenClassifier(Classifier):
                                 max_iter=int(self.cfg.get('max_iter', 300)),
                                 early_stopping=True, random_state=seed)
         else:
-            clf = LogisticRegression(max_iter=1000, C=float(self.cfg.get('C', 1.0)))
+            clf = LogisticRegression(max_iter=int(self.cfg.get('max_iter', 1000)),
+                                     C=float(self.cfg.get('C', 1.0)))
         _fit_with_heartbeat(clf, Xtr, ytr)
         if self.cfg.get('export_onnx_path'):          # deployable bundle: encoder + head ONNX
             _export_frozen_bundle(self.cfg, clf, Xtr.shape[1], Xval)
