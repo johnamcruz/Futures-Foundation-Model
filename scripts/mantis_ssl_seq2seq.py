@@ -54,20 +54,15 @@ except ImportError as e:
 # ======================================= CELL 2 — CONFIG + pre-flight ==========================
 import os, torch
 
-# ── PATHS (Drive) ──
-# This IS the stage-2 seq2seq encoder — the Optuna sweep (forecast_wr_sweep_9tk_4tf trial 1, WR@3R
-# 50.3% on pre-2026 val) just found its config. The SHIP GATE is the repo checkpoint + BASE_BACKBONE_CKPT
-# pointer: only commit this over checkpoints/mantis_ssl_seq2seq.pt AFTER it beats the current base on
-# the one-shot 2026. (The old Drive copy is overwritten, but the current base stays in the repo until then.)
-# ENV-OVERRIDABLE so this script serves BOTH the default stage-2 AND the REORDER's forecast-last step:
-#   DEFAULT (mask->forecast): warm from stage-1 mask -> mantis_ssl_seq2seq.pt
-#   REORDER (mask->contrastive->forecast) STEP 2: warm from the contrastive-from-mask checkpoint,
-#     FREEZE early blocks so forecast can't erase the regime, write a DISTINCT file:
-#     WARM_CKPT=.../mantis_ssl_regime_from_mask.pt  OUT_PATH=.../mantis_ssl_seq2seq_reordered.pt \
-#       FREEZE_ENCODER_LAYERS=3  python3 scripts/mantis_ssl_seq2seq.py
+# ── PATHS (Drive) — DEFAULT = the REORDER's forecast-last step (STEP 2). Env-overridable. ──
+# REORDER (mask->contrastive->forecast): warm from the contrastive-from-mask regime checkpoint,
+#   FREEZE early blocks (=3) so forecast learns ON TOP of the regime instead of erasing it, and
+#   write a DISTINCT file so the shipped seq2seq stays put. Copy-and-run as-is for step 2.
+# Old default lineage (mask->forecast) if ever needed:
+#   WARM_CKPT=.../mantis_ssl_ohlcv.pt OUT_PATH=.../mantis_ssl_seq2seq.pt FREEZE_ENCODER_LAYERS=0
 DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
-WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt')
-OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt')
+WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt')
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq_reordered.pt')
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
@@ -98,9 +93,10 @@ SEED = 0
 
 # ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
 RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery)
-# sweep winner for the DEFAULT lineage = frz=0 (full fine-tune). For the REORDER's forecast-last
-# step, set FREEZE_ENCODER_LAYERS=3 to protect the regime the contrastive stage just built.
-FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '0'))
+# DEFAULT = 3 for the REORDER's forecast-last step: freeze the first 3 (of 6) blocks so forecast
+# learns on top of the regime instead of erasing it. Set FREEZE_ENCODER_LAYERS=0 for the old
+# default lineage (mask->forecast full fine-tune, the original sweep winner).
+FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '3'))
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -120,7 +116,9 @@ print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm-start <
 print(f'   SWEEP-WINNER: obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
       f'wd={WEIGHT_DECAY} BATCH={BATCH} (parity w/ sweep) EPOCHS={EPOCHS}')
 print(f'   horizons={HORIZONS} context_lengths={CONTEXT_LENGTHS}')
-print(f'   OUTPUT -> {OUT_PATH}')
+_live = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'
+_safe = '   (live mantis_ssl_seq2seq.pt UNTOUCHED)' if os.path.abspath(OUT_PATH) != os.path.abspath(_live) else '   ⚠️ WRITES THE LIVE seq2seq'
+print(f'   OUTPUT -> {OUT_PATH}{_safe}')
 
 
 # ======================================= CELL 3 — TRAIN (single run, no Optuna) ================
