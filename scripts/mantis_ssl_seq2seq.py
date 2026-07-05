@@ -59,9 +59,15 @@ import os, torch
 # 50.3% on pre-2026 val) just found its config. The SHIP GATE is the repo checkpoint + BASE_BACKBONE_CKPT
 # pointer: only commit this over checkpoints/mantis_ssl_seq2seq.pt AFTER it beats the current base on
 # the one-shot 2026. (The old Drive copy is overwritten, but the current base stays in the repo until then.)
-DATA_DIR  = '/content/drive/MyDrive/Futures Data'
-WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt'       # stage-1 encoder (warm-start)
-OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'     # stage-2 seq2seq encoder
+# ENV-OVERRIDABLE so this script serves BOTH the default stage-2 AND the REORDER's forecast-last step:
+#   DEFAULT (mask->forecast): warm from stage-1 mask -> mantis_ssl_seq2seq.pt
+#   REORDER (mask->contrastive->forecast) STEP 2: warm from the contrastive-from-mask checkpoint,
+#     FREEZE early blocks so forecast can't erase the regime, write a DISTINCT file:
+#     WARM_CKPT=.../mantis_ssl_regime_from_mask.pt  OUT_PATH=.../mantis_ssl_seq2seq_reordered.pt \
+#       FREEZE_ENCODER_LAYERS=3  python3 scripts/mantis_ssl_seq2seq.py
+DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
+WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_ohlcv.pt')
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt')
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
@@ -92,7 +98,9 @@ SEED = 0
 
 # ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
 RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery)
-FREEZE_ENCODER_LAYERS = 0   # sweep winner: frz=0 (full fine-tune) beat every frozen config
+# sweep winner for the DEFAULT lineage = frz=0 (full fine-tune). For the REORDER's forecast-last
+# step, set FREEZE_ENCODER_LAYERS=3 to protect the regime the contrastive stage just built.
+FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '0'))
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -100,11 +108,21 @@ if device.type != 'cuda':
     print('⚠️  No CUDA — SSL is designed for a Colab GPU runtime (Runtime > Change runtime type > GPU).')
 
 # ── PRE-FLIGHT ──
+# GUARD: a REORDER run (warm-starting from a regime/contrastive checkpoint) must write a DISTINCT
+# file — never overwrite the shipped seq2seq or stage-1. A default stage-2 run (warm from ohlcv)
+# writing seq2seq.pt is the intended path and allowed.
+_reorder = 'regime' in os.path.basename(WARM_CKPT) or 'contrastive' in os.path.basename(WARM_CKPT)
+if _reorder and os.path.basename(OUT_PATH) in {'mantis_ssl_seq2seq.pt', 'mantis_ssl_ohlcv.pt'}:
+    raise SystemExit(f'❌ REORDER run (warm={os.path.basename(WARM_CKPT)}) must NOT overwrite '
+                     f'{os.path.basename(OUT_PATH)} — set OUT_PATH to a distinct file '
+                     f'(e.g. mantis_ssl_seq2seq_reordered.pt).')
+if os.path.abspath(OUT_PATH) == os.path.abspath(WARM_CKPT):
+    raise SystemExit('❌ OUT_PATH == WARM_CKPT — would overwrite the warm-start.')
 if not os.path.isdir(DATA_DIR):
     raise FileNotFoundError(f'DATA_DIR does not exist:\n  {DATA_DIR}')
 if not os.path.exists(WARM_CKPT):
-    raise FileNotFoundError(f'WARM_CKPT (stage-1 encoder) not found:\n  {WARM_CKPT}\n'
-                            f'Run scripts/mantis_ssl_pretrain.py first.')
+    raise FileNotFoundError(f'WARM_CKPT not found:\n  {WARM_CKPT}\n'
+                            f'Run the prior stage first (stage-1 mask, or contrastive-from-mask).')
 found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
          if os.path.exists(os.path.join(DATA_DIR, f'{tk}_{tf}.csv'))]
 if not found:

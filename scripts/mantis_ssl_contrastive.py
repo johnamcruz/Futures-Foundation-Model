@@ -57,10 +57,14 @@ except ImportError as e:
 # ======================================= CELL 2 — CONFIG + pre-flight ==========================
 import os, torch
 
-# ── PATHS (Drive) ──
-DATA_DIR  = '/content/drive/MyDrive/Futures Data'
-WARM_CKPT = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'    # stage-2 (warm-start)
-OUT_PATH  = '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt'     # stage-3 CANDIDATE (NEW file)
+# ── PATHS (Drive) — ENV-OVERRIDABLE so this one script runs either lineage ──
+#   DEFAULT (mask->forecast->contrastive): warm from seq2seq -> mantis_ssl_regime.pt
+#   REORDER (mask->contrastive->forecast) STEP 1: warm from stage-1 MASK, distinct out:
+#     WARM_CKPT=.../mantis_ssl_ohlcv.pt  OUT_PATH=.../mantis_ssl_regime_from_mask.pt  python3 scripts/mantis_ssl_contrastive.py
+#   then STEP 2 = scripts/mantis_ssl_seq2seq.py with WARM_CKPT=that out + FREEZE_ENCODER_LAYERS=3.
+DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
+WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt')
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt')
 
 # ── CORPUS (same universe as stage 1/2 — the ruler must not drift) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']
@@ -76,7 +80,7 @@ TEMPERATURE = 0.1
 AUG_NOISE, AUG_SCALE, AUG_TMASK, CROP_MAX = 0.10, 0.20, 0.15, 0.2
 VOL_WEIGHT  = 1.0                     # σ_t down-weighting strength (0 = off)
 NEW_CHANNELS, PROJ_DIM = 8, 128
-FREEZE_ENCODER_LAYERS  = 0            # bump to 4 if the geometry forms but drifts off seq2seq
+FREEZE_ENCODER_LAYERS  = int(os.environ.get('FREEZE_ENCODER_LAYERS', '0'))   # 0 for reorder step 1
 
 # ── TRAINING ──
 BATCH   = 256                         # 5 windows/anchor stacked -> 1280 encoder rows/step
