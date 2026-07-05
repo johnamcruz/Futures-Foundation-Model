@@ -28,6 +28,8 @@
 
 # ======================================= CELL 1 — SETUP (clone FFM @ main, install) ===========
 import os, subprocess
+# Reduce CUDA fragmentation OOM (must be set BEFORE torch inits CUDA -> after a runtime restart).
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 os.chdir('/content')
 
 from google.colab import drive
