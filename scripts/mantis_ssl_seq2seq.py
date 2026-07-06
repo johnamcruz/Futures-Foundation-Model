@@ -67,7 +67,7 @@ WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
 # freeze-2-vs-3 A/B: this tuned freeze=2 winner vs the anchor freeze=3, both vs seq2seq.
-OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq_reorder_tuned.pt')
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt')
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
