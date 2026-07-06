@@ -1,4 +1,11 @@
-"""OOF-stacked shape-adapter feature for the selection pipeline.
+"""
+    DEPRECATED (2026-07-06) — DERIVED MODEL FEATURE. FFM is a pure SELF-SUPERVISED representation
+    model and no longer provides its own hand-crafted model features; the learned embedding replaces
+    them (no-handcraft Pivot 2 beat handcraft Pivot 1 live +10%). KEPT for now so the live model
+    stays reproducible — slated for removal once Pivot 2 is promoted. Shared TRIGGER PRIMITIVES (ATR,
+    pivots, gate, barriers, sessions) are NOT affected and stay. Do NOT build new model features on
+    this path; a strategy that needs a specific feature hand-crafts its own.
+OOF-stacked shape-adapter feature for the selection pipeline.
 
 Turns the ShapeAwareAdapter (which learns the DEVELOPMENT of per-bar features over
 time) into a leak-safe, overfit-guarded FEATURE the pipeline can fuse with the
