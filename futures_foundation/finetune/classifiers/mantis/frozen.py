@@ -113,15 +113,20 @@ def _load_bar_cache(path):
         return None, None
     try:
         d = np.load(path)
-        return d['idx'], d['emb']
+        return d['idx'], np.asarray(d['emb'], np.float32)   # fp16 caches upcast on load
     except Exception:
         return None, None
 
 
 def _save_bar_cache(path, idx, emb):
+    # EMBED_CACHE_FP16=1 halves the on-disk cache (multi-TF gate-off ~61GB -> ~31GB on Drive).
+    # Precision-safe for this consumer: embeddings are ~O(1) values that get train-stat
+    # standardized before the head, and fp16 keeps ~3 significant digits (the same contract the
+    # Chronos fp16 embeds validated). Loads always upcast to fp32 — downstream sees fp32 either way.
+    dt = np.float16 if os.environ.get('EMBED_CACHE_FP16', '0') == '1' else np.float32
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f"{path.stem}.{os.getpid()}.tmp.npz"      # atomic write
-    np.savez(tmp, idx=np.asarray(idx, np.int64), emb=np.asarray(emb, np.float32))
+    np.savez(tmp, idx=np.asarray(idx, np.int64), emb=np.asarray(emb, dt))
     os.replace(tmp, path)
 
 

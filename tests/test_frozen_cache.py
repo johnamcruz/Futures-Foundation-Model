@@ -44,6 +44,19 @@ def test_bar_cache_roundtrip(tmp_path):
     assert list(ci) == [3, 7, 9] and np.allclose(ce, emb)
 
 
+def test_bar_cache_fp16_halves_disk_and_upcasts(tmp_path, monkeypatch):
+    # EMBED_CACHE_FP16=1 stores half-size embeds; loads ALWAYS return fp32 (downstream unchanged)
+    idx = np.arange(1000, dtype=np.int64)
+    emb = np.random.default_rng(0).standard_normal((1000, 256)).astype(np.float32)
+    p32 = tmp_path / 'e32.npz'; _save_bar_cache(p32, idx, emb)
+    monkeypatch.setenv('EMBED_CACHE_FP16', '1')
+    p16 = tmp_path / 'e16.npz'; _save_bar_cache(p16, idx, emb)
+    assert p16.stat().st_size < 0.6 * p32.stat().st_size    # ~half on disk
+    _, ce = _load_bar_cache(p16)
+    assert ce.dtype == np.float32                            # upcast on load
+    assert np.abs(ce - emb).max() < 0.01                     # ~O(1) embeds keep 3 sig digits
+
+
 def test_bar_cache_subset_reuse_and_partial(tmp_path, monkeypatch):
     monkeypatch.setenv('EMBED_CACHE_DIR', str(tmp_path))
     monkeypatch.setenv('EMBED_CACHE', '1')
