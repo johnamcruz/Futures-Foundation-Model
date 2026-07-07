@@ -71,10 +71,10 @@ import os, torch
 # Old default lineage (mask->forecast) if ever needed:
 #   WARM_CKPT=.../mantis_ssl_ohlcv.pt OUT_PATH=.../mantis_ssl_seq2seq.pt FREEZE_ENCODER_LAYERS=0
 DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
-# WARM_CKPT resolved AFTER EXTEND_FROM (below): in extension mode it defaults to EXTEND_FROM (the
-# base = ctr_seq2seq) so build_net ALSO warm-starts from the base, not regime; fresh mode -> regime.
-WARM_CKPT = os.environ.get('WARM_CKPT', '')
-_WARM_DEFAULT = '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt'   # fresh stage-2 reorder warm
+# WARM_CKPT = the base we warm-start the encoder from. DEFAULT = ctr_seq2seq (the validated base).
+# Simple: point it at the checkpoint, done. (EXTEND_FROM below is an OPT-IN disconnect-resume mode
+# for long runs — off by default; a plain run just warm-starts from WARM_CKPT.)
+WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt')
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
 # freeze-2-vs-3 A/B: this tuned freeze=2 winner vs the anchor freeze=3, both vs seq2seq.
@@ -164,20 +164,12 @@ RESUME  = os.environ.get('RESUME', '0') == '1'   # resume from the best saved to
 # default lineage (mask->forecast full fine-tune, the original sweep winner).
 FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))   # trial 3 = freeze=2
 
-# ── RoBERTa EXTENSION MODE — "was the base undertrained?" ──
-# EXTEND_FROM=<promoted base .pt> continues that checkpoint's OWN training (same recipe) with a
-# bigger epoch budget, into a DISTINCT OUT_PATH (the extended model is a NEW CANDIDATE — it must
-# win the 2025 dry-run like everything else; the promoted base is never overwritten):
-#   EXTEND_FROM=/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt \
-#   OUT_PATH=/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq_ext.pt  EPOCHS=120
-# NOTE: on resume the epoch counter restarts at 0, so EPOCHS = ADDITIONAL epochs on top of the
-# base's 60 (EPOCHS=120 -> up to +120 more). patience(8) still stops early if the base was
-# ALREADY converged — that's the cheap answer to "was it undertrained".
-# Mechanics: OUT_PATH seeded with a COPY of EXTEND_FROM, RESUME forced on -> trainer loads it.
-# DEFAULT = the extension run (copy-paste-and-run). Set EXTEND_FROM='' to run the original
-# stage-2 recipe from WARM_CKPT instead.
-EXTEND_FROM = os.environ.get('EXTEND_FROM',
-                             '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt')
+# ── OPT-IN disconnect-resume (OFF by default) ──
+# A plain run just warm-starts the encoder from WARM_CKPT (= ctr_seq2seq) — simple, no copy dance.
+# EXTEND_FROM is ONLY for crash-resilience on long runs: it seeds OUT_PATH with a copy of the base
+# and forces RESUME=True, so a dropped Colab run CONTINUES from OUT_PATH instead of restarting. Same
+# trained model either way; set EXTEND_FROM=<base .pt> only if you want auto-resume.
+EXTEND_FROM = os.environ.get('EXTEND_FROM', '')
 if EXTEND_FROM:
     import shutil
     if not os.path.exists(EXTEND_FROM):
@@ -190,9 +182,6 @@ if EXTEND_FROM:
     else:
         print(f'[extend] OUT_PATH exists — resuming the extension already in progress')
     RESUME = True
-# Resolve WARM_CKPT default now that EXTEND_FROM is known: extension -> the base (ctr_seq2seq) so the
-# build_net warm-start matches the resume base; fresh run (EXTEND_FROM='') -> the regime reorder warm.
-WARM_CKPT = WARM_CKPT or EXTEND_FROM or _WARM_DEFAULT
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
