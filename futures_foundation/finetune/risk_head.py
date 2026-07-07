@@ -18,6 +18,29 @@ from .calibration import fit_platt, apply_platt
 TARGETS = (2.0, 3.0, 4.0, 6.0, 8.0)      # reach ladder (8R = max trend); matches the pivot FIXED_TARGETS
 
 
+def _fit_heartbeat(clf, X, y, msg, every=60):
+    """clf.fit with a liveness heartbeat — the ladder fits 5 rungs, each a silent sklearn solver on
+    millions of rows at produce scale; without this the whole REAL fit reads as HUNG. A daemon thread
+    prints elapsed time every `every`s while fit() runs; fits under `every`s stay quiet (no WF spam)."""
+    import threading
+    import time
+    t0 = time.time()
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(every):
+            print(f"    [risk-head] {msg} ... {time.time() - t0:,.0f}s elapsed (alive)", flush=True)
+
+    th = threading.Thread(target=_beat, daemon=True)
+    th.start()
+    try:
+        clf.fit(X, y)
+    finally:
+        stop.set()
+        th.join(timeout=1)
+    return clf
+
+
 def reach_labels(keys, targets=TARGETS):
     """Per-threshold binary reach label from strategy keys: 1 if the trade reached >= Xr
     before the -1R stop (realized-at-target > 0), else 0. Shape [N, len(targets)]."""
@@ -94,7 +117,9 @@ class RiskHead:
             if len(np.unique(ytr)) < 2:                 # degenerate threshold -> constant head
                 self._heads.append((None, float(ytr.mean())))
                 continue
-            clf.fit(Xtr, ytr)
+            _fit_heartbeat(clf, Xtr, ytr,               # liveness on the long produce-scale rung fits
+                           f"rung {ti + 1}/{len(self.targets)} (>={self.targets[ti]:g}R) "
+                           f"on {len(Xtr):,}x{Xtr.shape[1]}")
             platt = None
             if self.calibrate and Xval is not None and Yval is not None:
                 raw = clf.predict_proba(Xval)[:, 1]
