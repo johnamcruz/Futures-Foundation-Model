@@ -66,10 +66,20 @@ except ImportError as e:
 # ======================================= CELL 2 — CONFIG + pre-flight ==========================
 import os, torch
 
-# ── PATHS (Drive) — warm from the PROMOTED base (the validated ctr_seq2seq lineage) ──
+# ── SPAN MODE (SpanBERT move) — 0 = original bar-ELECTRA; >0 (e.g. 4) = span-ELECTRA: corrupt
+# CONTIGUOUS multi-bar spans (geometric mean SPAN_MEAN, clipped SPAN_MAX). The generator must fake
+# a plausible MOVE and the encoder must detect the fake SPAN -> models development-over-bars.
+# Recommended span run: SPAN_MEAN=4 MASK_RATIO=0.2, WARM_CKPT = whichever base won the benchmark.
+SPAN_MEAN = float(os.environ.get('SPAN_MEAN', '0'))
+SPAN_MAX  = int(os.environ.get('SPAN_MAX', '10'))
+
+# ── PATHS (Drive) — warm from the PROMOTED base (the validated ctr_seq2seq lineage). OUT_PATH
+# auto-switches for span runs so a span experiment can NEVER clobber the bar-mode candidate. ──
 DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
 WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt')
-OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_electra.pt')
+_DEFAULT_OUT = ('/content/drive/MyDrive/AI_Models/mantis_ssl_span_electra.pt' if SPAN_MEAN > 0
+                else '/content/drive/MyDrive/AI_Models/mantis_ssl_electra.pt')
+OUT_PATH  = os.environ.get('OUT_PATH', _DEFAULT_OUT)
 
 # ── CORPUS (same universe as every stage — the ruler must not drift) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']
@@ -116,7 +126,8 @@ found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
 if not found:
     raise FileNotFoundError(f'No {{TICKER}}_{{TF}}.csv files under {DATA_DIR}.')
 print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm-start <- {WARM_CKPT}')
-print(f'   mask={MASK_RATIO} rtd_w={RTD_WEIGHT} gen_width={GEN_WIDTH} lr={LR:.1e} '
+print(f'   mode={"SPAN-electra (mean=" + str(SPAN_MEAN) + ", max=" + str(SPAN_MAX) + ")" if SPAN_MEAN > 0 else "bar-electra"} '
+      f'| mask={MASK_RATIO} rtd_w={RTD_WEIGHT} gen_width={GEN_WIDTH} lr={LR:.1e} '
       f'batch={BATCH} frz={FREEZE_ENCODER_LAYERS}')
 print(f'   OUTPUT -> {OUT_PATH}   (promoted bases UNTOUCHED)')
 
@@ -126,6 +137,7 @@ verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH, tickers=TICKERS, tfs=TFS,
     pretext='electra', backbone_ckpt=WARM_CKPT,
     seq=SEQ, mask_ratio=MASK_RATIO, rtd_weight=RTD_WEIGHT, gen_width=GEN_WIDTH,
+    span_mean=SPAN_MEAN, span_max=SPAN_MAX,
     new_channels=NEW_CHANNELS,
     batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR, weight_decay=WEIGHT_DECAY,
     patience=PATIENCE, val_frac=VAL_FRAC, holdout_start=HOLDOUT_START,
