@@ -2,6 +2,17 @@
 # MANTIS SSL STAGE 4 — ELECTRA-STYLE REPLACED-CANDLE DETECTION (RTD) (Colab GPU)
 # ==============================================================================
 #
+# ██ VERDICT (2026-07-06): bar-ELECTRA (this recipe, unanchored) FAILED the 2025 dry-run ██
+#   52.7% vs base 64.6% WR@3R @1/d (mlp) — lost at EVERY operating point despite warm-starting
+#   FROM the base. ROOT CAUSE: the ENCODER's only gradient is the RTD BCE (the recon loss trains
+#   just the GENERATOR) → pure discrimination destroyed the reconstruction lineage (emb_std
+#   1.0->2.35 drift; freeze=2 insufficient). Same lesson as the forecast_dist sweep: the
+#   reconstruction anchor is LOAD-BEARING. The pretext-level metrics (bal_acc 0.82, probe +0.032,
+#   all checks green) did NOT predict this — the probe is a ticket, never a verdict.
+#   -> DO NOT re-run this recipe as-is, and do NOT run SPAN mode unanchored (same flaw).
+#   -> A retry requires an ENCODER-SIDE JOINT loss (recon + rtd on the encoder) — not built yet.
+#   2026 one-shot NOT spent. ctr_seq2seq remains the base. Kept for the record + future v2.
+#
 # Refines the PROMOTED base (ctr_seq2seq) with a DISCRIMINATIVE objective. A small, deliberately
 # weak conv GENERATOR fills masked bars with plausible fakes; the Mantis encoder (the foundation
 # we keep) labels EVERY bar real-vs-replaced. Every bar carries a training signal (vs ~15% for
