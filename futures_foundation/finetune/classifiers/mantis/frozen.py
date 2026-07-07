@@ -330,14 +330,35 @@ class MantisFrozenClassifier(Classifier):
         # (contract round-trip, manual cfg) can never divide by zero
         sd = None if sd is None else np.maximum(np.asarray(sd, np.float32), 1e-6).reshape(1, -1, 1)
 
-        def arr(a):
-            x = np.asarray(np.load(a, mmap_mode='r') if isinstance(a, str) else a, np.float32)
+        def arr(a, rows=None):
+            m = np.load(a, mmap_mode='r') if isinstance(a, str) else a
+            if rows is not None:                          # subsample AT the memmap (copies only the
+                m = m[rows]                               # selected rows — never materializes full X)
+            x = np.asarray(m, np.float32)
             if mu is not None:
                 x = x - mu                                # new array (x may be a read-only mmap)
                 x /= sd
             return x.reshape(len(x), -1)                  # [N, emb_dim, 1] -> [N, emb_dim]
-        Xtr, Xval, Xeval = arr(Xtr), arr(Xval), arr(Xeval)
-        ytr = np.asarray(ytr).astype(int); yval = np.asarray(yval).astype(int)
+
+        # RAM GUARD (produce scale): cap the head's TRAINING rows. sklearn's early_stopping makes an
+        # internal train_test_split COPY of X, so peak RAM ~ 2x the train matrix — at the multi-TF
+        # gate-off scale (~4.7M x 2560 fp32 ~ 48GB) that exceeds the box. max_fit_rows subsamples the
+        # train rows (seeded, sorted -> deterministic) BEFORE the memmap materializes; val/eval stay
+        # FULL (scoring/calibration/OOS are never subsampled). None/0 = off.
+        cap = int(self.cfg.get('max_fit_rows') or 0)
+        n_tr = len(np.load(Xtr, mmap_mode='r')) if isinstance(Xtr, str) else len(Xtr)
+        rows = None
+        if cap and n_tr > cap:
+            rows = np.sort(np.random.default_rng(seed).choice(n_tr, cap, replace=False))
+            print(f"    [head] max_fit_rows: training on {cap:,}/{n_tr:,} rows "
+                  f"(seeded subsample; val/eval full)", flush=True)
+        ytr = np.asarray(ytr).astype(int)
+        if rows is not None:
+            ytr = ytr[rows]
+            if keys_tr is not None:
+                keys_tr = [keys_tr[i] for i in rows]
+        Xtr, Xval, Xeval = arr(Xtr, rows), arr(Xval), arr(Xeval)
+        yval = np.asarray(yval).astype(int)
         if len(np.unique(ytr)) < 2:
             return np.full(len(Xval), .5), np.full(len(Xeval), .5), 0.5
         # DISTRIBUTIONAL reach-ladder head (rank='expected_reach'): instead of one P(3R) head,

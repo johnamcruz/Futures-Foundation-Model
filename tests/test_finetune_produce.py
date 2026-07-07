@@ -125,6 +125,27 @@ def test_ladder_signal_contract_shape(tmp_path):
     assert c['calibration']['baked_into_onnx'] is True
 
 
+def test_contract_window_recipe_for_multi_tf(tmp_path):
+    # a labeler that declares MV_AGG=(1,5) gets an explicit window_recipe in signal.json (how the
+    # bot builds the [10, seq] input); single-TF labelers get None (backward-compatible).
+    import json
+    out = dict(oos_auc=0.6, oos_meanR=0.5, shuffle_meanR=None, edge_shuffle=None,
+               oos_trades=10, n_train=100, n_oos=50, platt=None)
+    lab = SyntheticLabeler(n_bars=200)
+    lab.MV_AGG, lab.MV_SEQ, lab.MV_MODE = (1, 5), 64, 'ohlcv_agg1-5'
+    produce._emit(out, 'mantis_frozen', {'head': 'mlp'}, lab, None, None, 10, 64,
+                  None, ['ES'], ['3min'], '2026-01-01', True, str(tmp_path / 'm'), verbose=False)
+    c = json.loads((tmp_path / 'm_signal.json').read_text())
+    r = c['window_recipe']
+    assert r['factors'] == [1, 5] and r['mv_seq'] == 64
+    assert 'O=first' in r['aggregation'] and 'anchored' in r['aggregation']
+    # single-TF -> no recipe (bot keeps feeding the plain [5, seq] window)
+    lab2 = SyntheticLabeler(n_bars=200)
+    produce._emit(dict(out), 'mantis_frozen', {'head': 'mlp'}, lab2, None, None, 5, 64,
+                  None, ['ES'], ['3min'], '2026-01-01', True, str(tmp_path / 'm2'), verbose=False)
+    assert json.loads((tmp_path / 'm2_signal.json').read_text())['window_recipe'] is None
+
+
 def test_train_final_writes_signal_contract(tmp_path):
     import json
     lab = SyntheticLabeler(n_bars=1600, seed=0)

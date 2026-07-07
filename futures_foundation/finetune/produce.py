@@ -135,10 +135,22 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
     sha = (hashlib.sha256(b''.join(Path(p).read_bytes() for p in bundle)).hexdigest()
            if bundle else None)
     dist = (ck or {}).get('rank') == 'expected_reach'     # reach-LADDER head (p_3r entry signal)
+    mv_agg = tuple(getattr(eval_lab, 'MV_AGG', ()) or ())  # multi-TF factors the labeler declares
     contract = {
         'contract_version': '1.0', 'role': 'signal', 'classifier': classifier,
         'input': {'channels': int(C), 'seq_len': int(seq),
                   'mv_mode': getattr(eval_lab, 'MV_MODE', None)},
+        # MULTI-TF WINDOW RECIPE — how the bot must BUILD the encoder input. For each factor f the
+        # window is the last MV_SEQ*f bars ENDING at the signal bar, each consecutive f-bar block
+        # aggregated to one candle (O=first, H=max, L=min, C=last, V=sum — anchored at the signal
+        # bar, NOT clock-aligned), stacked on the channel axis in factor order. factors=[1] or
+        # absent = the plain single-TF window (backward-compatible).
+        'window_recipe': ({'factors': [int(f) for f in mv_agg],
+                           'mv_seq': int(getattr(eval_lab, 'MV_SEQ', seq) or seq),
+                           'aggregation': 'O=first H=max L=min C=last V=sum; anchored at signal bar',
+                           'channel_order': 'per factor: [O,H,L,C,V], factors ascending',
+                           'ref': 'futures_foundation.primitives.multi_scale_ohlcv_window'}
+                          if mv_agg and tuple(mv_agg) != (1,) else None),
         'channel_names': channel_names,
         'standardize': ({'mu': np.asarray(mu).tolist(), 'sd': np.asarray(sd).tolist()}
                         if mu is not None else None),

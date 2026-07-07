@@ -86,6 +86,23 @@ def test_shuffle_keys_degrades_ranking():
         assert roc_auc_score(yev, p_real) > roc_auc_score(yev, p_shuf) + 0.05
 
 
+def test_max_fit_rows_caps_training_not_scoring(tmp_path):
+    # RAM guard: max_fit_rows subsamples the TRAIN rows (memmap path included) while val/eval are
+    # scored in FULL — output shapes match the full eval sets and the head still learns.
+    from sklearn.metrics import roc_auc_score
+    Xtr, ytr, ktr = _data(3000, seed=30)
+    Xev, yev, kev = _data(800, seed=31)
+    p_tr = str(tmp_path / 'xtr.npy'); np.save(p_tr, Xtr)     # memmap path (the produce shape)
+    clf = _clf(max_fit_rows=1000)
+    p_val, p_ev, auc = clf.fit_predict(p_tr, ytr, Xev, yev, Xev, seed=0)
+    assert p_val.shape == (800,) and p_ev.shape == (800,)    # full eval scoring
+    if len(np.unique(yev)) == 2:
+        assert roc_auc_score(yev, p_ev) > 0.6                # still learns on the 1k subsample
+    # cap off (0/None) -> full training, unchanged behavior
+    base = _clf(max_fit_rows=0).fit_predict(Xtr, ytr, Xev, yev, Xev, seed=0)
+    assert base[0].shape == (800,)
+
+
 def test_keys_backcompat_single_head_unchanged():
     # without rank=, passing keys_tr must NOT change the single-head result at all (ignored)
     Xtr, ytr, ktr = _data(900, seed=8)
