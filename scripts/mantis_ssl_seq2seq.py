@@ -78,10 +78,10 @@ WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
 # freeze-2-vs-3 A/B: this tuned freeze=2 winner vs the anchor freeze=3, both vs seq2seq.
-# DEFAULT OUT = the LONG-HORIZON extension file (plain run = warm-start ctr_seq2seq + reach to 75).
-# DISTINCT from the short-horizon ext (ctr_seq2seq_ext.pt) so this can't resume/overwrite it. For the
-# short-horizon RoBERTa ext set OUT_PATH=...ctr_seq2seq_ext.pt HORIZONS=5,10,20,25 .
-OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_lh75_seq2seq.pt')
+# DEFAULT OUT = the forecast_dist LONG-HORIZON file (plain run = the NEXT experiment: distributional
+# teacher, warm from ctr_seq2seq, reach to 75). The candle_mse long-horizon (lh75) is already trained;
+# for it set PRETEXT=forecast OUT_PATH=...mantis_ssl_lh75_seq2seq.pt .
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_fdist_lh.pt')
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
@@ -125,7 +125,7 @@ DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 (~0.3) for c
 # mse_weight KEEPS the reconstruction anchor (default 1.0 -> NO drift, unlike ELECTRA). Recipe:
 #   PRETEXT=forecast_dist OBJECTIVE=candle_quantile QUANTILE_TAUS=bolt9 HORIZONS=10,25,50,75 \
 #   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_fdist_lh.pt EPOCHS=120
-PRETEXT       = os.environ.get('PRETEXT', 'forecast')
+PRETEXT       = os.environ.get('PRETEXT', 'forecast_dist')    # DEFAULT = the distributional teacher run
 MSE_WEIGHT    = float(os.environ.get('MSE_WEIGHT', '1.0'))     # forecast_dist reconstruction ANCHOR (keep!)
 QUANTILE_TAUS = os.environ.get('QUANTILE_TAUS', 'bolt9')       # candle_quantile: 'lohi'(2) | 'bolt9'(9)
 BINS_K        = int(os.environ.get('BINS_K', '41'))            # candle_bins resolution
