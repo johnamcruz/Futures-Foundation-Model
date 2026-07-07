@@ -129,6 +129,15 @@ PRETEXT       = os.environ.get('PRETEXT', 'forecast')
 MSE_WEIGHT    = float(os.environ.get('MSE_WEIGHT', '1.0'))     # forecast_dist reconstruction ANCHOR (keep!)
 QUANTILE_TAUS = os.environ.get('QUANTILE_TAUS', 'bolt9')       # candle_quantile: 'lohi'(2) | 'bolt9'(9)
 BINS_K        = int(os.environ.get('BINS_K', '41'))            # candle_bins resolution
+# ── forecast_dist config = WHAT THE SCAN TAUGHT US, not guesses ──
+# The forecast_dist Optuna scan came back FLAT at short horizons (redundant with stage-2), so it never
+# crowned a winner. What it DID establish: (1) the base hyperparams are the forecast sweep-winner (trial
+# 3: lr 1.19e-4 / nc3 / frz2 / wd0 — already the defaults above), and (2) the reconstruction ANCHOR is
+# load-bearing — the scan's mse_weight=0 arm is the drift trap ([[electra]] lesson). So we KEEP
+# mse_weight=1.0 and the spread-carrying head (candle_quantile / bolt9 — 'spread SHAPE is the signal').
+# The NEW variable the scan never tried = LONG horizons; that's the actual bet.
+if PRETEXT == 'forecast_dist' and OBJECTIVE == 'candle_mse':  # forecast default -> dist default
+    OBJECTIVE = 'candle_quantile'                             # Bolt pinball (spread shape = the signal)
 
 # ── TRAINING (sweep-winner; BATCH MATCHES THE SWEEP so the tuned LR transfers) ──
 BATCH   = 512         # PARITY with the sweep (lr was tuned at 512; 1024 would need a different lr)
