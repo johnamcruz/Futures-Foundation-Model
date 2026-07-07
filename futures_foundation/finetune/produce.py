@@ -43,9 +43,11 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     rows = []
     for r in rates:
         n = int(min(len(proba), max(1, round(r * days))))
-        Rs = R_all[order[:n]]
+        sel = order[:n]
+        Rs = R_all[sel]
         rows.append(dict(rate=r, n=n, days=days, wr3R=float((Rs > 0).mean()),
-                         meanR=float(Rs.mean())))
+                         meanR=float(Rs.mean()),
+                         thresh=float(proba[sel[-1]])))     # the score cutoff -> 'enter if score>=thresh'
     return rows
 
 
@@ -82,11 +84,11 @@ def _print_operating_points(op_rows, band_rows, title='2026 OOS'):
             print(f"    {b['band']:>7} {b['n']:>6} {b['per_day']:>11.2f} "
                   f"{b['wr3R']:>8.1%} {b['meanR']:>+8.3f}", flush=True)
     if op_rows:
-        print(f"  {title} — CUMULATIVE operating points (take top N/day, {op_rows[0]['days']} OOS days):",
-              flush=True)
+        print(f"  {title} — CUMULATIVE operating points (enter if score>=thresh, {op_rows[0]['days']} "
+              "OOS days):", flush=True)
         for r in op_rows:
-            print(f"    ~{r['rate']}/day: n={r['n']:>5}  WR@3R={r['wr3R']:6.1%}  "
-                  f"meanR={r['meanR']:+.3f}", flush=True)
+            print(f"    ~{r['rate']}/day: n={r['n']:>5}  score>={r.get('thresh', float('nan')):.3f}  "
+                  f"WR@3R={r['wr3R']:6.1%}  meanR={r['meanR']:+.3f}", flush=True)
 
 
 def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
@@ -159,11 +161,17 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
             'head_type': 'reach_ladder',
             'reach_targets': list(ck.get('reach_targets', [])),
             'head_outputs': ['p_3r', 'expected_reach'],
-            'entry_signal': 'p_3r',
-            'proba_meaning': 'p_3r = P(reach>=3R before stop), Platt-CALIBRATED (baked into onnx); '
-                             'expected_reach = E[peak favorable R] (area under survival) = ranking',
+            # DEPLOY: the ENTRY signal is expected_reach (what the WF/produce validated -> the 80%
+            # WR@3R tiers). The bot ENTERS when expected_reach >= T; entry_thresholds gives ready T's
+            # per quality tier (val-derived, leak-free). p_3r is exported too (calibrated P(>=3R)) but
+            # is NOT the validated entry signal — it's ~ the single-head proba.
+            'entry_signal': 'expected_reach',
+            'entry_rule': 'enter if expected_reach >= entry_thresholds[tier]',
+            'entry_thresholds': out.get('entry_thresholds'),
+            'proba_meaning': 'expected_reach = E[peak favorable R] (area under the calibrated '
+                             'survival curve) = the ENTRY ranking score; p_3r = calibrated P(reach>=3R)',
             'calibration': {'method': 'platt', 'baked_into_onnx': True,
-                            'note': 'per-rung Platt applied inside signal_head.onnx; read p_3r as-is'},
+                            'note': 'per-rung Platt baked into signal_head.onnx; read outputs as-is'},
             'output_fn': 'signal_head.onnx -> {p_3r, expected_reach}',
         })
     else:
@@ -237,6 +245,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, operating_points=ops,
+               entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None))       # Platt (A,B) -> deploy contract
     if verbose:
         _print_operating_points(ops, bands)

@@ -355,6 +355,13 @@ class MantisFrozenClassifier(Classifier):
                 _export_ladder_bundle(self.cfg, rh, targets, Xtr.shape[1], Xval[:2048])
             p_val = rh.predict_stats(Xval)['exp_reach']
             p_eval = rh.predict_stats(Xeval)['exp_reach']
+            # DEPLOY THRESHOLDS: expected_reach cutoffs at quality tiers, from the VAL distribution
+            # (leak-free — val is held out of train and is NOT the 2026 holdout). The bot enters when
+            # expected_reach >= T; these are honest, ready-to-use T's (the 2026 table just confirms
+            # the WR each tier delivers). Tightest tiers ~ the A+ 1-2/day zone.
+            _tiers = {'top0.05pct': 0.9995, 'top0.1pct': 0.999, 'top0.5pct': 0.995,
+                      'top1pct': 0.99, 'top5pct': 0.95, 'top10pct': 0.90}
+            self._entry_thresholds = {k: float(np.quantile(p_val, q)) for k, q in _tiers.items()}
             auc = roc_auc_score(yval, p_val) if len(np.unique(yval)) == 2 else 0.5
             return p_val, p_eval, float(auc)
         if self.cfg.get('head', 'logistic') == 'mlp':
