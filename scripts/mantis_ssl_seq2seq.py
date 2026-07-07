@@ -103,12 +103,32 @@ CONTEXT_LENGTHS = _int_tuple('CONTEXT_LENGTHS', (100, 150, 200, 200))  # longer 
 #   HORIZONS=10,25,50,75 CONTEXT_LENGTHS=100,150,200,200 \
 #   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_lh75_seq2seq.pt EPOCHS=120
 # Judge on the 2025 dry-run vs ctr_seq2seq + the trend_eff/range_expand probes; one-shot 2026 if it wins.
+#
+# ── DIRECTION TEACHER (fakeout vs trend) — the CONTINUE-vs-REVERSE run ──────────────────────────
+# The pivot's weakness is direction×regime: fading a move that KEEPS GOING (real trend) vs one that
+# REVERSES (fakeout). candle_mse at h50/h75 is noisy (the exact far candle is ~random); but the SIGN
+# of the far move IS learnable and IS the fakeout-vs-trend signal. candle_direction adds BCE on
+# sign(fwd close move) at each horizon -> at h50/h75 that BCE literally teaches "does this continue or
+# reverse over the next 50-75 bars." Causal (past-only), in the forecast family (not a new objective).
+#   OBJECTIVE=candle_direction DIR_WEIGHT=0.3 HORIZONS=10,25,50,75 CONTEXT_LENGTHS=100,150,200,200 \
+#   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_lhdir_seq2seq.pt EPOCHS=120
+# Then feed it downstream with more context: pivot MV_SEQ=128|200 on this backbone; the TEST is
+# WR@3R AMONG counter-trend entries. (Run the plain long-horizon candle_mse FIRST as the baseline.)
 # DEFAULTS = the REORDER-sweep winner (trial 3): candle_mse / nc=3 / wd=0 / freeze=2 / lr=1.19e-4.
-# All env-overridable so any sweep config can be full-trained without editing (e.g. OBJECTIVE=
-# candle_direction DIR_WEIGHT=0.29 for trial 5; NEW_CHANNELS=4 LR=1.1e-4 for trial 6).
-OBJECTIVE       = os.environ.get('OBJECTIVE', 'candle_mse')
+OBJECTIVE       = os.environ.get('OBJECTIVE', 'candle_mse')    # candle_direction = direction teacher;
+#                                             forecast_dist objectives: candle_quantile | candle_bins
 NEW_CHANNELS    = int(os.environ.get('NEW_CHANNELS', '3'))
-DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 only for candle_direction
+DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 (~0.3) for candle_direction
+# ── PRETEXT: 'forecast' (candle_mse/direction) | 'forecast_dist' (DISTRIBUTIONAL — the richer
+# fakeout-vs-trend teacher). forecast_dist predicts the DISTRIBUTION of the far candle (quantile/bins)
+# -> at h50/h75 where the point forecast is noise, the distribution's SHAPE carries continue-vs-reverse.
+# mse_weight KEEPS the reconstruction anchor (default 1.0 -> NO drift, unlike ELECTRA). Recipe:
+#   PRETEXT=forecast_dist OBJECTIVE=candle_quantile QUANTILE_TAUS=bolt9 HORIZONS=10,25,50,75 \
+#   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_fdist_lh.pt EPOCHS=120
+PRETEXT       = os.environ.get('PRETEXT', 'forecast')
+MSE_WEIGHT    = float(os.environ.get('MSE_WEIGHT', '1.0'))     # forecast_dist reconstruction ANCHOR (keep!)
+QUANTILE_TAUS = os.environ.get('QUANTILE_TAUS', 'bolt9')       # candle_quantile: 'lohi'(2) | 'bolt9'(9)
+BINS_K        = int(os.environ.get('BINS_K', '41'))            # candle_bins resolution
 
 # ── TRAINING (sweep-winner; BATCH MATCHES THE SWEEP so the tuned LR transfers) ──
 BATCH   = 512         # PARITY with the sweep (lr was tuned at 512; 1024 would need a different lr)
@@ -186,8 +206,10 @@ print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | '
       f'BASE (continues from) <- {_base}'
       + (f'  [WARM_CKPT {os.path.basename(WARM_CKPT)} is loaded then overwritten by resume]'
          if EXTEND_FROM else ''))
-print(f'   SWEEP-WINNER: obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
-      f'wd={WEIGHT_DECAY} BATCH={BATCH} (parity w/ sweep) EPOCHS={EPOCHS}')
+print(f'   pretext={PRETEXT} obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
+      f'wd={WEIGHT_DECAY} BATCH={BATCH} EPOCHS={EPOCHS}'
+      + (f' | DIST mse_w={MSE_WEIGHT} taus={QUANTILE_TAUS} bins_k={BINS_K}'
+         if PRETEXT == 'forecast_dist' else ''))
 print(f'   horizons={HORIZONS} context_lengths={CONTEXT_LENGTHS}')
 _live = '/content/drive/MyDrive/AI_Models/mantis_ssl_seq2seq.pt'
 _safe = '   (live mantis_ssl_seq2seq.pt UNTOUCHED)' if os.path.abspath(OUT_PATH) != os.path.abspath(_live) else '   ⚠️ WRITES THE LIVE seq2seq'
@@ -197,8 +219,9 @@ print(f'   OUTPUT -> {OUT_PATH}{_safe}')
 # ======================================= CELL 3 — TRAIN (single run, no Optuna) ================
 verdict = ssl.loop_ssl(
     data_dir=DATA_DIR, out_path=OUT_PATH, tickers=TICKERS, tfs=TFS,
-    pretext='forecast', backbone_ckpt=WARM_CKPT,               # <- stage-2 forecast, warm-start stage-1
+    pretext=PRETEXT, backbone_ckpt=WARM_CKPT,                  # forecast | forecast_dist, warm-start
     horizons=HORIZONS, context_lengths=CONTEXT_LENGTHS, objective=OBJECTIVE,
+    mse_weight=MSE_WEIGHT, quantile_taus=QUANTILE_TAUS, bins_k=BINS_K,   # forecast_dist knobs (anchor)
     new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR,
     weight_decay=WEIGHT_DECAY, patience=PATIENCE, clamp=CLAMP, grad_clip=GRAD_CLIP, val_frac=VAL_FRAC,
     holdout_start=HOLDOUT_START, controls=CONTROLS, probe=PROBE,
