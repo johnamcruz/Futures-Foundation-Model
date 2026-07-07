@@ -45,6 +45,14 @@ os.chdir('/content/Futures-Foundation-Model')
 os.system('pip install -e . -q 2>&1 | tail -1')
 os.system('pip install mantis-tsfm -q 2>&1 | tail -1')
 
+# torch.utils._sympy references sympy.printing WITHOUT importing it -> stringifying a dynamic-shape
+# expr (the long-horizon windows hit torch's symbolic-shape path) crashes with "module 'sympy' has
+# no attribute 'printing'". Force the submodule import so torch can format symbolic exprs.
+try:
+    import sympy.printing  # noqa: F401
+except Exception as _e:      # pragma: no cover
+    print(f'[warn] sympy.printing preload skipped: {_e}')
+
 try:
     from futures_foundation.finetune import ssl, ssl_data
     print('FFM + SSL modules import OK')
