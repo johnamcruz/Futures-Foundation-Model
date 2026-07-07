@@ -87,7 +87,10 @@ DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 only for can
 
 # ── TRAINING (sweep-winner; BATCH MATCHES THE SWEEP so the tuned LR transfers) ──
 BATCH   = 512         # PARITY with the sweep (lr was tuned at 512; 1024 would need a different lr)
-EPOCHS  = 60          # full budget (the sweep used a short 12-epoch proxy to RANK; train to convergence)
+EPOCHS  = int(os.environ.get('EPOCHS', '60'))   # 60 = the original full budget. The 60-cap is a WALL,
+#                       not convergence (the identical harness hit it still improving) -> the RoBERTa
+#                       extension uses EPOCHS=120 (ADDITIONAL, on top of the base's 60) with
+#                       EXTEND_FROM (below); patience still governs.
 STEPS   = 200         # steps/epoch
 LR      = float(os.environ.get('LR', '0.0001188117389055629'))   # reorder-sweep winner (trial 3, ~1.19e-4)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', '0.0'))       # trial 3 (env-overridable)
@@ -100,11 +103,35 @@ PROBE = True                                    # probe vs vanilla (diagnostic, 
 SEED = 0
 
 # ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
-RESUME  = False        # True -> resume from the best saved to OUT_PATH (crash recovery)
+RESUME  = os.environ.get('RESUME', '0') == '1'   # resume from the best saved to OUT_PATH
 # DEFAULT = 3 for the REORDER's forecast-last step: freeze the first 3 (of 6) blocks so forecast
 # learns on top of the regime instead of erasing it. Set FREEZE_ENCODER_LAYERS=0 for the old
 # default lineage (mask->forecast full fine-tune, the original sweep winner).
 FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))   # trial 3 = freeze=2
+
+# ── RoBERTa EXTENSION MODE — "was the base undertrained?" ──
+# EXTEND_FROM=<promoted base .pt> continues that checkpoint's OWN training (same recipe) with a
+# bigger epoch budget, into a DISTINCT OUT_PATH (the extended model is a NEW CANDIDATE — it must
+# win the 2025 dry-run like everything else; the promoted base is never overwritten):
+#   EXTEND_FROM=/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt \
+#   OUT_PATH=/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq_ext.pt  EPOCHS=120
+# NOTE: on resume the epoch counter restarts at 0, so EPOCHS = ADDITIONAL epochs on top of the
+# base's 60 (EPOCHS=120 -> up to +120 more). patience(8) still stops early if the base was
+# ALREADY converged — that's the cheap answer to "was it undertrained".
+# Mechanics: OUT_PATH seeded with a COPY of EXTEND_FROM, RESUME forced on -> trainer loads it.
+EXTEND_FROM = os.environ.get('EXTEND_FROM', '')
+if EXTEND_FROM:
+    import shutil
+    if not os.path.exists(EXTEND_FROM):
+        raise FileNotFoundError(f'EXTEND_FROM not found: {EXTEND_FROM}')
+    if os.path.abspath(OUT_PATH) == os.path.abspath(EXTEND_FROM):
+        raise SystemExit('❌ EXTEND_FROM == OUT_PATH — the extension must write a NEW file.')
+    if not os.path.exists(OUT_PATH):
+        shutil.copy2(EXTEND_FROM, OUT_PATH)
+        print(f'[extend] seeded {OUT_PATH} <- copy of {EXTEND_FROM}')
+    else:
+        print(f'[extend] OUT_PATH exists — resuming the extension already in progress')
+    RESUME = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
