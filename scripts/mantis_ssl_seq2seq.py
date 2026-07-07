@@ -72,8 +72,7 @@ import os, torch
 #   WARM_CKPT=.../mantis_ssl_ohlcv.pt OUT_PATH=.../mantis_ssl_seq2seq.pt FREEZE_ENCODER_LAYERS=0
 DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
 # WARM_CKPT = the base we warm-start the encoder from. DEFAULT = ctr_seq2seq (the validated base).
-# Simple: point it at the checkpoint, done. (EXTEND_FROM below is an OPT-IN disconnect-resume mode
-# for long runs — off by default; a plain run just warm-starts from WARM_CKPT.)
+# Simple: point it at the checkpoint, done.
 WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt')
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
@@ -101,7 +100,7 @@ CONTEXT_LENGTHS = _int_tuple('CONTEXT_LENGTHS', (100, 150, 200, 200))  # longer 
 # DEVELOP over the range where runners form. Keep the count at 4 (head shape matches the warm-start)
 # and 50 as the stepping-stone anchor for 75 (halfway to the trade horizon; further = too noisy).
 #   HORIZONS=10,25,50,75 CONTEXT_LENGTHS=100,150,200,200 \
-#   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_lh75_seq2seq.pt EPOCHS=120
+#   OUT_PATH=.../mantis_ssl_lh75_seq2seq.pt EPOCHS=120
 # Judge on the 2025 dry-run vs ctr_seq2seq + the trend_eff/range_expand probes; one-shot 2026 if it wins.
 #
 # ── DIRECTION TEACHER (fakeout vs trend) — the CONTINUE-vs-REVERSE run ──────────────────────────
@@ -111,7 +110,7 @@ CONTEXT_LENGTHS = _int_tuple('CONTEXT_LENGTHS', (100, 150, 200, 200))  # longer 
 # sign(fwd close move) at each horizon -> at h50/h75 that BCE literally teaches "does this continue or
 # reverse over the next 50-75 bars." Causal (past-only), in the forecast family (not a new objective).
 #   OBJECTIVE=candle_direction DIR_WEIGHT=0.3 HORIZONS=10,25,50,75 CONTEXT_LENGTHS=100,150,200,200 \
-#   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_lhdir_seq2seq.pt EPOCHS=120
+#   OUT_PATH=.../mantis_ssl_lhdir_seq2seq.pt EPOCHS=120
 # Then feed it downstream with more context: pivot MV_SEQ=128|200 on this backbone; the TEST is
 # WR@3R AMONG counter-trend entries. (Run the plain long-horizon candle_mse FIRST as the baseline.)
 # DEFAULTS = the REORDER-sweep winner (trial 3): candle_mse / nc=3 / wd=0 / freeze=2 / lr=1.19e-4.
@@ -124,7 +123,7 @@ DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 (~0.3) for c
 # -> at h50/h75 where the point forecast is noise, the distribution's SHAPE carries continue-vs-reverse.
 # mse_weight KEEPS the reconstruction anchor (default 1.0 -> NO drift, unlike ELECTRA). Recipe:
 #   PRETEXT=forecast_dist OBJECTIVE=candle_quantile QUANTILE_TAUS=bolt9 HORIZONS=10,25,50,75 \
-#   EXTEND_FROM=.../mantis_ssl_ctr_seq2seq.pt OUT_PATH=.../mantis_ssl_fdist_lh.pt EPOCHS=120
+#   OUT_PATH=.../mantis_ssl_fdist_lh.pt EPOCHS=120
 PRETEXT       = os.environ.get('PRETEXT', 'forecast_dist')    # DEFAULT = the distributional teacher run
 MSE_WEIGHT    = float(os.environ.get('MSE_WEIGHT', '1.0'))     # forecast_dist reconstruction ANCHOR (keep!)
 QUANTILE_TAUS = os.environ.get('QUANTILE_TAUS', 'bolt9')       # candle_quantile: 'lohi'(2) | 'bolt9'(9)
@@ -141,11 +140,8 @@ if PRETEXT == 'forecast_dist' and OBJECTIVE == 'candle_mse':  # forecast default
 
 # ── TRAINING (sweep-winner; BATCH MATCHES THE SWEEP so the tuned LR transfers) ──
 BATCH   = 512         # PARITY with the sweep (lr was tuned at 512; 1024 would need a different lr)
-EPOCHS  = int(os.environ.get('EPOCHS', '120'))  # DEFAULT = the RoBERTa extension budget (ADDITIONAL
-#                       epochs on resume). The original stage-2 run used 60 — a WALL,
-#                       not convergence (the identical harness hit it still improving) -> the RoBERTa
-#                       extension uses EPOCHS=120 (ADDITIONAL, on top of the base's 60) with
-#                       EXTEND_FROM (below); patience still governs.
+EPOCHS  = int(os.environ.get('EPOCHS', '120'))  # the original stage-2 hit a WALL at 60 still improving,
+#                       so 120 (patience governs early-stop). Warm-starting from ctr_seq2seq trains on top.
 STEPS   = 200         # steps/epoch
 LR      = float(os.environ.get('LR', '0.0001188117389055629'))   # reorder-sweep winner (trial 3, ~1.19e-4)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', '0.0'))       # trial 3 (env-overridable)
@@ -157,31 +153,11 @@ CONTROLS = ()                                  # skip shuffle/random retrains (f
 PROBE = True                                    # probe vs vanilla (diagnostic, not a gate)
 SEED = 0
 
-# ── CRASH-SAFE + ANTI-FORGETTING (best saved PROGRESSIVELY to OUT_PATH; Colab-disconnect resilient) ──
-RESUME  = os.environ.get('RESUME', '0') == '1'   # resume from the best saved to OUT_PATH
-# DEFAULT = 3 for the REORDER's forecast-last step: freeze the first 3 (of 6) blocks so forecast
-# learns on top of the regime instead of erasing it. Set FREEZE_ENCODER_LAYERS=0 for the old
-# default lineage (mask->forecast full fine-tune, the original sweep winner).
-FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))   # trial 3 = freeze=2
-
-# ── OPT-IN disconnect-resume (OFF by default) ──
-# A plain run just warm-starts the encoder from WARM_CKPT (= ctr_seq2seq) — simple, no copy dance.
-# EXTEND_FROM is ONLY for crash-resilience on long runs: it seeds OUT_PATH with a copy of the base
-# and forces RESUME=True, so a dropped Colab run CONTINUES from OUT_PATH instead of restarting. Same
-# trained model either way; set EXTEND_FROM=<base .pt> only if you want auto-resume.
-EXTEND_FROM = os.environ.get('EXTEND_FROM', '')
-if EXTEND_FROM:
-    import shutil
-    if not os.path.exists(EXTEND_FROM):
-        raise FileNotFoundError(f'EXTEND_FROM not found: {EXTEND_FROM}')
-    if os.path.abspath(OUT_PATH) == os.path.abspath(EXTEND_FROM):
-        raise SystemExit('❌ EXTEND_FROM == OUT_PATH — the extension must write a NEW file.')
-    if not os.path.exists(OUT_PATH):
-        shutil.copy2(EXTEND_FROM, OUT_PATH)
-        print(f'[extend] seeded {OUT_PATH} <- copy of {EXTEND_FROM}')
-    else:
-        print(f'[extend] OUT_PATH exists — resuming the extension already in progress')
-    RESUME = True
+# The encoder is warm-started from WARM_CKPT (= ctr_seq2seq) and the best epoch is saved PROGRESSIVELY
+# to OUT_PATH (crash-safe). RESUME=1 continues from a best already saved to OUT_PATH (long-run resume).
+RESUME  = os.environ.get('RESUME', '0') == '1'
+# freeze the first N (of 6) encoder blocks so forecast learns ON TOP of the base instead of erasing it.
+FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))   # sweep winner (trial 3)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
@@ -197,13 +173,7 @@ found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
          if os.path.exists(os.path.join(DATA_DIR, f'{tk}_{tf}.csv'))]
 if not found:
     raise FileNotFoundError(f'No {{TICKER}}_{{TF}}.csv files under {DATA_DIR}.')
-# In EXTENSION mode the EFFECTIVE base is EXTEND_FROM (resume-loads it over the WARM_CKPT backbone,
-# common.py fit(): build_net warm-starts WARM_CKPT, then resume overwrites with the EXTEND_FROM copy).
-_base = EXTEND_FROM if EXTEND_FROM else WARM_CKPT
-print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | '
-      f'BASE (continues from) <- {_base}'
-      + (f'  [WARM_CKPT {os.path.basename(WARM_CKPT)} is loaded then overwritten by resume]'
-         if EXTEND_FROM else ''))
+print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm-start <- {WARM_CKPT}')
 print(f'   pretext={PRETEXT} obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
       f'wd={WEIGHT_DECAY} BATCH={BATCH} EPOCHS={EPOCHS}'
       + (f' | DIST mse_w={MSE_WEIGHT} taus={QUANTILE_TAUS} bins_k={BINS_K}'
