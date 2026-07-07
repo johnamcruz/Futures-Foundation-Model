@@ -8,10 +8,19 @@ sample) and applied per-batch — no standardized full copy.
 
 torch-free. Used by produce/loop for large/full-data runs; small runs can still use
 the in-RAM array path.
+
+FEATURIZE_FP16=1 stores the memmaps at float16 — HALVES the on-disk footprint (the multi-TF
+gate-off full-universe X is ~61GB fp32 -> ~31GB), which is what fits a Colab local disk. Safe for
+the frozen-embedding consumer: embeddings are ~O(1) values, fp16 keeps ~3 significant digits, and
+every reader upcasts to fp32 before standardize/fit (same contract as the fp16 embed cache).
 """
 import os
 
 import numpy as np
+
+
+def _memmap_dtype():
+    return np.float16 if os.environ.get('FEATURIZE_FP16', '0') == '1' else np.float32
 
 
 def concat_memmaps(parts, out_path):
@@ -23,10 +32,10 @@ def concat_memmaps(parts, out_path):
     if not parts:
         raise ValueError("no parts to concatenate")
     m0 = np.load(parts[0][0], mmap_mode='r')
-    C, seq = int(m0.shape[1]), int(m0.shape[2])
+    C, seq, dt = int(m0.shape[1]), int(m0.shape[2]), m0.dtype
     del m0
     total = sum(n for _, n in parts)
-    out = np.lib.format.open_memmap(out_path, mode='w+', dtype=np.float32,
+    out = np.lib.format.open_memmap(out_path, mode='w+', dtype=dt,   # preserve parts' dtype (fp16-aware)
                                     shape=(total, C, seq))
     off = 0
     for p, n in parts:
@@ -50,7 +59,7 @@ def slice_memmap(full_path, rows, out_path, chunk=20000):
     rows = np.sort(np.asarray(rows))
     mm = np.load(full_path, mmap_mode='r')
     C, seq = int(mm.shape[1]), int(mm.shape[2])
-    out = np.lib.format.open_memmap(out_path, mode='w+', dtype=np.float32,
+    out = np.lib.format.open_memmap(out_path, mode='w+', dtype=mm.dtype,   # preserve (fp16-aware)
                                     shape=(len(rows), C, seq))
     for s in range(0, len(rows), chunk):
         out[s:s + chunk] = mm[rows[s:s + chunk]]
@@ -69,14 +78,15 @@ def featurize_to_memmap(clf, labeler, keys, path, chunk=2000):
     n = len(keys)
     if n == 0:
         raise ValueError("no keys to featurize")
+    dt = _memmap_dtype()                                 # FEATURIZE_FP16=1 -> half-size memmaps
     if getattr(clf, 'embed_once', False):
         X = np.asarray(clf.featurize(labeler, keys), np.float32)    # one pass, model loads once
-        mm = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=X.shape)
+        mm = np.lib.format.open_memmap(path, mode='w+', dtype=dt, shape=X.shape)
         mm[:] = X; mm.flush(); del mm
         return path, X.shape
     x0 = np.asarray(clf.featurize(labeler, keys[:1]), np.float32)   # learn (C, seq)
     C, seq = int(x0.shape[1]), int(x0.shape[2])
-    mm = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(n, C, seq))
+    mm = np.lib.format.open_memmap(path, mode='w+', dtype=dt, shape=(n, C, seq))
     mm[0] = x0[0]
     for s in range(1, n, chunk):
         e = min(s + chunk, n)

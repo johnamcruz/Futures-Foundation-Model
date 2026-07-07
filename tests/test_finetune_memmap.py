@@ -210,3 +210,32 @@ def test_rolling_folds_excludes_holdout():
     for tr, va, te in folds:                        # 2026 NEVER in any fold (reserved OOS)
         for rows in (tr, va, te):
             assert (ts[rows] < cutoff).all()
+
+
+def test_featurize_fp16_halves_disk_and_flows_end_to_end(tmp_path, monkeypatch):
+    """FEATURIZE_FP16=1: memmaps store fp16 (half disk — the Colab local/Drive fix), dtype is
+    PRESERVED through concat + slice, stats/heads read fp32-upcast values (contract: ~O(1) embeds
+    keep 3 sig digits; every consumer upcasts before standardize/fit)."""
+    import os as _os
+    from futures_foundation.finetune._memmap import concat_memmaps, slice_memmap
+    rng = np.random.default_rng(2)
+    X = rng.standard_normal((60, 4, 16)).astype(np.float32)
+    lab = _StubLabeler(X)
+    clf = get_classifier('logistic')
+    p32 = str(tmp_path / 'x32.npy')
+    featurize_to_memmap(clf, lab, list(range(60)), p32, chunk=13)
+    monkeypatch.setenv('FEATURIZE_FP16', '1')
+    p16a = str(tmp_path / 'a16.npy'); p16b = str(tmp_path / 'b16.npy')
+    featurize_to_memmap(clf, lab, list(range(30)), p16a, chunk=13)
+    featurize_to_memmap(clf, lab, list(range(30, 60)), p16b, chunk=13)
+    assert _os.path.getsize(p16a) < 0.6 * _os.path.getsize(p32) // 2 + 200   # ~half per part
+    # concat + slice preserve fp16; values ~= fp32 originals
+    full, shape = concat_memmaps([(p16a, 30), (p16b, 30)], str(tmp_path / 'full16.npy'))
+    mm = np.load(full, mmap_mode='r')
+    assert mm.dtype == np.float16 and shape == (60, 4, 16)
+    assert np.abs(np.asarray(mm, np.float32) - X).max() < 0.01
+    sl, _ = slice_memmap(full, np.arange(10, 40), str(tmp_path / 'sl16.npy'))
+    assert np.load(sl, mmap_mode='r').dtype == np.float16
+    # stats read fine (upcast inside)
+    mu, sd = memmap_standardize_stats(full)
+    assert mu.shape == (4,) and np.isfinite(mu).all() and (sd > 0).all()
