@@ -165,7 +165,13 @@ found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
          if os.path.exists(os.path.join(DATA_DIR, f'{tk}_{tf}.csv'))]
 if not found:
     raise FileNotFoundError(f'No {{TICKER}}_{{TF}}.csv files under {DATA_DIR}.')
-print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm-start <- {WARM_CKPT}')
+# In EXTENSION mode the EFFECTIVE base is EXTEND_FROM (resume-loads it over the WARM_CKPT backbone,
+# common.py fit(): build_net warm-starts WARM_CKPT, then resume overwrites with the EXTEND_FROM copy).
+_base = EXTEND_FROM if EXTEND_FROM else WARM_CKPT
+print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | '
+      f'BASE (continues from) <- {_base}'
+      + (f'  [WARM_CKPT {os.path.basename(WARM_CKPT)} is loaded then overwritten by resume]'
+         if EXTEND_FROM else ''))
 print(f'   SWEEP-WINNER: obj={OBJECTIVE} lr={LR:.2e} nc={NEW_CHANNELS} frz={FREEZE_ENCODER_LAYERS} '
       f'wd={WEIGHT_DECAY} BATCH={BATCH} (parity w/ sweep) EPOCHS={EPOCHS}')
 print(f'   horizons={HORIZONS} context_lengths={CONTEXT_LENGTHS}')
