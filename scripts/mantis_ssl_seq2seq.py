@@ -63,7 +63,10 @@ import os, torch
 # Old default lineage (mask->forecast) if ever needed:
 #   WARM_CKPT=.../mantis_ssl_ohlcv.pt OUT_PATH=.../mantis_ssl_seq2seq.pt FREEZE_ENCODER_LAYERS=0
 DATA_DIR  = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
-WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt')
+# WARM_CKPT resolved AFTER EXTEND_FROM (below): in extension mode it defaults to EXTEND_FROM (the
+# base = ctr_seq2seq) so build_net ALSO warm-starts from the base, not regime; fresh mode -> regime.
+WARM_CKPT = os.environ.get('WARM_CKPT', '')
+_WARM_DEFAULT = '/content/drive/MyDrive/AI_Models/mantis_ssl_regime.pt'   # fresh stage-2 reorder warm
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
 # freeze-2-vs-3 A/B: this tuned freeze=2 winner vs the anchor freeze=3, both vs seq2seq.
@@ -150,6 +153,9 @@ if EXTEND_FROM:
     else:
         print(f'[extend] OUT_PATH exists — resuming the extension already in progress')
     RESUME = True
+# Resolve WARM_CKPT default now that EXTEND_FROM is known: extension -> the base (ctr_seq2seq) so the
+# build_net warm-start matches the resume base; fresh run (EXTEND_FROM='') -> the regime reorder warm.
+WARM_CKPT = WARM_CKPT or EXTEND_FROM or _WARM_DEFAULT
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'\nDevice: {device}')
