@@ -23,7 +23,7 @@ class LogisticClassifier(Classifier):
     def featurize(self, labeler, keys):
         return np.asarray(labeler.mv_contexts(keys), np.float32)
 
-    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
         from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
         from sklearn.metrics import roc_auc_score

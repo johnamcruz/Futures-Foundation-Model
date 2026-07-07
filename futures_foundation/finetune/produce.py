@@ -102,18 +102,24 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
 
 
 def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yte, seed, verbose,
-               onnx_path=None):
+               onnx_path=None, keys_tr=None, keys_val=None):
     """Fit REAL (exporting ONNX during that fit when onnx_path is set) + SHUFFLE control.
     Two fits total — the export must ride the REAL fit; a separate export refit doubles
-    peak RAM (fresh standardized copies on top of allocator creep) and OOMs at full scale."""
+    peak RAM (fresh standardized copies on top of allocator creep) and OOMs at full scale.
+
+    keys_tr/keys_val (distributional reach-ladder produce) carry the per-target labels; the
+    SHUFFLE control permutes them in lockstep with the label (else the ladder is untouched and the
+    control collapses onto REAL)."""
     import gc
+    dist = (ck or {}).get('rank') == 'expected_reach'
     rng = np.random.default_rng(seed)
     if verbose:
         print(f"  [produce 1/2] fit REAL head{' (+ ONNX export)' if onnx_path else ''}",
               flush=True)
     ck_real = dict(ck, export_onnx_path=onnx_path) if onnx_path else ck
     clf_real = get_classifier(classifier, **ck_real)          # keep the instance: it holds _platt
-    p_val, p_te, ba = clf_real.fit_predict(Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed)
+    p_val, p_te, ba = clf_real.fit_predict(Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed,
+                                           keys_tr=keys_tr, keys_val=keys_val)
     gc.collect()
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(eval_lab, Kte, p_te, thr)
@@ -124,10 +130,15 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
         if verbose:
             print("  [produce 2/2] SKIPPED (SKIP_SHUFFLE=1; honest ruler already run in WF)", flush=True)
     else:
-        ysh = np.asarray(Ytr_tr).copy(); rng.shuffle(ysh)
+        if dist and keys_tr is not None:
+            perm = rng.permutation(len(Ytr_tr))
+            ysh = np.asarray(Ytr_tr)[perm]; Ksh = [keys_tr[i] for i in perm]
+        else:
+            ysh = np.asarray(Ytr_tr).copy(); rng.shuffle(ysh); Ksh = None
         if verbose:
             print("  [produce 2/2] fit SHUFFLE control (honest ruler)", flush=True)
-        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(Xtr, ysh, Xval, Ytr_va, Xte, seed)
+        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(Xtr, ysh, Xval, Ytr_va, Xte, seed,
+                                                                  keys_tr=Ksh, keys_val=keys_val)
         gc.collect()
         Rs = _arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE))
     auc = None
@@ -168,6 +179,7 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
 
     tr_parts, va_parts, te_parts = [], [], []
     Ytr_tr, Ytr_va, all_Kte, all_Yte = [], [], [], []
+    Ktr_tr, Ktr_va = [], []                          # per-subset keys (distributional ladder labels)
     channel_names = None; C = seq = None; eval_lab = None
     for i, (tk, tf) in enumerate(streams):
         lab = make_labeler(tk, tf)                       # loads ONLY this stream's bars
@@ -183,9 +195,11 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
             p = str(rundir / f'_tr{i}.npy')
             _, sh = featurize_to_memmap(clf, lab, [Ktr[j] for j in tr_i], p, chunk)
             tr_parts.append((p, len(tr_i))); Ytr_tr += list(Ytr[tr_i]); C, seq = sh[1], sh[2]
+            Ktr_tr += [Ktr[j] for j in tr_i]
             p = str(rundir / f'_va{i}.npy')
             featurize_to_memmap(clf, lab, [Ktr[j] for j in va_i], p, chunk)
             va_parts.append((p, len(va_i))); Ytr_va += list(Ytr[va_i])
+            Ktr_va += [Ktr[j] for j in va_i]
         if len(Kte):
             p = str(rundir / f'_te{i}.npy')
             featurize_to_memmap(clf, lab, list(Kte), p, chunk)
@@ -216,8 +230,10 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
               f"good(train)={Ytr_tr.mean():.3f} good(oos)={Yte.mean():.3f}", flush=True)
     onnx_path = (str(Path(output_path).with_suffix('')) + '.onnx'
                  if (export_onnx and output_path) else None)
+    dist = ck.get('rank') == 'expected_reach'
     out = _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, all_Kte, Yte,
-                     seed, verbose, onnx_path=onnx_path)
+                     seed, verbose, onnx_path=onnx_path,
+                     keys_tr=(Ktr_tr if dist else None), keys_val=(Ktr_va if dist else None))
     return _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
                  channel_names, tks, tfs, holdout_start, export_onnx, output_path, verbose)
 
@@ -290,15 +306,22 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
     if verbose:
         print(f"  [produce 1/2] fit REAL head{' (+ ONNX export)' if onnx_path else ''}",
               flush=True)
+    dist = ck.get('rank') == 'expected_reach'
+    kt, kv = (Ktr_tr, Ktr_va) if dist else (None, None)   # distributional ladder labels
     ck_real = dict(ck, export_onnx_path=onnx_path) if onnx_path else ck
     p_val, p_te, ba = get_classifier(classifier, **ck_real).fit_predict(
-        Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed)
+        Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed, keys_tr=kt, keys_val=kv)
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(labeler, Kte, p_te, thr)
-    ysh = Ytr_tr.copy(); rng.shuffle(ysh)
+    if dist:
+        perm = rng.permutation(len(Ytr_tr))               # permute label + ladder keys together
+        ysh, Ksh = Ytr_tr[perm], [Ktr_tr[i] for i in perm]
+    else:
+        ysh = Ytr_tr.copy(); rng.shuffle(ysh); Ksh = None
     if verbose:
         print("  [produce 2/2] fit SHUFFLE control (honest ruler)", flush=True)
-    psv, ps, _ = get_classifier(classifier, **ck).fit_predict(Xtr, ysh, Xval, Ytr_va, Xte, seed)
+    psv, ps, _ = get_classifier(classifier, **ck).fit_predict(Xtr, ysh, Xval, Ytr_va, Xte, seed,
+                                                              keys_tr=Ksh, keys_val=kv)
     Rs = _arm_R(labeler, Kte, ps, _pct_threshold(psv, OP_PERCENTILE))
 
     auc = None

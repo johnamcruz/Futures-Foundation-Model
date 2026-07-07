@@ -149,7 +149,7 @@ def test_run_folds_disconnect_resume(tmp_path):
         def featurize(self, labeler, keys):              # not used by _run_folds
             raise NotImplementedError
 
-        def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+        def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
             calls['fits'] += 1
             n_v = len(np.load(Xval, mmap_mode='r')) if isinstance(Xval, str) else len(Xval)
             n_e = len(np.load(Xeval, mmap_mode='r')) if isinstance(Xeval, str) else len(Xeval)

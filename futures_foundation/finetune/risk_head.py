@@ -15,7 +15,7 @@ import numpy as np
 
 from .calibration import fit_platt, apply_platt
 
-TARGETS = (2.0, 3.0, 4.0, 6.0)
+TARGETS = (2.0, 3.0, 4.0, 6.0, 8.0)      # reach ladder (8R = max trend); matches the pivot FIXED_TARGETS
 
 
 def reach_labels(keys, targets=TARGETS):

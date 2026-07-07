@@ -267,7 +267,7 @@ class MantisFrozenClassifier(Classifier):
         # 3) caching off / non-ohlcv -> embed directly
         return self._with_features(labeler, keys, self._embed(labeler, keys))
 
-    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
         from sklearn.linear_model import LogisticRegression
         from sklearn.neural_network import MLPClassifier
         from sklearn.metrics import roc_auc_score
@@ -292,6 +292,30 @@ class MantisFrozenClassifier(Classifier):
         ytr = np.asarray(ytr).astype(int); yval = np.asarray(yval).astype(int)
         if len(np.unique(ytr)) < 2:
             return np.full(len(Xval), .5), np.full(len(Xeval), .5), 0.5
+        # DISTRIBUTIONAL reach-ladder head (rank='expected_reach'): instead of one P(3R) head,
+        # fit a per-target survival head P(reach >= Xr) over reach_targets from the strategy keys
+        # (each key carries per-target realized R), and RANK pivots by expected forward-R (the
+        # area under the calibrated survival curve). The ship METRIC is unchanged — WR@3R — since
+        # yval stays the 3R label and expected-R ranks 3R-reachers to the top; the ladder just adds
+        # the "how far will it run" signal (P(>=6R/8R) big-runner detection) to the ranking. Needs
+        # keys; falls back to the single head if they aren't threaded. Head type = MLP (same as the
+        # signal head) so every rung is an MLPClassifier.
+        if self.cfg.get('rank') == 'expected_reach' and keys_tr is not None:
+            from ...risk_head import RiskHead, TARGETS
+            targets = tuple(self.cfg.get('reach_targets', TARGETS))
+            rh = RiskHead(targets=targets, head=self.cfg.get('head', 'mlp'),
+                          calibrate=bool(self.cfg.get('calibrate', True)),
+                          hidden=tuple(self.cfg.get('hidden', (128,))),
+                          max_iter=int(self.cfg.get('max_iter', 300)),
+                          mlp_batch=int(self.cfg.get('mlp_batch', 4096)),
+                          mlp_alpha=float(self.cfg.get('mlp_alpha', 1e-4)),
+                          C=float(self.cfg.get('C', 1.0)))
+            rh.fit(Xtr, keys_tr, Xval, keys_val, seed=seed)
+            self._risk_head = rh
+            p_val = rh.predict_stats(Xval)['exp_reach']
+            p_eval = rh.predict_stats(Xeval)['exp_reach']
+            auc = roc_auc_score(yval, p_val) if len(np.unique(yval)) == 2 else 0.5
+            return p_val, p_eval, float(auc)
         if self.cfg.get('head', 'logistic') == 'mlp':
             # batch_size: sklearn's default is min(200, n) — absurdly small at produce scale (2.78M
             # rows -> ~14k minibatches/epoch). A bigger batch = ~same solution (early-stopping guards

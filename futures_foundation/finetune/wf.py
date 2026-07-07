@@ -96,11 +96,14 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
             print(f"\n[fold {fold}] train={len(Ytr)} val={len(Yval)} test={len(Yte)} "
                   f"X={tuple(Xtr.shape[1:])} good={Ytr.mean():.3f}", flush=True)
 
+        dist = (clf_kwargs or {}).get('rank') == 'expected_reach'
+        Ktr = list(Ktr) if dist else None                 # ladder labels (distributional only)
         fold_p_te = fold_p_val = None
         for seed in seeds:
             rng = np.random.default_rng(seed)
             # REAL
-            p_val, p_te, ba = clf.fit_predict(Xtr, Ytr, Xval, Yval, Xte, seed)
+            p_val, p_te, ba = clf.fit_predict(Xtr, Ytr, Xval, Yval, Xte, seed,
+                                              keys_tr=Ktr, keys_val=list(Kval))
             thr = _pct_threshold(p_val, OP_PERCENTILE)
             R_te = _arm_R(labeler, Kte, p_te, thr)
             pool['REAL'].append(R_te)
@@ -114,9 +117,14 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
                 ta = (roc_auc_score(Yte, p_te) if len(np.unique(Yte)) == 2 else float('nan'))
                 print(f"  seed{seed} REAL best_val_auc={ba:.4f} test_auc={ta:.4f} "
                       f"meanR={_meanR(R_te):+.3f}", flush=True)
-            # SHUFFLE
-            ysh = Ytr.copy(); rng.shuffle(ysh)
-            psv, ps, _ = clf.fit_predict(Xtr, ysh, Xval, Yval, Xte, seed)
+            # SHUFFLE — permute label + ladder keys together (dist) so the control isn't a no-op
+            if dist:
+                perm = rng.permutation(len(Ytr))
+                ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
+            else:
+                ysh = Ytr.copy(); rng.shuffle(ysh); Ksh = None
+            psv, ps, _ = clf.fit_predict(Xtr, ysh, Xval, Yval, Xte, seed,
+                                         keys_tr=Ksh, keys_val=list(Kval))
             pool['SHUFFLE'].append(_arm_R(labeler, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
             # RANDOM
             pr = rng.random(len(Kte))
@@ -308,25 +316,42 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     if verbose and res['real']:
         print(f"  [fold-ckpt] resumed {len(res['real'])}/{len(folds)} folds from {fold_ckpt}",
               flush=True)
+    # DISTRIBUTIONAL reach-ladder mode threads the strategy keys (the ladder's labels) into
+    # fit_predict. The SHUFFLE control must then permute the KEYS in lockstep with the label — the
+    # ladder reads its per-target labels from the keys, so shuffling only the label vector would
+    # leave the ladder intact and collapse SHUFFLE onto REAL (dead control). The `dist` branch uses
+    # rng.permutation (label+keys together); the single-head path keeps its exact rng.shuffle stream
+    # so existing fold-ckpts stay byte-identical (distributional adds rank= to the sig -> new ckpt).
+    dist = (ck or {}).get('rank') == 'expected_reach'
     rng = np.random.default_rng(seed)
     for fi, (tr, va, te) in enumerate(folds):
         tr, va, te = np.sort(tr), np.sort(va), np.sort(te)
         if fi < len(res['real']):                         # done in a previous session ->
-            d = np.empty(len(tr)); rng.shuffle(d)         # replay the control RNG stream so the
-            rng.random(len(te))                           # remaining folds match a 1-session run
+            if dist:                                      # replay the control RNG stream so the
+                rng.permutation(len(tr))                  # remaining folds match a 1-session run
+            else:
+                d = np.empty(len(tr)); rng.shuffle(d)
+            rng.random(len(te))
             continue
         ftr, fva, fte = (str(rundir / '_ftr.npy'), str(rundir / '_fva.npy'),
                          str(rundir / '_fte.npy'))
         slice_memmap(Xall, tr, ftr); slice_memmap(Xall, va, fva); slice_memmap(Xall, te, fte)
         Ytr, Yva, Yte = Y[tr], Y[va], Y[te]
         Kte = [keys[i] for i in te]; Kva = [keys[i] for i in va]
-        p_val, p_te, ba = clf_run.fit_predict(ftr, Ytr, fva, Yva, fte, seed)
+        Ktr = [keys[i] for i in tr] if dist else None     # ladder labels (distributional only)
+        p_val, p_te, ba = clf_run.fit_predict(ftr, Ytr, fva, Yva, fte, seed,
+                                              keys_tr=Ktr, keys_val=Kva)
         thr = _pct_threshold(p_val, OP_PERCENTILE)
         R_te = _arm_R(eval_lab, Kte, p_te, thr)
         res['real'].append(R_te); res['yte'].append(np.asarray(Yte)); res['pte'].append(np.asarray(p_te))
         res['valm'].append(_meanR(_arm_R(eval_lab, Kva, p_val, thr))); res['testm'].append(_meanR(R_te))
-        ysh = Ytr.copy(); rng.shuffle(ysh)
-        psv, ps, _ = clf_run.fit_predict(ftr, ysh, fva, Yva, fte, seed)
+        if dist:
+            perm = rng.permutation(len(Ytr))              # permute label + ladder-keys together
+            ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
+        else:
+            ysh = Ytr.copy(); rng.shuffle(ysh); Ksh = None
+        psv, ps, _ = clf_run.fit_predict(ftr, ysh, fva, Yva, fte, seed,
+                                         keys_tr=Ksh, keys_val=Kva)
         res['shuf'].append(_arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
         pr = rng.random(len(Kte))
         res['rand'].append(_arm_R(eval_lab, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))

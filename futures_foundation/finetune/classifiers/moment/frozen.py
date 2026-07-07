@@ -19,7 +19,7 @@ class MomentFrozenClassifier(Classifier):
         # Same labeler API as Mantis: raw OHLCV windows [N, C, seq] -> the MOMENT encoder.
         return np.asarray(labeler.mv_contexts(keys), np.float32)
 
-    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
         raise NotImplementedError(
             "MOMENT backbone is a stub. Implement the frozen MOMENT-encoder embedding + head here "
             "(mirror classifiers/mantis/frozen.py); the generic harness, calibration, and "

@@ -41,7 +41,7 @@ class MantisClassifier(Classifier):
     def featurize(self, labeler, keys):
         return np.asarray(labeler.mv_contexts(keys), np.float32)
 
-    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
         cfg = dict(self.cfg)
         log_path = cfg.pop('log_path', None)        # parent-side only (not a trainer arg)
         cmd = [sys.executable, '-u', '-m', 'futures_foundation.finetune.classifiers.mantis._worker']

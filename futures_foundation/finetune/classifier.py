@@ -35,9 +35,14 @@ class Classifier(ABC):
         ...
 
     @abstractmethod
-    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0):
+    def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None, keys_val=None):
         """Fit on (Xtr,ytr) with (Xval,yval) for early-stop/guard, return
-        (p_val, p_eval, best_val_auc) where p_* are P(class 1) for Xval/Xeval."""
+        (p_val, p_eval, best_val_auc) where p_* are P(class 1) for Xval/Xeval.
+
+        keys_tr/keys_val (optional) are the strategy keys aligned to Xtr/Xval. A backbone that
+        supports a DISTRIBUTIONAL reach-ladder head (rank='expected_reach') reads its per-target
+        labels from them and returns expected-R as the ranking score; impls that don't use a
+        ladder ignore them (the single-head default is unchanged)."""
         ...
 
 
