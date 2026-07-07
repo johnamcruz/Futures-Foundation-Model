@@ -140,6 +140,16 @@ class _ElectraTrainer(BaseTrainer):
                               'gen_mse': float(recon)}   # generator plausibility (strength knob)
         return recon + self.rtd_weight * rtd
 
+    def log_line(self, ep, tr_loss, vloss, extra, improved):
+        # live learning verification: show the RTD diagnostics per epoch (base prints only std)
+        if self.verbose:
+            print(f"  ep{ep:>3} train={tr_loss:.4f} val={vloss:.4f} "
+                  f"bal_acc={extra.get('rtd_bal_acc', float('nan')):.3f} "
+                  f"(fake={extra.get('fake_recall', float('nan')):.3f}/"
+                  f"real={extra.get('real_acc', float('nan')):.3f}) "
+                  f"gen_mse={extra.get('gen_mse', float('nan')):.4f} "
+                  f"emb_std={extra.get('std', 0.0):.4f}{'  *' if improved else ''}", flush=True)
+
     @torch.no_grad()
     def val_eval(self):
         self.net.eval(); tot = 0.0
