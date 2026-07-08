@@ -38,6 +38,12 @@ from .windows import (
     aggregate_ohlcv_window,
     multi_scale_ohlcv_window,
 )
+from .pairs import (
+    DEFAULT_SIBLINGS,
+    parse_siblings,
+    asof_sibling_index,
+    sibling_ohlcv_window,
+)
 
 __all__ = [
     "compute_atr", "compute_supertrend", "compute_supertrend_htf",
@@ -47,4 +53,5 @@ __all__ = [
     "apply_rr_barriers", "best_rr_hit", "realized_r_trailing", "r_bucket",
     "session_mask", "session_end_mask", "compute_vwap",
     "aggregate_ohlcv_window", "multi_scale_ohlcv_window",
+    "DEFAULT_SIBLINGS", "parse_siblings", "asof_sibling_index", "sibling_ohlcv_window",
 ]
