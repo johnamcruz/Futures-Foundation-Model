@@ -90,6 +90,7 @@ TURN_W      = int(os.environ.get('TURN_W', '3'))            # swing neighborhood
 TURN_BIAS   = float(os.environ.get('TURN_BIAS', '0.85'))    # P(span centered on a turn); 0 = uniform ablation
 RTD_WEIGHT  = float(os.environ.get('RTD_WEIGHT', '5.0'))    # bce weight (0 = denoising-AE ablation)
 RECON_WEIGHT = float(os.environ.get('RECON_WEIGHT', '1.0')) # encoder-recon anchor (0 = pure discrim)
+STD_GUARD   = float(os.environ.get('STD_GUARD', '1.6'))    # in-loop drift halt: emb_std ceiling (0=off)
 GEN_WIDTH   = int(os.environ.get('GEN_WIDTH', '48'))        # generator size — the strength knob
 NEW_CHANNELS = 3                      # overcomplete adapter — sweep-winner setting of the base
 FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))  # anti-forgetting (base=frz2)
@@ -139,6 +140,7 @@ verdict = ssl.loop_ssl(
     pretext='electra', backbone_ckpt=WARM_CKPT,
     seq=SEQ, mask_ratio=MASK_RATIO, span_mean=SPAN_MEAN, span_max=SPAN_MAX,
     turn_w=TURN_W, turn_bias=TURN_BIAS, rtd_weight=RTD_WEIGHT, recon_weight=RECON_WEIGHT,
+    std_guard=STD_GUARD,
     gen_width=GEN_WIDTH, new_channels=NEW_CHANNELS,
     batch=BATCH, epochs=EPOCHS, steps_per_epoch=STEPS, lr=LR, weight_decay=WEIGHT_DECAY,
     patience=PATIENCE, val_frac=VAL_FRAC, holdout_start=HOLDOUT_START,

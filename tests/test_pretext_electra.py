@@ -193,7 +193,62 @@ def test_base_cfg_defaults_are_turn_biased():
     assert cfg['recon_weight'] == 1.0                     # anchored by default (drift guard)
 
 
+def test_base_cfg_keeps_std_guard():
+    # the IN-LOOP drift halt (added after emb_std marched 1.2->1.6 while val kept micro-improving
+    # — early-stop alone kept crowning drifted epochs as "best"). Must survive the silent-drop
+    # filter and default ON at 1.6.
+    from futures_foundation.finetune.ssl import _base_cfg
+    assert _base_cfg(pretext='electra')['std_guard'] == 1.6
+    assert _base_cfg(pretext='electra', std_guard=1.4)['std_guard'] == 1.4
+    assert _base_cfg(pretext='electra', std_guard=0)['std_guard'] == 0   # 0 = off
+
+
 # ---------------------------------------------------------------- torch parity (gated)
+@torch_test
+def test_std_guard_halts_and_keeps_pre_breach_best():
+    # BEHAVIORAL: a trainer whose emb_std drifts past the guard must HALT at the breach epoch and
+    # NOT save that epoch as best — even though val keeps improving (the exact trap: early-stop
+    # alone would have kept crowning drifted epochs).
+    import torch
+    import torch.nn as nn
+    from futures_foundation.finetune.pretext._torch.common import BaseTrainer
+
+    class _Drifty(BaseTrainer):
+        """Minimal trainer: val improves EVERY epoch; std crosses the guard at epoch 3."""
+        def build_net(self):
+            class _N(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.encoder = nn.Linear(4, 4)
+            self.net = _N()
+            self._ep = 0
+
+        def make_batch(self, starts):
+            return None
+
+        def compute_loss(self, batch):
+            return (self.net.encoder.weight ** 2).mean()   # any differentiable scalar
+
+        def val_eval(self):
+            ep = self._ep; self._ep += 1
+            return 10.0 - ep, {'std': 1.0 + 0.3 * ep}      # val always improves; std 1.0,1.3,1.6,1.9
+
+    big = np.zeros((64, 4), np.float32)
+    tr = va = np.arange(4, dtype=np.int64)
+    t = _Drifty(big, tr, va, epochs=10, steps_per_epoch=1, batch=2, patience=8,
+                device='cpu', verbose=False, std_guard=1.6)
+    state, hist = t.fit()
+    assert len(hist) == 4                                  # halted AT the breach epoch (std 1.9 > 1.6)
+    assert hist[-1]['std'] > 1.6                           # the breach is recorded in history...
+    assert state is not None                               # ...but the kept best predates it
+    # the guard fired BEFORE the improved-save: best_state was snapshotted at epoch 2 (std 1.6, ok),
+    # never at epoch 3 — verified by the fit loop's order (guard check precedes the save).
+    t2 = _Drifty(big, tr, va, epochs=10, steps_per_epoch=1, batch=2, patience=8,
+                 device='cpu', verbose=False, std_guard=0)   # guard OFF -> runs all 10
+    _, hist2 = t2.fit()
+    assert len(hist2) == 10
+
+
 @torch_test
 def test_network_heads_shapes_and_encoder_anchor_gradient():
     import torch

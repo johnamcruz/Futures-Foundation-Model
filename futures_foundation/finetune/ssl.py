@@ -192,6 +192,11 @@ def _base_cfg(**kw):
              # keeps the embedding tied to the data (0 = pure discrimination / drift risk).
              # span_mean/span_max (shared above) set span lengths; electra coerces span_mean<=0 to 4.
              rtd_weight=5.0, recon_weight=1.0, gen_width=48, turn_w=3, turn_bias=0.85,
+             # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
+             # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination
+             # runs against slow drift that val loss rewards (val micro-improves while the
+             # representation walks off the data).
+             std_guard=1.6,
              # crash-safe progressive best-save + resume + anti-forgetting layer-freeze (ALL pretexts,
              # real run only; controls never touch the ckpt). ckpt_path is set to out_path by loop_ssl.
              ckpt_path=None, resume=False, freeze_encoder_layers=0,

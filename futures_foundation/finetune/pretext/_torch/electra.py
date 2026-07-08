@@ -204,7 +204,7 @@ def train_ssl_electra(big, train_starts, val_starts, *, seq=64, new_channels=8, 
                       lr=1e-4, weight_decay=0.05, patience=8, device=None,
                       model_id='paris-noah/Mantis-8M', backbone_ckpt=None, compile_model=False,
                       control='real', seed=0, amp_dtype='fp16', verbose=True, ckpt_path=None,
-                      resume=False, freeze_encoder_layers=0, **_ignore):
+                      resume=False, freeze_encoder_layers=0, std_guard=1.6, **_ignore):
     """TURN-ELECTRA: replaced-TURN detection (spans centered on detected swings, turn_bias of the
     time). Returns (best_encoder_state, history) with 'val_loss' (gen_recon + rtd_weight*bce +
     recon_weight*enc_recon), 'rtd_bal_acc'/'fake_recall'/'real_acc' (balanced-acc diagnostics),
@@ -221,4 +221,5 @@ def train_ssl_electra(big, train_starts, val_starts, *, seq=64, new_channels=8, 
                                weight_decay=weight_decay, patience=patience, device=device,
                                seed=seed, grad_clip=None, amp_dtype=amp_dtype, verbose=verbose,
                                control=control, ckpt_path=ckpt_path, resume=resume,
-                               freeze_encoder_layers=freeze_encoder_layers).fit()
+                               freeze_encoder_layers=freeze_encoder_layers,
+                               std_guard=std_guard).fit()

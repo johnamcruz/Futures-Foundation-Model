@@ -256,10 +256,11 @@ class BaseTrainer:
     def __init__(self, big, train_starts, val_starts, *, epochs=60, steps_per_epoch=200, batch=512,
                  lr=1e-4, weight_decay=0.05, patience=8, device=None, seed=0, grad_clip=None,
                  amp=True, amp_dtype='fp16', verbose=True, control='real',
-                 ckpt_path=None, resume=False, freeze_encoder_layers=0):
+                 ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=0.0):
         os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
         self.ckpt_path, self.resume = ckpt_path, resume    # progressive best-save + resume (real run only)
         self.freeze_encoder_layers = freeze_encoder_layers  # anti-forgetting: freeze first N enc layers
+        self.std_guard = float(std_guard or 0.0)           # >0: HALT when emb_std exceeds it (drift guard)
         self.dev = device or ('cuda' if torch.cuda.is_available()
                               else 'mps' if torch.backends.mps.is_available() else 'cpu')
         torch.manual_seed(seed)
@@ -350,6 +351,16 @@ class BaseTrainer:
             vloss, extra = self.val_eval()
             history.append({'epoch': ep, 'train_loss': tr_tot / self.steps_per_epoch,
                             'val_loss': vloss, **extra})
+            if self.std_guard and extra.get('std', 0.0) > self.std_guard:
+                # DRIFT GUARD: embedding std past the ceiling = the representation is drifting off
+                # the data (the unanchored-discrimination failure mode). HALT NOW and do NOT save
+                # this epoch — val often keeps micro-improving while drift bakes in, so waiting for
+                # early-stop would keep crowning drifted epochs as "best".
+                if self.verbose:
+                    print(f"  [std-guard] emb_std {extra['std']:.3f} > {self.std_guard:.2f} at "
+                          f"ep{ep} — HALTED (best checkpoint kept from before the breach)",
+                          flush=True)
+                break
             improved = vloss < best - 1e-5
             if improved:
                 best, bad = vloss, 0
