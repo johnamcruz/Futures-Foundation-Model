@@ -89,8 +89,15 @@ SPAN_MAX    = int(os.environ.get('SPAN_MAX', '10'))
 TURN_W      = int(os.environ.get('TURN_W', '3'))            # swing neighborhood (±bars)
 TURN_BIAS   = float(os.environ.get('TURN_BIAS', '0.85'))    # P(span centered on a turn); 0 = uniform ablation
 RTD_WEIGHT  = float(os.environ.get('RTD_WEIGHT', '5.0'))    # bce weight (0 = denoising-AE ablation)
-RECON_WEIGHT = float(os.environ.get('RECON_WEIGHT', '1.0')) # encoder-recon anchor (0 = pure discrim)
-STD_GUARD   = float(os.environ.get('STD_GUARD', '1.6'))    # in-loop drift halt: emb_std ceiling (0=off)
+# ── ANTI-DRIFT (v2 defaults, 2026-07-08): run 1 (recon_w=1, no in-loop guard) drifted emb_std
+# 1.20->1.59 over 32 epochs while val micro-improved; the benchmark priced it at -12.5pts @1/d —
+# damage tracks drift across every discriminative run (v1 RTD std 2.35 -> -12; break-hold std ~1.0
+# -> -4.5; turn-electra std 1.59 -> -12.5). Fix = DOUBLE the anchor + HALT well before drift
+# territory. Expect bal_acc to land LOWER (~0.80s, not 0.93) — that's the correct trade: less
+# pretext accuracy, intact foundation. ──
+RECON_WEIGHT = float(os.environ.get('RECON_WEIGHT', '2.0')) # encoder-recon anchor, DOUBLED (0 = pure discrim)
+STD_GUARD   = float(os.environ.get('STD_GUARD', '1.4'))    # in-loop drift halt: BaseTrainer stops BEFORE
+#                                                            the breach epoch can be saved as best (0=off)
 GEN_WIDTH   = int(os.environ.get('GEN_WIDTH', '48'))        # generator size — the strength knob
 NEW_CHANNELS = 3                      # overcomplete adapter — sweep-winner setting of the base
 FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))  # anti-forgetting (base=frz2)
