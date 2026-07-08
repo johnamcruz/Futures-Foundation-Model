@@ -121,7 +121,7 @@ def detect_atr_zigzag_pivots(o, h, l, c, atr_period=20, rev_atr=1.25,
     return pivots
 
 
-def detect_fractal_pivots(h, l, k=2, min_bars_apart=0):
+def detect_fractal_pivots(h, l, k=2, min_bars_apart=0, live_edge=False):
     """WILLIAMS-FRACTAL pivots — TIME-based confirmation (the trigger-scan winner, 2026-07-09).
 
     A bar is a pivot LOW when its low is strictly the lowest of the k bars on EACH side (unique in
@@ -135,7 +135,11 @@ def detect_fractal_pivots(h, l, k=2, min_bars_apart=0):
     is_trend) so every consumer accepts it as a drop-in trigger variant: origin = leg_end = the
     fractal extreme (stop reference); R/is_trend are placeholders (0/False — no leg semantics here).
     min_bars_apart > 0 optionally suppresses a pivot within that many bars of the previous SAME-
-    direction pivot (fractals can cluster on flat stretches). Strictly causal at the confirm bar."""
+    direction pivot (fractals can cluster on flat stretches). Strictly causal at the confirm bar.
+
+    live_edge: training keeps the cf+1 < n guard (every emitted pivot has an entry bar, needed for
+    labeling); a bar-by-bar LIVE/backtest consumer passes live_edge=True so a pivot confirming on
+    the NEWEST bar is emitted (its entry bar is the next bar, which doesn't exist yet)."""
     h = np.asarray(h, float)
     l = np.asarray(l, float)
     n = len(h)
@@ -154,7 +158,7 @@ def detect_fractal_pivots(h, l, k=2, min_bars_apart=0):
         if min_bars_apart and i - last[d] < int(min_bars_apart):
             continue
         cf = i + int(k)
-        if cf + 1 >= n:
+        if not live_edge and cf + 1 >= n:    # training-only: require the entry bar to exist
             continue
         last[d] = i
         out.append({'confirm': int(cf), 'direction': int(d), 'origin': int(i),
@@ -162,7 +166,8 @@ def detect_fractal_pivots(h, l, k=2, min_bars_apart=0):
     return out
 
 
-def detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=1.25, atr_period=20):
+def detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=1.25, atr_period=20,
+                                 live_edge=False):
     """FRACTAL-ZIGZAG hybrid — fractal TIME confirmation + zigzag STRUCTURE (the trigger-scan
     causal winner, 2026-07-09: WR@3R 37.0% / meanR +0.449 @ leg=1.25 vs the ATR-zigzag incumbent's
     33.8% / +0.323 on ES+NQ 3min pre-2026).
@@ -179,7 +184,7 @@ def detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=1.25, atr_period=2
     atr = compute_atr(h, l, c, atr_period)
     out = []
     last_d, last_px, last_i = 0, None, None
-    for p in detect_fractal_pivots(h, l, k=k):
+    for p in detect_fractal_pivots(h, l, k=k, live_edge=live_edge):
         i, d = p['origin'], p['direction']
         px = l[i] if d == 1 else h[i]
         a = atr[i]

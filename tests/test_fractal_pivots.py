@@ -166,6 +166,36 @@ def test_truncation_invariance_no_lookahead():
         assert full == trunc, f'LOOKAHEAD at cut {t}: full={full[-3:]} trunc={trunc[-3:]}'
 
 
+def test_live_edge_emits_newest_bar_confirm():
+    """live_edge=True: a pivot whose confirm IS the newest bar is emitted (bar-by-bar consumers
+    need gate[-1] to be able to fire); default (training) drops it — everything else identical."""
+    h, l = _v(center=30, n=33)                             # extreme@30, confirm=32 = last bar
+    assert not any(p['confirm'] == 32 for p in detect_fractal_pivots(h, l, k=2))
+    live = detect_fractal_pivots(h, l, k=2, live_edge=True)
+    p = next(p for p in live if p['confirm'] == 32)
+    assert p['origin'] == 30 and p['direction'] == 1
+    # away from the edge the two modes are byte-identical
+    o, hh, ll, c = _rw(seed=9)
+    train = detect_fractal_zigzag_pivots(o, hh, ll, c, k=2, min_leg_atr=1.25)
+    live = detect_fractal_zigzag_pivots(o, hh, ll, c, k=2, min_leg_atr=1.25, live_edge=True)
+    assert [p for p in live if p['confirm'] + 1 < len(c)] == train
+
+
+def test_truncation_invariance_live_edge():
+    """The live consumer's proof: at every cut t, live_edge=True on data[:t+1] must emit exactly
+    the full-series pivots with confirm <= t — INCLUDING one confirming on bar t itself. This is
+    the no-drift guarantee for the bot's bar-by-bar port."""
+    o, h, l, c = _rw(n=3000, seed=13)
+    full = detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=1.25, live_edge=True)
+    rng = np.random.default_rng(2)
+    for t in sorted(rng.integers(300, 2990, 25)):
+        want = [(p['confirm'], p['direction'], p['origin']) for p in full if p['confirm'] <= t]
+        piv = detect_fractal_zigzag_pivots(o[:t + 1], h[:t + 1], l[:t + 1], c[:t + 1],
+                                           k=2, min_leg_atr=1.25, live_edge=True)
+        got = [(p['confirm'], p['direction'], p['origin']) for p in piv]
+        assert got == want, f'LIVE-EDGE DRIFT at cut {t}'
+
+
 def test_truncation_invariance_pure_fractal():
     """Same proof for the raw fractal detector."""
     o, h, l, c = _rw(n=2000, seed=12)
