@@ -94,10 +94,14 @@ FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))  # ant
 
 # ── TRAINING ──
 BATCH   = int(os.environ.get('BATCH', '512'))
-EPOCHS  = int(os.environ.get('EPOCHS', '60'))
+EPOCHS  = int(os.environ.get('EPOCHS', '60'))               # cosine LR anneals over EXACTLY this many
 STEPS   = 200
 LR      = float(os.environ.get('LR', '1e-4'))               # gentle: a REFINE of a proven base
-WEIGHT_DECAY, PATIENCE = 0.05, 8
+WEIGHT_DECAY = 0.05
+# PATIENCE must scale with EPOCHS or a long run early-stops in the first ~15% (the refine converges
+# fast — it peaked ~ep9 on a 60-epoch schedule). For EPOCHS=120 use PATIENCE~20 so the gentler cosine
+# decay has room to keep improving. Default tracks EPOCHS (min 8) so long runs "just work".
+PATIENCE = int(os.environ.get('PATIENCE', str(max(8, EPOCHS // 6))))
 CONTROLS = ()                          # honest-ruler controls run downstream (WF), not here
 PROBE = True                           # frozen-embedding probe = the representation gate
 SEED  = 0
