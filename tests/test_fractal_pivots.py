@@ -139,3 +139,41 @@ def test_hybrid_stricter_leg_fewer_pivots():
     loose = detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=0.5)
     tight = detect_fractal_zigzag_pivots(o, h, l, c, k=2, min_leg_atr=2.5)
     assert len(tight) < len(loose)
+
+
+# ---------------------------------------------------------------- THE LOOKAHEAD PROOF
+def test_truncation_invariance_no_lookahead():
+    """THE SHOWSTOPPER TEST: a causal detector's decisions at bar t are identical whether or not
+    the future exists. For random cut points t: pivots with confirm <= t computed on the FULL
+    series must equal those computed on data[:t+1]. Any lookahead (future bars influencing the
+    extreme choice, the alternation state, or the leg rule) breaks this equality."""
+    from futures_foundation.pipeline._primitives import compute_atr
+    o, h, l, c = _rw(n=3000, seed=11)
+
+    def confirmed_by(data_end, t):
+        piv = detect_fractal_zigzag_pivots(o[:data_end], h[:data_end], l[:data_end],
+                                           c[:data_end], k=2, min_leg_atr=1.25)
+        return [(p['confirm'], p['direction'], p['origin']) for p in piv if p['confirm'] <= t]
+
+    rng = np.random.default_rng(0)
+    for t in sorted(rng.integers(300, 2990, 25)):
+        full = confirmed_by(3000, t)
+        trunc = confirmed_by(t + 1, t)
+        # the last pivot near the boundary may differ only via the cf+1<n guard (needs an entry
+        # bar) — drop pivots confirmed exactly at the boundary from both sides before comparing
+        full = [p for p in full if p[0] < t]
+        trunc = [p for p in trunc if p[0] < t]
+        assert full == trunc, f'LOOKAHEAD at cut {t}: full={full[-3:]} trunc={trunc[-3:]}'
+
+
+def test_truncation_invariance_pure_fractal():
+    """Same proof for the raw fractal detector."""
+    o, h, l, c = _rw(n=2000, seed=12)
+
+    def confirmed_by(data_end, t):
+        piv = detect_fractal_pivots(h[:data_end], l[:data_end], k=3)
+        return [(p['confirm'], p['direction'], p['origin']) for p in piv if p['confirm'] < t]
+
+    rng = np.random.default_rng(1)
+    for t in sorted(rng.integers(200, 1990, 15)):
+        assert confirmed_by(2000, t) == confirmed_by(t + 1, t), f'LOOKAHEAD at cut {t}'
