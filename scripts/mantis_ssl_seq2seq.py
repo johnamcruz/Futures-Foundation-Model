@@ -77,10 +77,20 @@ WARM_CKPT = os.environ.get('WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis
 # DEFAULT OUT = the TUNED reorder (Optuna sweep winner, trial 3) — a DISTINCT file so the manual
 # freeze=3 anchor (mantis_ssl_seq2seq_reordered.pt, 52.6%) is NEVER overwritten. The two are the
 # freeze-2-vs-3 A/B: this tuned freeze=2 winner vs the anchor freeze=3, both vs seq2seq.
-# DEFAULT OUT = the forecast_dist LONG-HORIZON file (plain run = the NEXT experiment: distributional
-# teacher, warm from ctr_seq2seq, reach to 75). The candle_mse long-horizon (lh75) is already trained;
-# for it set PRETEXT=forecast OUT_PATH=...mantis_ssl_lh75_seq2seq.pt .
-OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_fdist_lh.pt')
+# ── CURRENT RUN (2026-07-09): the TREND LIFE-CYCLE / LONG-CONTEXT run — teach the encoder how
+# trends START, DEVELOP and END by finally showing it whole trends. Motivation: live forensics =
+# trend-aligned shorts stopped at -1R by premature pivots in bear chop (right direction, wrong
+# life-cycle position); the naive exhaustion scan (leg contraction / effort-result / ext-fail on
+# 9,560 strong-counter fades) is FLAT-to-contradictory -> simple rules can't see it; the [5,64]
+# window (~3h of 3min) physically can't contain a trend's leg structure. CONTEXT to 512 = Mantis's
+# NATIVE grid (64-bar windows were stretched 8x across it; 512 = full resolution, ~26h of 3min).
+# Same proven generic objective (candle seq2seq), warm from ctr_seq2seq — the corruption span now
+# CONTAINS the trend story (turn-electra lesson: never a discriminative pretext, aim the input).
+# Judge: MV_SEQ downstream A/B (WF honest ruler, fractal_zigzag pool, pre-2026) + the specific
+# counter-trend/exhaustion tables; 2026 untouched.
+# (Prior default = the forecast_dist long-horizon file mantis_ssl_fdist_lh.pt; the candle_mse
+#  long-horizon lh75 is already trained: PRETEXT=forecast OUT_PATH=...mantis_ssl_lh75_seq2seq.pt .)
+OUT_PATH  = os.environ.get('OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_lc512_seq2seq.pt')
 
 # ── CORPUS (same as stage 1) ──
 TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']      # all 9
@@ -94,7 +104,10 @@ def _int_tuple(env, default):                 # "10,25,50,75" -> (10,25,50,75); 
     return tuple(int(x) for x in v.split(',') if x.strip()) if v else default
 HORIZONS        = _int_tuple('HORIZONS', (10, 25, 50, 75))   # DEFAULT = long-horizon extension (reach
 #                                       to 75 = halfway to the 150-bar trade horizon; 50 anchors it)
-CONTEXT_LENGTHS = _int_tuple('CONTEXT_LENGTHS', (100, 150, 200, 200))  # longer context to support it
+CONTEXT_LENGTHS = _int_tuple('CONTEXT_LENGTHS', (128, 256, 384, 512))  # TREND LIFE-CYCLE contexts:
+#                                       up to 512 = Mantis's NATIVE grid (no stretch), ~26h of 3min —
+#                                       the window finally CONTAINS whole trends (start/develop/end);
+#                                       variable lengths keep the scale-invariance of the base recipe
 # LONG-HORIZON EXTENSION (build on what ctr_seq2seq knows -> reach FURTHER): the base only forecasts
 # 25 bars ahead but a trade runs 150 (VERT) — extend the horizons so the encoder learns how moves
 # DEVELOP over the range where runners form. Keep the count at 4 (head shape matches the warm-start)
@@ -124,7 +137,8 @@ DIR_WEIGHT      = float(os.environ.get('DIR_WEIGHT', '0.0'))   # >0 (~0.3) for c
 # mse_weight KEEPS the reconstruction anchor (default 1.0 -> NO drift, unlike ELECTRA). Recipe:
 #   PRETEXT=forecast_dist OBJECTIVE=candle_quantile QUANTILE_TAUS=bolt9 HORIZONS=10,25,50,75 \
 #   OUT_PATH=.../mantis_ssl_fdist_lh.pt EPOCHS=120
-PRETEXT       = os.environ.get('PRETEXT', 'forecast_dist')    # DEFAULT = the distributional teacher run
+PRETEXT       = os.environ.get('PRETEXT', 'forecast')         # DEFAULT = the long-context candle run
+#                                       (forecast_dist = the distributional teacher, recipe above)
 MSE_WEIGHT    = float(os.environ.get('MSE_WEIGHT', '1.0'))     # forecast_dist reconstruction ANCHOR (keep!)
 QUANTILE_TAUS = os.environ.get('QUANTILE_TAUS', 'bolt9')       # candle_quantile: 'lohi'(2) | 'bolt9'(9)
 BINS_K        = int(os.environ.get('BINS_K', '41'))            # candle_bins resolution
