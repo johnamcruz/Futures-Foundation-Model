@@ -4,7 +4,7 @@
 
 **A model-agnostic classification foundation for futures markets — any pretrained time-series classification backbone learns market structure from raw OHLCV, then thin per-strategy heads finetune on top, all held to an honest-ruler walk-forward.**
 
-**Contents:** [Quick Start](#quick-start) · [Philosophy](#philosophy--bert-for-futures) · [Overview](#overview) · [Self-Supervised Pretraining (3 stages)](#self-supervised-pretraining--3-progressive-stages) · [The Classifier Seam](#the-classifier-seam--model-agnostic) · [Finetuning Pipeline](#finetuning-pipeline--walk-forward--produce) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Data](#data) · [Project Structure](#project-structure)
+**Contents:** [Quick Start](#quick-start) · [Philosophy](#philosophy--bert-for-futures) · [Overview](#overview) · [Self-Supervised Pretraining (2 stages)](#self-supervised-pretraining--2-progressive-stages) · [The Classifier Seam](#the-classifier-seam--model-agnostic) · [Finetuning Pipeline](#finetuning-pipeline--walk-forward--produce) · [The Training Loop](#the-training-loop--overfit-driven) · [Add a Strategy](#add-a-strategy) · [Data](#data) · [Project Structure](#project-structure)
 
 ---
 
@@ -192,7 +192,7 @@ data/
 
 ### Features
 
-Raw OHLCV is the backbone's input. For strategies that fuse hand-crafted geometry, `futures_foundation.features.derive_features` produces instrument-agnostic (ATR-normalized), strictly causal features (bar anatomy, returns/momentum, volume dynamics, volatility, session context, market structure, HTF context) — every feature held to the no-look-ahead causal-parity rule (streaming == batch, per bar).
+Raw OHLCV is the backbone's input — the foundation learns market context directly from price and volume; no derived features are fed to it. Shared, certified trigger primitives (`futures_foundation.primitives`: pivots, barriers, indicators, sessions) are available for strategy labelers, every one held to the no-look-ahead causal-parity rule (streaming == batch, per bar).
 
 ---
 
@@ -215,10 +215,8 @@ Futures-Foundation-Model/
 │   │   ├── tune.py / loop.py          #   Optuna search + overfit-driven loop
 │   │   ├── _memmap.py                 #   featurize-to-disk streaming (bounded RAM)
 │   │   └── base.py / health.py        #   StrategyLabeler + FoldHealthMonitor
-│   ├── extractors/                    #   Pluggable backbone interface (FeatureExtractor)
-│   ├── features.py / primitives/      #   OHLCV → causal features; indicators/barriers
-│   └── prepare.py                     #   raw CSVs → features parquet
-├── colab/                             # ★ Colab runners: clone → install → Drive paths → run
+│   └── primitives/                    #   certified causal trigger primitives (pivots / barriers / indicators)
+├── scripts/                           # ★ SSL pretraining runner scripts (GPU)
 ├── databento/                         # Continuous-contract build + incremental update
 ├── tests/                             # Unit tests (pre-commit gated; torch-free by contract)
 └── data/                              # Raw OHLCV CSVs (gitignored)
