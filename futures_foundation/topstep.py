@@ -77,6 +77,15 @@ _EPS = 0.005
 
 
 def _net_pnl(fill: Fill, rules: CombineRules) -> float:
+    if not 1 <= abs(fill.qty) <= rules.max_contracts:
+        raise ValueError(
+            f"contract-cap violation: fill of {fill.qty} contracts on {fill.symbol} "
+            f"(allowed: 1..{rules.max_contracts} per side)"
+        )
+    if fill.symbol not in SYMBOL_SPECS:
+        raise KeyError(
+            f"unknown symbol {fill.symbol!r}: no tick spec (known: {sorted(SYMBOL_SPECS)})"
+        )
     tick_size, tick_value = SYMBOL_SPECS[fill.symbol]
     gross = fill.qty * (fill.exit - fill.entry) * (tick_value / tick_size)
     friction = abs(fill.qty) * 2.0 * (rules.slippage_ticks * tick_value + rules.commission_per_side)
@@ -94,9 +103,13 @@ def simulate_combine(fills: Sequence[Fill], rules: CombineRules = TOPSTEP_100K) 
     best_day_pnl = 0.0   # best completed-day P&L (consistency target input)
     halted = False       # DLL breached: no more fills this session day
     anchor = rules.start_balance  # highest END-OF-DAY balance; moves only at EOD
-
     for fill in fills:
         if last_day is None or fill.day != last_day:
+            if last_day is not None and fill.day < last_day:
+                raise ValueError(
+                    f"fills out of chronological order: day {fill.day!r} "
+                    f"after day {last_day!r}"
+                )
             # EOD of the previous day: the trailing anchor ratchets up here
             # and only here — never intraday, never down.
             anchor = max(anchor, equity)

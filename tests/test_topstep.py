@@ -178,3 +178,77 @@ def test_dll_measured_from_day_start_not_high_water():
     res = simulate_combine([ym(1, 1_500.0), ym(1, -2_000.0), ym(1, 400.0)])
     assert res.state == "timeout"
     assert res.equity[-1] == pytest.approx(START - 100.0)
+
+
+# ---------------------------------------------------------------------------
+# Consistency target (published mechanic, PRD-sanctioned check): best day at
+# or below 50% of total profit is required to pass — a single monster day
+# delays the pass until the ratio is back in line.
+# ---------------------------------------------------------------------------
+
+def test_monster_day_delays_pass_until_consistency_satisfied():
+    fills = [ym(1, 5_000.0), ym(2, 1_500.0), ym(3, 3_600.0)]
+    # After day 2: profit 6,500 >= 6,000 but best day 5,000 > 3,250 -> no pass.
+    partial = simulate_combine(fills[:2])
+    assert partial.state == "timeout"
+    # Day 3 brings total to 10,100 >= 2 x 5,000 -> passed on day 3.
+    res = simulate_combine(fills)
+    assert res.state == "passed"
+    assert res.days == 3
+
+
+def test_single_day_target_hit_cannot_pass():
+    # 6,200 in one day: target met, but best day is 100% of profit -> timeout.
+    res = simulate_combine([ym(1, 6_200.0)])
+    assert res.state == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# AC4 — purity: same fills in, same result out; input never mutated.
+# ---------------------------------------------------------------------------
+
+def test_same_fills_in_same_result_out():
+    fills = [ym(1, 2_500.0), ym(2, -1_500.0), ym(3, -1_600.0), ym(4, 100.0)]
+    a = simulate_combine(fills)
+    b = simulate_combine(fills)
+    assert a.state == b.state
+    assert a.days == b.days
+    assert (a.equity == b.equity).all()
+
+
+def test_input_fills_not_mutated():
+    fills = [ym(1, -2_100.0), ym(1, 500.0), ym(2, 300.0)]
+    snapshot = list(fills)
+    simulate_combine(fills)
+    assert fills == snapshot
+
+
+# ---------------------------------------------------------------------------
+# AC5 — contract-cap violations are rejected loudly, not silently clipped.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("qty", [11, -11, 25])
+def test_contract_cap_violation_raises(qty):
+    with pytest.raises(ValueError, match="contract"):
+        simulate_combine([Fill(day=1, symbol="NQ", qty=qty, entry=15_000.0, exit=15_001.0)])
+
+
+def test_zero_contract_fill_raises():
+    with pytest.raises(ValueError, match="contract"):
+        simulate_combine([Fill(day=1, symbol="NQ", qty=0, entry=15_000.0, exit=15_001.0)])
+
+
+def test_ten_contracts_is_allowed():
+    res = simulate_combine([Fill(day=1, symbol="NQ", qty=10, entry=15_000.0, exit=15_001.0)])
+    # gross 10 * 1pt * $20 = 200, friction 10 * 12.80 = 128 -> net 72
+    assert res.equity[-1] - START == pytest.approx(72.0)
+
+
+def test_unknown_symbol_rejected_loudly():
+    with pytest.raises(KeyError, match="CL"):
+        simulate_combine([Fill(day=1, symbol="CL", qty=1, entry=70.0, exit=71.0)])
+
+
+def test_out_of_order_days_rejected():
+    with pytest.raises(ValueError, match="order"):
+        simulate_combine([ym(2, 100.0), ym(1, 100.0)])
