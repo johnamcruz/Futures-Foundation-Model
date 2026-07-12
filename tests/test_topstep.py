@@ -87,3 +87,94 @@ def test_data_exhausted_is_timeout():
     assert res.state == "timeout"
     assert res.days == 3
     assert res.equity[-1] == pytest.approx(START + 800.0)
+
+
+# ---------------------------------------------------------------------------
+# AC1 — DLL breach: trading halted for the rest of that session day, but the
+# account survives (soft breach under current published Topstep mechanics).
+# ---------------------------------------------------------------------------
+
+def test_dll_breach_halts_day_but_account_survives():
+    res = simulate_combine([
+        ym(1, -2_100.0),  # daily loss 2,100 >= 2,000 -> halt: fill applied, day locked
+        ym(1, 5_000.0),   # same day: skipped, equity unchanged
+        ym(1, -5_000.0),  # same day: skipped, equity unchanged
+        ym(2, 300.0),     # next day: trading resumes
+    ])
+    assert res.state == "timeout"  # survived — not busted
+    assert res.days == 2
+    assert res.equity == pytest.approx(
+        [START - 2_100.0, START - 2_100.0, START - 2_100.0, START - 1_800.0]
+    )
+
+
+def test_dll_touch_exactly_halts():
+    # Hitting the limit exactly counts as a breach.
+    res = simulate_combine([ym(1, -2_000.0), ym(1, 1_000.0), ym(2, 100.0)])
+    assert res.equity == pytest.approx([START - 2_000.0, START - 2_000.0, START - 1_900.0])
+
+
+# ---------------------------------------------------------------------------
+# AC1 + AC2 — EOD-trailing MLL: breach busts the account; the trailing anchor
+# provably updates only at end-of-day (an intraday spike does not move it),
+# never moves down, and locks at the starting balance.
+# ---------------------------------------------------------------------------
+
+def test_mll_breach_busts_account():
+    res = simulate_combine([ym(1, -3_100.0), ym(2, 500.0)])
+    assert res.state == "busted-MLL"
+    assert res.days == 1
+    assert len(res.equity) == 1  # nothing after the bust is processed
+    assert res.equity[-1] == pytest.approx(START - 3_100.0)
+
+
+def test_mll_touch_exactly_busts():
+    # "If your account touches $97,000 (or lower)" — touching counts.
+    res = simulate_combine([ym(1, -3_000.0)])
+    assert res.state == "busted-MLL"
+
+
+def test_intraday_spike_does_not_move_mll_anchor():
+    # +2,000 intraday spike (equity 102,000) then -4,500 the same day
+    # (equity 97,500). If the anchor trailed intraday the threshold would be
+    # 99,000 and this would bust; EOD-trailing keeps it at 97,000 — survive.
+    res = simulate_combine([ym(1, 2_000.0), ym(1, -4_500.0), ym(2, 500.0)])
+    assert res.state == "timeout"
+    assert res.equity[-1] == pytest.approx(START - 2_000.0)
+
+
+def test_mll_anchor_updates_at_eod():
+    # Day 1 closes at 102,500 -> threshold rises to 99,500 at EOD.
+    # Day 2 equity 99,400 is above the original 97,000 floor but below the
+    # trailed threshold -> busted.
+    res = simulate_combine([ym(1, 2_500.0), ym(2, -3_100.0)])
+    assert res.state == "busted-MLL"
+    assert res.days == 2
+
+
+def test_mll_anchor_never_moves_down():
+    # Day 1 EOD 102,500 (threshold 99,500). Day 2 closes lower at 101,000 —
+    # the anchor must NOT drop. Day 3 equity 99,400 <= 99,500 -> busted.
+    res = simulate_combine([ym(1, 2_500.0), ym(2, -1_500.0), ym(3, -1_600.0)])
+    assert res.state == "busted-MLL"
+    assert res.days == 3
+
+
+def test_mll_locks_at_start_balance():
+    # Day 1 EOD 104,000: uncapped trailing would put the threshold at
+    # 101,000, but it locks at the 100,000 starting balance. Day 2 drop to
+    # 100,500 must survive (a DLL halt, not a bust)...
+    res = simulate_combine([ym(1, 4_000.0), ym(2, -3_500.0)])
+    assert res.state == "timeout"
+    # ...while touching 100,000 itself busts.
+    res = simulate_combine([ym(1, 4_000.0), ym(2, -4_000.0)])
+    assert res.state == "busted-MLL"
+
+
+def test_dll_measured_from_day_start_not_high_water():
+    # Intraday gain first: +1,500 then -2,000 leaves daily P&L at -500 —
+    # no breach (DLL measures from the day's starting balance, not the
+    # intraday high), so a later fill the same day still executes.
+    res = simulate_combine([ym(1, 1_500.0), ym(1, -2_000.0), ym(1, 400.0)])
+    assert res.state == "timeout"
+    assert res.equity[-1] == pytest.approx(START - 100.0)

@@ -92,18 +92,44 @@ def simulate_combine(fills: Sequence[Fill], rules: CombineRules = TOPSTEP_100K) 
     last_day: object = None
     day_pnl = 0.0        # running P&L of the current session day
     best_day_pnl = 0.0   # best completed-day P&L (consistency target input)
+    halted = False       # DLL breached: no more fills this session day
+    anchor = rules.start_balance  # highest END-OF-DAY balance; moves only at EOD
 
     for fill in fills:
         if last_day is None or fill.day != last_day:
+            # EOD of the previous day: the trailing anchor ratchets up here
+            # and only here — never intraday, never down.
+            anchor = max(anchor, equity)
             best_day_pnl = max(best_day_pnl, day_pnl)
             day_pnl = 0.0
+            halted = False
             days += 1
             last_day = fill.day
+
+        # MLL threshold trails the anchor and locks at the starting balance.
+        mll_floor = min(rules.start_balance, anchor - rules.max_loss)
+
+        if halted:  # DLL soft breach: fills for the rest of the day are ignored
+            path.append(equity)
+            continue
 
         pnl = _net_pnl(fill, rules)
         equity += pnl
         day_pnl += pnl
         path.append(equity)
+
+        # MLL: touching the trailed floor busts the account. Checked before
+        # the DLL — the max loss limit is the account-killer, so a fill that
+        # breaches both is a bust, not a halt.
+        if equity <= mll_floor + _EPS:
+            state = BUSTED_MLL
+            break
+
+        # DLL: daily loss at/over the limit halts trading for the rest of the
+        # session day. The breaching fill stands; the account survives.
+        if day_pnl <= -(rules.daily_loss - _EPS):
+            halted = True
+            continue
 
         # Passed: profit target reached AND no single day exceeds the
         # consistency fraction of total profit (the current day counts).
