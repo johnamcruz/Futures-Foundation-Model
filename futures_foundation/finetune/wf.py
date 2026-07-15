@@ -291,8 +291,8 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     saved atomically after EVERY fold via the shared resume toolkit (finetune/resume.py, the same
     machinery as the sweep's DB snapshot); on restart, completed folds reload and only the
     remaining ones run. Keyed on a CONFIG SIGNATURE (classifier + clf_kwargs + fold layout +
-    seed) so a changed config auto-invalidates; the control RNG stream is replayed for skipped
-    folds so a resumed run is byte-identical to a single-session run."""
+    seed + FEATURE WIDTH) so a changed config auto-invalidates; the control RNG stream is replayed
+    for skipped folds so a resumed run is byte-identical to a single-session run."""
     import os as _os
     import warnings
     from ._memmap import slice_memmap
@@ -310,8 +310,15 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     if 'standardize_mu' in (ck or {}):
         cfg['_fit_std'] = 1      # heads now FIT on standardized features -> invalidate any
         #                          partial fold-ckpt written under the old raw-fit regime
+    # FEATURE SHAPE is part of the key: a strategy that adds/drops handcraft columns keeps the
+    # same classifier, kwargs, seed and fold layout — without this the signature COLLIDES and the
+    # previous feature set's fold results reload as if they were this run's (silently, and the
+    # verdict comes back byte-identical, which is how the bug hides). Xall is a memmap PATH here,
+    # so read the per-row shape off the .npy header rather than the object.
+    xshape = (list(np.load(str(Xall), mmap_mode='r').shape[1:])
+              if isinstance(Xall, (str, _os.PathLike)) else list(np.shape(Xall)[1:]))
     ckpt = KeyedCheckpoint(fold_ckpt, config_signature(
-        classifier, cfg, int(seed), [[len(a), len(b), len(c)] for a, b, c in folds]))
+        classifier, cfg, int(seed), [[len(a), len(b), len(c)] for a, b, c in folds], xshape))
     res = ckpt.load(dict(real=[], shuf=[], rand=[], yte=[], pte=[], valm=[], testm=[]))
     if verbose and res['real']:
         print(f"  [fold-ckpt] resumed {len(res['real'])}/{len(folds)} folds from {fold_ckpt}",
