@@ -38,6 +38,12 @@ from .windows import (
     aggregate_ohlcv_window,
     multi_scale_ohlcv_window,
 )
+from .splice import (
+    detect_splice_jumps,
+    splice_prefix_counts,
+    splice_taints_window,
+    splice_taints_outcome,
+)
 from .pairs import (
     DEFAULT_SIBLINGS,
     parse_siblings,
