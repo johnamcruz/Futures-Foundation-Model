@@ -291,6 +291,19 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     bands = wr_by_score(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
+    # TIER-LEVEL SHUFFLE RULER (2026-07-16): the pool-level beats_shuffle compares REAL vs
+    # SHUFFLE over the top ~half of the pool — a scale where fixed-R constructions cap the edge
+    # below the pass margin for ANY model (oracle-proven), so it fails unconditionally for
+    # top-tier instruments. The honest ruler compares the arms WHERE THE MODEL TRADES: the same
+    # per-day operating points. PASS = REAL meanR beats SHUFFLE meanR by PASS_LIFT_MARGIN_R at
+    # EVERY rate (and a shuffle tier sitting near the take-all floor = no artifact rescue).
+    ops_sh = (operating_points(eval_lab, Kte, ps, oos_ts)
+              if (Rs is not None and oos_ts is not None) else [])
+    beats_shuffle_tiers = None
+    if ops and ops_sh:
+        beats_shuffle_tiers = all(
+            (r['meanR'] - s['meanR']) >= PASS_LIFT_MARGIN_R
+            for r, s in zip(ops, ops_sh) if r['rate'] == s['rate'])
     # PER-TICKER operating points (the deploy question is per-instrument: "NQ at N/day") —
     # rank WITHIN each ticker's candidates, same forward-threshold semantics.
     per_tk = {}
@@ -309,7 +322,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, operating_points=ops, wr_by_alignment=align,
-               per_ticker_ops=per_tk,
+               per_ticker_ops=per_tk, shuffle_operating_points=ops_sh,
+               beats_shuffle_tiers=beats_shuffle_tiers,
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None))       # Platt (A,B) -> deploy contract
     if verbose:
@@ -325,9 +339,23 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
         if edge is not None:
             print(f"  OOS meanR REAL {out['oos_meanR']:+.3f} SHUFFLE {out['shuffle_meanR']:+.3f} "
                   f"edge {edge:+.3f} (trades={out['oos_trades']})  -> "
-                  f"{'beats SHUFFLE' if out['beats_shuffle'] else 'does NOT beat SHUFFLE'}")
+                  f"{'beats SHUFFLE' if out['beats_shuffle'] else 'does NOT beat SHUFFLE'}"
+                  f"  [POOL-scale ruler: construction-capped; deploy verdict = the TIER ruler]")
         else:
             print(f"  OOS meanR REAL {out['oos_meanR']:+.3f} (SHUFFLE skipped; trades={out['oos_trades']})")
+        if ops and ops_sh:
+            print("  TIER RULER — REAL vs SHUFFLE at the SAME per-day operating points "
+                  "(where the model actually trades):", flush=True)
+            for r, s in zip(ops, ops_sh):
+                if r['rate'] != s['rate']:
+                    continue
+                lift = r['meanR'] - s['meanR']
+                print(f"    ~{r['rate']}/day: REAL {r['wr3R']:5.1%} {r['meanR']:+.3f}  vs  "
+                      f"SHUFFLE {s['wr3R']:5.1%} {s['meanR']:+.3f}   lift {lift:+.3f} "
+                      f"{'PASS' if lift >= PASS_LIFT_MARGIN_R else 'FAIL'}", flush=True)
+            print(f"  -> TIER VERDICT: "
+                  f"{'BEATS SHUFFLE at every deploy tier' if out['beats_shuffle_tiers'] else 'FAIL — tier lift below margin'}",
+                  flush=True)
     return out
 
 
