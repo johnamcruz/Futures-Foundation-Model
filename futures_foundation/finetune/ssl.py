@@ -192,6 +192,8 @@ def _base_cfg(**kw):
              # keeps the embedding tied to the data (0 = pure discrimination / drift risk).
              # span_mean/span_max (shared above) set span lengths; electra coerces span_mean<=0 to 4.
              rtd_weight=5.0, recon_weight=1.0, gen_width=48, turn_w=3, turn_bias=0.85,
+             # stage-2.6 NEXT-LEG forecasting (bars; pure-fractal pivots, NO ATR):
+             leg_cap=256, leg_w=1.0, leg_k=2,
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
              # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination
              # runs against slow drift that val loss rewards (val micro-improves while the

@@ -26,9 +26,10 @@ from .forecast import ForecastTask
 from .forecast_dist import ForecastDistTask
 from .contrastive import ContrastiveTask
 from .electra import TurnElectraTask
+from .nextleg import NextLegTask
 
 PRETEXTS = {t.name: t for t in (MaskTask(), ForecastTask(), ForecastDistTask(),
-                                ContrastiveTask(), TurnElectraTask())}
+                                ContrastiveTask(), TurnElectraTask(), NextLegTask())}
 
 
 def get_pretext(name):
@@ -37,4 +38,4 @@ def get_pretext(name):
 
 
 __all__ = ['PretextTask', 'MaskTask', 'ForecastTask', 'ForecastDistTask', 'ContrastiveTask',
-           'TurnElectraTask', 'PRETEXTS', 'get_pretext']
+           'TurnElectraTask', 'NextLegTask', 'PRETEXTS', 'get_pretext']

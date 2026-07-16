@@ -18,5 +18,6 @@ from .pretext._torch.forecast_dist import (                # noqa: F401  stage-2
     train_ssl_forecast_dist, get_dist_objective, CandleQuantile, CandleBins)
 from .pretext._torch.contrastive import (                 # noqa: F401  stage-3 temporal regime geometry
     ContrastiveTrendNet, train_ssl_contrastive, regime_gate, _random_crop_resize)
+from .pretext._torch.nextleg import NextLegNet, train_ssl_nextleg              # noqa: F401
 from .pretext._torch.electra import (                     # noqa: F401  stage-4 turn-electra (replaced-TURN)
     ElectraNetwork, train_ssl_electra, clamp_valid_ohlc_t)
