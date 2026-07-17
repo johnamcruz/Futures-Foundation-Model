@@ -74,6 +74,16 @@ class _NextLegTrainer(_ForecastTrainer):
         confirms, tgts, ok = _leg_targets(np.asarray(big, np.float32), int(leg_k), int(leg_cap))
         confirms, tgts = confirms[ok], tgts[ok]            # resolved-only anchors
         starts = confirms - self.max_ctx + 1               # window start s.t. ctx ENDS at confirm
+        # ── LEAK GUARD (2026-07-17): the target reads out to o_nn = confirm + t1 + t2. That index
+        # MUST stay inside the reserved window [start, start+parent) or a boundary anchor's target
+        # peeks across the train/val or pre-2026 split. tgts hold log1p(bars) -> recover t1+t2.
+        _horizon = np.expm1(tgts[:, 0]) + np.expm1(tgts[:, 1])          # o_nn - confirm, in bars
+        _max_future = float(_horizon.max()) if len(_horizon) else 0.0
+        _reserved_future = self.parent - self.max_ctx                   # bars of future in the window
+        assert _max_future < _reserved_future + 1, (
+            f'TEMPORAL LEAK: target reads {_max_future:.0f} bars ahead but only {_reserved_future} '
+            f'reserved (parent={self.parent}, ctx={self.max_ctx}). reserve() must cover the FULL '
+            f'target horizon (both legs) or boundary anchors leak across the split.')
         # anchor sets = pivot-anchored starts that are LEGAL train/val window starts (leak-safe
         # split + in-stream reserve both inherited from the orchestrator's start sets)
         tr_np, va_np = tr if isinstance(tr, np.ndarray) else np.asarray(tr), \

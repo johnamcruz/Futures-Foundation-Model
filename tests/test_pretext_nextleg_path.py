@@ -213,3 +213,18 @@ def test_default_config_keeps_all_antiforgetting_guards_on():
     assert "FREEZE_ENCODER_LAYERS', '2'" in src            # freeze ON by default in the launcher
     assert 'mantis_ssl_nextleg.pt' in src and 'mantis_ssl_nextleg_path.pt' in src
     assert 'ssl/stage-2.7-adverse-path' in src             # runs from the MERGED branch
+
+
+def test_reserve_covers_both_legs_no_target_leak():
+    """LEAK GUARD (2026-07-17): the leg target reads the pivot TWO ahead (o_nn = confirm+t1+t2,
+    up to 2*leg_cap). reserve() MUST cover both legs or boundary anchors' t2 reads across the
+    train/val and pre-2026 split. Regression test for the fix (was context+1*leg_cap -> leak)."""
+    from futures_foundation.finetune.pretext.nextleg import NextLegTask
+    from futures_foundation.finetune.pretext.nextleg_path import NextLegPathTask
+    cfg = {'context_lengths': [128], 'leg_cap': 256}
+    # both the base and the path task must reserve context + 2*leg_cap (the full o_nn horizon)
+    assert NextLegTask().reserve(cfg) == 128 + 2 * 256
+    assert NextLegPathTask().reserve(cfg) == 128 + 2 * 256      # inherits the fix
+    # the reserved FUTURE (parent - context) must be >= the max target horizon (2*leg_cap)
+    reserved_future = NextLegTask().reserve(cfg) - max(cfg['context_lengths'])
+    assert reserved_future >= 2 * cfg['leg_cap']
