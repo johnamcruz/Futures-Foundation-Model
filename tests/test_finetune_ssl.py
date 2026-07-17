@@ -741,3 +741,15 @@ def test_forecast_direction_head_optional_and_backcompat():
                                    control='real', objective='candle_direction', dir_weight=0.5, verbose=False)
     assert 'dir_acc' in hist[-1] and 0.0 <= hist[-1]['dir_acc'] <= 1.0
     assert np.isfinite(hist[-1]['val_loss']) and 'skill' in hist[-1]    # candle metrics still there
+
+
+def test_nextleg_reserve_covers_both_legs_no_target_leak():
+    """LEAK FIX (2026-07-17): the nextleg leg target reads the pivot TWO ahead (t2 = o_nn - o_n),
+    so it touches up to confirm + 2*leg_cap of future. reserve() must cover BOTH legs — reserving
+    one leg_cap let boundary anchors' t2 read across the train/val and pre-2026 split (window_starts
+    only enforces contiguity over `reserve` bars). Regression guard: reserve == ctx + 2*leg_cap."""
+    from futures_foundation.finetune.pretext.nextleg import NextLegTask
+    cfg = {'context_lengths': [128], 'leg_cap': 256}
+    r = NextLegTask().reserve(cfg)
+    assert r == 128 + 2 * 256                                   # both legs reserved
+    assert r - max(cfg['context_lengths']) >= 2 * cfg['leg_cap']  # reserved future >= full target horizon
