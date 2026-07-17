@@ -23,8 +23,13 @@ class NextLegTask(ForecastTask):
     name, trainer = 'nextleg', 'train_ssl_nextleg'
 
     def reserve(self, cfg):
-        # context + enough future for the two legs to RESOLVE (unresolved -> masked, not fabricated)
-        return max(int(x) for x in cfg['context_lengths']) + int(cfg.get('leg_cap', 256))
+        # context + enough future for BOTH legs to RESOLVE (unresolved -> masked, not fabricated).
+        # LEAK FIX (2026-07-17): the target reads the pivot TWO ahead (t2 = o_nn - o_n), so the
+        # future span the target touches is up to t1 + t2 <= 2*leg_cap, NOT one leg_cap. Reserving
+        # only 1*leg_cap let boundary anchors' t2 read across the train/val and pre-holdout/2026
+        # split (window_starts only enforces contiguity over `reserve` bars). Reserve BOTH legs so
+        # every kept anchor's o_nn stays inside its own split. Asserted in the trainer.
+        return max(int(x) for x in cfg['context_lengths']) + 2 * int(cfg.get('leg_cap', 256))
 
     def finalize_verdict(self, verdict, fc_skill, probe_res):
         verdict = super().finalize_verdict(verdict, fc_skill, probe_res)
