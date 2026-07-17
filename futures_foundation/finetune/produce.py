@@ -33,6 +33,53 @@ def _oos_days(ts):
     return max(1, int(pd.DatetimeIndex(ts).normalize().nunique())) if len(ts) else 1
 
 
+# ── VAL SPLIT (2026-07-16). The inner val set places the Platt calibration AND the entry
+# thresholds, and early-stops the head — so a val row that is a near-duplicate of a train row
+# makes all three optimistic, and the resulting probas COLLAPSE on genuinely unseen data (the
+# measured symptom: live probas never reach the backtest's floors).
+# A RANDOM permutation split does exactly that: adjacent pivots share a `seq`-bar input window
+# and a VERT-bar outcome window, so a shuffled val row sits inside its train neighbours' windows.
+# TEMPORAL (default) = val is the LAST val_frac of the stream, PURGED: a train row whose outcome
+# window reaches the val start is dropped — the same barrier rule build() applies at test_start.
+# VAL_SPLIT=random restores the legacy behaviour (needed only to reproduce pre-fix bundles). ──
+VAL_SPLIT = os.environ.get('VAL_SPLIT', 'temporal')      # temporal (default/honest) | random (legacy)
+
+
+def _key_bar_index(k):
+    """Bar index out of a key tuple, WITHOUT assuming one strategy's layout: the mantis
+    strategies key on (sid, i, ...) while simple/test labelers key on (i, ...). -> int or None."""
+    try:
+        v = k[1] if (len(k) >= 2 and isinstance(k[0], str)) else k[0]
+        return int(v) if float(v) == int(v) else None    # reject R-floats etc.
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _val_split(Ktr, val_frac, lab, rng, min_val=1):
+    """-> (va_i, tr_i) index arrays into Ktr.
+
+    The SPLIT needs no key introspection: build() walks signals forward, so the last val_frac of
+    the list IS the last val_frac of the calendar. Only the PURGE needs bar indices — if the key
+    layout doesn't expose one, split temporally anyway and skip the purge (still strictly better
+    than a random split, which interleaves val INSIDE the train windows)."""
+    n = len(Ktr)
+    nv = max(int(min_val), int(n * val_frac))
+    if VAL_SPLIT == 'random':                            # legacy: leaks train->val (see above)
+        idx = rng.permutation(n)
+        return idx[:nv], idx[nv:]
+    cut = n - nv
+    va_i, tr_i = np.arange(cut, n), np.arange(cut)
+    bars = [_key_bar_index(k) for k in Ktr]
+    if any(b is None for b in bars):                     # unknown key layout -> temporal, unpurged
+        return va_i, tr_i
+    bars = np.asarray(bars)
+    if not np.all(np.diff(bars) >= 0):                   # not time-ordered -> can't purge safely
+        return va_i, tr_i
+    vert = int(getattr(lab, 'VERT', 150))
+    keep = np.arange(cut)[bars[:cut] + 1 + vert < bars[cut]]   # PURGE the barrier overlap
+    return va_i, (keep if len(keep) else tr_i)           # degenerate stream -> unpurged
+
+
 def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     """OOS quality at DEPLOY operating points (CUMULATIVE): rank all OOS pivots by score, take the
     top N = rate * trading_days, report WR@3R + meanR + count at each per-day trade rate. The honest
@@ -454,8 +501,7 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
         if channel_names is None and hasattr(lab, 'mv_feature_names'):
             channel_names = lab.mv_feature_names()
         if len(Ktr) >= 2:
-            idx = rng.permutation(len(Ktr)); nv = max(1, int(len(Ktr) * val_frac))
-            va_i, tr_i = idx[:nv], idx[nv:]
+            va_i, tr_i = _val_split(Ktr, val_frac, lab, rng)
             p = str(rundir / f'_tr{i}.npy')
             _, sh = featurize_to_memmap(clf, lab, [Ktr[j] for j in tr_i], p, chunk)
             tr_parts.append((p, len(tr_i))); Ytr_tr += list(Ytr[tr_i]); C, seq = sh[1], sh[2]
@@ -536,12 +582,11 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
     if len(Ytr) < 50 or len(Kte) < 20:
         raise ValueError(f"insufficient data: train={len(Ytr)} oos={len(Kte)}")
     if max_train and len(Ktr) > max_train:
-        sub = np.random.default_rng(seed).choice(len(Ktr), max_train, replace=False)
+        # sorted: the subsample is random but must STAY time-ordered or the temporal split breaks
+        sub = np.sort(np.random.default_rng(seed).choice(len(Ktr), max_train, replace=False))
         Ktr = [Ktr[j] for j in sub]; Ytr = Ytr[sub]
     rng = np.random.default_rng(seed)
-    idx = np.arange(len(Ktr)); rng.shuffle(idx)
-    nv = max(10, int(len(idx) * val_frac))
-    va_i, tr_i = idx[:nv], idx[nv:]
+    va_i, tr_i = _val_split(Ktr, val_frac, labeler, rng, min_val=10)
     Ktr_tr = [Ktr[j] for j in tr_i]; Ytr_tr = Ytr[tr_i]
     Ktr_va = [Ktr[j] for j in va_i]; Ytr_va = Ytr[va_i]
 

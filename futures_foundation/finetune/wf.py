@@ -126,9 +126,11 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
             psv, ps, _ = clf.fit_predict(Xtr, ysh, Xval, Yval, Xte, seed,
                                          keys_tr=Ksh, keys_val=list(Kval))
             pool['SHUFFLE'].append(_arm_R(labeler, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
-            # RANDOM
+            # RANDOM — threshold from a val-sized draw (same forward protocol as REAL/SHUFFLE;
+            # thresholding pr on itself reads the test distribution, an asymmetric ruler)
             pr = rng.random(len(Kte))
-            pool['RANDOM'].append(_arm_R(labeler, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))
+            pool['RANDOM'].append(_arm_R(labeler, Kte, pr,
+                                         _pct_threshold(rng.random(len(Kval)), OP_PERCENTILE)))
 
         # per-fold health (REAL, first seed)
         monitor.check(f'F{n_folds}', _health_metrics(fold_p_te, Yte, fold_p_val, Yval))
@@ -353,8 +355,9 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         psv, ps, _ = clf_run.fit_predict(ftr, ysh, fva, Yva, fte, seed,
                                          keys_tr=Ksh, keys_val=Kva)
         res['shuf'].append(_arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE)))
-        pr = rng.random(len(Kte))
-        res['rand'].append(_arm_R(eval_lab, Kte, pr, _pct_threshold(pr, OP_PERCENTILE)))
+        pr = rng.random(len(Kte))                        # val-sized threshold draw: same forward
+        res['rand'].append(_arm_R(eval_lab, Kte, pr,     # protocol as the REAL/SHUFFLE arms
+                                  _pct_threshold(rng.random(len(Kva)), OP_PERCENTILE)))
         if monitor:                                       # legacy P@80 monitor (opt-in; callers
             monitor.check(f'F{fi}', _health_metrics(p_te, Yte, p_val, Yva))   # pass None to skip)
         if verbose:

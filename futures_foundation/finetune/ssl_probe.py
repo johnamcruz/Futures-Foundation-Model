@@ -88,13 +88,25 @@ def probe_embedding(emb, y, kind, seed=0, test_frac=0.3, folds=1):
     too noisy to trust the ordering)."""
     emb = np.asarray(emb, np.float32)
     n = len(emb)
+    # ── SPLIT (2026-07-16): rows are OVERLAPPING windows in stream order, so a SHUFFLED split
+    # puts near-duplicate windows on both sides — every probe score (the SSL gates) reads
+    # optimistic. Default = CONTIGUOUS blocks (KFold shuffle=False / temporal tail), which keeps
+    # overlap only at block edges. PROBE_SPLIT=random reproduces legacy (banked bar) numbers —
+    # never compare a contiguous score against a banked shuffled one. ──
+    import os
+    legacy = os.environ.get('PROBE_SPLIT', 'contiguous') == 'random'
     if folds and folds > 1:
         from sklearn.model_selection import KFold
-        kf = KFold(n_splits=int(folds), shuffle=True, random_state=seed)
+        kf = (KFold(n_splits=int(folds), shuffle=True, random_state=seed) if legacy
+              else KFold(n_splits=int(folds), shuffle=False))
         return float(np.mean([_fit_score(emb, y, kind, tr, te) for tr, te in kf.split(emb)]))
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    nt = int(n * (1 - test_frac))
+    if legacy:
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(n)
+        nt = int(n * (1 - test_frac))
+        return _fit_score(emb, y, kind, idx[:nt], idx[nt:])
+    nt = int(n * (1 - test_frac))                       # temporal: test = the stream tail
+    idx = np.arange(n)
     return _fit_score(emb, y, kind, idx[:nt], idx[nt:])
 
 
