@@ -55,18 +55,23 @@ def leg_retrace(h, l, o_i, o_n, d, cap=2.0):
     ever touching ATR — the same property that lets t1/t2 live in bars.
 
     -> float in [0, cap], or NaN when the leg has no extent (target UNRESOLVED -> the caller
-    drops the anchor; never fabricate 0.0, which would read as 'a clean leg')."""
-    h = np.asarray(h, float); l = np.asarray(l, float)
-    seg_h, seg_l = h[o_i:o_n + 1], l[o_i:o_n + 1]
+    drops the anchor; never fabricate 0.0, which would read as 'a clean leg').
+
+    PERF (do not "clean up"): SLICE FIRST, convert after. `h`/`l` are columns of the full ~25M-bar
+    corpus and this runs ~2M times (once per pivot). An `np.asarray(h, float)` on the whole column
+    copies the entire float32 array to float64 EVERY CALL -> ~20h of memcpy before epoch 1. Slicing
+    first bounds every conversion to <= leg_cap elements."""
+    seg_h = np.asarray(h[o_i:o_n + 1], dtype=np.float64)
+    seg_l = np.asarray(l[o_i:o_n + 1], dtype=np.float64)
     if len(seg_h) < 2:
         return np.nan
     if d == 1:                                             # pivot LOW -> leg travels UP
-        extent = h[o_n] - l[o_i]
+        extent = seg_h[-1] - seg_l[0]                      # h[o_n] - l[o_i]
         if not (extent > 0):
             return np.nan
         dd = float((np.maximum.accumulate(seg_h) - seg_l).max())     # peak-to-trough giveback
     else:                                                  # pivot HIGH -> leg travels DOWN
-        extent = h[o_i] - l[o_n]
+        extent = seg_h[0] - seg_l[-1]                      # h[o_i] - l[o_n]
         if not (extent > 0):
             return np.nan
         dd = float((seg_h - np.minimum.accumulate(seg_l)).max())

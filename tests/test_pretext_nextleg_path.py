@@ -53,6 +53,29 @@ def test_retrace_is_scale_free():
     assert leg_retrace(ROUGH_H * 0.1, ROUGH_L * 0.1, 0, 5, d=1) == pytest.approx(base)
 
 
+def test_retrace_does_not_touch_the_whole_column():
+    """PERF GUARD — this bug HUNG a GPU run for ~20h before epoch 1.
+
+    h/l are columns of the ~25M-bar float32 corpus and leg_retrace runs ~2M times (once per
+    pivot). An `np.asarray(h, float)` on the WHOLE column copies 25M float32 -> float64 on EVERY
+    call. Slice first, convert after: every conversion is bounded by leg_cap. A regression here
+    is invisible in a unit test on 6-bar arrays and catastrophic in production."""
+    import time
+    rng = np.random.default_rng(0)
+    n = 2_000_000
+    c = (100 + rng.normal(0, 1, n).cumsum()).astype(np.float32)      # float32 = the trigger
+    h = (c + 0.3).astype(np.float32)
+    l = (c - 0.3).astype(np.float32)
+    t = time.time()
+    for i in range(2000):
+        o = i * 37 % (n - 300)
+        leg_retrace(h, l, o, o + 120, 1 if i % 2 else -1)
+    per = (time.time() - t) / 2000
+    # a bounded slice is ~microseconds; touching the full column is ~milliseconds+
+    assert per < 5e-4, (f'leg_retrace is {per*1e6:.0f} us/call on a 2M-bar column — it is '
+                        f'touching the whole array. ~2M pivots would take {per*2e6/3600:.1f} h.')
+
+
 def test_retrace_degenerate_leg_is_nan_not_zero():
     """No extent -> unresolved. MUST be NaN so the anchor is dropped; 0.0 would read as 'clean'."""
     flat = np.full(4, 100.)
