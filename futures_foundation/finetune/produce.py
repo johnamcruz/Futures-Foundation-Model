@@ -397,32 +397,35 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
             # VAL distribution (leak-free). The bot enters when calibrated P >= T.
             'entry_rule': 'enter if calibrated_proba >= entry_thresholds[tier]',
             'entry_thresholds': out.get('entry_thresholds'),
-            # ── PER-STREAM PERCENTILE SCALE (the 0-100 deploy score) ──────────────────────────
-            # A calibrated proba is anchored to its LABEL'S BASE RATE, so its absolute scale moves
-            # with the label: a 4R head (base 23%) centres ~0.24, a strict-6R head (base 14.9%)
-            # centres ~0.15. A floor tuned for one takes LITERALLY NOTHING from the other. The
-            # scale also differs BY STREAM at a fixed rate (measured: 15 takes/day needs 0.145 on
-            # ES@3min but 0.186 on NQ@1min). `val_percentiles` maps proba -> 0-100 PER STREAM, so
-            # one floor means the same thing on every ticker/TF and across models.
-            #   score = 100 * (fraction of that stream's VAL probas below this proba)
-            #   take  if score >= score_floor AND calibrated_proba >= p_min
-            # THE BACKSTOP IS NOT OPTIONAL: a percentile floor ALWAYS FIRES — in a dead regime the
-            # top decile of junk is still p90. `p_min` is what lets the model stand down. Keep it
-            # LOW (it is a backstop, not a filter); when it binds, that is information.
-            # p_min default = the VAL median: below the median the model is, by its own
-            # distribution, not distinguishing anything. Override per deployment.
-            'score_scale': {
-                'kind': 'per_stream_val_percentile',
-                'rule': ('score = 100 * P(val proba of this stream < calibrated_proba); '
-                         'take if score >= score_floor AND calibrated_proba >= p_min'),
-                'percentiles': out.get('val_percentiles'),
-                'p_min': (float(np.median([v['p50'] for v in out['val_percentiles'].values()]))
-                          if out.get('val_percentiles') else None),
-                'note': ('percentiles are VAL-derived (forward-legal). Percentiles over the TEST '
-                         'year would be hindsight ranking — the tier-table defect. Keyed by the '
-                         "labeler's opaque stream id; a stream is whatever the strategy says."),
-            },
         })
+    # ── PER-STREAM PERCENTILE SCALE (the 0-100 deploy score) — EMITTED FOR EVERY HEAD ──────────
+    # THE STANDARDIZED SCORE (user directive 2026-07-17): whether distributional or not, the raw
+    # entry signal (calibrated_proba for the single head, expected_reach for the ladder) is mapped
+    # to ONE 0-100 axis so the bot/RL floors on a single stable number and a head swap needs NO bot
+    # change. Built ONCE here (not per-branch) so the two heads can never drift.
+    # WHY per-stream: the raw signal's absolute scale moves with the LABEL and the STREAM — a
+    # calibrated proba anchors to its base rate (4R head ~0.24, strict-6R ~0.15); expected_reach is
+    # an E[R] ~0-8. Both differ by stream at a fixed rate (measured: 15 takes/day needs 0.145 on
+    # ES@3min but 0.186 on NQ@1min). val_percentiles maps the signal -> 0-100 PER STREAM, so 'take
+    # if score >= 60' means the same on every ticker/TF AND across models.
+    #   score = 100 * (fraction of that stream's VAL signal values below this one)
+    #   take  if score >= score_floor AND raw_signal >= p_min
+    # THE BACKSTOP IS NOT OPTIONAL: a percentile floor ALWAYS FIRES — in a dead regime the top
+    # decile of junk is still p90. `p_min` (VAL median) is what lets the model stand down; keep it
+    # LOW (a backstop, not a filter) — when it binds, that is information. Override per deployment.
+    _sig = 'expected_reach' if dist else 'calibrated_proba'
+    contract['score_scale'] = {
+        'kind': 'per_stream_val_percentile',
+        'signal': _sig,                                   # what the percentile ranks (head-dependent)
+        'rule': (f'score = 100 * P(val {_sig} of this stream < {_sig}); '
+                 f'take if score >= score_floor AND {_sig} >= p_min'),
+        'percentiles': out.get('val_percentiles'),
+        'p_min': (float(np.median([v['p50'] for v in out['val_percentiles'].values()]))
+                  if out.get('val_percentiles') else None),
+        'note': ('percentiles are VAL-derived (forward-legal; TEST-year percentiles would be '
+                 'hindsight ranking — the tier-table defect). SAME 0-100 axis for every head so a '
+                 'head swap needs no bot change. Keyed by the strategy\'s opaque stream id.'),
+    }
     cpath = str(base) + '_signal.json'
     Path(cpath).write_text(json.dumps(contract, indent=2))
     out['artifacts'] = {'onnx': (bundle if sha else None), 'contract': cpath, 'content_sha': sha}
