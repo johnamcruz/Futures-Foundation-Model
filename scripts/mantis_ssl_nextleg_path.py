@@ -47,7 +47,10 @@ os.chdir('/content')
 # The 2.7 pretext ships on its own branch until merged. Cloning 'main' before the merge gives
 # KeyError: 'nextleg_path' from the registry (fail-fast, working as intended) — point this at the
 # branch to test pre-merge, or leave it on main once the PR lands.
-FFM_BRANCH = os.environ.get('FFM_BRANCH', 'ssl/stage-2.7-nextleg-path')
+# 2026-07-17: branch superseded by ssl/stage-2.7-adverse-path = the SAME four 2.7 commits merged
+# with current main (temporal purged splits 1e4bf45, score_scale, ledger opt-in) — the honest
+# probe split matters for gates 3-5, so the run must come from the MERGED branch.
+FFM_BRANCH = os.environ.get('FFM_BRANCH', 'ssl/stage-2.7-adverse-path')
 
 from google.colab import drive
 drive.mount('/content/drive', force_remount=True)

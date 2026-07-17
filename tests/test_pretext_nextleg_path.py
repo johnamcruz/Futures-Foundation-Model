@@ -146,3 +146,70 @@ def test_trainer_signature_matches_2_6_and_swallows_cfg():
     assert {'retrace_w', 'retrace_cap'} <= set(s27)
     # the exact key that broke the Colab run
     assert 'seq' not in s27 and any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s27.values())
+
+
+@torch_test
+def test_freeze_encoder_protects_what_2_6_learned():
+    """THE RETENTION GUARD (2026-07-17): 'previous is frozen so we don't lose what was previously
+    learned.' freeze_encoder_layers is the whole anti-forgetting mechanism — if the flag silently
+    fails to reach requires_grad, 2.7 retrains 2.6's early layers and the drift-damage failure
+    mode (lc512, turn-electra) comes back with no error. Assert the contract directly on the
+    encoder structure the freezer walks: tokenizer + first N blocks frozen, later blocks live."""
+    import torch
+    import torch.nn as nn
+    from futures_foundation.finetune.pretext._torch.common import _freeze_encoder
+
+    class _Enc(nn.Module):                                # minimal Mantis-shaped encoder
+        def __init__(self):
+            super().__init__()
+            self.tokgen_unit = nn.Linear(5, 8)
+            unit = nn.Module()
+            tr = nn.Module()
+            tr.layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(4)])
+            unit.transformer = tr
+            self.vit_unit = unit
+
+    enc = _Enc()
+    n = _freeze_encoder(enc, 2)
+    assert n == 2                                          # froze exactly the first 2 blocks
+    assert all(not p.requires_grad for p in enc.tokgen_unit.parameters())
+    layers = enc.vit_unit.transformer.layers
+    assert all(not p.requires_grad for p in layers[0].parameters())
+    assert all(not p.requires_grad for p in layers[1].parameters())
+    assert all(p.requires_grad for p in layers[2].parameters())      # later blocks STAY trainable
+    assert all(p.requires_grad for p in layers[3].parameters())
+
+    # BYTE-IDENTITY after a real optimizer step: frozen params cannot move, trainable ones do.
+    before = {k: v.clone() for k, v in enc.state_dict().items()}
+    opt = torch.optim.AdamW([p for p in enc.parameters() if p.requires_grad], lr=1e-2)
+    x = torch.randn(16, 5)
+    out = enc.tokgen_unit(x)                               # frozen: contributes but can't update
+    for blk in layers:
+        out = blk(out)
+    out.sum().backward()
+    opt.step()
+    after = enc.state_dict()
+    for k in before:
+        frozen = k.startswith('tokgen_unit') or k.startswith(('vit_unit.transformer.layers.0',
+                                                              'vit_unit.transformer.layers.1'))
+        if frozen:
+            assert torch.equal(before[k], after[k]), f'FROZEN param {k} moved — retention broken'
+        else:
+            assert not torch.equal(before[k], after[k]), f'trainable param {k} did not update'
+
+
+@torch_test
+def test_default_config_keeps_all_antiforgetting_guards_on():
+    """The launch script's DEFAULTS are the run — assert the three anti-forgetting levers are on
+    by default in the trainer surface: warm-start param exists, freeze default > 0 comes from the
+    script (checked textually — the script is the deploy artifact), and the candle anchor
+    (mse_weight) defaults to ON in the trainer signature."""
+    import inspect
+    from futures_foundation.finetune._ssl_torch import train_ssl_nextleg_path
+    sig = inspect.signature(train_ssl_nextleg_path).parameters
+    assert 'backbone_ckpt' in sig                          # warm-start surface exists
+    assert sig['mse_weight'].default == 1.0                # candle ANCHOR on by default
+    src = open('scripts/mantis_ssl_nextleg_path.py').read()
+    assert "FREEZE_ENCODER_LAYERS', '2'" in src            # freeze ON by default in the launcher
+    assert 'mantis_ssl_nextleg.pt' in src and 'mantis_ssl_nextleg_path.pt' in src
+    assert 'ssl/stage-2.7-adverse-path' in src             # runs from the MERGED branch
