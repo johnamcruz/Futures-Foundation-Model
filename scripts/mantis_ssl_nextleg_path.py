@@ -39,21 +39,26 @@
 # ==============================================================================
 
 
-# ======================================= CELL 1 — SETUP (clone FFM @ main, install) ==========
+# ======================================= CELL 1 — SETUP (clone FFM, install) =================
 import os, subprocess
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 os.chdir('/content')
 
+# The 2.7 pretext ships on its own branch until merged. Cloning 'main' before the merge gives
+# KeyError: 'nextleg_path' from the registry (fail-fast, working as intended) — point this at the
+# branch to test pre-merge, or leave it on main once the PR lands.
+FFM_BRANCH = os.environ.get('FFM_BRANCH', 'ssl/stage-2.7-nextleg-path')
+
 from google.colab import drive
 drive.mount('/content/drive', force_remount=True)
 
-print('Cloning FFM repo (main)...')
+print(f'Cloning FFM repo ({FFM_BRANCH})...')
 os.system('rm -rf /content/Futures-Foundation-Model')
-r = subprocess.run(['git', 'clone', '--branch', 'main',
+r = subprocess.run(['git', 'clone', '--branch', FFM_BRANCH,
                     'https://github.com/johnamcruz/Futures-Foundation-Model.git',
                     '/content/Futures-Foundation-Model'], capture_output=True, text=True)
 if r.returncode != 0:
-    print(r.stderr); raise RuntimeError('git clone failed')
+    print(r.stderr); raise RuntimeError(f'git clone failed (branch {FFM_BRANCH!r})')
 print('Cloned')
 
 os.chdir('/content/Futures-Foundation-Model')
