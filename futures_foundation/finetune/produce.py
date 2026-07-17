@@ -8,9 +8,13 @@ Two modes:
     per-channel standardize stats applied per-batch. Lets a transformer train on the
     FULL aligned-pivot set (no 5.6GB array in RAM) — the data it needs to not overfit.
 
-Either way: train on all data < holdout_start (inner val + early-stop), score the
-held-out 2026 OOS once with a SHUFFLE control, and (export_onnx) emit <base>.onnx +
-<base>_signal.json (input spec, channel names, standardize mu/sd, oos metrics, sha).
+Either way: train on all data < holdout_start (inner val + early-stop), score the held-out
+OOS window [holdout_start, oos_end) ONCE with a SHUFFLE control, and (export_onnx) emit
+<base>.onnx + <base>_signal.json (input spec, channel names, standardize mu/sd, oos metrics,
+sha). Every run also appends a record to the DOWNSTREAM METRICS LEDGER (_ledger_append) —
+config + head-fit curve + tier tables + ruler verdict, keyed by checkpoint, for longitudinal
+encoder evaluation. Logs name the ACTUAL OOS window (an anchored 2022 fold says 2022, not
+'2026' — the label was hardcoded until 2026-07-16).
 """
 import hashlib
 import json
@@ -100,10 +104,10 @@ def alignment_breakdown(eval_lab, keys, proba, ts):
     return out or None
 
 
-def _print_alignment(ab):
+def _print_alignment(ab, title='OOS'):
     if not ab:
         return
-    print("  2026 OOS — COUNTER-TREND readout (WR@3R by model score WITHIN each HTF-alignment "
+    print(f"  {title} — COUNTER-TREND readout (WR@3R by model score WITHIN each HTF-alignment "
           "group; counter rising with score = SIGHTED soft-gating):", flush=True)
     for name, g in ab.items():
         print(f"    {name:>7}: n={g['n']:,}  base WR@3R={g['base_wr3R']:.1%}  "
@@ -113,7 +117,7 @@ def _print_alignment(ab):
                   f"WR@3R={r['wr3R']:6.1%}  meanR={r['meanR']:+.3f}", flush=True)
 
 
-def _print_operating_points(op_rows, band_rows, title='2026 OOS'):
+def _print_operating_points(op_rows, band_rows, title='OOS'):
     if band_rows:
         print(f"  {title} — WR@3R by score band (non-cumulative; monotone WR down the bands = the "
               "ranking is real, top band = the A+ signals):", flush=True)
@@ -285,7 +289,7 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
 
 
 def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yte, seed, verbose,
-               onnx_path=None, keys_tr=None, keys_val=None, oos_ts=None):
+               onnx_path=None, keys_tr=None, keys_val=None, oos_ts=None, title='OOS'):
     """Fit REAL (exporting ONNX during that fit when onnx_path is set) + SHUFFLE control.
     Two fits total — the export must ride the REAL fit; a separate export refit doubles
     peak RAM (fresh standardized copies on top of allocator creep) and OOMs at full scale.
@@ -368,24 +372,28 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                per_ticker_ops=per_tk, shuffle_operating_points=ops_sh,
                beats_shuffle_tiers=beats_shuffle_tiers,
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
-               platt=getattr(clf_real, '_platt', None))       # Platt (A,B) -> deploy contract
+               platt=getattr(clf_real, '_platt', None),      # Platt (A,B) -> deploy contract
+               # HEAD-FIT REPORT (iters/converged/curve/seconds) — the training-side diagnostic:
+               # convergence speed on a FROZEN embedding is an encoder signal, and a capped fit
+               # is a caveat on every number below it. Ledgered for cross-checkpoint comparison.
+               head_fit=getattr(clf_real, '_fit_report', None))
     if verbose:
-        _print_operating_points(ops, bands)
+        _print_operating_points(ops, bands, title=title)
         if per_tk:
-            print("  OOS — PER-TICKER operating points (rank within the ticker; the "
+            print(f"  {title} — PER-TICKER operating points (rank within the ticker; the "
                   "'N/day per instrument' deploy read):", flush=True)
             for _t, rows in per_tk.items():
                 cells = '  '.join(f"{r['rate']}/d {r['wr3R']:5.1%} {r['meanR']:+.2f}" for r in rows)
                 print(f"    {_t:>4}: {cells}", flush=True)
-        _print_alignment(align)
-        print(f"  OOS AUC {auc:.4f}" if auc is not None else "  OOS AUC n/a")
+        _print_alignment(align, title)
+        print(f"  {title} AUC {auc:.4f}" if auc is not None else f"  {title} AUC n/a")
         if edge is not None:
-            print(f"  OOS meanR REAL {out['oos_meanR']:+.3f} SHUFFLE {out['shuffle_meanR']:+.3f} "
+            print(f"  {title} meanR REAL {out['oos_meanR']:+.3f} SHUFFLE {out['shuffle_meanR']:+.3f} "
                   f"edge {edge:+.3f} (trades={out['oos_trades']})  -> "
                   f"{'beats SHUFFLE' if out['beats_shuffle'] else 'does NOT beat SHUFFLE'}"
                   f"  [POOL-scale ruler: construction-capped; deploy verdict = the TIER ruler]")
         else:
-            print(f"  OOS meanR REAL {out['oos_meanR']:+.3f} (SHUFFLE skipped; trades={out['oos_trades']})")
+            print(f"  {title} meanR REAL {out['oos_meanR']:+.3f} (SHUFFLE skipped; trades={out['oos_trades']})")
         if ops and ops_sh:
             print("  TIER RULER — REAL vs SHUFFLE at the SAME per-day operating points "
                   "(where the model actually trades):", flush=True)
@@ -475,7 +483,8 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
         ck['standardize_mu'] = mu.tolist(); ck['standardize_sd'] = sd.tolist()
     tks = sorted({s[0] for s in streams}); tfs = sorted({s[1] for s in streams})
     if verbose:
-        print(f"=== PRODUCE STREAMED ({classifier}: {len(streams)} streams, 2026 OOS) ===")
+        print(f"=== PRODUCE STREAMED ({classifier}: {len(streams)} streams, "
+              f"OOS {holdout_start}..{oos_end or 'end'}) ===")
         print(f"  train={len(Ytr_tr)} val={len(Ytr_va)} oos={len(all_Kte)} C={C} seq={seq} "
               f"good(train)={Ytr_tr.mean():.3f} good(oos)={Yte.mean():.3f}", flush=True)
     onnx_path = (str(Path(output_path).with_suffix('')) + '.onnx'
@@ -484,9 +493,10 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
     out = _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, all_Kte, Yte,
                      seed, verbose, onnx_path=onnx_path,
                      keys_tr=(Ktr_tr if dist else None), keys_val=(Ktr_va if dist else None),
-                     oos_ts=all_te_ts)
+                     oos_ts=all_te_ts,
+                     title=f"OOS {holdout_start}..{oos_end or 'end'}")
     _ledger_append({
-        'ts': pd.Timestamp.utcnow().isoformat(), 'kind': 'produce_streamed',
+        'ts': pd.Timestamp.now('UTC').isoformat(), 'kind': 'produce_streamed',
         'classifier': classifier,
         'backbone': os.path.basename(str(ck.get('backbone_ckpt') or '')),
         'holdout_start': holdout_start, 'oos_end': oos_end,
@@ -562,7 +572,7 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
 
     if verbose:
         print(f"=== PRODUCE ({classifier}{' STREAM' if stream else ''}: train < "
-              f"{holdout_start}, 2026 OOS) ===")
+              f"{holdout_start}, OOS {holdout_start}..end) ===")
         print(f"  train={len(tr_i)} val={len(va_i)} oos={len(Kte)} C={C} seq={seq} "
               f"good(train)={Ytr_tr.mean():.3f} good(oos)={Yte.mean():.3f}", flush=True)
 
@@ -601,7 +611,7 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
                beats_shuffle=bool(edge >= PASS_LIFT_MARGIN_R),
                wr_by_score=bands, operating_points=ops)
     if verbose:
-        print(f"  OOS AUC {auc:.4f}" if auc is not None else "  OOS AUC n/a")
+        print(f"  {title} AUC {auc:.4f}" if auc is not None else f"  {title} AUC n/a")
         print(f"  OOS meanR REAL {out['oos_meanR']:+.3f} SHUFFLE {out['shuffle_meanR']:+.3f} "
               f"edge {edge:+.3f} (trades={out['oos_trades']})")
         print(f"  -> {'beats SHUFFLE' if out['beats_shuffle'] else 'does NOT beat SHUFFLE'}")

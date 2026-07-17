@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -128,6 +129,42 @@ def _save_bar_cache(path, idx, emb):
     tmp = path.parent / f"{path.stem}.{os.getpid()}.tmp.npz"      # atomic write
     np.savez(tmp, idx=np.asarray(idx, np.int64), emb=np.asarray(emb, dt))
     os.replace(tmp, path)
+
+
+def head_fit_report(clf, fit_seconds=None):
+    """The head's TRAINING-CURVE record — what the fit itself reveals, which no OOS metric can.
+
+    Reported (and ledgered) because these are ENCODER diagnostics, not just head trivia: a head
+    that converges in few epochs on a frozen embedding is telling you the task is nearly LINEAR
+    in that embedding space (the representation already separates it); one that grinds to the
+    iteration cap and still improves is telling you the embedding makes the task hard. Comparing
+    epochs-to-best across checkpoints on a MATCHED protocol is a cheap capability signal.
+
+    Fields (absent when the head doesn't expose them — logistic has no curve):
+      n_iter        — iterations/epochs actually run
+      converged     — did the solver converge, or hit max_iter (a capped fit is a caveat on
+                      every downstream number: the head may be under-trained, not the encoder weak)
+      best_val_loss / final_val_loss / val_curve — MLP early-stopping trajectory (last 20)
+      fit_seconds   — wall clock
+    """
+    rep = {}
+    n_iter = getattr(clf, 'n_iter_', None)
+    if n_iter is not None:
+        rep['n_iter'] = int(np.max(np.atleast_1d(n_iter)))
+        mx = getattr(clf, 'max_iter', None)
+        if mx is not None:
+            rep['converged'] = bool(rep['n_iter'] < int(mx))
+    curve = getattr(clf, 'validation_scores_', None)          # MLP early_stopping=True
+    if curve is not None and len(curve):
+        rep['val_curve'] = [round(float(v), 5) for v in list(curve)[-20:]]
+        rep['best_val_score'] = round(float(np.max(curve)), 5)
+        rep['epochs_to_best'] = int(np.argmax(curve) + 1)
+    loss_curve = getattr(clf, 'loss_curve_', None)
+    if loss_curve is not None and len(loss_curve):
+        rep['final_train_loss'] = round(float(loss_curve[-1]), 5)
+    if fit_seconds is not None:
+        rep['fit_seconds'] = round(float(fit_seconds), 1)
+    return rep
 
 
 def _fit_with_heartbeat(clf, X, y, every=60):
@@ -460,7 +497,21 @@ class MantisFrozenClassifier(Classifier):
         else:
             clf = LogisticRegression(max_iter=int(self.cfg.get('max_iter', 1000)),
                                      C=float(self.cfg.get('C', 1.0)))
+        _t0 = time.time()
         _fit_with_heartbeat(clf, Xtr, ytr)
+        # HEAD-FIT REPORT: the training curve — an ENCODER diagnostic (fast convergence on a
+        # frozen embedding = the task is near-linear in that space) + the under-training caveat
+        # (a max_iter-capped fit taints every downstream number). Surfaces in the result dict and
+        # the run ledger. DIAGNOSTIC ONLY — never a gate (corpus-label paradox).
+        self._fit_report = head_fit_report(clf, time.time() - _t0)
+        if self.cfg.get('verbose', True) and self._fit_report:
+            _fr = self._fit_report
+            _cap = '' if _fr.get('converged', True) else '  ** CAPPED at max_iter (under-trained?)'
+            print(f"    [head] iters={_fr.get('n_iter', '?')} "
+                  f"converged={_fr.get('converged', '?')} "
+                  + (f"epochs_to_best={_fr['epochs_to_best']} " if 'epochs_to_best' in _fr else '')
+                  + (f"best_val={_fr['best_val_score']:.4f} " if 'best_val_score' in _fr else '')
+                  + f"({_fr.get('fit_seconds', 0):.0f}s){_cap}", flush=True)
         # CALIBRATION (Platt) — OFF by default (cfg 'calibrate'). Fit on the VAL set, which the clf
         # never trained on (leak-free), so the proba tracks the empirical hit rate: P=0.5 => a true
         # ~50% signal, and the proba is a trustworthy regime-confidence across tiers (proba-sizing).
