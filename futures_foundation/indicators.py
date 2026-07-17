@@ -16,7 +16,7 @@ import pandas as pd
 from futures_foundation.pipeline._primitives import (      # noqa: F401  certified — ONE impl
     compute_atr, compute_adx, compute_supertrend, apply_rr_barriers, ehlers_decycler)
 from futures_foundation.primitives.detection import (      # noqa: F401  certified — ONE impl
-    detect_fractal_pivots, detect_fractal_zigzag_pivots, detect_atr_zigzag_pivots)
+    detect_fractal_pivots, detect_fractal_zigzag_pivots)
 
 
 # ── THE PRODUCTION PIVOT TRIGGER (2026-07-16) — the 4R model's candidate universe, params

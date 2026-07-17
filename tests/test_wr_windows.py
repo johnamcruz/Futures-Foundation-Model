@@ -48,16 +48,13 @@ def test_seq_controls_window_width(tmp_path):
     assert load_wr_cache(long)['win'].shape[2] == 256
 
 
-def test_detector_switch_changes_pool(tmp_path):
+def test_unknown_detector_raises(tmp_path):
+    # atr_zigzag DELETED 2026-07-16 (lookahead in R/is_trend/leg_end) — only the certified
+    # production trigger remains; asking for anything else must fail loud, never fall back.
     _write_csv(tmp_path, 'ES', '3min', seed=3)
-    zz = tmp_path / 'zz.npz'; fz = tmp_path / 'fz.npz'
-    build_wr_cache(zz, data_dir=str(tmp_path), tickers=['ES'], tfs=['3min'],
-                   seq=64, detector='zigzag', verbose=False)
-    build_wr_cache(fz, data_dir=str(tmp_path), tickers=['ES'], tfs=['3min'],
-                   seq=64, detector='fractal_zigzag', verbose=False)
-    # different triggers -> different pivot pools (both non-empty, not identical counts)
-    nz, nf = load_wr_cache(zz)['win'].shape[0], load_wr_cache(fz)['win'].shape[0]
-    assert nz > 0 and nf > 0 and nz != nf
+    with pytest.raises(ValueError, match='fractal_zigzag'):
+        build_wr_cache(tmp_path / 'zz.npz', data_dir=str(tmp_path), tickers=['ES'],
+                       tfs=['3min'], seq=64, detector='zigzag', verbose=False)
 
 
 def test_window_is_causal_past_only(tmp_path):

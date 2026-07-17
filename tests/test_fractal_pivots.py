@@ -1,12 +1,12 @@
 """Williams-fractal pivots (detect_fractal_pivots) — the time-confirmation trigger variant.
 
-Contract: same schema as detect_atr_zigzag_pivots (drop-in), strictly causal (confirm = extreme+k,
+Contract: the shared pivot schema, strictly causal (confirm = extreme+k,
 entry bar exists), extremes unique in their 2k+1 window, byte-exact detection.
 """
 import numpy as np
 
 from futures_foundation.primitives.detection import (
-    detect_atr_zigzag_pivots, detect_fractal_pivots)
+    detect_fractal_pivots)
 
 
 def _v(center=30, n=64, depth=5.0):
@@ -26,20 +26,6 @@ def test_finds_the_v_bottom():
     p = next(p for p in lows if p['origin'] == 30)
     assert p['confirm'] == 32                              # confirm = extreme + k
     assert p['leg_end'] == 30
-
-
-def test_schema_matches_atr_zigzag():
-    # independent wick noise — derived h/l from rolled closes creates systematic TIES, which the
-    # uniqueness rule correctly rejects (a tied extreme is not a fractal)
-    rng = np.random.default_rng(0)
-    c = 100 + rng.normal(0, 1, 400).cumsum()
-    o = np.roll(c, 1); o[0] = c[0]
-    h = np.maximum(o, c) + np.abs(rng.normal(0, 0.3, 400))
-    l = np.minimum(o, c) - np.abs(rng.normal(0, 0.3, 400))
-    zz = detect_atr_zigzag_pivots(o, h, l, c)
-    fr = detect_fractal_pivots(h, l, k=2)
-    assert len(fr) > 0 and len(zz) > 0
-    assert set(fr[0]) == set(zz[0])                        # identical keys = drop-in trigger
 
 
 def test_causal_confirm_and_unique_extreme():

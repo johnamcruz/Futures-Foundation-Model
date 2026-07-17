@@ -27,7 +27,6 @@ def test_reexports_are_the_certified_implementations_not_copies():
     from futures_foundation.pipeline import _primitives as P
     assert I.detect_fractal_pivots is D.detect_fractal_pivots
     assert I.detect_fractal_zigzag_pivots is D.detect_fractal_zigzag_pivots
-    assert I.detect_atr_zigzag_pivots is D.detect_atr_zigzag_pivots
     assert I.compute_atr is P.compute_atr
 
 

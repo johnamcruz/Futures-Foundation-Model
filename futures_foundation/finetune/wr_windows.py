@@ -75,8 +75,7 @@ def build_wr_cache(path, *, data_dir, tickers, tfs, seq=64, detector='zigzag',
     Writes an ATOMIC v2 npz: win, peak, r3, ts, tk, tf, dir, trend (+ meta: seq/detector/tickers/tfs).
     """
     from futures_foundation.pipeline._primitives import compute_atr
-    from futures_foundation.primitives.detection import (
-        detect_atr_zigzag_pivots, detect_fractal_zigzag_pivots)
+    from futures_foundation.primitives.detection import detect_fractal_zigzag_pivots
     from futures_foundation.pivots import causal_htf_dir
     seq = int(seq)
     r3i = list(targets).index(3.0)
@@ -98,9 +97,9 @@ def build_wr_cache(path, *, data_dir, tickers, tfs, seq=64, detector='zigzag',
             v = df['volume'].to_numpy(float); n = len(c)
             atr = compute_atr(h, l, c, atr_period)
             htf = causal_htf_dir({'ts': ts, 'o': o, 'h': h, 'l': l, 'c': c}, tf, ts, atr_period)
-            pivots = (detect_fractal_zigzag_pivots(o, h, l, c, k=fractal_k, min_leg_atr=fractal_leg_atr)
-                      if detector == 'fractal_zigzag'
-                      else detect_atr_zigzag_pivots(o, h, l, c, atr_period=atr_period, rev_atr=rev_atr))
+            if detector != 'fractal_zigzag':      # atr_zigzag DELETED 2026-07-16 (lookahead fields)
+                raise ValueError(f'unknown detector {detector!r}; only fractal_zigzag is certified')
+            pivots = detect_fractal_zigzag_pivots(o, h, l, c, k=fractal_k, min_leg_atr=fractal_leg_atr)
             w, pk, r3, tsp, dr, tnd = [], [], [], [], [], []
             min_hist = max(min_history, seq)                     # long windows need seq bars of history
             for p in pivots:
