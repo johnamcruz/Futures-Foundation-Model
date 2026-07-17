@@ -11,6 +11,12 @@ its own file keeps ssl.py a clean orchestrator.
   contrastive   (stage 3)   — TEMPORAL-NEIGHBORHOOD contrastive: regime geometry from
                               multi-scale time proximity + augmentations, sigma-weighted
                               (replaced the outcome-keyed v1-v3, dropped 2026-07-02)
+  nextleg       (stage 2.6) — NEXT-LEG forecasting: from a context ending at a confirmed
+                              fractal pivot, predict the newborn leg's / counter-leg's length in
+                              BARS. The GRADUATED backbone (mantis_ssl_nextleg.pt) — do not edit.
+  nextleg_path  (stage 2.7) — nextleg + the leg's PATH ROUGHNESS (deepest pullback within the
+                              leg / that leg's own extent — unitless, pure candles). Own modules;
+                              2.6 untouched, so the A/B stays honest.
   electra       (stage 4)   — TURN-ELECTRA (replaced-TURN detection): span-mask the regions around
                               DETECTED SWINGS (the event a pivot entry trades), a weak generator
                               fills each masked turn with a plausible alternative development (a
@@ -27,9 +33,11 @@ from .forecast_dist import ForecastDistTask
 from .contrastive import ContrastiveTask
 from .electra import TurnElectraTask
 from .nextleg import NextLegTask
+from .nextleg_path import NextLegPathTask
 
 PRETEXTS = {t.name: t for t in (MaskTask(), ForecastTask(), ForecastDistTask(),
-                                ContrastiveTask(), TurnElectraTask(), NextLegTask())}
+                                ContrastiveTask(), TurnElectraTask(), NextLegTask(),
+                                NextLegPathTask())}
 
 
 def get_pretext(name):
@@ -38,4 +46,5 @@ def get_pretext(name):
 
 
 __all__ = ['PretextTask', 'MaskTask', 'ForecastTask', 'ForecastDistTask', 'ContrastiveTask',
-           'TurnElectraTask', 'NextLegTask', 'PRETEXTS', 'get_pretext']
+           'TurnElectraTask', 'NextLegTask', 'NextLegPathTask', 'PRETEXTS',
+           'get_pretext']
