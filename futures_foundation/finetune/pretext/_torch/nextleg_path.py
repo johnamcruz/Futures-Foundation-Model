@@ -146,10 +146,20 @@ class _NextLegPathTrainer(_NextLegTrainer):
                   f"{'  *' if improved else ''}", flush=True)
 
 
-def train_ssl_nextleg_path(big, train_starts, val_starts, *, retrace_w=1.0, retrace_cap=2.0,
-                           **kw):
+def train_ssl_nextleg_path(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25),
+                           context_lengths=(64, 100, 150, 200), new_channels=8, epochs=60,
+                           steps_per_epoch=200, batch=512, lr=1e-4, weight_decay=0.05, patience=8,
+                           device=None, model_id='paris-noah/Mantis-8M', backbone_ckpt=None,
+                           control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
+                           ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=1.6,
+                           leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
+                           retrace_w=1.0, retrace_cap=2.0, **_ignore):
     """NEXT-LEG + PATH SSL -> (best_encoder_state, history). History adds 'retrace_corr' (the
     learning diagnostic for the path target) to 2.6's 'skill'/'leg_corr1'/'leg_corr2'/'std'.
+
+    Signature MIRRORS train_ssl_nextleg (+retrace_w/retrace_cap): the orchestrator hands every
+    task the WHOLE shared cfg, so a trainer must name what it wants and swallow the rest in
+    **_ignore. A **kw passthrough forwards cfg keys like `seq` down to BaseTrainer -> TypeError.
 
     GATES a 2.7 candidate must clear before it replaces 2.6 anywhere:
       1. retrace_corr materially > 0        — it actually learned the path target
@@ -159,6 +169,15 @@ def train_ssl_nextleg_path(big, train_starts, val_starts, *, retrace_w=1.0, retr
          measured under the OLD shuffled probe split (fixed 1e4bf45), so they are not comparable
       5. downstream WR@3R / meanR >= 2.6 at the deploy operating points
     """
-    t = _NextLegPathTrainer(big, train_starts, val_starts, retrace_w=retrace_w,
-                            retrace_cap=retrace_cap, **kw)
+    t = _NextLegPathTrainer(big, train_starts, val_starts,
+                            horizons=horizons, context_lengths=context_lengths,
+                            new_channels=new_channels, model_id=model_id,
+                            backbone_ckpt=backbone_ckpt, clamp=clamp, leg_cap=leg_cap,
+                            leg_w=leg_w, leg_k=leg_k, mse_weight=mse_weight,
+                            retrace_w=retrace_w, retrace_cap=retrace_cap,
+                            epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch, lr=lr,
+                            weight_decay=weight_decay, patience=patience, device=device,
+                            seed=seed, grad_clip=grad_clip, verbose=verbose, control=control,
+                            ckpt_path=ckpt_path, resume=resume,
+                            freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard)
     return t.fit()

@@ -104,3 +104,22 @@ def test_path_targets_shape_and_range():
     r1 = g[ok][:, 2]
     assert len(r1) > 100
     assert (r1 >= 0).all() and (r1 <= 2.0).all() and np.isfinite(r1).all()
+
+
+@torch_test
+def test_trainer_signature_matches_2_6_and_swallows_cfg():
+    """The orchestrator hands EVERY task the whole shared cfg (base.py: `**kw` from cfg), so a
+    trainer must NAME what it wants and swallow the rest in **_ignore. A **kw passthrough forwards
+    keys like `seq` down to BaseTrainer -> TypeError at Colab runtime, ~2 min in. Caught in prod;
+    this is the guard. 2.7 must accept exactly 2.6's params + the retrace lever."""
+    import inspect
+    from futures_foundation.finetune._ssl_torch import train_ssl_nextleg, train_ssl_nextleg_path
+    s26 = inspect.signature(train_ssl_nextleg).parameters
+    s27 = inspect.signature(train_ssl_nextleg_path).parameters
+    assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s27.values()), \
+        'train_ssl_nextleg_path must end in **_ignore to swallow the shared cfg'
+    missing = set(s26) - set(s27)
+    assert not missing, f'2.7 dropped 2.6 params (cfg keys would fall into _ignore): {missing}'
+    assert {'retrace_w', 'retrace_cap'} <= set(s27)
+    # the exact key that broke the Colab run
+    assert 'seq' not in s27 and any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s27.values())
