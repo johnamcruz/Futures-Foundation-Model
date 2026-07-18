@@ -97,7 +97,8 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
                   f"X={tuple(Xtr.shape[1:])} good={Ytr.mean():.3f}", flush=True)
 
         dist = (clf_kwargs or {}).get('rank') == 'expected_reach'
-        Ktr = list(Ktr) if dist else None                 # ladder labels (distributional only)
+        keyed = dist or bool((clf_kwargs or {}).get('requires_keys'))
+        Ktr = list(Ktr) if keyed else None                # ladder or auxiliary teacher labels
         fold_p_te = fold_p_val = None
         for seed in seeds:
             rng = np.random.default_rng(seed)
@@ -118,7 +119,7 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
                 print(f"  seed{seed} REAL best_val_auc={ba:.4f} test_auc={ta:.4f} "
                       f"meanR={_meanR(R_te):+.3f}", flush=True)
             # SHUFFLE — permute label + ladder keys together (dist) so the control isn't a no-op
-            if dist:
+            if keyed:
                 perm = rng.permutation(len(Ytr))
                 ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
             else:
@@ -325,11 +326,12 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
     # rng.permutation (label+keys together); the single-head path keeps its exact rng.shuffle stream
     # so existing fold-ckpts stay byte-identical (distributional adds rank= to the sig -> new ckpt).
     dist = (ck or {}).get('rank') == 'expected_reach'
+    keyed = dist or bool((ck or {}).get('requires_keys'))
     rng = np.random.default_rng(seed)
     for fi, (tr, va, te) in enumerate(folds):
         tr, va, te = np.sort(tr), np.sort(va), np.sort(te)
         if fi < len(res['real']):                         # done in a previous session ->
-            if dist:                                      # replay the control RNG stream so the
+            if keyed:                                     # replay the control RNG stream so the
                 rng.permutation(len(tr))                  # remaining folds match a 1-session run
             else:
                 d = np.empty(len(tr)); rng.shuffle(d)
@@ -340,14 +342,14 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         slice_memmap(Xall, tr, ftr); slice_memmap(Xall, va, fva); slice_memmap(Xall, te, fte)
         Ytr, Yva, Yte = Y[tr], Y[va], Y[te]
         Kte = [keys[i] for i in te]; Kva = [keys[i] for i in va]
-        Ktr = [keys[i] for i in tr] if dist else None     # ladder labels (distributional only)
+        Ktr = [keys[i] for i in tr] if keyed else None    # ladder or auxiliary teacher labels
         p_val, p_te, ba = clf_run.fit_predict(ftr, Ytr, fva, Yva, fte, seed,
                                               keys_tr=Ktr, keys_val=Kva)
         thr = _pct_threshold(p_val, OP_PERCENTILE)
         R_te = _arm_R(eval_lab, Kte, p_te, thr)
         res['real'].append(R_te); res['yte'].append(np.asarray(Yte)); res['pte'].append(np.asarray(p_te))
         res['valm'].append(_meanR(_arm_R(eval_lab, Kva, p_val, thr))); res['testm'].append(_meanR(R_te))
-        if dist:
+        if keyed:
             perm = rng.permutation(len(Ytr))              # permute label + ladder-keys together
             ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
         else:

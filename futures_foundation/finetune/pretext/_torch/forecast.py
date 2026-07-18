@@ -91,7 +91,7 @@ class _ForecastTrainer(BaseTrainer):
     @torch.no_grad()
     def val_eval(self):
         from .forecast_objectives import dir_acc as _dir_acc
-        self.net.eval(); tot = 0.0; ptot = 0.0
+        self.net.eval(); tot_obj = 0.0; tot_mse = 0.0; ptot = 0.0
         toth = torch.zeros(len(self.hlist), device=self.dev)        # per-horizon: is 20/25 learning?
         ptoth = torch.zeros(len(self.hlist), device=self.dev)
         dacc = torch.zeros(len(self.hlist), device=self.dev)        # per-horizon directional accuracy
@@ -99,18 +99,22 @@ class _ForecastTrainer(BaseTrainer):
         for _ in range(nb):
             mc, tg = self.make_batch(self.va)
             with self.amp_ctx():
-                candles, _aux = self.net(mc)                        # net ALWAYS returns (candles, aux)
+                candles, aux = self.net(mc)                         # net ALWAYS returns (candles, aux)
+                # Checkpoint selection must use the SAME objective as training. Previously every
+                # forecast variant (direction/quantile/bins/mixture) early-stopped on candle MSE,
+                # silently discarding the epoch best at its added supervision.
+                obj_loss = self.obj.loss(candles, aux, tg, self.close_ch, self.dir_weight)
             se = (candles.float() - tg) ** 2
-            tot += float(se.mean()); ptot += float((tg ** 2).mean())
+            tot_obj += float(obj_loss); tot_mse += float(se.mean()); ptot += float((tg ** 2).mean())
             toth += se.mean(dim=(0, 1)); ptoth += (tg ** 2).mean(dim=(0, 1))
             dacc += _dir_acc(candles, tg, self.close_ch)            # universal (comparable across objectives)
         estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
         self.net.train()
-        vloss, ploss = tot / nb, ptot / nb
-        skill = float(1.0 - vloss / ploss) if ploss > 1e-12 else 0.0
+        vloss, candle_mse, ploss = tot_obj / nb, tot_mse / nb, ptot / nb
+        skill = float(1.0 - candle_mse / ploss) if ploss > 1e-12 else 0.0
         skill_h = (1.0 - toth / ptoth.clamp_min(1e-12)).cpu().tolist()
         dir_h = (dacc / nb).cpu().tolist()                          # dir_acc>0.5 = learning direction
-        return vloss, {'persist_loss': ploss, 'skill': skill,
+        return vloss, {'candle_mse': candle_mse, 'persist_loss': ploss, 'skill': skill,
                        'skill_per_h': dict(zip(self.hlist, skill_h)),
                        'dir_acc': float(sum(dir_h) / len(dir_h)),
                        'dir_acc_per_h': dict(zip(self.hlist, dir_h)), 'std': estd}
@@ -119,7 +123,8 @@ class _ForecastTrainer(BaseTrainer):
         if self.verbose:
             ph = ' '.join(f"h{h}={s:+.2f}" for h, s in extra['skill_per_h'].items())
             print(f"  ep{ep:>3} train={tr_loss:.4f} val={vloss:.4f} "
-                  f"persist={extra['persist_loss']:.4f} skill={extra['skill']:+.3f} [{ph}] "
+                  f"mse={extra['candle_mse']:.4f} persist={extra['persist_loss']:.4f} "
+                  f"skill={extra['skill']:+.3f} [{ph}] "
                   f"dir={extra['dir_acc']:.3f} emb_std={extra['std']:.4f}{'  *' if improved else ''}",
                   flush=True)
 

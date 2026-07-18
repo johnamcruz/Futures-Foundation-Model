@@ -19,5 +19,9 @@ from .pretext._torch.forecast_dist import (                # noqa: F401  stage-2
 from .pretext._torch.contrastive import (                 # noqa: F401  stage-3 temporal regime geometry
     ContrastiveTrendNet, train_ssl_contrastive, regime_gate, _random_crop_resize)
 from .pretext._torch.nextleg import NextLegNet, train_ssl_nextleg              # noqa: F401
+from .pretext._torch.nextleg_path import (                # noqa: F401  stage-2.7 nextleg + PATH
+    NextLegPathNet, leg_retrace, train_ssl_nextleg_path)
+from .pretext._torch.nextleg_race import (                # noqa: F401  stage-2.8 ordered path race
+    NextLegRaceNet, ordered_adverse_curve, train_ssl_nextleg_race)
 from .pretext._torch.electra import (                     # noqa: F401  stage-4 turn-electra (replaced-TURN)
     ElectraNetwork, train_ssl_electra, clamp_valid_ohlc_t)

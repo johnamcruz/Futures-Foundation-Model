@@ -261,8 +261,8 @@ def test_pretext_reserve_per_task():
     cfg = ssl._base_cfg(context_lengths=(64, 200), horizons=(5, 25))
     assert ssl.get_pretext('mask').reserve(cfg) == 0                 # stage-1: none
     assert ssl.get_pretext('forecast').reserve(cfg) == 200 + 25      # stage-2: ctx + horizon
-    # stage-3 v2: ctx + the FUTURE key horizon (the key reads the next contrast_horizon bars)
-    assert ssl.get_pretext('contrastive').reserve(cfg) == max(cfg['pos_deltas'])
+    # stage-3: a positive starts at anchor+delta and then reads a complete seq-length window
+    assert ssl.get_pretext('contrastive').reserve(cfg) == cfg['seq'] + max(cfg['pos_deltas'])
 
 
 def test_base_cfg_has_contrastive_keys():
@@ -496,7 +496,7 @@ def test_candle_bins_ce_rewards_true_bin():
     B, nH, K = 32, 4, obj.K
     target = torch.randn(B, 5, nH)
     candles = target.clone()
-    edges = torch.linspace(-obj.BIN_RANGE, obj.BIN_RANGE, K + 1)[1:-1]
+    edges = torch.linspace(-obj.bin_range, obj.bin_range, K + 1)[1:-1]
     idx = torch.bucketize(target[:, 3, :].contiguous(), edges)
     good = torch.full((B, nH, K), -5.0)
     good.scatter_(2, idx.unsqueeze(-1), 5.0)              # peaked ON the true bin
@@ -590,6 +590,8 @@ def test_forecast_dist_trainer_smoke():
                                             control='real', verbose=False)
     assert len(hist) >= 1 and np.isfinite(hist[-1]['val_loss'])
     assert 'skill' in hist[-1] and 'dir_acc' in hist[-1] and hist[-1]['std'] > 0
+    # Distributional objective selects the checkpoint; plain candle MSE remains diagnostic only.
+    assert 'candle_mse' in hist[-1] and hist[-1]['val_loss'] > hist[-1]['candle_mse']
 
 
 # --------------------------- stage-3 temporal-neighborhood contrastive (torch, gated)
@@ -714,6 +716,7 @@ def test_contrastive_save_resume_and_control_guard(tmp_path):
 def test_base_cfg_has_direction_keys():
     cfg = ssl._base_cfg()
     assert cfg['dir_weight'] == 0.0 and cfg['dir_close_ch'] == 3      # off by default (backward-compat)
+    assert cfg['balance_w'] == 0.02                                  # mixture anti-collapse is configurable
     assert ssl._base_cfg(dir_weight=0.5)['dir_weight'] == 0.5
 
 
@@ -741,6 +744,8 @@ def test_forecast_direction_head_optional_and_backcompat():
                                    control='real', objective='candle_direction', dir_weight=0.5, verbose=False)
     assert 'dir_acc' in hist[-1] and 0.0 <= hist[-1]['dir_acc'] <= 1.0
     assert np.isfinite(hist[-1]['val_loss']) and 'skill' in hist[-1]    # candle metrics still there
+    # checkpoint/early-stop loss includes BCE; candle MSE remains a separate comparable diagnostic
+    assert hist[-1]['val_loss'] > hist[-1]['candle_mse']
 
 
 def test_nextleg_reserve_covers_both_legs_no_target_leak():

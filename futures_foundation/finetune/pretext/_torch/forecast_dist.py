@@ -79,11 +79,14 @@ class CandleQuantile(ForecastObjective):
 class CandleBins(ForecastObjective):
     """Chronos-classic style bin-CLASSIFICATION supervision (see module docstring)."""
     name = 'candle_bins'
-    BIN_RANGE = 10.0                                      # uniform bins over [-clamp, clamp]
+    BIN_RANGE = 20.0                                      # compatibility/default = 2 * clamp(10)
 
-    def __init__(self, mse_weight=1.0, bins_k=41, **_):
+    def __init__(self, mse_weight=1.0, bins_k=41, bin_range=BIN_RANGE, **_):
         self.mse_w = float(mse_weight)
         self.K = int(bins_k or 41)
+        # Target = clipped_future - clipped_now, so its legal range is [-2*clamp, 2*clamp].
+        # The old fixed [-10, 10] grid clipped valid tail moves when clamp=10.
+        self.bin_range = float(bin_range)
 
     def aux_dim(self, nH):
         return nH * self.K
@@ -93,7 +96,7 @@ class CandleBins(ForecastObjective):
         import torch.nn.functional as F
         w = weight if weight and weight > 0 else 1.0
         t = target[:, close_ch, :]                                       # [B, nH] close move
-        edges = torch.linspace(-self.BIN_RANGE, self.BIN_RANGE, self.K + 1,
+        edges = torch.linspace(-self.bin_range, self.bin_range, self.K + 1,
                                device=t.device)[1:-1]                    # inner edges -> K bins
         idx = torch.bucketize(t.contiguous(), edges)                     # [B, nH] in [0, K)
         logits = aux.view(aux.shape[0], t.shape[1], self.K)              # [B, nH, K]
@@ -194,16 +197,19 @@ class _DistForecastTrainer(_ForecastTrainer):
     forecast.py is imported, never modified; net/batching/val (universal dir_acc) all inherited."""
 
     def __init__(self, big, tr, va, *, objective='candle_quantile', mse_weight=1.0,
-                 quantile_taus='lohi', bins_k=41, **kw):
+                 quantile_taus='lohi', bins_k=41, balance_w=0.02, **kw):
         super().__init__(big, tr, va, objective='candle_mse', **kw)      # base init (placeholder obj)
         self.obj = get_dist_objective(objective, mse_weight=mse_weight,  # swap BEFORE build_net()
-                                      quantile_taus=quantile_taus, bins_k=bins_k)
+                                      quantile_taus=quantile_taus, bins_k=bins_k,
+                                      balance_w=balance_w, bin_range=2.0 * self.clamp)
 
     def val_eval(self):
         """Base val (skill/dir_acc/std) + the objective's own health diagnostics (e.g. mixture
         collapse: mix_entropy / mix_mean_df) so a degenerate trial is VISIBLE in the log — never
         a low loss silently faking learning. forecast.py untouched (pure override)."""
         import torch
+        # Base validation now selects on self.obj.loss (the distributional objective), while its
+        # candle_mse/skill reads remain directly comparable with the stage-2 MSE baseline.
         vloss, extra = super().val_eval()
         try:
             mc, tg = self.make_batch(self.va)
@@ -224,7 +230,8 @@ def train_ssl_forecast_dist(big, train_starts, val_starts, *, horizons=(5, 10, 2
                             grad_clip=1.0, clamp=10.0, verbose=True,
                             ckpt_path=None, resume=False, freeze_encoder_layers=0,
                             objective='candle_quantile', dir_weight=1.0, dir_close_ch=3,
-                            mse_weight=1.0, quantile_taus='lohi', bins_k=41, **_ignore):
+                            mse_weight=1.0, quantile_taus='lohi', bins_k=41,
+                            balance_w=0.02, **_ignore):
     """Distributional forecast (stage-2.5). TWO experiment shapes, same trainer:
       REFINE  backbone_ckpt = the promoted stage-2 encoder; mixed loss (mse_weight=1).
       PRIMARY backbone_ckpt = the stage-1 masked encoder; PURE Chronos loss (mse_weight=0,
@@ -244,4 +251,5 @@ def train_ssl_forecast_dist(big, train_starts, val_starts, *, horizons=(5, 10, 2
                                 resume=resume, freeze_encoder_layers=freeze_encoder_layers,
                                 objective=objective, dir_weight=dir_weight,
                                 dir_close_ch=dir_close_ch, mse_weight=mse_weight,
-                                quantile_taus=quantile_taus, bins_k=bins_k).fit()
+                                quantile_taus=quantile_taus, bins_k=bins_k,
+                                balance_w=balance_w).fit()
