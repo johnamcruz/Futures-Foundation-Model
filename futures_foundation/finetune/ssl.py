@@ -175,7 +175,7 @@ def _base_cfg(**kw):
              # stage-2.5 forecast_dist faithfulness knobs (defaults = the original refine-study
              # behavior): mse_weight 0 = PURE Chronos loss (no MSE anchor); quantile_taus 'bolt9'
              # = the full 9-level quantile head; bins_k = bin-classification resolution.
-             mse_weight=1.0, quantile_taus='lohi', bins_k=41,
+             mse_weight=1.0, quantile_taus='lohi', bins_k=41, balance_w=0.02,
              # stage-3 TEMPORAL-NEIGHBORHOOD contrastive (regime geometry, label-free): positives =
              # windows at multi-scale time offsets (pos_deltas) + augmented views; negatives =
              # far-in-time windows (pairs closer than far_min excluded); per-anchor volatility

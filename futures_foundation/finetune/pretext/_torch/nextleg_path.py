@@ -116,7 +116,7 @@ class _NextLegPathTrainer(_NextLegTrainer):
         """2.6's val_eval + the r1 diagnostic. NOT super() + a second pass: preds and targets must
         come from the SAME batch or every correlation is measured across mismatched samples."""
         self.net.eval()
-        tot_c = tot_p = tot_l = 0.0
+        tot_c = tot_p = tot_l = tot_r = 0.0
         preds, tgts = [], []
         nb = min(20, max(1, len(self.va) // self.batch))
         for _ in range(nb):
@@ -125,6 +125,7 @@ class _NextLegPathTrainer(_NextLegTrainer):
             tot_c += float(F.mse_loss(candles.float(), cand_t))
             tot_p += float((cand_t ** 2).mean())
             tot_l += float(F.smooth_l1_loss(legs[:, :2].float(), leg_t[:, :2]))
+            tot_r += float(F.smooth_l1_loss(legs[:, 2].float(), leg_t[:, 2]))
             preds.append(legs.float().cpu()); tgts.append(leg_t.cpu())
         P, T = torch.cat(preds), torch.cat(tgts)
         corr = [float(np.corrcoef(P[:, j].numpy(), T[:, j].numpy())[0, 1]) for j in (0, 1, 2)]
@@ -132,9 +133,13 @@ class _NextLegPathTrainer(_NextLegTrainer):
                for j in (0, 1)]                                     # bars, bias diagnostic
         estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
         skill = 1.0 - (tot_c / nb) / max(tot_p / nb, 1e-12)
-        vloss = self.mse_weight * (tot_c / nb) + self.leg_w * (tot_l / nb)
+        # Select the checkpoint on every objective used for training. The original 2.7 code
+        # reported retrace correlation but omitted retrace loss from early stopping/checkpointing.
+        vloss = (self.mse_weight * (tot_c / nb) + self.leg_w * (tot_l / nb)
+                 + self.retrace_w * (tot_r / nb))
         return vloss, {'skill': skill, 'leg_corr1': corr[0], 'leg_corr2': corr[1],
                        'leg_bias1': mae[0], 'leg_bias2': mae[1], 'std': estd,
+                       'retrace_loss': tot_r / nb,
                        'retrace_corr': corr[2],
                        'retrace_bias': float(P[:, 2].numpy().mean() - T[:, 2].numpy().mean())}
 
