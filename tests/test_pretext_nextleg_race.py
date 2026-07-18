@@ -125,3 +125,45 @@ def test_trainer_accepts_shared_config_without_forwarding_it():
     assert set(s26) <= set(s28)
     assert {'race_w', 'race_cap', 'race_levels'} <= set(s28)
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s28.values())
+
+
+@torch_test
+def test_race_validation_is_fixed_and_restores_training_rng():
+    """Repeated validation uses identical anchors and must not perturb subsequent training draws."""
+    import torch
+    from futures_foundation.finetune.pretext._torch.nextleg_race import _NextLegRaceTrainer
+
+    class _Net(torch.nn.Module):
+        def forward_all(self, ctx):
+            # Deterministic predictions whose rows depend on the sampled validation batch.
+            candles = ctx[:, :, :2]
+            legs = torch.cat((ctx[:, :1, :2].flatten(1),
+                              ctx[:, :1, :4].flatten(1)), dim=1)
+            return candles, legs
+
+        def embed(self, ctx):
+            return torch.cat((ctx.mean((1, 2), keepdim=False)[:, None],
+                              ctx.std((1, 2), keepdim=False)[:, None]), dim=1)
+
+    t = object.__new__(_NextLegRaceTrainer)
+    t.net = _Net()
+    t.gen = torch.Generator().manual_seed(17)
+    t.va = torch.arange(64)
+    t.batch = 8
+    t.mse_weight, t.leg_w, t.race_w = 1.0, 1.0, 0.25
+
+    def make_batch(_starts):
+        x = torch.randn(8, 5, 4, generator=t.gen)
+        candles = x[:, :, :2] + 0.1
+        legs = torch.cat((x[:, :1, :2].flatten(1) + 0.2,
+                          x[:, :1, :4].flatten(1) + 0.3), dim=1)
+        return x, candles, legs
+
+    t.make_batch = make_batch
+    before = t.gen.get_state().clone()
+    v1, e1 = t.val_eval()
+    assert torch.equal(t.gen.get_state(), before)
+    v2, e2 = t.val_eval()
+    assert v1 == pytest.approx(v2)
+    assert e1['race_loss'] == pytest.approx(e2['race_loss'])
+    assert torch.equal(t.gen.get_state(), before)

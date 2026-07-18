@@ -111,29 +111,42 @@ class _NextLegRaceTrainer(_NextLegTrainer):
 
     @torch.no_grad()
     def val_eval(self):
-        """Validation and checkpoint selection include the new objective."""
+        """Validation and checkpoint selection include the new objective on a FIXED pivot set.
+
+        Pivot difficulty varies substantially, so resampling validation anchors every epoch made
+        the composite loss too noisy to identify the best encoder. Save/restore the training RNG
+        and replay the same validation batches each epoch; training sampling is unaffected.
+        """
         self.net.eval()
+        gen_state = self.gen.get_state()
+        self.gen.manual_seed(20260718)
         tot_c = tot_p = tot_l = tot_r = 0.0
         preds, tgts = [], []
         nb = min(20, max(1, len(self.va) // self.batch))
-        for _ in range(nb):
-            ctx, cand_t, leg_t = self.make_batch(self.va)
-            candles, legs = self.net.forward_all(ctx)
-            tot_c += float(F.mse_loss(candles.float(), cand_t))
-            tot_p += float((cand_t ** 2).mean())
-            tot_l += float(F.smooth_l1_loss(legs[:, :2].float(), leg_t[:, :2]))
-            tot_r += float(F.smooth_l1_loss(legs[:, 2:].float(), leg_t[:, 2:]))
-            preds.append(legs.float().cpu()); tgts.append(leg_t.cpu())
-        P, T = torch.cat(preds), torch.cat(tgts)
-        corr = [float(np.corrcoef(P[:, j].numpy(), T[:, j].numpy())[0, 1])
-                for j in range(P.shape[1])]
-        mae = [float(np.expm1(P[:, j].numpy()).mean() - np.expm1(T[:, j].numpy()).mean())
-               for j in (0, 1)]
-        estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
-        skill = 1.0 - (tot_c / nb) / max(tot_p / nb, 1e-12)
-        vloss = (self.mse_weight * (tot_c / nb) + self.leg_w * (tot_l / nb)
-                 + self.race_w * (tot_r / nb))
-        extra = {'skill': skill, 'leg_corr1': corr[0], 'leg_corr2': corr[1],
+        try:
+            for _ in range(nb):
+                ctx, cand_t, leg_t = self.make_batch(self.va)
+                candles, legs = self.net.forward_all(ctx)
+                tot_c += float(F.mse_loss(candles.float(), cand_t))
+                tot_p += float((cand_t ** 2).mean())
+                tot_l += float(F.smooth_l1_loss(legs[:, :2].float(), leg_t[:, :2]))
+                tot_r += float(F.smooth_l1_loss(legs[:, 2:].float(), leg_t[:, 2:]))
+                preds.append(legs.float().cpu()); tgts.append(leg_t.cpu())
+            P, T = torch.cat(preds), torch.cat(tgts)
+            corr = [float(np.corrcoef(P[:, j].numpy(), T[:, j].numpy())[0, 1])
+                    for j in range(P.shape[1])]
+            mae = [float(np.expm1(P[:, j].numpy()).mean() - np.expm1(T[:, j].numpy()).mean())
+                   for j in (0, 1)]
+            estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
+        finally:
+            self.gen.set_state(gen_state)
+            self.net.train()
+        candle_loss, leg_loss, race_loss = tot_c / nb, tot_l / nb, tot_r / nb
+        skill = 1.0 - candle_loss / max(tot_p / nb, 1e-12)
+        vloss = (self.mse_weight * candle_loss + self.leg_w * leg_loss
+                 + self.race_w * race_loss)
+        extra = {'skill': skill, 'candle_loss': candle_loss, 'leg_loss': leg_loss,
+                 'race_loss': race_loss, 'leg_corr1': corr[0], 'leg_corr2': corr[1],
                  'leg_bias1': mae[0], 'leg_bias2': mae[1], 'std': estd,
                  'race_corr': float(np.mean(corr[2:])),
                  'race_corrs': tuple(float(x) for x in corr[2:])}
@@ -143,6 +156,8 @@ class _NextLegRaceTrainer(_NextLegTrainer):
         if self.verbose:
             rc = '/'.join(f'{x:+.3f}' for x in extra['race_corrs'])
             print(f"  ep{ep:>3} train={tr_loss:.4f} val={vloss:.4f} "
+                  f"loss(c/l/r)={extra['candle_loss']:.3f}/{extra['leg_loss']:.3f}/"
+                  f"{extra['race_loss']:.3f} "
                   f"skill={extra['skill']:+.3f} "
                   f"legR={extra['leg_corr1']:+.3f}/{extra['leg_corr2']:+.3f} "
                   f"raceR={rc} emb_std={extra['std']:.4f}"
