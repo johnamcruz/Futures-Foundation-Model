@@ -104,8 +104,11 @@ class _NextLegRaceTrainer(_NextLegTrainer):
         ctx, cand_t, leg_t = batch
         candles, legs = self.net.forward_all(ctx)
         cand_loss = F.mse_loss(candles.float(), cand_t)
-        leg_loss = F.smooth_l1_loss(legs[:, :2].float(), leg_t[:, :2])
-        race_loss = F.smooth_l1_loss(legs[:, 2:].float(), leg_t[:, 2:])
+        # MPS requires contiguous operands here (CUDA accepts the strided column slices).
+        leg_loss = F.smooth_l1_loss(
+            legs[:, :2].float().contiguous(), leg_t[:, :2].contiguous())
+        race_loss = F.smooth_l1_loss(
+            legs[:, 2:].float().contiguous(), leg_t[:, 2:].contiguous())
         return (self.mse_weight * cand_loss + self.leg_w * leg_loss
                 + self.race_w * race_loss)
 
@@ -129,8 +132,10 @@ class _NextLegRaceTrainer(_NextLegTrainer):
                 candles, legs = self.net.forward_all(ctx)
                 tot_c += float(F.mse_loss(candles.float(), cand_t))
                 tot_p += float((cand_t ** 2).mean())
-                tot_l += float(F.smooth_l1_loss(legs[:, :2].float(), leg_t[:, :2]))
-                tot_r += float(F.smooth_l1_loss(legs[:, 2:].float(), leg_t[:, 2:]))
+                tot_l += float(F.smooth_l1_loss(
+                    legs[:, :2].float().contiguous(), leg_t[:, :2].contiguous()))
+                tot_r += float(F.smooth_l1_loss(
+                    legs[:, 2:].float().contiguous(), leg_t[:, 2:].contiguous()))
                 preds.append(legs.float().cpu()); tgts.append(leg_t.cpu())
             P, T = torch.cat(preds), torch.cat(tgts)
             corr = [float(np.corrcoef(P[:, j].numpy(), T[:, j].numpy())[0, 1])
