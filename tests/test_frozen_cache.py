@@ -6,7 +6,8 @@ SUBSETS reuse one embed (produce train/val/oos), and partial requests only embed
 import numpy as np
 
 from futures_foundation.finetune.classifiers.mantis.frozen import (
-    MantisFrozenClassifier, _embed_cache_path, _save_bar_cache, _load_bar_cache, _bar_cache_path)
+    MantisFrozenClassifier, _embed_cache_path, _save_bar_cache, _load_bar_cache, _bar_cache_path,
+    bar_embedding_cache_path)
 
 
 class FakeLab:
@@ -105,8 +106,7 @@ def test_legacy_cache_preferred(tmp_path, monkeypatch):
 
 def test_bar_cache_multi_tf_mode_distinct_and_reusable(tmp_path, monkeypatch):
     """Multi-TF modes (MV_MODE='ohlcv_agg1-5') get their OWN bar-cache file — never colliding with
-    the single-TF cache — and the plain 'ohlcv' filename is UNCHANGED (existing caches keep
-    hitting). Non-ohlcv modes stay uncached."""
+    the single-TF cache. Non-ohlcv modes stay uncached."""
     monkeypatch.setenv('EMBED_CACHE_DIR', str(tmp_path))
     monkeypatch.setenv('EMBED_CACHE', '1')
     keys = _keys(range(5))
@@ -117,7 +117,7 @@ def test_bar_cache_multi_tf_mode_distinct_and_reusable(tmp_path, monkeypatch):
     p_multi = _bar_cache_path({'backbone_ckpt': None}, multi, keys)
     assert p_single is not None and p_multi is not None
     assert p_single != p_multi                                 # distinct files, no collision
-    assert p_single.name.endswith('_64.npz')                   # plain-ohlcv filename unchanged
+    assert '_64_embed-v2_' in p_single.name                    # schema-versioned plain OHLCV
     assert 'ohlcv_agg1-5' in p_multi.name                      # mode-tagged
     assert _bar_cache_path({'backbone_ckpt': None}, other, keys) is None   # non-ohlcv -> uncached
 
@@ -130,6 +130,16 @@ def test_bar_cache_multi_tf_mode_distinct_and_reusable(tmp_path, monkeypatch):
     calls.clear()
     Xs = clf.featurize(multi, _keys(range(3, 7)))
     assert calls == [] and np.allclose(Xs[:, 0, 0], [3, 4, 5, 6])
+
+
+def test_bar_cache_backend_is_part_of_portable_identity(tmp_path):
+    """MPS train embeddings must never be consumed by the CPU/ONNX serve path."""
+    args = (tmp_path, None, 'NQ', '3min', 500, 128)
+    cpu = bar_embedding_cache_path(*args, device='cpu')
+    mps = bar_embedding_cache_path(*args, device='mps')
+    assert cpu != mps
+    assert 'backend-cpu' in cpu.name
+    assert 'backend-mps' in mps.name
 
 
 def test_cache_off(tmp_path, monkeypatch):

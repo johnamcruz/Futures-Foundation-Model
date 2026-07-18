@@ -24,6 +24,7 @@ import numpy as np
 from ...classifier import Classifier, register_classifier
 
 _EMBED_KEYS = ('model_id', 'device', 'batch')
+_BAR_CACHE_SCHEMA = 'embed-v2'
 
 _CKPT_FP_CACHE: dict = {}
 
@@ -74,10 +75,40 @@ def _embed_cache_path(cfg, labeler, keys):
     bi = np.asarray([int(k[1]) for k in keys], np.int64)
     di = np.asarray([int(k[2]) for k in keys], np.int64)
     h = hashlib.sha1()
-    h.update(f"{ckpt_id}|{sid}|{mv_mode}|{seq}|{nbars}|{len(keys)}".encode())
+    # Mantis/MPS is not numerically interchangeable with CPU/ONNX for these
+    # embeddings.  The execution backend is therefore part of the artifact
+    # identity, just like the checkpoint and window contract.  Callers that
+    # serve on MPS must pass device='mps'; portable ONNX/CPU bundles must pass
+    # device='cpu'. Never allow an implicit cross-backend cache hit.
+    backend = str(cfg.get('device') or 'auto').lower()
+    h.update(f"{ckpt_id}|{sid}|{mv_mode}|{seq}|{nbars}|{len(keys)}|{backend}".encode())
     h.update(bi.tobytes()); h.update(di.tobytes())
     cache_dir = Path(os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'))
     return cache_dir / f"{tk}_{tf}_{h.hexdigest()[:16]}.npy"
+
+
+def bar_embedding_cache_path(cache_dir, checkpoint, ticker, timeframe, n_bars, seq, *,
+                             device='cpu', mv_mode='ohlcv',
+                             model_id='paris-noah/Mantis-8M'):
+    """Canonical path for a reusable bar-indexed frozen-Mantis embedding cache.
+
+    This public path builder is shared by FFM training and downstream consumers
+    such as Algo Trader's RL cache generator.  Backend and schema are explicit:
+    a cache produced by MPS can never be mistaken for CPU/ONNX embeddings (or
+    vice versa). Downstream serving must select the same backend as training.
+    """
+    p = Path(checkpoint) if checkpoint else None
+    if p is not None and p.exists():
+        ckpt_id = f"{p.name}-{_ckpt_fingerprint(p)}-{p.stat().st_size}"
+    else:
+        ckpt_id = (str(checkpoint).replace('/', '_') if checkpoint else 'vanilla')
+    mode = str(mv_mode)
+    mode_tag = '' if mode == 'ohlcv' else f"_{mode}"
+    backend = str(device or 'auto').lower()
+    model_tag = hashlib.sha1(str(model_id).encode()).hexdigest()[:8]
+    return Path(cache_dir) / (
+        f"bars_{ticker}_{timeframe}_{ckpt_id}_{int(n_bars)}_{int(seq)}"
+        f"{mode_tag}_{_BAR_CACHE_SCHEMA}_model-{model_tag}_backend-{backend}.npz")
 
 
 def _bar_cache_path(cfg, labeler, keys):
@@ -92,21 +123,17 @@ def _bar_cache_path(cfg, labeler, keys):
     mv_mode = str(getattr(labeler, 'MV_MODE', '?'))
     if not mv_mode.startswith('ohlcv'):                   # ohlcv family: emb independent of dir
         return None
-    ckpt = cfg.get('backbone_ckpt')
-    if ckpt and Path(ckpt).exists():
-        p = Path(ckpt)
-        ckpt_id = f"{p.name}-{_ckpt_fingerprint(p)}-{p.stat().st_size}"   # content hash, not mtime
-    else:
-        ckpt_id = (str(ckpt).replace('/', '_') if ckpt else 'vanilla')
     tk, tf = keys[0][0].split('@')
     seq = int(getattr(labeler, 'MV_SEQ', 0))
     try:
         nbars = int(len(labeler._b[(tk, tf)]['c']))
     except Exception:
         nbars = -1
-    cache_dir = Path(os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'))
-    tag = '' if mv_mode == 'ohlcv' else f"_{mv_mode}"     # existing single-TF filenames untouched
-    return cache_dir / f"bars_{tk}_{tf}_{ckpt_id}_{nbars}_{seq}{tag}.npz"
+    return bar_embedding_cache_path(
+        os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'),
+        cfg.get('backbone_ckpt'), tk, tf, nbars, seq,
+        device=cfg.get('device') or 'auto', mv_mode=mv_mode,
+        model_id=cfg.get('model_id', 'paris-noah/Mantis-8M'))
 
 
 def _load_bar_cache(path):
