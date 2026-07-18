@@ -165,6 +165,39 @@ def selection_concentration(keys, proba, ts, rates=(5, 3, 2, 1)):
     return rows
 
 
+def ticker_generalization(per_ticker_ops, rates=(5, 3, 2, 1), min_mean_r=0.0):
+    """Gate a pooled model on profitable, sustainable operation for every ticker.
+
+    This prevents a strong aggregate result from hiding an instrument that loses consistently.
+    Timeframe-specific suitability remains visible separately in ``per_stream_ops``.
+    """
+    requested = tuple(int(r) for r in rates)
+    rows, failures = {}, []
+    for ticker, ops in sorted((per_ticker_ops or {}).items()):
+        by_rate = {int(row['rate']): row for row in ops}
+        ticker_rows = {}
+        for rate in requested:
+            row = by_rate.get(rate)
+            passed = bool(row and row.get('rate_met', False)
+                          and np.isfinite(row.get('meanR', np.nan))
+                          and float(row['meanR']) > float(min_mean_r))
+            ticker_rows[str(rate)] = {
+                'passed': passed,
+                'meanR': (float(row['meanR']) if row is not None else None),
+                'rate_met': (bool(row.get('rate_met', False)) if row is not None else False),
+            }
+            if not passed:
+                failures.append(f'{ticker}@{rate}/day')
+        rows[ticker] = ticker_rows
+    return {
+        'passed': bool(rows) and not failures,
+        'rates': list(requested),
+        'min_meanR_exclusive': float(min_mean_r),
+        'tickers': rows,
+        'failures': failures,
+    }
+
+
 def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     """OOS WR@3R broken down by MODEL SCORE band (NON-cumulative) — 'is a higher score actually a
     better trade?'. Splits pivots into score quantile bands (top 10% / 10-25% / 25-50% / 50-75% /
@@ -610,6 +643,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ks = [k for k, mm in zip(Kte, m) if mm]
             ts_s = [t for t, mm in zip(oos_ts, m) if mm]
             per_stream[_s] = operating_points(eval_lab, ks, _pa[m], ts_s, rates=DEPLOY_RATES)
+    generalization = ticker_generalization(per_tk)
     out = dict(oos_auc=auc, best_val_auc=ba, oos_meanR=_meanR(R),
                shuffle_meanR=(_meanR(Rs) if Rs is not None else None), edge_shuffle=edge,
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
@@ -618,6 +652,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                wr_by_regime=regimes,
                selection_concentration=concentration,
                per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
+               ticker_generalization=generalization,
                # PER-STREAM PERCENTILES from the VAL distribution -> the deploy contract's 0-100
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
                # distributional ladder's labels and is None on the single-head path, while this
@@ -641,6 +676,10 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             for _t, rows in per_tk.items():
                 cells = '  '.join(f"{r['rate']}/d {r['wr3R']:5.1%} {r['meanR']:+.2f}" for r in rows)
                 print(f"    {_t:>4}: {cells}", flush=True)
+            print(f"  {title} — TICKER GENERALIZATION (positive meanR at 5/3/2/1 per day): "
+                  f"{'PASS' if generalization['passed'] else 'FAIL'}"
+                  f"{'' if generalization['passed'] else ' ' + ','.join(generalization['failures'])}",
+                  flush=True)
         if concentration:
             print(f"  {title} — pooled tier concentration (max stream/ticker share; lower HHI "
                   "means broader support):", flush=True)

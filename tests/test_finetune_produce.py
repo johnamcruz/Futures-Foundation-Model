@@ -267,6 +267,34 @@ def test_contract_window_recipe_for_multi_tf(tmp_path):
     assert json.loads((tmp_path / 'm2_signal.json').read_text())['window_recipe'] is None
 
 
+def test_ticker_generalization_requires_every_ticker_and_rate_positive():
+    def rows(values):
+        return [dict(rate=r, meanR=v, rate_met=True)
+                for r, v in zip((5, 3, 2, 1), values)]
+
+    good = produce.ticker_generalization({
+        'ES': rows((.1, .2, .3, .4)),
+        'NQ': rows((.2, .3, .4, .5)),
+    })
+    assert good['passed'] is True and good['failures'] == []
+
+    bad = produce.ticker_generalization({
+        'ES': rows((.1, .2, .3, .4)),
+        'NQ': rows((.2, -.01, .4, .5)),
+    })
+    assert bad['passed'] is False
+    assert bad['failures'] == ['NQ@3/day']
+
+
+def test_ticker_generalization_fails_missing_or_unsustainable_rate():
+    out = produce.ticker_generalization({
+        'GC': [dict(rate=5, meanR=.2, rate_met=True),
+               dict(rate=3, meanR=.3, rate_met=False)],
+    })
+    assert out['passed'] is False
+    assert out['failures'] == ['GC@3/day', 'GC@2/day', 'GC@1/day']
+
+
 def test_train_final_writes_signal_contract(tmp_path):
     import json
     lab = SyntheticLabeler(n_bars=1600, seed=0)
