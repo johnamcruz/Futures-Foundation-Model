@@ -33,6 +33,15 @@ def _oos_days(ts):
     return max(1, int(pd.DatetimeIndex(ts).normalize().nunique())) if len(ts) else 1
 
 
+def _win_truth(eval_lab, keys, realized):
+    """Exact strategy win event when available; legacy positive-R event otherwise."""
+    fn = getattr(eval_lab, 'win_truth', None)
+    wins = np.asarray(fn(list(keys)), bool) if fn is not None else np.asarray(realized) > 0
+    if len(wins) != len(realized):
+        raise ValueError('win_truth must return one boolean per evaluated key')
+    return wins
+
+
 # ── DEPLOY RATES (2026-07-17) — the per-stream tier ladder must COVER WHERE YOU TRADE.
 # The old ladders stopped at 4/day per-ticker and 5/day pooled, so every tier table in this
 # project was blind above ~5 takes/day — while the deploy zone is 8-15/day per stream. That is
@@ -99,7 +108,11 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     proba = np.asarray(proba, float)
     if len(proba) == 0:
         return []
-    R_all = np.asarray(eval_lab.evaluate(list(keys), np.ones(len(keys), int)), float)  # take-all R
+    keys = list(keys)
+    R_all = np.asarray(eval_lab.evaluate(keys, np.ones(len(keys), int)), float)  # take-all R
+    # Strategies with vertically marked unresolved trades can report the exact target-first
+    # event separately. Falling back to R>0 preserves the protocol for older labelers.
+    W_all = _win_truth(eval_lab, keys, R_all)
     days = _oos_days(ts)
     order = np.argsort(-proba)                             # best pivots first
     rows = []
@@ -107,7 +120,7 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
         n = int(min(len(proba), max(1, round(r * days))))
         sel = order[:n]
         Rs = R_all[sel]
-        rows.append(dict(rate=r, n=n, days=days, wr3R=float((Rs > 0).mean()),
+        rows.append(dict(rate=r, n=n, days=days, wr3R=float(W_all[sel].mean()),
                          meanR=float(Rs.mean()),
                          # pool = candidates AVAILABLE (n is the TAKEN count, capped by the pool).
                          # n < rate*days => the stream CANNOT sustain that rate: its frequency
@@ -128,7 +141,9 @@ def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     proba = np.asarray(proba, float)
     if len(proba) == 0:
         return []
-    R_all = np.asarray(eval_lab.evaluate(list(keys), np.ones(len(keys), int)), float)
+    keys = list(keys)
+    R_all = np.asarray(eval_lab.evaluate(keys, np.ones(len(keys), int)), float)
+    W_all = _win_truth(eval_lab, keys, R_all)
     days = _oos_days(ts)
     qs = [float(np.quantile(proba, e)) for e in edges]     # score thresholds (desc)
     rows, hi = [], np.inf
@@ -137,7 +152,7 @@ def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
         m = (proba < hi) & (proba >= lo)
         Rs = R_all[m]
         rows.append(dict(band=lab, lo=lo, n=int(m.sum()), per_day=float(m.sum()) / days,
-                         wr3R=(float((Rs > 0).mean()) if len(Rs) else float('nan')),
+                         wr3R=(float(W_all[m].mean()) if len(Rs) else float('nan')),
                          meanR=(float(Rs.mean()) if len(Rs) else float('nan'))))
         hi = lo
     return rows
@@ -162,9 +177,34 @@ def alignment_breakdown(eval_lab, keys, proba, ts):
         ks = [k for k, mm in zip(keys, m) if mm]
         ts_s = [t for t, mm in zip(ts, m) if mm]
         R = np.asarray(eval_lab.evaluate(ks, np.ones(len(ks), int)), float)
-        out[name] = dict(n=int(m.sum()), base_wr3R=float((R > 0).mean()),
+        out[name] = dict(n=int(m.sum()), base_wr3R=float(_win_truth(eval_lab, ks, R).mean()),
                          base_meanR=float(R.mean()),
                          ops=operating_points(eval_lab, ks, proba[m], ts_s))
+    return out or None
+
+
+def regime_breakdown(eval_lab, keys, proba):
+    """Exact-WR and economics by a strategy-provided *causal* regime audit bucket.
+
+    The top-decile slice is descriptive OOS auditing only; it never sets a deploy threshold.
+    """
+    fn = getattr(eval_lab, 'regime_bucket', None)
+    if fn is None or not len(keys):
+        return None
+    keys = list(keys); p = np.asarray(proba, float); b = np.asarray(fn(keys), object)
+    out = {}
+    for name in sorted(set(b.tolist())):
+        m = b == name
+        if int(m.sum()) < 100:
+            continue
+        ks = [k for k, take in zip(keys, m) if take]
+        R = np.asarray(eval_lab.evaluate(ks, np.ones(len(ks), int)), float)
+        W = _win_truth(eval_lab, ks, R)
+        pp = p[m]; n10 = max(1, int(np.ceil(.10 * len(pp))))
+        top = np.argsort(-pp)[:n10]
+        out[str(name)] = dict(n=len(ks), base_wr3R=float(W.mean()), base_meanR=float(R.mean()),
+                              top10_n=n10, top10_wr3R=float(W[top].mean()),
+                              top10_meanR=float(R[top].mean()))
     return out or None
 
 
@@ -447,6 +487,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     (WR@3R at 5/3/2/1 trades/day) so the deploy signal-count floor is read directly."""
     import gc
     dist = (ck or {}).get('rank') == 'expected_reach'
+    keyed = dist or bool((ck or {}).get('requires_keys'))
     rng = np.random.default_rng(seed)
     if verbose:
         print(f"  [produce 1/2] fit REAL head{' (+ ONNX export)' if onnx_path else ''}",
@@ -465,7 +506,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
         if verbose:
             print("  [produce 2/2] SKIPPED (SKIP_SHUFFLE=1; honest ruler already run in WF)", flush=True)
     else:
-        if dist and keys_tr is not None:
+        if keyed and keys_tr is not None:
             perm = rng.permutation(len(Ytr_tr))
             ysh = np.asarray(Ytr_tr)[perm]; Ksh = [keys_tr[i] for i in perm]
         else:
@@ -485,6 +526,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     bands = wr_by_score(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
+    regimes = regime_breakdown(eval_lab, Kte, p_te)
     # TIER-LEVEL SHUFFLE RULER (2026-07-16): the pool-level beats_shuffle compares REAL vs
     # SHUFFLE over the top ~half of the pool — a scale where fixed-R constructions cap the edge
     # below the pass margin for ANY model (oracle-proven), so it fails unconditionally for
@@ -530,6 +572,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, operating_points=ops, wr_by_alignment=align,
+               wr_by_regime=regimes,
                per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
                # PER-STREAM PERCENTILES from the VAL distribution -> the deploy contract's 0-100
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
@@ -572,6 +615,13 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             print("      ('*' = rate NOT sustainable on that stream — pool exhausted, not a "
                   "quality signal)", flush=True)
         _print_alignment(align, title)
+        if regimes:
+            print(f"  {title} — CAUSAL VOLATILITY REGIME audit (base -> within-regime top10%):",
+                  flush=True)
+            for name, row in regimes.items():
+                print(f"    {name:>8}: n={row['n']:,}  exact WR {row['base_wr3R']:.1%} -> "
+                      f"{row['top10_wr3R']:.1%}  meanR {row['base_meanR']:+.3f} -> "
+                      f"{row['top10_meanR']:+.3f}", flush=True)
         print(f"  {title} AUC {auc:.4f}" if auc is not None else f"  {title} AUC n/a")
         if edge is not None:
             print(f"  {title} meanR REAL {out['oos_meanR']:+.3f} SHUFFLE {out['shuffle_meanR']:+.3f} "
@@ -675,9 +725,10 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
     onnx_path = (str(Path(output_path).with_suffix('')) + '.onnx'
                  if (export_onnx and output_path) else None)
     dist = ck.get('rank') == 'expected_reach'
+    keyed = dist or bool(ck.get('requires_keys'))
     out = _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, all_Kte, Yte,
                      seed, verbose, onnx_path=onnx_path,
-                     keys_tr=(Ktr_tr if dist else None), keys_val=(Ktr_va if dist else None),
+                     keys_tr=(Ktr_tr if keyed else None), keys_val=(Ktr_va if keyed else None),
                      oos_ts=all_te_ts, val_keys=Ktr_va,      # ALWAYS -> val_percentiles
                      title=f"OOS {holdout_start}..{oos_end or 'end'}")
     _ledger_append({
@@ -766,13 +817,14 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
         print(f"  [produce 1/2] fit REAL head{' (+ ONNX export)' if onnx_path else ''}",
               flush=True)
     dist = ck.get('rank') == 'expected_reach'
-    kt, kv = (Ktr_tr, Ktr_va) if dist else (None, None)   # distributional ladder labels
+    keyed = dist or bool(ck.get('requires_keys'))
+    kt, kv = (Ktr_tr, Ktr_va) if keyed else (None, None)  # ladder or auxiliary labels
     ck_real = dict(ck, export_onnx_path=onnx_path) if onnx_path else ck
     p_val, p_te, ba = get_classifier(classifier, **ck_real).fit_predict(
         Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed, keys_tr=kt, keys_val=kv)
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(labeler, Kte, p_te, thr)
-    if dist:
+    if keyed:
         perm = rng.permutation(len(Ytr_tr))               # permute label + ladder keys together
         ysh, Ksh = Ytr_tr[perm], [Ktr_tr[i] for i in perm]
     else:

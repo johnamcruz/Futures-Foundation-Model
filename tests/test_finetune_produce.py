@@ -88,6 +88,22 @@ def test_operating_points_top_slice_is_all_winners():
     assert by[1]['wr3R'] >= by[2]['wr3R']
 
 
+def test_operating_points_uses_exact_strategy_win_truth():
+    class _ExactLab(_RLabeler):
+        def win_truth(self, keys):
+            return np.array([k[5] for k in keys], bool)
+
+    # Both exits made money, but only the first touched the target. WR must not count the
+    # positive vertical-barrier mark as an exact target-first win.
+    keys = [('ES@3min', 1, 1, 0.0, 2.95, True),
+            ('ES@3min', 2, 1, 0.0, 0.40, False)]
+    rows = produce.operating_points(_ExactLab(), keys, np.array([.9, .8]),
+                                    pd.to_datetime(['2025-01-02', '2025-01-02'], utc=True),
+                                    rates=(2,))
+    assert rows[0]['wr3R'] == pytest.approx(.5)
+    assert rows[0]['meanR'] == pytest.approx(1.675)
+
+
 def test_wr_by_score_bands_are_monotone():
     lab, keys, proba, ts = _ranked_oos()
     bands = produce.wr_by_score(lab, keys, proba, ts)
@@ -122,6 +138,31 @@ def test_alignment_breakdown_counter_vs_aligned():
     assert ab['aligned']['base_wr3R'] == pytest.approx(0.5)
     # no htf_alignment on the labeler -> None (backward-compatible)
     assert produce.alignment_breakdown(_RLabeler(), keys, np.array(proba), ts) is None
+
+
+def test_regime_breakdown_reports_exact_top_decile_without_filtering_pool():
+    class _RegimeLab(_RLabeler):
+        def regime_bucket(self, keys):
+            return np.array([k[5] for k in keys], object)
+
+        def win_truth(self, keys):
+            return np.array([k[6] for k in keys], bool)
+
+    keys, score = [], []
+    for regime in ('normal', 'expanded'):
+        for i in range(100):
+            exact = i < 20
+            # Exact winners rank first inside each regime; positive unresolved exits deliberately
+            # remain non-wins so the audit cannot inflate target-first WR.
+            r = 2.95 if exact else (0.25 if i < 40 else -1.05)
+            keys.append(('ES@3min', i, 1, 0.0, r, regime, exact))
+            score.append(1.0 - i / 100)
+    out = produce.regime_breakdown(_RegimeLab(), keys, np.asarray(score))
+    assert set(out) == {'normal', 'expanded'}
+    for row in out.values():
+        assert row['n'] == 100 and row['top10_n'] == 10
+        assert row['base_wr3R'] == pytest.approx(.20)
+        assert row['top10_wr3R'] == pytest.approx(1.0)
 
 
 def test_operating_points_empty_is_safe():
