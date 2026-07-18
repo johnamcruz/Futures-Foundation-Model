@@ -80,6 +80,17 @@ def test_task_is_additive_and_inherits_nextleg_reserve():
     assert get_pretext('nextleg').trainer == 'train_ssl_nextleg'
 
 
+def test_shared_config_keeps_race_overrides():
+    """loop_ssl's allowlist must not silently discard the new experiment's knobs."""
+    from futures_foundation.finetune.ssl import _base_cfg
+    cfg = _base_cfg(pretext='nextleg_race', race_w=.5, race_cap=1.5,
+                    race_levels=(.20, .40, .80, 1.0))
+    assert cfg['pretext'] == 'nextleg_race'
+    assert cfg['race_w'] == .5
+    assert cfg['race_cap'] == 1.5
+    assert cfg['race_levels'] == (.20, .40, .80, 1.0)
+
+
 def _rw(n=4000, seed=0):
     rng = np.random.default_rng(seed)
     c = 100 + rng.normal(0, 1, n).cumsum()
@@ -114,4 +125,3 @@ def test_trainer_accepts_shared_config_without_forwarding_it():
     assert set(s26) <= set(s28)
     assert {'race_w', 'race_cap', 'race_levels'} <= set(s28)
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s28.values())
-

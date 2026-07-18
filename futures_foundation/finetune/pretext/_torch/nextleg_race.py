@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..nextleg_race import RACE_LEVELS, ordered_adverse_curve
+from .forecast import _ForecastTrainer
 from .nextleg import NextLegNet, _NextLegTrainer, _alternating_fractals
 
 
@@ -50,25 +51,45 @@ class NextLegRaceNet(NextLegNet):
 
 
 class _NextLegRaceTrainer(_NextLegTrainer):
-    def __init__(self, big, tr, va, *, race_w=1.0, race_cap=2.0,
-                 race_levels=RACE_LEVELS, **kw):
+    def __init__(self, big, tr, va, *, leg_cap=256, leg_w=1.0, leg_k=2,
+                 mse_weight=1.0, race_w=1.0, race_cap=2.0,
+                 race_levels=RACE_LEVELS, **fw):
         self.race_w = float(race_w)
         self.race_cap = float(race_cap)
         self.race_levels = tuple(float(q) for q in race_levels)
-        # Reuse every anchor, normalization, batching, reserve, and leak guard from production
-        # NextLeg. Only target assembly is swapped during construction; the parent is restored even
-        # if initialization fails, so stage-2.6 remains byte-reproducible.
-        from . import nextleg as _nl
-        original = _nl._leg_targets
-        _nl._leg_targets = (lambda b, k, cap, _lv=self.race_levels, _rc=self.race_cap:
-                            _leg_race_targets(b, k, cap, _lv, _rc))
-        try:
-            super().__init__(big, tr, va, **kw)
-        finally:
-            _nl._leg_targets = original
+        self.leg_w, self.mse_weight = float(leg_w), float(mse_weight)
+        tr_np = tr if isinstance(tr, np.ndarray) else np.asarray(tr)
+        va_np = va if isinstance(va, np.ndarray) else np.asarray(va)
+        # Override only NextLeg's anchor initializer. Its current assertion confuses the small
+        # candle-decoder tensor (max_ctx+25) with the assembler's temporal reserve
+        # (max_ctx+2*leg_cap). Everything else—network lineage, make_batch normalization/control,
+        # optimizer, shared fit loop, and encoder-only checkpoint—is inherited unchanged.
+        _ForecastTrainer.__init__(self, big, tr, va, **fw)
+        confirms, tgts, ok = _leg_race_targets(
+            np.asarray(big, np.float32), int(leg_k), int(leg_cap),
+            self.race_levels, self.race_cap)
+        confirms, tgts = confirms[ok], tgts[ok]
+        starts = confirms - self.max_ctx + 1
+        horizon = np.expm1(tgts[:, 0]) + np.expm1(tgts[:, 1])
+        max_future = float(horizon.max()) if len(horizon) else 0.0
+        reserved_future = 2 * int(leg_cap)
+        assert max_future < reserved_future + 1, (
+            f'TEMPORAL LEAK: race target reads {max_future:.0f} bars ahead but the task permits '
+            f'only {reserved_future} (2*leg_cap)')
+        # tr/va contain only starts whose COMPLETE task.reserve() window stays within one stream,
+        # temporal split, and the pre-2026 region. Membership is the actual boundary purge.
+        m_tr, m_va = np.isin(starts, tr_np), np.isin(starts, va_np)
+        if m_tr.sum() < 1000 or m_va.sum() < 200:
+            raise ValueError(f'nextleg_race: too few resolved pivot anchors '
+                             f'(train={int(m_tr.sum())}, val={int(m_va.sum())})')
+        self.tr = torch.as_tensor(starts[m_tr], device=self.dev)
+        self.va = torch.as_tensor(starts[m_va], device=self.dev)
+        self._tgt_tr = torch.as_tensor(tgts[m_tr], device=self.dev)
+        self._tgt_va = torch.as_tensor(tgts[m_va], device=self.dev)
         if self.verbose:
             med = np.median(self._tgt_tr[:, 2:].cpu().numpy(), axis=0)
-            print(f"  [nextleg_race] race_w={self.race_w:g} levels={self.race_levels} "
+            print(f"  [nextleg_race] anchors train={len(self.tr):,} val={len(self.va):,} "
+                  f"k={leg_k} cap={leg_cap} | race_w={self.race_w:g} levels={self.race_levels} "
                   f"median={np.round(med, 3).tolist()} (future-only, ordered)", flush=True)
 
     def build_net(self):

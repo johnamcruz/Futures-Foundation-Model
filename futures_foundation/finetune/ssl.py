@@ -194,6 +194,8 @@ def _base_cfg(**kw):
              rtd_weight=5.0, recon_weight=1.0, gen_width=48, turn_w=3, turn_bias=0.85,
              # stage-2.6 NEXT-LEG forecasting (bars; pure-fractal pivots, NO ATR):
              leg_cap=256, leg_w=1.0, leg_k=2,
+             # stage-2.8 NEXT-LEG-RACE (future-only ordered candle path; no ATR/R/strategy data):
+             race_w=0.25, race_cap=2.0, race_levels=(0.25, 0.50, 0.75, 1.00),
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
              # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination
              # runs against slow drift that val loss rewards (val micro-improves while the
