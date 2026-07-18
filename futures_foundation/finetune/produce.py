@@ -132,6 +132,39 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     return rows
 
 
+def selection_concentration(keys, proba, ts, rates=(5, 3, 2, 1)):
+    """Composition of each pooled top-score tier, for hidden stream-dependence audits."""
+    if len(keys) == 0:
+        return []
+    score = np.asarray(proba, float)
+    streams = np.asarray([str(k[0]) for k in keys], object)
+    tickers = np.asarray([s.split('@')[0] for s in streams], object)
+    order, days, rows = np.argsort(-score), _oos_days(ts), []
+    for rate in rates:
+        n = int(min(len(score), max(1, round(rate * days))))
+        take = order[:n]
+
+        def shares(values):
+            names, counts = np.unique(values[take], return_counts=True)
+            pairs = sorted(zip(names.tolist(), (counts / n).tolist()),
+                           key=lambda z: z[1], reverse=True)
+            return pairs, float(np.sum((counts / n) ** 2))
+
+        stream_shares, stream_hhi = shares(streams)
+        ticker_shares, ticker_hhi = shares(tickers)
+        rows.append({
+            'rate': rate, 'n': n,
+            'active_streams': len(stream_shares),
+            'max_stream_share': stream_shares[0][1],
+            'stream_hhi': stream_hhi,
+            'top_streams': dict(stream_shares[:5]),
+            'max_ticker_share': ticker_shares[0][1],
+            'ticker_hhi': ticker_hhi,
+            'top_tickers': dict(ticker_shares[:5]),
+        })
+    return rows
+
+
 def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     """OOS WR@3R broken down by MODEL SCORE band (NON-cumulative) — 'is a higher score actually a
     better trade?'. Splits pivots into score quantile bands (top 10% / 10-25% / 25-50% / 50-75% /
@@ -494,8 +527,14 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
               flush=True)
     ck_real = dict(ck, export_onnx_path=onnx_path) if onnx_path else ck
     clf_real = get_classifier(classifier, **ck_real)          # keep the instance: it holds _platt
-    p_val, p_te, ba = clf_real.fit_predict(Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed,
-                                           keys_tr=keys_tr, keys_val=keys_val)
+    _key_args = dict(keys_tr=keys_tr, keys_val=keys_val)
+    # Keyed multi-task classifiers may carry masked auxiliary truths in strategy keys. Thread the
+    # evaluation keys only for classifiers that explicitly request them; ordinary classifiers
+    # retain the long-standing fit_predict contract.
+    if bool((ck or {}).get('requires_keys')):
+        _key_args['keys_eval'] = Kte
+    p_val, p_te, ba = clf_real.fit_predict(
+        Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed, **_key_args)
     gc.collect()
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(eval_lab, Kte, p_te, thr)
@@ -513,8 +552,11 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ysh = np.asarray(Ytr_tr).copy(); rng.shuffle(ysh); Ksh = None
         if verbose:
             print("  [produce 2/2] fit SHUFFLE control (honest ruler)", flush=True)
-        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(Xtr, ysh, Xval, Ytr_va, Xte, seed,
-                                                                  keys_tr=Ksh, keys_val=keys_val)
+        _shuffle_key_args = dict(keys_tr=Ksh, keys_val=keys_val)
+        if bool((ck or {}).get('requires_keys')):
+            _shuffle_key_args['keys_eval'] = Kte
+        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(
+            Xtr, ysh, Xval, Ytr_va, Xte, seed, **_shuffle_key_args)
         gc.collect()
         Rs = _arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE))
     auc = None
@@ -527,6 +569,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
     regimes = regime_breakdown(eval_lab, Kte, p_te)
+    concentration = selection_concentration(Kte, p_te, oos_ts) if oos_ts is not None else []
     # TIER-LEVEL SHUFFLE RULER (2026-07-16): the pool-level beats_shuffle compares REAL vs
     # SHUFFLE over the top ~half of the pool — a scale where fixed-R constructions cap the edge
     # below the pass margin for ANY model (oracle-proven), so it fails unconditionally for
@@ -573,6 +616,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, operating_points=ops, wr_by_alignment=align,
                wr_by_regime=regimes,
+               selection_concentration=concentration,
                per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
                # PER-STREAM PERCENTILES from the VAL distribution -> the deploy contract's 0-100
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
@@ -583,6 +627,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                beats_shuffle_tiers=beats_shuffle_tiers,
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None),      # Platt (A,B) -> deploy contract
+               forecast_metrics=getattr(clf_real, '_forecast_metrics', None),
                # HEAD-FIT REPORT (iters/converged/curve/seconds) — the training-side diagnostic:
                # convergence speed on a FROZEN embedding is an encoder signal, and a capped fit
                # is a caveat on every number below it. Ledgered for cross-checkpoint comparison.
@@ -596,6 +641,14 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             for _t, rows in per_tk.items():
                 cells = '  '.join(f"{r['rate']}/d {r['wr3R']:5.1%} {r['meanR']:+.2f}" for r in rows)
                 print(f"    {_t:>4}: {cells}", flush=True)
+        if concentration:
+            print(f"  {title} — pooled tier concentration (max stream/ticker share; lower HHI "
+                  "means broader support):", flush=True)
+            for row in concentration:
+                print(f"    ~{row['rate']}/day: streams={row['active_streams']:>2} "
+                      f"max_stream={row['max_stream_share']:.1%} HHI={row['stream_hhi']:.3f} | "
+                      f"max_ticker={row['max_ticker_share']:.1%} HHI={row['ticker_hhi']:.3f}",
+                      flush=True)
         if per_stream:
             # THE DEPLOY READ: train on every stream (the pattern is fractal), but decide on the
             # stream you actually trade. A ticker-level number averages 1min (~150 candidates/day)

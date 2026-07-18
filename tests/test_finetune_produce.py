@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from futures_foundation.finetune import produce
+from futures_foundation.finetune.classifier import Classifier, register_classifier
 
 
 class SyntheticLabeler:
@@ -168,6 +169,51 @@ def test_regime_breakdown_reports_exact_top_decile_without_filtering_pool():
 def test_operating_points_empty_is_safe():
     assert produce.operating_points(_RLabeler(), [], np.array([]), []) == []
     assert produce.wr_by_score(_RLabeler(), [], np.array([]), []) == []
+    assert produce.selection_concentration([], np.array([]), []) == []
+
+
+def test_selection_concentration_exposes_single_stream_dependency():
+    keys = ([('CL@3min', i, 1, 0.0, 2.0) for i in range(8)]
+            + [('ES@3min', 100 + i, 1, 0.0, 2.0) for i in range(2)])
+    score = np.linspace(1.0, .1, 10)
+    ts = pd.to_datetime(['2025-01-02'] * 10, utc=True)
+    row = produce.selection_concentration(keys, score, ts, rates=(5,))[0]
+    assert row['n'] == 5 and row['active_streams'] == 1
+    assert row['max_stream_share'] == 1.0 and row['stream_hhi'] == 1.0
+    assert row['top_streams'] == {'CL@3min': 1.0}
+
+
+def test_keyed_classifier_receives_eval_keys_for_auxiliary_audit():
+    seen = []
+
+    @register_classifier('_test_keyed_eval_audit')
+    class _KeyedAuditClassifier(Classifier):
+        def __init__(self, **cfg):
+            self.cfg = cfg
+
+        def featurize(self, labeler, keys):
+            raise NotImplementedError
+
+        def fit_predict(self, Xtr, ytr, Xval, yval, Xeval, seed=0, keys_tr=None,
+                        keys_val=None, keys_eval=None):
+            seen.append((list(keys_tr), list(keys_val), list(keys_eval)))
+            self._forecast_metrics = {'oos': {'aux': {'auc': .6}}}
+            return (np.linspace(.1, .9, len(Xval)),
+                    np.linspace(.1, .9, len(Xeval)), .55)
+
+    train_keys = [('ES@3min', i, 1, 0.0, 2.0) for i in range(12)]
+    val_keys = [('ES@3min', 100 + i, 1, 0.0, 2.0) for i in range(4)]
+    eval_keys = [('ES@3min', 200 + i, 1, 0.0, 2.0 if i % 2 else -1.0)
+                 for i in range(6)]
+    out = produce._fit_score(
+        '_test_keyed_eval_audit', {'requires_keys': True}, _RLabeler(),
+        np.zeros((12, 2)), np.arange(12) % 2,
+        np.zeros((4, 2)), np.arange(4) % 2,
+        np.zeros((6, 2)), eval_keys, np.arange(6) % 2, 0, False,
+        keys_tr=train_keys, keys_val=val_keys)
+    assert len(seen) == 2  # real and label-shuffle control
+    assert seen[0][2] == eval_keys and seen[1][2] == eval_keys
+    assert out['forecast_metrics'] == {'oos': {'aux': {'auc': .6}}}
 
 
 def test_ladder_signal_contract_shape(tmp_path):
