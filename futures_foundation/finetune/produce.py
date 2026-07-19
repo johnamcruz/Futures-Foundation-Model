@@ -853,6 +853,14 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
                      keys_tr=(Ktr_tr if keyed else None), keys_val=(Ktr_va if keyed else None),
                      oos_ts=all_te_ts, val_keys=Ktr_va,      # ALWAYS -> val_percentiles
                      title=f"OOS {holdout_start}..{oos_end or 'end'}")
+    # Persist the exact comparison universe in every machine-readable result. Stability and
+    # ablation gates must never compare runs that silently differ by ticker/timeframe scope.
+    out['evaluation_scope'] = {
+        'tickers': tks, 'timeframes': tfs, 'seed': int(seed),
+        'holdout_start': str(holdout_start),
+        'oos_end': None if oos_end is None else str(oos_end),
+        'n_train': int(len(Ytr_tr)), 'n_oos': int(len(Yte)),
+    }
     _ledger_append({
         'ts': pd.Timestamp.now('UTC').isoformat(), 'kind': 'produce_streamed',
         'classifier': classifier,
