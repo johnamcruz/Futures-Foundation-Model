@@ -121,6 +121,11 @@ def test_produce_streamed_per_stream(tmp_path):
         seed=0, chunk=200, export_onnx=True, output_path=str(tmp_path / 'm'), verbose=False)
     assert out['n_oos'] > 0 and out['oos_trades'] > 0
     assert out['oos_auc'] is not None and out['oos_auc'] > 0.75   # learnable across streams
+    assert out['evaluation_scope'] == {
+        'tickers': ['A', 'B', 'C'], 'timeframes': ['3min'], 'seed': 0,
+        'holdout_start': '2021-06-01', 'oos_end': None,
+        'n_train': out['n_train'], 'n_oos': out['n_oos'],
+    }
     c = json.loads(open(out['artifacts']['contract']).read())
     assert c['train_scope']['tickers'] == ['A', 'B', 'C']
     assert c['train_scope']['timeframes'] == ['3min']

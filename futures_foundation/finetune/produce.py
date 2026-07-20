@@ -370,6 +370,17 @@ def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
                         'n_train': int(n_train), 'n_oos': int(n_oos)},
         'oos_metrics': {k: out.get(k) for k in
                         ('oos_auc', 'oos_meanR', 'shuffle_meanR', 'edge_shuffle', 'oos_trades')},
+        'auxiliary_metrics': {
+            'forecast': out.get('forecast_metrics'),
+            'chop': out.get('chop_metrics'),
+            'chop_abstention_audit': out.get('chop_abstention_audit'),
+            'chop_fusion': out.get('chop_fusion'),
+        },
+        'chop_calibration': ({'method': 'platt', 'baked_into_onnx': True,
+                              'A': out['chop_platt'][0], 'B': out['chop_platt'][1]}
+                             if out.get('chop_platt') else None),
+        'chop_percentiles': out.get('chop_percentiles'),
+        'chop_fusion': out.get('chop_fusion'),
         'onnx': (Path(onnx_path).name if sha else None), 'content_sha': sha,
     }
 
@@ -462,6 +473,20 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
                         'n_train': int(out['n_train']), 'n_oos': int(out['n_oos'])},
         'oos_metrics': {k: out.get(k) for k in
                         ('oos_auc', 'oos_meanR', 'shuffle_meanR', 'edge_shuffle', 'oos_trades')},
+        # Optional auxiliary-head evidence. Generic producers leave these null; multi-head
+        # strategies persist enough information for a fail-closed deployment validator and for
+        # serving the separately calibrated auxiliary output without private-code assumptions.
+        'auxiliary_metrics': {
+            'forecast': out.get('forecast_metrics'),
+            'chop': out.get('chop_metrics'),
+            'chop_abstention_audit': out.get('chop_abstention_audit'),
+            'chop_fusion': out.get('chop_fusion'),
+        },
+        'chop_calibration': ({'method': 'platt', 'baked_into_onnx': True,
+                              'A': out['chop_platt'][0], 'B': out['chop_platt'][1]}
+                             if out.get('chop_platt') else None),
+        'chop_percentiles': out.get('chop_percentiles'),
+        'chop_fusion': out.get('chop_fusion'),
         'onnx': ([Path(p).name for p in bundle] if sha else None), 'content_sha': sha,
     }
     if dist:
@@ -663,6 +688,11 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None),      # Platt (A,B) -> deploy contract
                forecast_metrics=getattr(clf_real, '_forecast_metrics', None),
+               chop_metrics=getattr(clf_real, '_chop_metrics', None),
+               chop_platt=getattr(clf_real, '_chop_platt', None),
+               chop_percentiles=getattr(clf_real, '_chop_percentiles', None),
+               chop_abstention_audit=getattr(clf_real, '_chop_abstention_audit', None),
+               chop_fusion=getattr(clf_real, '_chop_fusion', None),
                # HEAD-FIT REPORT (iters/converged/curve/seconds) — the training-side diagnostic:
                # convergence speed on a FROZEN embedding is an encoder signal, and a capped fit
                # is a caveat on every number below it. Ledgered for cross-checkpoint comparison.
@@ -823,6 +853,14 @@ def train_final_streamed(make_labeler, streams, classifier, clf_kwargs=None,
                      keys_tr=(Ktr_tr if keyed else None), keys_val=(Ktr_va if keyed else None),
                      oos_ts=all_te_ts, val_keys=Ktr_va,      # ALWAYS -> val_percentiles
                      title=f"OOS {holdout_start}..{oos_end or 'end'}")
+    # Persist the exact comparison universe in every machine-readable result. Stability and
+    # ablation gates must never compare runs that silently differ by ticker/timeframe scope.
+    out['evaluation_scope'] = {
+        'tickers': tks, 'timeframes': tfs, 'seed': int(seed),
+        'holdout_start': str(holdout_start),
+        'oos_end': None if oos_end is None else str(oos_end),
+        'n_train': int(len(Ytr_tr)), 'n_oos': int(len(Yte)),
+    }
     _ledger_append({
         'ts': pd.Timestamp.now('UTC').isoformat(), 'kind': 'produce_streamed',
         'classifier': classifier,

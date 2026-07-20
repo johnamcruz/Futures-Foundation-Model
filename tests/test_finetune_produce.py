@@ -198,6 +198,12 @@ def test_keyed_classifier_receives_eval_keys_for_auxiliary_audit():
                         keys_val=None, keys_eval=None):
             seen.append((list(keys_tr), list(keys_val), list(keys_eval)))
             self._forecast_metrics = {'oos': {'aux': {'auc': .6}}}
+            self._chop_metrics = {'oos': {'name': 'CHOP20', 'auc': .55}}
+            self._chop_platt = (.8, -.1)
+            self._chop_percentiles = {'ES@3min': {'p50': .4, 'p75': .6, 'p90': .8}}
+            self._chop_abstention_audit = {'oos': {'p99': {'keep_75': {'mean_r': 1.2}}}}
+            self._chop_fusion = {'architecture': 'confidence_tapered_separate_tower_v3',
+                                 'fusion_alpha': .12, 'hard_gate': False}
             return (np.linspace(.1, .9, len(Xval)),
                     np.linspace(.1, .9, len(Xeval)), .55)
 
@@ -214,6 +220,11 @@ def test_keyed_classifier_receives_eval_keys_for_auxiliary_audit():
     assert len(seen) == 2  # real and label-shuffle control
     assert seen[0][2] == eval_keys and seen[1][2] == eval_keys
     assert out['forecast_metrics'] == {'oos': {'aux': {'auc': .6}}}
+    assert out['chop_metrics']['oos']['auc'] == .55
+    assert out['chop_platt'] == (.8, -.1)
+    assert out['chop_percentiles']['ES@3min']['p75'] == .6
+    assert out['chop_abstention_audit']['oos']['p99']['keep_75']['mean_r'] == 1.2
+    assert out['chop_fusion']['architecture'] == 'confidence_tapered_separate_tower_v3'
 
 
 def test_ladder_signal_contract_shape(tmp_path):
@@ -222,6 +233,8 @@ def test_ladder_signal_contract_shape(tmp_path):
     import json
     out = dict(oos_auc=0.6, oos_meanR=0.63, shuffle_meanR=None, edge_shuffle=None,
                oos_trades=1000, n_train=100, n_oos=50, platt=None,
+               chop_fusion={'architecture': 'confidence_tapered_separate_tower_v3',
+                            'fusion_alpha': .12, 'hard_gate': False},
                entry_thresholds={'top0.1pct': 4.2, 'top1pct': 3.3, 'top10pct': 2.8},
                val_percentiles={'ES@3min': {'p50': 1.7, 'p90': 3.1, 'p99': 4.4}})
     ck = {'rank': 'expected_reach', 'reach_targets': [2.0, 3.0, 4.0, 6.0, 8.0], 'head': 'mlp'}
@@ -236,6 +249,7 @@ def test_ladder_signal_contract_shape(tmp_path):
     assert c['head_outputs'] == ['p_3r', 'expected_reach']
     assert c['reach_targets'] == [2.0, 3.0, 4.0, 6.0, 8.0]
     assert c['calibration']['baked_into_onnx'] is True
+    assert c['auxiliary_metrics']['chop_fusion']['fusion_alpha'] == .12
     # STANDARDIZED 0-100 SCORE (2026-07-17): the ladder MUST carry the per-stream percentile scale
     # too — same 0-100 axis as the single head, ranking expected_reach, so a head swap needs no bot
     # change. Regression guard for the wiring gap where only the single head emitted it.
