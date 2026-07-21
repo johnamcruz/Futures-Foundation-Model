@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import _enc, _apply_control, _gather_batch, BaseTrainer
+from .common import _encode_channels, _apply_control, _gather_batch, BaseTrainer
 
 
 class MultiHorizonForecastNet(nn.Module):
@@ -32,7 +32,7 @@ class MultiHorizonForecastNet(nn.Module):
 
     def embed(self, x):                                   # [B,C,L] -> [B, new_c*hidden]
         a = self.adapter(x)
-        return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
+        return _encode_channels(self.encoder, a)
 
     def forward(self, ctx):                               # -> (candles [B,C,nH], aux [B,aux_dim] or None)
         e = self.embed(ctx)
