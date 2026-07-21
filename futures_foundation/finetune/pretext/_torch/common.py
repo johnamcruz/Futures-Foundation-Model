@@ -105,11 +105,14 @@ def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M
     return np.concatenate(out) if out else np.zeros((0, 0), np.float32), s
 
 
-@torch.no_grad()
-def embed_windows(windows, *, ckpt=None, model_id='paris-noah/Mantis-8M', device=None, batch=512):
-    """Frozen ENCODER-ONLY embeddings of pre-extracted windows [N, C, seq] -> [N, C*hidden]. The
-    head-only/cached downstream primitive: backbone frozen, embed ONCE, then a cheap head trains
-    on the cache."""
+def embed_window_chunks(chunks, *, ckpt=None, model_id='paris-noah/Mantis-8M', device=None,
+                        batch=512):
+    """Yield frozen embeddings for an iterable of bounded ``[N,C,seq]`` chunks.
+
+    The encoder is loaded once and retained across chunks.  This is the safe path
+    for multi-million-window diagnostics: callers can stream source windows and
+    write each result to a memmap without materializing either full array in RAM.
+    """
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     from mantis.architecture import Mantis8M
     dev = device or ('cuda' if torch.cuda.is_available()
@@ -118,13 +121,28 @@ def embed_windows(windows, *, ckpt=None, model_id='paris-noah/Mantis-8M', device
     if ckpt:
         enc.load_state_dict(torch.load(ckpt, map_location='cpu'))
     enc = enc.to(dev).eval()
-    X = torch.as_tensor(np.asarray(windows, np.float32))
-    out = []
-    for b in range(0, len(X), batch):
-        w = _standardize(X[b:b + batch].to(dev))
-        emb = _encode_channels(enc, w)
-        out.append(emb.float().cpu().numpy())
-    return np.concatenate(out) if out else np.zeros((0, 0), np.float32)
+
+    def _iterator():
+        with torch.no_grad():
+            for windows in chunks:
+                X = torch.as_tensor(np.asarray(windows, np.float32))
+                out = []
+                for b in range(0, len(X), batch):
+                    w = _standardize(X[b:b + batch].to(dev))
+                    emb = _encode_channels(enc, w)
+                    out.append(emb.float().cpu().numpy())
+                yield (np.concatenate(out) if out else
+                       np.zeros((0, 0), np.float32))
+
+    return _iterator()
+
+
+def embed_windows(windows, *, ckpt=None, model_id='paris-noah/Mantis-8M', device=None, batch=512):
+    """Frozen ENCODER-ONLY embeddings of pre-extracted windows [N, C, seq] -> [N, C*hidden]. The
+    head-only/cached downstream primitive: backbone frozen, embed ONCE, then a cheap head trains
+    on the cache."""
+    return next(embed_window_chunks((windows,), ckpt=ckpt, model_id=model_id,
+                                    device=device, batch=batch))
 
 
 class _EncoderONNX(nn.Module):
