@@ -70,11 +70,12 @@ class _ForecastTrainer(BaseTrainer):
             net = torch.compile(net)
         self.net = net
 
-    def make_batch(self, starts):
-        b_idx = self.sample_indices(starts)
+    def make_batch(self, starts, gen=None):
+        gen = gen or self.gen
+        b_idx = self.sample_indices(starts, generator=gen)
         w = _gather_batch(self.big_t, starts, b_idx, self.parent)     # [B,C,max_ctx+h_max] real
         L = int(self.clens_t[torch.randint(0, len(self.clens_t), (1,), device=self.dev,
-                                           generator=self.gen)].item())
+                                           generator=gen)].item())
         ctx_raw = w[:, :, self.max_ctx - L:self.max_ctx]             # [B,C,L] context ending at 'now'
         fut_raw = w[:, :, self.max_ctx:]                            # [B,C,h_max] future candles
         m = ctx_raw.mean(2, keepdim=True); s = ctx_raw.std(2, keepdim=True) + 1e-6
@@ -96,8 +97,14 @@ class _ForecastTrainer(BaseTrainer):
         ptoth = torch.zeros(len(self.hlist), device=self.dev)
         dacc = torch.zeros(len(self.hlist), device=self.dev)        # per-horizon directional accuracy
         nb = min(20, max(1, len(self.va) // self.batch))
+        # Fixed validation draws make early stopping compare model epochs rather than
+        # different random windows/context lengths. Training keeps its independent RNG.
+        vgen = torch.Generator(device=self.dev); vgen.manual_seed(20260704)
+        embed_ctx = None
         for _ in range(nb):
-            mc, tg = self.make_batch(self.va)
+            mc, tg = self.make_batch(self.va, gen=vgen)
+            if embed_ctx is None:
+                embed_ctx = mc
             with self.amp_ctx():
                 candles, aux = self.net(mc)                         # net ALWAYS returns (candles, aux)
                 # Checkpoint selection must use the SAME objective as training. Previously every
@@ -108,7 +115,7 @@ class _ForecastTrainer(BaseTrainer):
             tot_obj += float(obj_loss); tot_mse += float(se.mean()); ptot += float((tg ** 2).mean())
             toth += se.mean(dim=(0, 1)); ptoth += (tg ** 2).mean(dim=(0, 1))
             dacc += _dir_acc(candles, tg, self.close_ch)            # universal (comparable across objectives)
-        estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
+        estd = float(self.net.embed(embed_ctx).std(0).mean())
         self.net.train()
         vloss, candle_mse, ploss = tot_obj / nb, tot_mse / nb, ptot / nb
         skill = float(1.0 - candle_mse / ploss) if ploss > 1e-12 else 0.0

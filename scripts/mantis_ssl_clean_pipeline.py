@@ -6,7 +6,7 @@ replacement and uses the repository's sealed continuous-contract ``data/`` corpu
 
     public Mantis-8M
       -> masked OHLCV
-      -> temporal contrastive
+      -> causal Kaufman-regime contrastive
       -> multi-horizon candle seq2seq
       -> NextLeg
 
@@ -42,7 +42,8 @@ TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
 TIMEFRAMES = ("1min", "3min", "5min", "15min")
 HOLDOUT_START = "2026-01-01"
 PROBE_SPLIT_SCHEMA = "balanced_stream_purged_temporal_v1"
-STAGE_ORDER = ("mask", "contrastive", "seq2seq", "nextleg")
+ATLAS_MEAN_RETENTION_TOLERANCE = 0.01
+ATLAS_SINGLE_PROBE_TOLERANCE = 0.03
 
 
 @dataclass(frozen=True)
@@ -55,18 +56,19 @@ class Stage:
     samples_per_epoch: int
 
 
+# Canonical production lineage. Keep this tuple authoritative: parent execution,
+# Probe Atlas progression, manifests, and completion all derive from it.
 STAGES = (
     Stage("mask", "mantis_ssl_ohlcv.pt", None, 60,
           {"cuda": 1024, "mps": 256, "cpu": 64}, 51_200),
-    # Contrastive materializes five views per anchor; 32 is intentionally conservative
-    # on a 16-GB M1. CUDA keeps the historically validated batch of 128.
-    Stage("contrastive", "mantis_ssl_regime_from_mask.pt", "mask", 60,
-          {"cuda": 128, "mps": 32, "cpu": 16}, 6_400),
-    Stage("seq2seq", "mantis_ssl_ctr_seq2seq.pt", "contrastive", 120,
+    Stage("contrastive", "mantis_ssl_regime_kaufman_from_mask.pt", "mask", 60,
+          {"cuda": 256, "mps": 64, "cpu": 16}, 12_800),
+    Stage("seq2seq", "mantis_ssl_kaufman_seq2seq.pt", "contrastive", 120,
           {"cuda": 512, "mps": 128, "cpu": 32}, 25_600),
     Stage("nextleg", "mantis_ssl_nextleg.pt", "seq2seq", 120,
           {"cuda": 512, "mps": 128, "cpu": 32}, 25_600),
 )
+STAGE_ORDER = tuple(stage.name for stage in STAGES)
 
 
 def _steps_for(stage: Stage, batch: int, env: dict[str, str] | None = None) -> int:
@@ -112,6 +114,31 @@ def _assert_completed_stage_recipe(report_path: Path, *, sampling_mode: str) -> 
             "choose a new --out-dir so experimental lineages cannot overwrite or reuse each other")
 
 
+def _assert_stage_parent(out_path: Path, stage: Stage,
+                         paths: dict[str, Path]) -> None:
+    """Refuse to resume or reuse a child produced from a different parent.
+
+    This matters when an output directory survives a curriculum change. A child
+    filename alone cannot prove which encoder initialized it.
+    """
+    if stage.parent is None or not out_path.exists():
+        return
+    provenance_path = Path(str(out_path) + ".data_provenance.json")
+    if not provenance_path.is_file():
+        raise RuntimeError(
+            f"cannot establish parent identity for existing {stage.name} checkpoint: "
+            f"{provenance_path} is missing; move it aside and restart this stage")
+    saved = json.loads(provenance_path.read_text())
+    expected_parent = paths[stage.parent]
+    expected_hash = sha256(expected_parent)
+    parent = saved.get("parent", {})
+    if saved.get("stage") != stage.name or parent.get("sha256") != expected_hash:
+        raise RuntimeError(
+            f"existing {stage.name} checkpoint has the wrong parent; expected "
+            f"{stage.parent} sha256={expected_hash}, found {parent.get('sha256')!r}; "
+            "move the stale child artifacts aside and restart this stage")
+
+
 def _stage_config(stage: str) -> dict:
     """Banked, non-experimental recipe for each clean-lineage objective."""
     lora = dict(lora_r=int(os.environ.get("LORA_R", "8")),
@@ -126,24 +153,31 @@ def _stage_config(stage: str) -> dict:
         log_every_steps=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")), **lora,
         )
     if stage == "contrastive":
-        return {**common, "pretext": "contrastive", "pos_deltas": (2, 16, 64),
-                "far_min": 512, "temperature": 0.1, "aug_noise": 0.10,
-                "aug_scale": 0.20, "aug_tmask": 0.15, "crop_max": 0.2,
-                "vol_weight": 1.0, "new_channels": 8, "proj_dim": 128,
-                "metrics_n": 768, "lr": 1e-4, "weight_decay": 0.05,
-                "clamp": 10.0, "grad_clip": 1.0, "freeze_encoder_layers": 0}
+        return {**common, "pretext": "contrastive", "regime_key": "kaufman",
+                "kaufman_chop": 0.25, "kaufman_trend": 0.50,
+                "pos_deltas": (2, 16, 64),
+                "far_min": 512, "temperature": 0.1, "aug_noise": 0.02,
+                "aug_scale": 0.10, "aug_tmask": 0.0, "crop_max": 0.0,
+                "vol_weight": 0.0, "new_channels": 8, "proj_dim": 128,
+                "metrics_n": 768,
+                "lr": float(os.environ.get("CONTRASTIVE_LR", "5e-5")),
+                "weight_decay": 0.05,
+                "clamp": 10.0, "grad_clip": 1.0, "freeze_encoder_layers": 2}
     if stage == "seq2seq":
-        # Intended ctr_seq2seq base—not the later lc512/long-horizon experiment.
+        # Banked multi-horizon recipe; the parent-hash contract guarantees this run
+        # starts from the retained Kaufman-regime representation.
         return {**common, "pretext": "forecast", "horizons": (5, 10, 20, 25),
                 "context_lengths": (64, 100, 150, 200), "objective": "candle_mse",
-                "new_channels": 3, "dir_weight": 0.0, "lr": 0.0001188117389055629,
+                "new_channels": 3, "dir_weight": 0.0,
+                "lr": float(os.environ.get("SEQ2SEQ_LR", "4e-5")),
                 "weight_decay": 0.0, "clamp": 10.0, "grad_clip": 1.0,
                 "freeze_encoder_layers": 2}
     if stage == "nextleg":
         return {**common, "pretext": "nextleg", "horizons": (5, 10, 20, 25),
                 "context_lengths": (64, 100, 150, 200), "leg_k": 2,
                 "leg_cap": 256, "leg_w": 1.0, "mse_weight": 1.0,
-                "new_channels": 3, "lr": 0.0001188117389055629,
+                "new_channels": 3,
+                "lr": float(os.environ.get("NEXTLEG_LR", "3e-5")),
                 "weight_decay": 0.0, "clamp": 10.0, "grad_clip": 1.0,
                 "freeze_encoder_layers": 2}
     raise KeyError(stage)
@@ -200,6 +234,7 @@ def _run_child(args: argparse.Namespace) -> None:
     parent = paths[stage.parent] if stage.parent else None
     if parent is None or not parent.is_file():
         raise FileNotFoundError(f"valid parent checkpoint missing for {stage.name}: {parent}")
+    _assert_stage_parent(out_path, stage, paths)
     data_dir = Path(args.data_dir).resolve()
     provenance = _seal(data_dir)
     config = _stage_config(stage.name)
@@ -296,6 +331,32 @@ def _refresh_atlas_progress(out_dir: Path) -> dict:
     temporary.write_text(json.dumps(progress, indent=2) + "\n")
     os.replace(temporary, path)
     return progress
+
+
+def _assert_atlas_retention(progress: dict, stage_name: str) -> None:
+    """Prevent a child objective from advancing after material capability loss.
+
+    Family means catch broad forgetting while the per-probe bound prevents one
+    important market-context capability from being hidden by gains elsewhere.
+    """
+    rows = progress.get("stages", [])
+    index = next((i for i, row in enumerate(rows) if row.get("stage") == stage_name), None)
+    if index is None or index == 0:
+        return
+    current, previous = rows[index], rows[index - 1]
+    failures = []
+    for metric in ("retention_mean_auc", "prediction_mean_auc"):
+        before, after = previous.get(metric), current.get(metric)
+        if before is not None and after is not None:
+            delta = float(after) - float(before)
+            if delta < -ATLAS_MEAN_RETENTION_TOLERANCE:
+                failures.append(f"{metric} delta={delta:+.4f}")
+    for name, delta in current.get("deltas_vs_previous", {}).items():
+        if float(delta) < -ATLAS_SINGLE_PROBE_TOLERANCE:
+            failures.append(f"{name} delta={float(delta):+.4f}")
+    if failures:
+        raise RuntimeError(
+            f"Probe Atlas retention failed after {stage_name}: " + ", ".join(failures))
 
 
 def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
@@ -432,9 +493,14 @@ def _run_parent(args: argparse.Namespace) -> None:
     print(f"  output  : {out_dir}")
     for stage in STAGES:
         steps = _steps_for(stage, stage.batch[device])
+        adaptation = ""
+        if stage.name != "mask":
+            cfg = _stage_config(stage.name)
+            adaptation = (f" lr={cfg['lr']:.1e}"
+                          f" freeze={cfg['freeze_encoder_layers']}")
         print(f"  {stage.name:11s}: batch={stage.batch[device]:4d} steps={steps:3d} "
               f"samples/epoch={stage.batch[device] * steps:6,d} max_epochs={stage.epochs:3d} "
-              f"-> {stage.filename}")
+              f"{adaptation} -> {stage.filename}")
     if args.preflight_only:
         return
 
@@ -458,10 +524,13 @@ def _run_parent(args: argparse.Namespace) -> None:
                        reason="stale_split_schema", checkpoint=str(out_path))
         if out_path.is_file() and report_path.is_file():
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
+            _assert_stage_parent(out_path, stage, paths)
             _assert_stage_verdict(report_path)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
-            _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
-                             labels=atlas_labels, data_dir=data_dir)
+            progress = _run_probe_atlas(
+                stage, out_path, out_dir=out_dir, device=device, python=python,
+                labels=atlas_labels, data_dir=data_dir)
+            _assert_atlas_retention(progress, stage.name)
             _event(out_dir, "stage_skipped", stage=stage.name, reason="complete",
                    checkpoint=str(out_path))
             continue
@@ -519,8 +588,10 @@ def _run_parent(args: argparse.Namespace) -> None:
             _notify(f"Clean SSL pipeline missing artifacts at {stage.name}")
             raise RuntimeError(f"incomplete stage artifacts: {stage.name}")
         _assert_stage_verdict(report_path)
-        _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
-                         labels=atlas_labels, data_dir=data_dir)
+        progress = _run_probe_atlas(
+            stage, out_path, out_dir=out_dir, device=device, python=python,
+            labels=atlas_labels, data_dir=data_dir)
+        _assert_atlas_retention(progress, stage.name)
         print(f"[{stage.name}] PASS; advancing lineage", flush=True)
         _event(out_dir, "stage_completed", stage=stage.name, batch=batch,
                checkpoint=str(out_path), checkpoint_sha256=sha256(out_path),

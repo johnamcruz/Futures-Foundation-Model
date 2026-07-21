@@ -1,20 +1,10 @@
-"""Stage-3 pretext: TEMPORAL-NEIGHBORHOOD CONTRASTIVE (regime geometry, label-free).
+"""Contrastive regime pretext with causal Kaufman and historical temporal modes.
 
-Positives = temporally-nearby windows at multiple scales + augmented views; negatives =
-far-in-time windows; per-anchor volatility DOWN-weighting (data-driven, not a label). Teaches
-the encoder a smooth "market state geometry": nearby-in-time / structurally-similar windows
-cluster, different structures separate — the regime representation the FFM vision wants the
-foundation to own.
-
-Replaces the outcome-keyed contrastive (v1-v3, dropped 2026-07-02 — ~90 trials, no arm beat
-stage-2): the key here is TIME PROXIMITY, never a future path statistic — a fundamentally
-different supervision source.
-
-GATE (this stage) = the requirement doc's structural metrics A-E on the embedding space
-(temporal consistency, emergent clusters, multi-scale ordering, noise robustness, temporal
-stability — `regime_gate` in the torch module). The SHIP gate is unchanged: stage-2 seq2seq
-stays the shipped base; a stage-3 checkpoint must beat it on the one-shot 2026 WR@3R benchmark
-before promotion (feedback_holdout_offlimits discipline)."""
+Production positives use completed-window Kaufman ER: chop windows group together, efficient
+up/down trends form directional groups, and ambiguous transition windows keep only their second
+augmented view as a positive. The historical temporal-neighborhood mode remains available for
+ablation. Both are strategy-agnostic and use no future bars or trading outcomes.
+"""
 from .base import PretextTask
 
 
@@ -22,6 +12,8 @@ class ContrastiveTask(PretextTask):
     name, trainer = 'contrastive', 'train_ssl_contrastive'
 
     def reserve(self, cfg):
+        if cfg.get('regime_key', 'temporal') == 'kaufman':
+            return int(cfg.get('seq', 64))
         # A positive starts at anchor+delta and itself reads `seq` candles. Reserve the COMPLETE
         # positive window; reserving only delta admits anchors whose positive crosses a stream or
         # temporal-split boundary even though the positive start still looks legal.
