@@ -23,6 +23,7 @@ setup(
         "heads": ["xgboost>=2.0", "joblib>=1.3"],
         "regime": ["hmmlearn>=0.3"],   # futures_foundation.regime market-state HMM
         "onnx": ["onnxmltools", "skl2onnx"],
+        "data": ["databento>=0.76", "zstandard>=0.23"],
         "dev": ["pytest>=7.0", "black", "ruff", "hmmlearn>=0.3"],
     },
 )

@@ -19,6 +19,16 @@ def seal_continuous_streams(
         data_dir: Path, streams: Iterable[tuple[str, str]],
         *, repo_root: Path | None = None) -> dict:
     """Validate manifests and return hashes for exact model inputs."""
+    update_lock = Path(data_dir) / ".continuous_update.lock"
+    if update_lock.exists():
+        raise RuntimeError(
+            f"continuous-contract data update is in progress: {update_lock}")
+    generation_path = Path(data_dir) / "continuous_generation.json"
+    generation = (json.loads(generation_path.read_text())
+                  if generation_path.exists() else None)
+    if generation is not None and generation.get("schema") != \
+            "ffm_continuous_generation_v1":
+        raise RuntimeError(f"invalid continuous generation manifest: {generation_path}")
     sealed = {}
     for ticker, timeframe in streams:
         bars = Path(data_dir) / f"{ticker}_{timeframe}.csv"
@@ -44,6 +54,19 @@ def seal_continuous_streams(
         if mismatches:
             raise RuntimeError(
                 f"invalid manifest for {ticker}@{timeframe}: {mismatches}")
+        if generation is not None:
+            generation_stream = generation.get("streams", {}).get(
+                f"{ticker}@{timeframe}")
+            expected_generation = {
+                "sha256": bars_sha,
+                "manifest_sha256": sha256(manifest_path),
+            }
+            if generation_stream is None or any(
+                    generation_stream.get(key) != value
+                    for key, value in expected_generation.items()):
+                raise RuntimeError(
+                    f"stream is absent or stale in dataset generation manifest: "
+                    f"{ticker}@{timeframe}")
         resolved = bars.resolve()
         if repo_root is not None:
             try:
@@ -65,5 +88,6 @@ def seal_continuous_streams(
     return {
         "schema": "ffm_training_data_provenance_v1",
         "continuous_contract": "session-dominant-back-adjusted",
+        "generation_id": generation.get("generation_id") if generation else None,
         "streams": sealed,
     }

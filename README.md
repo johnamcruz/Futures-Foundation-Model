@@ -307,9 +307,13 @@ chosen timeframe; there is no tick-level or order-book input path in the pipelin
 (tick and order-book support is on the roadmap, not yet implemented).
 If your source data is tick-by-tick, aggregate it into bars first — `databento/build_continuous.py`
 resamples raw 1-min bars to any coarser timeframe (it does not build bars from ticks); a
-tick→1-min aggregation step is on you before that. `databento/append_update.py` splices new
-exports into `data/` continuously. A configurable `data_dir` (e.g. a Google-Drive mount on
-Colab) lets pretraining and finetuning read the same CSVs anywhere.
+tick→1-min aggregation step is on you before that. To extend the dataset, use
+`databento/append_update.py`: despite its compatibility name, it never splices derived CSVs.
+It hash-checks the recorded raw lineage, merges the overlapping raw contract bars, rebuilds
+the back-adjusted 1/3/5/15-minute streams together, verifies exact resampling parity in a
+staging directory, and only then promotes them. Run without `--commit` for a dry run. A
+configurable `data_dir` (e.g. a Google-Drive mount on Colab) lets pretraining and finetuning
+read the same CSVs anywhere.
 
 ### Features
 
