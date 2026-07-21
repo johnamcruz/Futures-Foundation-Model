@@ -43,3 +43,34 @@ def test_rejects_unsealed_or_modified_stream(tmp_path, kwargs):
     _write_stream(tmp_path, **kwargs)
     with pytest.raises(RuntimeError, match="invalid manifest"):
         seal_continuous_streams(tmp_path, [("NQ", "3min")])
+
+
+def test_rejects_streams_during_continuous_update(tmp_path):
+    _write_stream(tmp_path)
+    (tmp_path / '.continuous_update.lock').write_text('in progress')
+    with pytest.raises(RuntimeError, match='update is in progress'):
+        seal_continuous_streams(tmp_path, [('NQ', '3min')])
+
+
+def test_generation_manifest_must_pin_stream_and_manifest_hashes(tmp_path):
+    bars = _write_stream(tmp_path)
+    manifest_path = bars.with_suffix('.csv.manifest.json')
+    generation = {
+        'schema': 'ffm_continuous_generation_v1',
+        'generation_id': 'test-generation',
+        'streams': {
+            'NQ@3min': {
+                'sha256': hashlib.sha256(bars.read_bytes()).hexdigest(),
+                'manifest_sha256': hashlib.sha256(
+                    manifest_path.read_bytes()).hexdigest(),
+            },
+        },
+    }
+    (tmp_path / 'continuous_generation.json').write_text(json.dumps(generation))
+    result = seal_continuous_streams(tmp_path, [('NQ', '3min')])
+    assert result['generation_id'] == 'test-generation'
+
+    generation['streams']['NQ@3min']['manifest_sha256'] = 'stale'
+    (tmp_path / 'continuous_generation.json').write_text(json.dumps(generation))
+    with pytest.raises(RuntimeError, match='absent or stale'):
+        seal_continuous_streams(tmp_path, [('NQ', '3min')])
