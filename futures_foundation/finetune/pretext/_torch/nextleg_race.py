@@ -82,8 +82,8 @@ class _NextLegRaceTrainer(_NextLegTrainer):
         if m_tr.sum() < 1000 or m_va.sum() < 200:
             raise ValueError(f'nextleg_race: too few resolved pivot anchors '
                              f'(train={int(m_tr.sum())}, val={int(m_va.sum())})')
-        self.tr = torch.as_tensor(starts[m_tr], device=self.dev)
-        self.va = torch.as_tensor(starts[m_va], device=self.dev)
+        self._replace_start_pool('tr', starts[m_tr])
+        self._replace_start_pool('va', starts[m_va])
         self._tgt_tr = torch.as_tensor(tgts[m_tr], device=self.dev)
         self._tgt_va = torch.as_tensor(tgts[m_va], device=self.dev)
         if self.verbose:

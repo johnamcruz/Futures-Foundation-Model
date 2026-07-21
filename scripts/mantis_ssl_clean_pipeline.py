@@ -99,6 +99,18 @@ def _stage_map(out_dir: Path) -> dict[str, Path]:
     return {stage.name: out_dir / stage.filename for stage in STAGES}
 
 
+def _assert_completed_stage_recipe(report_path: Path, *, sampling_mode: str) -> None:
+    """Refuse to reuse a complete checkpoint from a different source mixture."""
+    report = json.loads(report_path.read_text())
+    # Reports written before source mixtures were configurable used the historical
+    # bar-proportional behavior and contain no sampling_mode field.
+    saved = report.get("config", {}).get("sampling_mode", "bar_proportional")
+    if saved != sampling_mode:
+        raise RuntimeError(
+            f"completed checkpoint uses sampling_mode={saved!r}, requested {sampling_mode!r}; "
+            "choose a new --out-dir so experimental lineages cannot overwrite or reuse each other")
+
+
 def _stage_config(stage: str) -> dict:
     """Banked, non-experimental recipe for each clean-lineage objective."""
     lora = dict(lora_r=int(os.environ.get("LORA_R", "8")),
@@ -106,6 +118,7 @@ def _stage_config(stage: str) -> dict:
                 lora_dropout=float(os.environ.get("LORA_DROPOUT", "0")))
     common = dict(
         seq=64, max_jitter=16, val_frac=0.1, holdout_start=HOLDOUT_START,
+        sampling_mode=os.environ.get("SAMPLING_MODE", "bar_proportional"),
         steps_per_epoch=int(os.environ.get("STEPS_PER_EPOCH", "200")),
         patience=int(os.environ.get("PATIENCE", "8")), seed=int(os.environ.get("SEED", "0")),
         probe=True, controls=(), compile_model=False,
@@ -388,6 +401,7 @@ def _run_parent(args: argparse.Namespace) -> None:
     os.environ["LORA_R"] = str(lora_r)
     os.environ["LORA_ALPHA"] = str(args.lora_alpha)
     os.environ["LORA_DROPOUT"] = str(args.lora_dropout)
+    os.environ["SAMPLING_MODE"] = args.sampling_mode
     os.environ["SSL_LOG_EVERY_STEPS"] = str(args.log_every_steps)
 
     print("\nCLEAN SSL PIPELINE PREFLIGHT PASSED")
@@ -396,6 +410,7 @@ def _run_parent(args: argparse.Namespace) -> None:
     print(f"  device  : {device}")
     print(f"  tuning  : {'LoRA' if lora_r else 'full'}"
           + (f" r={lora_r} alpha={args.lora_alpha:g}" if lora_r else ""))
+    print(f"  sampling: {args.sampling_mode}")
     print(f"  output  : {out_dir}")
     for stage in STAGES:
         steps = _steps_for(stage, stage.batch[device])
@@ -406,6 +421,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         return
 
     _event(out_dir, "pipeline_started", device=device, lora_r=lora_r,
+           sampling_mode=args.sampling_mode,
            holdout_start=HOLDOUT_START, stage_order=STAGE_ORDER)
     atlas_labels = _ensure_atlas_labels(data_dir=data_dir, out_dir=out_dir,
                                         provenance=provenance, python=python)
@@ -414,6 +430,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         out_path = paths[stage.name]
         report_path = Path(str(out_path) + ".report.json")
         if out_path.is_file() and report_path.is_file():
+            _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
             _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
                              labels=atlas_labels)
@@ -434,7 +451,8 @@ def _run_parent(args: argparse.Namespace) -> None:
                             "EPOCHS": str(stage.epochs), "STEPS": str(steps),
                             "LORA_R": str(lora_r),
                             "LORA_ALPHA": str(args.lora_alpha),
-                            "LORA_DROPOUT": str(args.lora_dropout)})
+                            "LORA_DROPOUT": str(args.lora_dropout),
+                            "SAMPLING_MODE": args.sampling_mode})
                 if out_path.exists():
                     env["RESUME"] = "1"
                 command = [str(python), str(ROOT / "scripts" / "mantis_ssl_pretrain.py")]
@@ -479,6 +497,7 @@ def _run_parent(args: argparse.Namespace) -> None:
     summary = {
         "schema": "ffm_clean_ssl_pipeline_v1",
         "holdout_start": HOLDOUT_START,
+        "sampling_mode": args.sampling_mode,
         "data_provenance": provenance,
         "stages": {stage.name: {"path": str(paths[stage.name]),
                                   "sha256": sha256(paths[stage.name])} for stage in STAGES},
@@ -503,6 +522,9 @@ def _parser() -> argparse.ArgumentParser:
                         default=float(os.environ.get("LORA_ALPHA", "16")))
     parser.add_argument("--lora-dropout", type=float,
                         default=float(os.environ.get("LORA_DROPOUT", "0")))
+    parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
+                        default=os.environ.get("SAMPLING_MODE", "bar_proportional"),
+                        help="Training source mixture; default preserves historical behavior")
     parser.add_argument("--log-every-steps", type=int,
                         default=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")),
                         help="Print optimizer progress every N steps; 0 disables step logs")

@@ -119,6 +119,92 @@ def test_assemble_physically_removes_holdout_bars(tmp_path):
     assert max(np.concatenate([tr, va])) + 3 <= len(big)
 
 
+def test_assemble_bar_proportional_remains_default(tmp_path):
+    """Existing callers receive the exact flat ndarray contract unless they opt in."""
+    _write_csv(tmp_path / 'ES_3min.csv', 240)
+    _write_csv(tmp_path / 'NQ_3min.csv', 480)
+    streams = ssl_data.load_ohlcv(str(tmp_path), ['ES', 'NQ'], ['3min'], verbose=False)
+    _, default_tr, default_va = ssl.assemble(
+        streams, seq=16, max_jitter=4, val_frac=0.1,
+        holdout_start=None, verbose=False)
+    _, explicit_tr, explicit_va = ssl.assemble(
+        streams, seq=16, max_jitter=4, val_frac=0.1,
+        holdout_start=None, sampling_mode='bar_proportional', verbose=False)
+    assert isinstance(default_tr, np.ndarray)
+    assert np.array_equal(default_tr, explicit_tr)
+    assert np.array_equal(default_va, explicit_va)
+
+
+def test_uniform_stream_pool_has_equal_source_probability_without_oversampling(tmp_path):
+    """Chronos-style mixture metadata must balance sources, not duplicate short streams."""
+    _write_csv(tmp_path / 'ES_3min.csv', 240)
+    _write_csv(tmp_path / 'NQ_3min.csv', 960)
+    streams = ssl_data.load_ohlcv(str(tmp_path), ['ES', 'NQ'], ['3min'], verbose=False)
+    _, tr, va = ssl.assemble(
+        streams, seq=16, max_jitter=4, val_frac=0.1,
+        holdout_start=None, sampling_mode='uniform_stream', verbose=False)
+    assert isinstance(tr, ssl_data.WindowStartPool)
+    counts = tr.group_counts()
+    assert counts['NQ@3min'] > 4 * counts['ES@3min']       # source lengths remain honest
+    assert tr.group_probabilities() == {'ES@3min': 0.5, 'NQ@3min': 0.5}
+    assert len(np.asarray(tr)) == sum(counts.values())      # no repeated-window memory blowup
+    assert isinstance(va, np.ndarray)                      # validation keeps natural distribution
+
+
+def test_uniform_stream_pool_preserves_holdout_and_stream_boundaries(tmp_path):
+    _write_csv(tmp_path / 'ES_3min.csv', 80, start='2025-12-31 21:00', freq='3min')
+    _write_csv(tmp_path / 'NQ_3min.csv', 120, start='2025-12-31 19:00', freq='3min')
+    streams = ssl_data.load_ohlcv(str(tmp_path), ['ES', 'NQ'], ['3min'], verbose=False)
+    big, tr, va = ssl.assemble(
+        streams, seq=4, max_jitter=2, val_frac=0.25,
+        holdout_start='2026-01-01', sampling_mode='uniform_stream', verbose=False)
+    starts = np.concatenate([np.asarray(tr), va])
+    assert len(starts) and starts.max() + 6 <= len(big)
+    # Every start inherits exactly one legal source; uniform sampling changes only
+    # draw probability and cannot manufacture a cross-stream or post-holdout window.
+    assert set(tr.group_counts()) == {'ES@3min', 'NQ@3min'}
+
+
+def test_assemble_rejects_unknown_sampling_mode(tmp_path):
+    _write_csv(tmp_path / 'ES_3min.csv', 100)
+    streams = ssl_data.load_ohlcv(str(tmp_path), ['ES'], ['3min'], verbose=False)
+    with pytest.raises(ValueError, match='unsupported sampling_mode'):
+        ssl.assemble(streams, seq=8, max_jitter=2, val_frac=0.1,
+                     holdout_start=None, sampling_mode='unknown', verbose=False)
+
+
+@torch_test
+def test_uniform_stream_device_sampler_is_balanced_reproducible_and_filter_safe():
+    """The actual trainer chooses stream first, including after pivot-like filtering."""
+    from futures_foundation.finetune.pretext._torch.common import BaseTrainer
+
+    starts = np.arange(100, dtype=np.int64)
+    groups = np.r_[np.zeros(90, np.int32), np.ones(10, np.int32)]
+    pool = ssl_data.WindowStartPool(starts, groups, ('long', 'short'))
+    big = np.zeros((200, 5), np.float32)
+    trainer = BaseTrainer(big, pool, np.arange(100, 120), batch=20_000,
+                          device='cpu', seed=17, verbose=False)
+    draw = trainer.sample_indices(trainer.tr).cpu().numpy()
+    source = groups[draw]
+    assert 0.48 < (source == 0).mean() < 0.52
+
+    historical = BaseTrainer(big, starts, np.arange(100, 120), batch=20_000,
+                             device='cpu', seed=17, verbose=False)
+    old_draw = historical.sample_indices(historical.tr).cpu().numpy()
+    assert 0.88 < (groups[old_draw] == 0).mean() < 0.92       # bar-proportional stays default
+
+    again = BaseTrainer(big, pool, np.arange(100, 120), batch=20_000,
+                        device='cpu', seed=17, verbose=False)
+    assert np.array_equal(draw, again.sample_indices(again.tr).cpu().numpy())
+
+    # Mimic NextLeg retaining only a subset of legal anchors from each stream.
+    filtered = np.r_[starts[:18], starts[90:93]]
+    trainer._replace_start_pool('tr', filtered)
+    draw_filtered = trainer.sample_indices(trainer.tr).cpu().numpy()
+    filtered_groups = groups[filtered][draw_filtered]
+    assert 0.48 < (filtered_groups == 0).mean() < 0.52
+
+
 # ---------------------------------------------------------------- probe + gate (torch-free)
 def test_targets_from_windows():
     seq = 8

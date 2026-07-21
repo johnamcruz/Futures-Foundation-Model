@@ -137,7 +137,7 @@ class _RelatedNextLegTrainer(_NextLegTrainer):
         related = self.tr_related if is_train else self.va_related
         masks = self.tr_mask if is_train else self.va_mask
         targets = self._tgt_tr if is_train else self._tgt_va
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+        b_idx = self.sample_indices(starts)
 
         primary = _gather_batch(self.big_t, starts, b_idx, self.parent)
         grouped = _gather_related(self.big_t, related[b_idx], self.max_ctx)

@@ -101,6 +101,7 @@ def test_alignment_rejects_primary_window_crossing_stream_boundary():
 
 def test_ssl_assemble_returns_related_metadata_without_changing_default_contract():
     from futures_foundation.finetune.ssl import assemble
+    from futures_foundation.finetune.ssl_data import WindowStartPool
 
     ts = _timestamps(np.arange(30))
     streams = [{"sid": "NQ@1min", "ticker": "NQ", "tf": "1min", "ts": ts,
@@ -114,6 +115,13 @@ def test_ssl_assemble_returns_related_metadata_without_changing_default_contract
     for left, right in zip(plain, related[:3]):
         assert np.array_equal(left, right)
     assert related[3].streams[0].sid == "NQ@1min"
+
+    uniform = assemble(streams, seq=3, max_jitter=1, val_frac=0.2,
+                       holdout_start="2026-01-01", verbose=False,
+                       sampling_mode="uniform_stream", return_related_layout=True)
+    assert isinstance(uniform[1], WindowStartPool)
+    assert np.array_equal(np.asarray(uniform[1]), plain[1])
+    assert uniform[3].streams[0].sid == "NQ@1min"
 
 
 def test_fusion_is_exact_primary_at_initialization_and_ignores_masked_members():

@@ -125,7 +125,7 @@ class _TurnElectraTrainer(BaseTrainer):
         self.net = net
 
     def make_batch(self, starts):
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+        b_idx = self.sample_indices(starts)
         w = _apply_control(_gather_batch(self.big_t, starts, b_idx, self.seq), self.control)
         # TURN-BIASED span mask from the window's own H/L (extrema are invariant under the
         # per-window standardize, so placement on raw == placement on z). CPU numpy is trivial
