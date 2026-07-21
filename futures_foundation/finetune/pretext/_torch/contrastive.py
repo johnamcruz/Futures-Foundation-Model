@@ -159,6 +159,8 @@ class _ContrastiveTrainer(BaseTrainer):
         last_start = len(self.big_t) - self.seq
         self.tr_sorted = torch.sort(self.tr[self.tr <= last_start])[0]  # snapping needs sorted
         self.va_sorted = torch.sort(self.va[self.va <= last_start])[0]
+        self.tr_sorted_sampling = self._sampling_for_values(self.tr_sorted, 'tr')
+        self.va_sorted_sampling = self._sampling_for_values(self.va_sorted, 'va')
         if not len(self.tr_sorted) or not len(self.va_sorted):
             raise ValueError("contrastive train/validation starts contain no complete windows")
 
@@ -181,7 +183,8 @@ class _ContrastiveTrainer(BaseTrainer):
     def make_batch(self, starts, gen=None):
         gen = gen or self.gen
         ss = self._sorted(starts)
-        b_idx = torch.randint(0, len(ss), (self.batch,), device=self.dev, generator=gen)
+        sampling = self.tr_sorted_sampling if starts is self.tr else self.va_sorted_sampling
+        b_idx = self.sample_indices(ss, generator=gen, sampling=sampling)
         s = ss[b_idx]                                           # [B] anchor start positions
         raw_a = self._windows_at(s)
         sigma = _vol_sigma(raw_a)                               # data-driven anchor volatility

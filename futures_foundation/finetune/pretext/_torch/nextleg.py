@@ -92,8 +92,8 @@ class _NextLegTrainer(_ForecastTrainer):
         if m_tr.sum() < 1000 or m_va.sum() < 200:
             raise ValueError(f'nextleg: too few resolved pivot anchors '
                              f'(train={int(m_tr.sum())}, val={int(m_va.sum())})')
-        self.tr = torch.as_tensor(starts[m_tr], device=self.dev)          # REPLACE start pools
-        self.va = torch.as_tensor(starts[m_va], device=self.dev)          # with pivot anchors
+        self._replace_start_pool('tr', starts[m_tr])                       # REPLACE start pools
+        self._replace_start_pool('va', starts[m_va])                       # with pivot anchors
         self._tgt_tr = torch.as_tensor(tgts[m_tr], device=self.dev)
         self._tgt_va = torch.as_tensor(tgts[m_va], device=self.dev)
         if self.verbose:
@@ -111,7 +111,7 @@ class _NextLegTrainer(_ForecastTrainer):
 
     def make_batch(self, starts):
         tgt_all = self._tgt_tr if starts is self.tr else self._tgt_va
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+        b_idx = self.sample_indices(starts)
         w = _gather_batch(self.big_t, starts, b_idx, self.parent)
         L = int(self.clens_t[torch.randint(0, len(self.clens_t), (1,), device=self.dev,
                                            generator=self.gen)].item())

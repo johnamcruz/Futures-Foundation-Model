@@ -1,7 +1,10 @@
 """Contract tests for the local clean SSL production lineage."""
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,10 +30,31 @@ def test_clean_pipeline_uses_banked_seq2seq_and_nextleg_recipes():
     assert seq['context_lengths'] == (64, 100, 150, 200)
     assert seq['holdout_start'] == '2026-01-01'
     assert seq['lora_r'] == 8 and seq['lora_alpha'] == 16
+    assert seq['sampling_mode'] == 'bar_proportional'
     assert seq['log_every_steps'] == 25
     leg = pipeline._stage_config('nextleg')
     assert leg['pretext'] == 'nextleg' and leg['leg_k'] == 2 and leg['leg_cap'] == 256
     assert leg['holdout_start'] == '2026-01-01'
+
+
+def test_clean_pipeline_uniform_stream_is_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv('SAMPLING_MODE', 'uniform_stream')
+    for name in ('contrastive', 'seq2seq', 'nextleg'):
+        assert pipeline._stage_config(name)['sampling_mode'] == 'uniform_stream'
+
+
+def test_completed_checkpoint_cannot_cross_sampling_recipes(tmp_path):
+    report = tmp_path / 'stage.pt.report.json'
+    report.write_text(json.dumps({'config': {'sampling_mode': 'bar_proportional'}}))
+    pipeline._assert_completed_stage_recipe(report, sampling_mode='bar_proportional')
+    with pytest.raises(RuntimeError, match='choose a new --out-dir'):
+        pipeline._assert_completed_stage_recipe(report, sampling_mode='uniform_stream')
+
+
+def test_legacy_report_is_treated_as_bar_proportional(tmp_path):
+    report = tmp_path / 'legacy.pt.report.json'
+    report.write_text(json.dumps({'config': {}}))
+    pipeline._assert_completed_stage_recipe(report, sampling_mode='bar_proportional')
 
 
 def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():

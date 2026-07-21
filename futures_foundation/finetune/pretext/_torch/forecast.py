@@ -71,7 +71,7 @@ class _ForecastTrainer(BaseTrainer):
         self.net = net
 
     def make_batch(self, starts):
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+        b_idx = self.sample_indices(starts)
         w = _gather_batch(self.big_t, starts, b_idx, self.parent)     # [B,C,max_ctx+h_max] real
         L = int(self.clens_t[torch.randint(0, len(self.clens_t), (1,), device=self.dev,
                                            generator=self.gen)].item())
