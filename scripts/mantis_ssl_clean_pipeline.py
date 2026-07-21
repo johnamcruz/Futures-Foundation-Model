@@ -333,7 +333,7 @@ def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
 
 
 def _run_probe_atlas(stage: Stage, checkpoint: Path, *, out_dir: Path, device: str,
-                     python: Path, labels: Path) -> dict:
+                     python: Path, labels: Path, data_dir: Path) -> dict:
     """Run the private capability atlas for one exact checkpoint; fail closed."""
     atlas_script = ROOT / "scripts" / "probe_atlas.py"
     if not atlas_script.is_file():
@@ -354,6 +354,7 @@ def _run_probe_atlas(stage: Stage, checkpoint: Path, *, out_dir: Path, device: s
         env = os.environ.copy()
         env.update({"FFM_ROOT": str(ROOT), "CKPT_NAME": checkpoint.name,
                     "CKPT_PATH": str(checkpoint), "CKPT_SHA256": checkpoint_hash,
+                    "DATA_DIR": str(data_dir),
                     "EMB_CACHE": str(atlas_dir / f"{stage.name}_emb.npy"),
                     "ATLAS_OUT": str(result_path), "ATLAS_BATCH": str(batch),
                     "DEVICE": device, "TREND_LABELS": str(labels)})
@@ -433,7 +434,7 @@ def _run_parent(args: argparse.Namespace) -> None:
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
             _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
-                             labels=atlas_labels)
+                             labels=atlas_labels, data_dir=data_dir)
             _event(out_dir, "stage_skipped", stage=stage.name, reason="complete",
                    checkpoint=str(out_path))
             continue
@@ -491,7 +492,7 @@ def _run_parent(args: argparse.Namespace) -> None:
             _notify(f"Clean SSL pipeline missing artifacts at {stage.name}")
             raise RuntimeError(f"incomplete stage artifacts: {stage.name}")
         _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
-                         labels=atlas_labels)
+                         labels=atlas_labels, data_dir=data_dir)
         print(f"[{stage.name}] PASS; advancing lineage", flush=True)
         _event(out_dir, "stage_completed", stage=stage.name, batch=batch,
                checkpoint=str(out_path), checkpoint_sha256=sha256(out_path),

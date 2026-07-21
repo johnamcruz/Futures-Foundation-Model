@@ -103,6 +103,32 @@ def test_clean_pipeline_probe_dependencies_are_public_scripts():
     assert 'ROOT / "scripts" / "probe_atlas.py"' in source
     assert 'ROOT / "scripts" / "generate_trend_labels.py"' in source
     assert 'ROOT / "colabs"' not in source
+    assert '"DATA_DIR": str(data_dir)' in source
+
+
+def test_probe_atlas_receives_external_data_directory(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'mask.pt'
+    checkpoint.write_bytes(b'checkpoint')
+    labels = tmp_path / 'labels.npz'
+    labels.write_bytes(b'labels')
+    data_dir = tmp_path / 'drive-data'
+    data_dir.mkdir()
+    captured = {}
+
+    def run_logged(_command, *, env, log_path):
+        captured.update(env)
+        result = Path(env['ATLAS_OUT'])
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text(json.dumps({
+            'checkpoint_sha256': env['CKPT_SHA256'], 'probes': {},
+        }))
+        return 0, False
+
+    monkeypatch.setattr(pipeline, '_run_logged', run_logged)
+    pipeline._run_probe_atlas(
+        pipeline.STAGES[0], checkpoint, out_dir=tmp_path, device='cuda',
+        python=Path(sys.executable), labels=labels, data_dir=data_dir)
+    assert captured['DATA_DIR'] == str(data_dir)
 
 
 def test_master_preserves_virtualenv_python_for_children():
