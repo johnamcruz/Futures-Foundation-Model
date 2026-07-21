@@ -449,11 +449,15 @@ def _run_parent(args: argparse.Namespace) -> None:
                 env.update({"DATA_DIR": str(data_dir), "OUT_PATH": str(out_path),
                             "DEVICE": device, "BATCH": str(batch),
                             "EPOCHS": str(stage.epochs), "STEPS": str(steps),
+                            "CONTROL_EPOCHS": str(args.control_epochs),
                             "LORA_R": str(lora_r),
                             "LORA_ALPHA": str(args.lora_alpha),
                             "LORA_DROPOUT": str(args.lora_dropout),
                             "SAMPLING_MODE": args.sampling_mode})
-                if out_path.exists():
+                real_marker = Path(str(out_path) + ".real_complete.json")
+                if out_path.exists() and (args.reuse_mask_real or real_marker.exists()):
+                    env["REUSE_REAL_CHECKPOINT"] = "1"
+                elif out_path.exists():
                     env["RESUME"] = "1"
                 command = [str(python), str(ROOT / "scripts" / "mantis_ssl_pretrain.py")]
             else:
@@ -528,6 +532,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every-steps", type=int,
                         default=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")),
                         help="Print optimizer progress every N steps; 0 disables step logs")
+    parser.add_argument("--control-epochs", type=int,
+                        default=int(os.environ.get("CONTROL_EPOCHS", "8")),
+                        help="maximum epochs for each diagnostic shuffle/random control")
+    parser.add_argument("--reuse-mask-real", action="store_true",
+                        default=os.environ.get("REUSE_MASK_REAL") == "1",
+                        help="finalize an existing REAL Mask checkpoint without retraining it")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--run-stage", choices=STAGE_ORDER, help=argparse.SUPPRESS)
     return parser

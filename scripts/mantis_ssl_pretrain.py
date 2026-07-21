@@ -73,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
     parser.add_argument("--patience", type=int, default=int(os.environ.get("PATIENCE", "8")))
     parser.add_argument("--controls", default=os.environ.get("CONTROLS", "shuffle,random"))
+    parser.add_argument("--control-epochs", type=int,
+                        default=int(os.environ.get("CONTROL_EPOCHS", "8")))
+    parser.add_argument("--reuse-real-checkpoint", action="store_true",
+                        default=os.environ.get("REUSE_REAL_CHECKPOINT") == "1",
+                        help="skip REAL optimization and finalize/probe an existing checkpoint")
     parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
                         default=os.environ.get("SAMPLING_MODE", "bar_proportional"),
                         help="Training source mixture; validation always keeps natural chronology")
@@ -120,8 +125,13 @@ def _preflight(args: argparse.Namespace) -> tuple[Path, Path, dict]:
     }
     if out_path in protected:
         raise SystemExit(f"refusing to overwrite an existing promoted checkpoint: {out_path}")
-    if out_path.exists() and not args.resume:
-        raise SystemExit(f"output already exists: {out_path}\nUse RESUME=1 only to resume this exact run.")
+    if args.reuse_real_checkpoint and not out_path.exists():
+        raise SystemExit(f"REAL checkpoint does not exist: {out_path}")
+    if out_path.exists() and not (args.resume or args.reuse_real_checkpoint):
+        raise SystemExit(
+            f"output already exists: {out_path}\n"
+            "Use RESUME=1 to resume optimization or REUSE_REAL_CHECKPOINT=1 "
+            "to rerun probe/controls only.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     return data_dir, out_path, provenance
 
@@ -170,9 +180,11 @@ def main() -> None:
         pretext="mask", backbone_ckpt=None,
         mask_ratio=args.mask_ratio, seq=args.seq, max_jitter=args.max_jitter,
         new_channels=args.new_channels, batch=batch, epochs=args.epochs,
-        steps_per_epoch=args.steps, lr=args.lr, patience=args.patience,
+        control_epochs=args.control_epochs, steps_per_epoch=args.steps,
+        lr=args.lr, patience=args.patience,
         val_frac=args.val_frac, holdout_start=PRODUCTION_HOLDOUT_START,
         controls=controls, probe=not args.no_probe, probe_folds=args.probe_folds,
+        reuse_real_checkpoint=args.reuse_real_checkpoint,
         resume=args.resume, device=device, compile_model=args.compile, seed=args.seed,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
         sampling_mode=args.sampling_mode,

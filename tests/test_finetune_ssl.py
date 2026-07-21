@@ -4,6 +4,9 @@ torch masked trainer (gated behind CHRONOS_TORCH_TESTS=1, libomp isolation).
 Run torch parts: CHRONOS_TORCH_TESTS=1 pytest tests/test_finetune_ssl.py
 """
 import os
+import json
+import sys
+import types
 
 import numpy as np
 import pandas as pd
@@ -348,6 +351,80 @@ def test_base_cfg_has_multihorizon_keys():
                          backbone_ckpt='/x/enc.pt')
     assert over['pretext'] == 'forecast' and over['horizons'] == (5, 10)
     assert over['context_lengths'] == (64,) and over['backbone_ckpt'] == '/x/enc.pt'
+
+
+def test_diagnostic_controls_are_capped_at_eight_epochs():
+    cfg = ssl._base_cfg(epochs=60, patience=20, control_epochs=8, resume=True)
+    control = ssl._control_cfg(cfg)
+    assert control['epochs'] == 8
+    assert control['patience'] == 8
+    assert control['resume'] is False
+    assert cfg['epochs'] == 60 and cfg['resume'] is True
+
+
+def test_finalize_applies_control_budget_to_each_diagnostic(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'mask.pt'
+    fake_torch = types.SimpleNamespace(
+        save=lambda _state, path: open(path, 'wb').write(b'checkpoint'))
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    seen = []
+
+    def train(_big, _tr, _va, cfg, control):
+        seen.append((control, cfg['epochs'], cfg['patience'], cfg['resume']))
+        return {'control': control}, []
+
+    monkeypatch.setattr(ssl, '_train', train)
+    monkeypatch.setattr(ssl, '_probe_state', lambda *args, **kwargs: {
+        'mean_core_delta': -0.1,
+    })
+    cfg = ssl._base_cfg(epochs=60, patience=20, control_epochs=8, resume=True)
+    verdict = ssl._finalize(
+        np.zeros((4, 5)), np.array([0]), np.array([1]), {'encoder': 'real'},
+        {'mean_core_delta': 0.2, 'learns_regime_vol_structure': True}, cfg,
+        out_path=str(checkpoint), controls=('shuffle', 'random'),
+        holdout_start='2026-01-01', val_frac=0.1,
+        streams=[{'ticker': 'NQ', 'tf': '3min'}],
+        history=[{'best_val': 0.3, 'std': 0.7}], verbose=False)
+    assert verdict['all_pass'] is True
+    assert seen == [('shuffle', 8, 8, False), ('random', 8, 8, False)]
+    marker = json.loads((tmp_path / 'mask.pt.real_complete.json').read_text())
+    assert marker['schema'] == 'ffm_ssl_real_complete_v1'
+    assert marker['checkpoint_sha256'] == ssl._file_sha256(checkpoint)
+
+
+def test_checkpoint_only_finalization_skips_real_optimization(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'mask.pt'
+    checkpoint.write_bytes(b'checkpoint')
+    checkpoint.with_suffix('.pt.meta.json').write_text(json.dumps({
+        'epoch': 37, 'best_val': 0.30769212692976,
+    }))
+    fake_torch = types.SimpleNamespace(load=lambda *args, **kwargs: {'encoder': 'saved'})
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setattr(ssl, '_load_assemble', lambda *args, **kwargs: (
+        [{'ticker': 'NQ', 'tf': '3min'}], np.zeros((4, 5)),
+        np.array([0]), np.array([1])))
+    monkeypatch.setattr(ssl, '_train', lambda *args, **kwargs: pytest.fail(
+        'REAL optimization must not run when reusing a checkpoint'))
+    probe = {
+        'embedding_std': 0.7, 'mean_core_delta': 0.1,
+        'learns_regime_vol_structure': True,
+    }
+    monkeypatch.setattr(ssl, '_probe_state', lambda *args, **kwargs: probe)
+    captured = {}
+
+    def finalize(*args, **kwargs):
+        captured['state'] = args[3]
+        captured['history'] = kwargs['history']
+        return {'all_pass': True}
+
+    monkeypatch.setattr(ssl, '_finalize', finalize)
+    result = ssl.loop_ssl(
+        out_path=str(checkpoint), tickers=['NQ'], tfs=['3min'], controls=(),
+        reuse_real_checkpoint=True, verbose=False)
+    assert result['all_pass']
+    assert captured['state'] == {'encoder': 'saved'}
+    assert captured['history'][0]['best_val'] == pytest.approx(0.30769212692976)
+    assert result['epochs'][0]['resumed_finalization_only'] is True
 
 
 def test_train_dispatches_on_pretext(monkeypatch):
