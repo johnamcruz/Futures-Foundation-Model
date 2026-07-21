@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import _enc, _apply_control, BaseTrainer
+from .common import _encode_channels, _apply_control, BaseTrainer
 
 
 def _random_crop_resize(x, crop_max=0.2):
@@ -59,7 +59,7 @@ class ContrastiveTrendNet(nn.Module):
 
     def embed(self, x):                                    # [B,C,L] -> [B, new_c*hidden]
         a = self.adapter(x)
-        return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
+        return _encode_channels(self.encoder, a)
 
     def forward(self, x):                                  # [B,C,L] -> [B, proj_dim] (normalized)
         return F.normalize(self.prj(self.embed(x)), dim=1)
@@ -152,8 +152,15 @@ class _ContrastiveTrainer(BaseTrainer):
         self.metrics_n = int(metrics_n)
         self.model_id, self.backbone_ckpt = model_id, backbone_ckpt
         self.C = int(self.big_t.shape[1])
-        self.tr_sorted = torch.sort(self.tr)[0]                 # snapping needs sorted starts
-        self.va_sorted = torch.sort(self.va)[0]
+        # Some legacy callers constructed starts for their historical context+horizon
+        # parent length rather than this trainer's explicit ``seq``.  Exclude any
+        # tail start that cannot hold a full window; otherwise random sampling makes
+        # the same run intermittently fail at the corpus boundary.
+        last_start = len(self.big_t) - self.seq
+        self.tr_sorted = torch.sort(self.tr[self.tr <= last_start])[0]  # snapping needs sorted
+        self.va_sorted = torch.sort(self.va[self.va <= last_start])[0]
+        if not len(self.tr_sorted) or not len(self.va_sorted):
+            raise ValueError("contrastive train/validation starts contain no complete windows")
 
     def build_net(self):
         net = ContrastiveTrendNet(C=self.C, new_channels=self.new_channels,

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from ..spans import sample_span_mask
-from .common import _enc, _standardize, _apply_control, _gather_batch, BaseTrainer
+from .common import _encode_channels, _standardize, _apply_control, _gather_batch, BaseTrainer
 
 
 class MaskNetwork(nn.Module):
@@ -27,7 +27,7 @@ class MaskNetwork(nn.Module):
 
     def embed(self, x):                                   # [B, C, seq] -> [B, new_c*hidden]
         a = self.adapter(x)
-        return torch.cat([_enc(self.encoder, a[:, [i], :]) for i in range(a.shape[1])], dim=-1)
+        return _encode_channels(self.encoder, a)
 
     def forward(self, x):                                 # masked [B,C,seq] -> recon [B,C,seq]
         return self.decoder(self.embed(x)).view(-1, self.C, self.seq)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -50,20 +51,33 @@ class Stage:
     parent: str | None
     epochs: int
     batch: dict[str, int]
+    samples_per_epoch: int
 
 
 STAGES = (
     Stage("mask", "mantis_ssl_ohlcv.pt", None, 60,
-          {"cuda": 1024, "mps": 256, "cpu": 64}),
+          {"cuda": 1024, "mps": 256, "cpu": 64}, 51_200),
     # Contrastive materializes five views per anchor; 32 is intentionally conservative
     # on a 16-GB M1. CUDA keeps the historically validated batch of 128.
     Stage("contrastive", "mantis_ssl_regime_from_mask.pt", "mask", 60,
-          {"cuda": 128, "mps": 32, "cpu": 16}),
+          {"cuda": 128, "mps": 32, "cpu": 16}, 6_400),
     Stage("seq2seq", "mantis_ssl_ctr_seq2seq.pt", "contrastive", 120,
-          {"cuda": 512, "mps": 128, "cpu": 32}),
+          {"cuda": 512, "mps": 128, "cpu": 32}, 25_600),
     Stage("nextleg", "mantis_ssl_nextleg.pt", "seq2seq", 120,
-          {"cuda": 512, "mps": 128, "cpu": 32}),
+          {"cuda": 512, "mps": 128, "cpu": 32}, 25_600),
 )
+
+
+def _steps_for(stage: Stage, batch: int, env: dict[str, str] | None = None) -> int:
+    """Keep each epoch's sampled-data budget invariant as physical batch changes.
+
+    Explicit per-stage/global step overrides retain their historical meaning.
+    Otherwise an OOM fallback halves the batch and automatically doubles steps,
+    preventing a memory retry from silently weakening training.
+    """
+    env = os.environ if env is None else env
+    override = env.get(f"{stage.name.upper()}_STEPS", env.get("STEPS_PER_EPOCH"))
+    return max(1, int(override)) if override is not None else math.ceil(stage.samples_per_epoch / batch)
 
 
 def _device() -> str:
@@ -162,10 +176,15 @@ def _run_child(args: argparse.Namespace) -> None:
     config = _stage_config(stage.name)
     epochs = int(os.environ.get(f"{stage.name.upper()}_EPOCHS", str(stage.epochs)))
     batch = int(os.environ.get(f"{stage.name.upper()}_BATCH", str(stage.batch[args.device])))
+    steps = _steps_for(stage, batch)
+    config["steps_per_epoch"] = steps
     resume = out_path.exists() and not Path(str(out_path) + ".report.json").exists()
     _write_lineage(out_path, stage.name, parent, provenance,
-                   {**config, "epochs": epochs, "batch": batch, "device": args.device})
-    print(f"\n[{stage.name}] parent={parent}\n[{stage.name}] output={out_path}", flush=True)
+                   {**config, "epochs": epochs, "batch": batch, "steps_per_epoch": steps,
+                    "samples_per_epoch": stage.samples_per_epoch, "device": args.device})
+    print(f"\n[{stage.name}] parent={parent}\n[{stage.name}] output={out_path}"
+          f"\n[{stage.name}] batch={batch} steps={steps} "
+          f"samples/epoch={batch * steps:,}", flush=True)
     verdict = ssl.loop_ssl(
         data_dir=str(data_dir), out_path=str(out_path), tickers=TICKERS, tfs=TIMEFRAMES,
         backbone_ckpt=str(parent), device=args.device, epochs=epochs, batch=batch,
@@ -379,7 +398,9 @@ def _run_parent(args: argparse.Namespace) -> None:
           + (f" r={lora_r} alpha={args.lora_alpha:g}" if lora_r else ""))
     print(f"  output  : {out_dir}")
     for stage in STAGES:
-        print(f"  {stage.name:11s}: batch={stage.batch[device]:4d} max_epochs={stage.epochs:3d} "
+        steps = _steps_for(stage, stage.batch[device])
+        print(f"  {stage.name:11s}: batch={stage.batch[device]:4d} steps={steps:3d} "
+              f"samples/epoch={stage.batch[device] * steps:6,d} max_epochs={stage.epochs:3d} "
               f"-> {stage.filename}")
     if args.preflight_only:
         return
@@ -400,13 +421,18 @@ def _run_parent(args: argparse.Namespace) -> None:
                    checkpoint=str(out_path))
             continue
         env = os.environ.copy()
+        # Keep explicit user overrides separate from the per-attempt value we
+        # inject below, so an OOM retry can recompute steps for its smaller batch.
+        budget_env = env.copy()
         batch = int(env.get(f"{stage.name.upper()}_BATCH", stage.batch[device]))
         min_batch = 8 if stage.name != "contrastive" else 4
         while True:
+            steps = _steps_for(stage, batch, budget_env)
             if stage.name == "mask":
                 env.update({"DATA_DIR": str(data_dir), "OUT_PATH": str(out_path),
                             "DEVICE": device, "BATCH": str(batch),
-                            "EPOCHS": str(stage.epochs), "LORA_R": str(lora_r),
+                            "EPOCHS": str(stage.epochs), "STEPS": str(steps),
+                            "LORA_R": str(lora_r),
                             "LORA_ALPHA": str(args.lora_alpha),
                             "LORA_DROPOUT": str(args.lora_dropout)})
                 if out_path.exists():
@@ -414,11 +440,13 @@ def _run_parent(args: argparse.Namespace) -> None:
                 command = [str(python), str(ROOT / "scripts" / "mantis_ssl_pretrain.py")]
             else:
                 env[f"{stage.name.upper()}_BATCH"] = str(batch)
+                env["STEPS_PER_EPOCH"] = str(steps)
                 command = [str(python), str(Path(__file__).resolve()),
                            "--run-stage", stage.name, "--data-dir", str(data_dir),
                            "--out-dir", str(out_dir), "--device", device]
-            print(f"\n[{stage.name}] START batch={batch}", flush=True)
-            _event(out_dir, "stage_started", stage=stage.name, batch=batch,
+            print(f"\n[{stage.name}] START batch={batch} steps={steps} "
+                  f"samples/epoch={batch * steps:,}", flush=True)
+            _event(out_dir, "stage_started", stage=stage.name, batch=batch, steps=steps,
                    checkpoint=str(out_path), parent=stage.parent)
             code, oom = _run_logged(command, env=env,
                                     log_path=out_dir / "logs" / f"{stage.name}.log")

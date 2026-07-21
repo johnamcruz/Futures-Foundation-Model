@@ -39,6 +39,22 @@ def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():
     assert len({stage.filename for stage in pipeline.STAGES}) == len(pipeline.STAGES)
 
 
+def test_batch_changes_preserve_the_sample_budget_and_oom_fallback():
+    for stage in pipeline.STAGES:
+        batch = stage.batch['mps']
+        steps = pipeline._steps_for(stage, batch, {})
+        assert batch * steps >= stage.samples_per_epoch
+        fallback = batch // 2
+        assert pipeline._steps_for(stage, fallback, {}) == steps * 2
+
+
+def test_explicit_step_override_wins_over_sample_budget():
+    stage = pipeline.STAGES[0]
+    assert pipeline._steps_for(stage, 512, {'STEPS_PER_EPOCH': '7'}) == 7
+    assert pipeline._steps_for(stage, 512, {'MASK_STEPS': '9',
+                                            'STEPS_PER_EPOCH': '7'}) == 9
+
+
 def test_probe_atlas_progress_compares_each_completed_stage(tmp_path):
     atlas = tmp_path / 'probe_atlas'; atlas.mkdir()
     for i, stage in enumerate(pipeline.STAGES[:2]):

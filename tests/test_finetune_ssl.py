@@ -16,6 +16,25 @@ torch_test = pytest.mark.skipif(
     reason='torch test — set CHRONOS_TORCH_TESTS=1 (libomp isolation)')
 
 
+@torch_test
+def test_channel_batch_folding_matches_sequential_encoder_calls():
+    """The MPS throughput path must preserve per-sample/channel embedding order."""
+    import torch
+    from futures_foundation.finetune.pretext._torch.common import _enc, _encode_channels
+
+    class Encoder(torch.nn.Module):
+        seq_len = 16
+
+        def forward(self, x):
+            return torch.stack((x.mean((1, 2)), x.square().mean((1, 2))), dim=1)
+
+    x = torch.randn(7, 5, 11)
+    enc = Encoder().eval()
+    sequential = torch.cat([_enc(enc, x[:, [i], :]) for i in range(x.shape[1])], dim=-1)
+    folded = _encode_channels(enc, x)
+    torch.testing.assert_close(folded, sequential)
+
+
 def _write_csv(path, n, start='2024-01-01', freq='3min', base=4000.0):
     ts = pd.date_range(start, periods=n, freq=freq, tz='UTC')
     rng = np.random.default_rng(abs(hash(path)) % 1000)

@@ -31,6 +31,19 @@ def _enc(encoder, x1):
     return encoder(x1)
 
 
+def _encode_channels(encoder, x):
+    """Encode ``[B,C,L]`` with one Mantis call and concatenate channel embeddings.
+
+    Mantis treats every input series independently, so folding channels into the
+    batch is mathematically equivalent to calling the encoder C times and
+    concatenating the results.  It removes C-1 Python/MPS dispatch round trips,
+    which is material for local training, while preserving output order.
+    """
+    B, C, L = x.shape
+    emb = _enc(encoder, x.reshape(B * C, 1, L))
+    return emb.reshape(B, C * emb.shape[1])
+
+
 def _standardize(x):                                     # per-window per-channel z-score
     m = x.mean(dim=2, keepdim=True)
     s = x.std(dim=2, keepdim=True)
@@ -87,7 +100,7 @@ def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M
     for b in range(0, len(s_t), batch):
         win = _gather_batch(big_t, s_t, torch.arange(b, min(b + batch, len(s_t)), device=dev), seq)
         win = _standardize(win)                          # [B, C, seq]
-        emb = torch.cat([_enc(enc, win[:, [i], :]) for i in range(win.shape[1])], dim=-1)
+        emb = _encode_channels(enc, win)
         out.append(emb.float().cpu().numpy())
     return np.concatenate(out) if out else np.zeros((0, 0), np.float32), s
 
@@ -109,7 +122,7 @@ def embed_windows(windows, *, ckpt=None, model_id='paris-noah/Mantis-8M', device
     out = []
     for b in range(0, len(X), batch):
         w = _standardize(X[b:b + batch].to(dev))
-        emb = torch.cat([_enc(enc, w[:, [i], :]) for i in range(w.shape[1])], dim=-1)
+        emb = _encode_channels(enc, w)
         out.append(emb.float().cpu().numpy())
     return np.concatenate(out) if out else np.zeros((0, 0), np.float32)
 
@@ -131,9 +144,7 @@ class _EncoderONNX(nn.Module):
 
     def forward(self, w):                                     # [B, C, seq] raw OHLCV
         w = _standardize(w)
-        flat = w.reshape(-1, 1, w.shape[2])                   # [B*C, 1, seq] — ONE encoder pass
-        emb = _enc(self.encoder, flat)                        # [B*C, hidden]
-        return emb.reshape(-1, self.C * emb.shape[1])         # [B, C*hidden] == per-channel cat
+        return _encode_channels(self.encoder, w)
 
 
 def _ort_optimize_graph(path):
