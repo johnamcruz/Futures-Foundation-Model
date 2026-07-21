@@ -37,10 +37,11 @@ from .electra import TurnElectraTask
 from .nextleg import NextLegTask
 from .nextleg_path import NextLegPathTask
 from .nextleg_race import NextLegRaceTask
+from .related_nextleg import RelatedNextLegTask
 
 PRETEXTS = {t.name: t for t in (MaskTask(), ForecastTask(), ForecastDistTask(),
                                 ContrastiveTask(), TurnElectraTask(), NextLegTask(),
-                                NextLegPathTask(), NextLegRaceTask())}
+                                NextLegPathTask(), NextLegRaceTask(), RelatedNextLegTask())}
 
 
 def get_pretext(name):
@@ -50,4 +51,4 @@ def get_pretext(name):
 
 __all__ = ['PretextTask', 'MaskTask', 'ForecastTask', 'ForecastDistTask', 'ContrastiveTask',
            'TurnElectraTask', 'NextLegTask', 'NextLegPathTask', 'NextLegRaceTask', 'PRETEXTS',
-           'get_pretext']
+           'RelatedNextLegTask', 'get_pretext']

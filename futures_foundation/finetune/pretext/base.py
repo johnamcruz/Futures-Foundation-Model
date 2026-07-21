@@ -10,6 +10,7 @@ unknown kwargs (**_ignore), so the shared cfg is safe to pass to any task.
 class PretextTask:
     name = 'base'
     trainer = None                                        # _ssl_torch trainer fn name
+    requires_related_series = False
 
     def reserve(self, cfg):
         """Extra bars reserved per window beyond `seq` (0 = none)."""

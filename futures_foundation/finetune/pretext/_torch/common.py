@@ -77,6 +77,12 @@ def _gather_batch(big, starts, b_idx, length):
     return big[rows].permute(0, 2, 1).contiguous()       # [B, C, length]
 
 
+def _plain_encoder_state(state):
+    """Accept an ordinary Mantis checkpoint or a composite related-series checkpoint."""
+    from .related_series import plain_encoder_state
+    return plain_encoder_state(state)
+
+
 # ----------------------------------------------------------------- frozen embedding (probe / cache)
 @torch.no_grad()
 def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M',
@@ -89,7 +95,7 @@ def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M
                      else 'mps' if torch.backends.mps.is_available() else 'cpu')
     enc = Mantis8M.from_pretrained(model_id)
     if ckpt:
-        enc.load_state_dict(torch.load(ckpt, map_location='cpu'))
+        enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(dev).eval()
     big_t = torch.as_tensor(np.asarray(big, np.float32), device=dev)
     s = np.asarray(starts, np.int64)
@@ -119,7 +125,7 @@ def embed_window_chunks(chunks, *, ckpt=None, model_id='paris-noah/Mantis-8M', d
                      else 'mps' if torch.backends.mps.is_available() else 'cpu')
     enc = Mantis8M.from_pretrained(model_id)
     if ckpt:
-        enc.load_state_dict(torch.load(ckpt, map_location='cpu'))
+        enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(dev).eval()
 
     def _iterator():
@@ -197,7 +203,7 @@ def export_encoder_onnx(path, *, ckpt=None, C=5, seq=64,
     from mantis.architecture import Mantis8M
     enc = Mantis8M.from_pretrained(model_id)
     if ckpt:
-        enc.load_state_dict(torch.load(ckpt, map_location='cpu'))
+        enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(device).eval()
     m = _EncoderONNX(enc, C).to(device).eval()
     dummy = torch.randn(2, int(C), int(seq), device=device)   # >1 row so std is well-defined
@@ -416,12 +422,22 @@ class BaseTrainer:
     def _params(self):
         return [p for p in self.net.parameters() if p.requires_grad]
 
+    def snapshot_state(self):
+        """Checkpoint hook; related-series trainers override to retain their fusion module."""
+        from .lora import merged_state_dict
+        return merged_state_dict(self._encoder())
+
+    def load_snapshot_state(self, state):
+        """Inverse checkpoint hook used by crash-safe resume."""
+        from .lora import load_plain_state_dict
+        load_plain_state_dict(self._encoder(), state)
+
     def fit(self):
         """Run the shared loop -> (best_encoder_state, history). Progressively saves the best
         ENCODER to ckpt_path (crash-safe) and resumes from it — real run only (controls never
         touch the checkpoint). freeze_encoder_layers anchors early layers against drift."""
         self.build_net()
-        from .lora import inject_mantis_lora, load_plain_state_dict, merged_state_dict
+        from .lora import inject_mantis_lora
         if self.lora_r:
             stats = inject_mantis_lora(self._encoder(), rank=self.lora_r,
                                        alpha=self.lora_alpha, dropout=self.lora_dropout)
@@ -432,9 +448,9 @@ class BaseTrainer:
         save_ok = bool(self.ckpt_path) and self.control == 'real'   # controls never touch the ckpt
         best, best_state = 1e18, None
         if self.resume and save_ok and os.path.exists(self.ckpt_path):     # resume from saved best
-            load_plain_state_dict(self._encoder(), torch.load(self.ckpt_path, map_location='cpu'))
+            self.load_snapshot_state(torch.load(self.ckpt_path, map_location='cpu'))
             best = _read_meta_best(self.ckpt_path)
-            best_state = merged_state_dict(self._encoder())
+            best_state = self.snapshot_state()
             if self.verbose:
                 print(f"  [resume] loaded {self.ckpt_path} (best_val={best:.4f})", flush=True)
         nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)   # anti-forgetting
@@ -492,7 +508,7 @@ class BaseTrainer:
             improved = vloss < best - 1e-5
             if improved:
                 best, bad = vloss, 0
-                best_state = merged_state_dict(self._encoder())
+                best_state = self.snapshot_state()
                 if save_ok:                                          # progressive best-save (crash-safe)
                     _atomic_save(best_state, self.ckpt_path)
                     _write_meta(self.ckpt_path, best, ep)
