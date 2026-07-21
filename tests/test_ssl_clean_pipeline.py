@@ -212,6 +212,32 @@ def test_master_preserves_virtualenv_python_for_children():
     assert 'Path(sys.executable).resolve()' not in source
 
 
+def test_logged_child_survives_durable_log_eio(tmp_path, monkeypatch):
+    class BrokenLog:
+        def write(self, _text):
+            raise OSError(5, 'Input/output error')
+
+        def close(self):
+            raise OSError(5, 'Input/output error')
+
+    real_open = Path.open
+    durable = tmp_path / 'drive' / 'stage.log'
+
+    def flaky_open(path, *args, **kwargs):
+        if path == durable:
+            return BrokenLog()
+        return real_open(path, *args, **kwargs)
+
+    fallback = tmp_path / 'runtime'
+    monkeypatch.setattr(Path, 'open', flaky_open)
+    code, oom = pipeline._run_logged(
+        [sys.executable, '-c', 'print("still-running")'],
+        env={**__import__('os').environ, 'FFM_LOCAL_LOG_DIR': str(fallback)},
+        log_path=durable)
+    assert code == 0 and oom is False
+    assert 'still-running' in (fallback / durable.name).read_text()
+
+
 def test_mask_controls_default_to_eight_epochs_and_resume_is_explicit(monkeypatch):
     parser = pipeline._parser()
     args = parser.parse_args([])

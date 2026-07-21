@@ -284,21 +284,63 @@ def _event(out_dir: Path, event: str, **fields) -> None:
 
 
 def _run_logged(command: list[str], *, env: dict[str, str], log_path: Path) -> tuple[int, bool]:
-    """Stream a child to terminal+log and identify accelerator-memory failures."""
+    """Stream a child without letting transient Drive logging kill the workload.
+
+    Colab's FUSE-mounted Drive can briefly raise ``EIO`` during otherwise healthy GPU
+    work. Console output remains authoritative; when the durable log becomes unavailable,
+    subsequent lines are also spooled to the runtime disk for diagnosis.
+    """
     oom = False
     needles = ("out of memory", "mps backend out of memory", "mpsallocator")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", buffering=1) as log:
-        process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
-        assert process.stdout is not None
+    durable = fallback = None
+    fallback_path = Path(env.get(
+        "FFM_LOCAL_LOG_DIR",
+        "/content/ffm_runtime_logs" if Path("/content").is_dir()
+        else str(ROOT / "temp" / "runtime_logs"))) / log_path.name
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        durable = log_path.open("a", buffering=1)
+    except OSError as exc:
+        print(f"[log-warning] durable log unavailable ({exc}); using {fallback_path}", flush=True)
+    process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1)
+    assert process.stdout is not None
+    try:
         for line in process.stdout:
             stamped = f"[{_utc_now()}] {line}"
             print(stamped, end="", flush=True)
-            log.write(stamped)
+            if durable is not None:
+                try:
+                    durable.write(stamped)
+                except OSError as exc:
+                    print(f"[log-warning] durable log write failed ({exc}); "
+                          f"continuing via {fallback_path}", flush=True)
+                    try:
+                        durable.close()
+                    except OSError:
+                        pass
+                    durable = None
+            if durable is None and fallback is not False:
+                try:
+                    if fallback is None:
+                        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+                        fallback = fallback_path.open("a", buffering=1)
+                    fallback.write(stamped)
+                except OSError as exc:
+                    if fallback is not False:
+                        print(f"[log-warning] runtime log also unavailable ({exc}); "
+                              "continuing with console output", flush=True)
+                    fallback = False
             if any(needle in line.lower() for needle in needles):
                 oom = True
         return process.wait(), oom
+    finally:
+        for handle in (durable, fallback if fallback is not False else None):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
 
 
 def _refresh_atlas_progress(out_dir: Path) -> dict:
