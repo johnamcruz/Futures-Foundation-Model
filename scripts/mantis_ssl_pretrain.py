@@ -125,8 +125,13 @@ def _preflight(args: argparse.Namespace) -> tuple[Path, Path, dict]:
     }
     if out_path in protected:
         raise SystemExit(f"refusing to overwrite an existing promoted checkpoint: {out_path}")
-    if out_path.exists() and not args.resume:
-        raise SystemExit(f"output already exists: {out_path}\nUse RESUME=1 only to resume this exact run.")
+    if args.reuse_real_checkpoint and not out_path.exists():
+        raise SystemExit(f"REAL checkpoint does not exist: {out_path}")
+    if out_path.exists() and not (args.resume or args.reuse_real_checkpoint):
+        raise SystemExit(
+            f"output already exists: {out_path}\n"
+            "Use RESUME=1 to resume optimization or REUSE_REAL_CHECKPOINT=1 "
+            "to rerun probe/controls only.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     return data_dir, out_path, provenance
 

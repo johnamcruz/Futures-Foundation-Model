@@ -13,6 +13,11 @@ SPEC = importlib.util.spec_from_file_location('mantis_ssl_clean_pipeline', SCRIP
 pipeline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pipeline
 SPEC.loader.exec_module(pipeline)
+PRETRAIN_SCRIPT = ROOT / 'scripts' / 'mantis_ssl_pretrain.py'
+PRETRAIN_SPEC = importlib.util.spec_from_file_location('mantis_ssl_pretrain', PRETRAIN_SCRIPT)
+pretrain = importlib.util.module_from_spec(PRETRAIN_SPEC)
+sys.modules[PRETRAIN_SPEC.name] = pretrain
+PRETRAIN_SPEC.loader.exec_module(pretrain)
 
 
 def test_clean_pipeline_order_and_parent_chain():
@@ -105,3 +110,39 @@ def test_mask_controls_default_to_eight_epochs_and_resume_is_explicit(monkeypatc
     assert args.reuse_mask_real is False
     monkeypatch.setenv('REUSE_MASK_REAL', '1')
     assert pipeline._parser().parse_args([]).reuse_mask_real is True
+
+
+def test_mask_preflight_allows_checkpoint_only_finalization(tmp_path, monkeypatch):
+    data_dir = tmp_path / 'data'
+    data_dir.mkdir()
+    checkpoint = tmp_path / 'mask.pt'
+    checkpoint.write_bytes(b'saved-real')
+    streams = tuple((ticker, timeframe) for ticker in pretrain.TICKERS
+                    for timeframe in pretrain.TIMEFRAMES)
+    monkeypatch.setattr(pretrain, 'seal_continuous_streams', lambda *args, **kwargs: {
+        'streams': [{'ticker': ticker, 'timeframe': timeframe}
+                    for ticker, timeframe in streams],
+    })
+    args = pretrain._parser().parse_args([
+        '--data-dir', str(data_dir), '--out', str(checkpoint),
+        '--reuse-real-checkpoint',
+    ])
+    _, resolved, _ = pretrain._preflight(args)
+    assert resolved == checkpoint.resolve()
+
+
+def test_mask_preflight_requires_checkpoint_for_reuse(tmp_path, monkeypatch):
+    data_dir = tmp_path / 'data'
+    data_dir.mkdir()
+    streams = tuple((ticker, timeframe) for ticker in pretrain.TICKERS
+                    for timeframe in pretrain.TIMEFRAMES)
+    monkeypatch.setattr(pretrain, 'seal_continuous_streams', lambda *args, **kwargs: {
+        'streams': [{'ticker': ticker, 'timeframe': timeframe}
+                    for ticker, timeframe in streams],
+    })
+    args = pretrain._parser().parse_args([
+        '--data-dir', str(data_dir), '--out', str(tmp_path / 'missing.pt'),
+        '--reuse-real-checkpoint',
+    ])
+    with pytest.raises(SystemExit, match='REAL checkpoint does not exist'):
+        pretrain._preflight(args)
