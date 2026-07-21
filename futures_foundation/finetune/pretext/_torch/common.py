@@ -300,8 +300,12 @@ class BaseTrainer:
         torch.manual_seed(seed)
         self.gen = torch.Generator(device=self.dev); self.gen.manual_seed(seed)
         self.big_t = torch.as_tensor(np.asarray(big, np.float32), device=self.dev)
-        self.tr = torch.as_tensor(np.asarray(train_starts, np.int64), device=self.dev)
-        self.va = torch.as_tensor(np.asarray(val_starts, np.int64), device=self.dev)
+        self._tr_source_values, self._tr_source_groups = self._source_arrays(train_starts)
+        self._va_source_values, self._va_source_groups = self._source_arrays(val_starts)
+        self.tr = torch.as_tensor(self._tr_source_values, device=self.dev)
+        self.va = torch.as_tensor(self._va_source_values, device=self.dev)
+        self._tr_sampling = self._sampling_spec(self._tr_source_groups)
+        self._va_sampling = self._sampling_spec(self._va_source_groups)
         self.epochs, self.steps_per_epoch, self.batch = epochs, steps_per_epoch, batch
         self.lr, self.weight_decay, self.patience = lr, weight_decay, patience
         self.grad_clip, self.verbose, self.control = grad_clip, verbose, control
@@ -310,6 +314,78 @@ class BaseTrainer:
         self.amp_ctx = (lambda: torch.autocast('cuda', dtype=_adt)) if self.use_amp else (lambda: _nullctx())
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         self.net = None
+
+    @staticmethod
+    def _source_arrays(source):
+        """Return ordinary starts plus optional source ids from a WindowStartPool.
+
+        This is deliberately duck-typed so the shared torch layer does not import
+        the torch-free orchestrator. Plain arrays preserve historical sampling.
+        """
+        values = np.asarray(getattr(source, 'starts', source), dtype=np.int64)
+        groups = getattr(source, 'group_ids', None)
+        if groups is not None:
+            groups = np.asarray(groups, dtype=np.int32)
+            if len(groups) != len(values):
+                raise ValueError('sampling group ids are not aligned with window starts')
+        return values, groups
+
+    def _sampling_spec(self, groups):
+        """Compact stream-first sampling plan for one start array.
+
+        Starts are assembled stream-by-stream, so each source occupies one contiguous
+        range. Selecting a range uniformly and then an offset within it reproduces
+        Chronos's choose-source-then-example mixture without an O(N) multinomial over
+        every window at every optimizer step.
+        """
+        if groups is None or not len(groups):
+            return None
+        changes = np.r_[0, np.flatnonzero(groups[1:] != groups[:-1]) + 1, len(groups)]
+        offsets = changes[:-1].astype(np.int64)
+        counts = np.diff(changes).astype(np.int64)
+        run_groups = groups[offsets]
+        if len(np.unique(run_groups)) != len(run_groups):
+            raise ValueError('uniform-stream groups must occupy contiguous start ranges')
+        return (torch.as_tensor(offsets, device=self.dev),
+                torch.as_tensor(counts, device=self.dev))
+
+    def _sampling_for_values(self, values, split):
+        """Inherit source membership after a pretext filters legal start anchors."""
+        vals = np.asarray(values.detach().cpu() if torch.is_tensor(values) else values,
+                          dtype=np.int64)
+        source_values = getattr(self, f'_{split}_source_values')
+        source_groups = getattr(self, f'_{split}_source_groups')
+        if source_groups is None or not len(vals):
+            return None
+        idx = np.searchsorted(source_values, vals)
+        if (idx >= len(source_values)).any() or not np.array_equal(source_values[idx], vals):
+            raise ValueError(f'{split} pretext anchors are not a subset of legal window starts')
+        return self._sampling_spec(source_groups[idx])
+
+    def _replace_start_pool(self, split, values):
+        """Replace a start tensor while retaining its original source-mixture policy."""
+        vals = np.asarray(values, dtype=np.int64)
+        tensor = torch.as_tensor(vals, device=self.dev)
+        setattr(self, split, tensor)
+        setattr(self, f'_{split}_sampling', self._sampling_for_values(vals, split))
+        return tensor
+
+    def sample_indices(self, starts, *, generator=None, sampling=None, size=None):
+        """Sample batch indices, stream-first when an opt-in mixture is attached."""
+        generator = generator or self.gen
+        size = self.batch if size is None else int(size)
+        if sampling is None:
+            sampling = (self._tr_sampling if starts is self.tr else
+                        self._va_sampling if starts is self.va else None)
+        if sampling is None:
+            return torch.randint(0, len(starts), (size,), device=self.dev, generator=generator)
+        offsets, counts = sampling
+        group_idx = torch.randint(0, len(offsets), (size,), device=self.dev, generator=generator)
+        # All production streams have far fewer than 2**24 starts, so float32
+        # resolution makes the standard floor(U*N) draw effectively uniform on MPS/CUDA.
+        within = torch.floor(torch.rand(size, device=self.dev, generator=generator)
+                             * counts[group_idx]).to(torch.long)
+        return offsets[group_idx] + within
 
     # ---- hooks (subclass implements) ----
     def build_net(self):

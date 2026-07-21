@@ -73,6 +73,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
     parser.add_argument("--patience", type=int, default=int(os.environ.get("PATIENCE", "8")))
     parser.add_argument("--controls", default=os.environ.get("CONTROLS", "shuffle,random"))
+    parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
+                        default=os.environ.get("SAMPLING_MODE", "bar_proportional"),
+                        help="Training source mixture; validation always keeps natural chronology")
     parser.add_argument("--probe-folds", type=int, default=int(os.environ.get("PROBE_FOLDS", "1")))
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"),
                         default=os.environ.get("DEVICE"))
@@ -154,6 +157,7 @@ def main() -> None:
     print(f"  adaptation : {'LoRA' if args.lora_r else 'full'}"
           + (f" r={args.lora_r} alpha={args.lora_alpha:g}" if args.lora_r else ""))
     print(f"  batch      : {batch}")
+    print(f"  sampling   : {args.sampling_mode}")
     print(f"  output     : {out_path}")
     print(f"  provenance : {provenance_path}", flush=True)
     if args.preflight_only:
@@ -171,6 +175,7 @@ def main() -> None:
         controls=controls, probe=not args.no_probe, probe_folds=args.probe_folds,
         resume=args.resume, device=device, compile_model=args.compile, seed=args.seed,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        sampling_mode=args.sampling_mode,
         log_every_steps=args.log_every_steps,
     )
 

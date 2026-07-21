@@ -122,6 +122,19 @@ Shared discipline across every stage:
 | **Input controls** | REAL, time-SHUFFLE, and RANDOM inputs can be trained against unchanged targets to expose temporal shortcuts |
 | **Bounded memory** | training data stays resident per process; downstream embeddings and large diagnostics support disk-backed/chunked execution |
 | **MPS/CUDA support** | device-specific batches, fixed sample budgets, and automatic MPS OOM fallback preserve comparable training exposure |
+| **Configurable source mixture** | `bar_proportional` remains the default; opt-in `uniform_stream` chooses a ticker/timeframe stream first, then a legal window within it |
+
+To test equal training exposure across the 9x4 corpus without changing the
+chronological validation distribution, use a separate output directory:
+
+```bash
+./.venv/bin/python scripts/mantis_ssl_clean_pipeline.py \
+  --sampling-mode uniform_stream \
+  --out-dir temp/clean_ssl_pre2026_lora_uniform
+```
+
+The runner refuses to reuse a completed checkpoint produced under a different
+sampling mode.
 
 ### LoRA
 

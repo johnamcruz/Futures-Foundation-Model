@@ -15,6 +15,7 @@ No torch here (testable without the GPU stack). The torch trainer (_ssl_torch)
 consumes these arrays + the window-start indices.
 """
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,59 @@ import pandas as pd
 TICKERS_9 = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']
 TFS_ALL = ['1min', '3min', '5min', '15min']
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
+
+SAMPLING_MODES = ('bar_proportional', 'uniform_stream')
+
+
+@dataclass(frozen=True)
+class WindowStartPool:
+    """Training-window starts with their source-stream membership.
+
+    ``uniform_stream`` follows Chronos's data-mixture semantics: choose a source
+    using explicit source probabilities, then draw an example from that source.
+    The compact group vector is retained instead of duplicating starts from short
+    streams or materializing one floating-point weight per window on the accelerator.
+
+    ``np.asarray(pool)`` intentionally returns the ordinary start array so existing
+    leak guards and pretext-specific anchor filters remain backward compatible.
+    Validation never uses this pool: it remains chronological and bar-proportional.
+    """
+
+    starts: np.ndarray
+    group_ids: np.ndarray
+    stream_ids: tuple[str, ...]
+    sampling_mode: str = 'uniform_stream'
+
+    def __post_init__(self):
+        starts = np.asarray(self.starts, dtype=np.int64)
+        groups = np.asarray(self.group_ids, dtype=np.int32)
+        if starts.ndim != 1 or groups.ndim != 1 or len(starts) != len(groups):
+            raise ValueError('window starts and group ids must be aligned 1-D arrays')
+        if self.sampling_mode not in SAMPLING_MODES:
+            raise ValueError(f'unsupported sampling_mode={self.sampling_mode!r}')
+        if len(starts) and (groups.min() < 0 or groups.max() >= len(self.stream_ids)):
+            raise ValueError('group ids must index stream_ids')
+        object.__setattr__(self, 'starts', starts)
+        object.__setattr__(self, 'group_ids', groups)
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __array__(self, dtype=None, copy=None):
+        out = self.starts if dtype is None else self.starts.astype(dtype, copy=False)
+        return out.copy() if copy else out
+
+    def group_counts(self) -> dict[str, int]:
+        """Number of legal training windows in each non-empty stream."""
+        counts = np.bincount(self.group_ids, minlength=len(self.stream_ids))
+        return {sid: int(counts[i]) for i, sid in enumerate(self.stream_ids)}
+
+    def group_probabilities(self) -> dict[str, float]:
+        """Configured source probability, independent of source length."""
+        if not self.stream_ids:
+            return {}
+        p = 1.0 / len(self.stream_ids)
+        return {sid: p for sid in self.stream_ids}
 
 _DATA = os.path.join(os.path.dirname(__file__), '..', '..', 'data')
 

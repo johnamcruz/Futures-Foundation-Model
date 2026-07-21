@@ -30,13 +30,23 @@ from . import ssl_data
 from .pretext import PRETEXTS, PretextTask, get_pretext   # noqa: F401 (pluggable pretext registry)
 
 
-def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0, verbose=True):
+def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0,
+             sampling_mode='bar_proportional', verbose=True):
     """Concatenate all stream OHLCV into one big [T, 5] array + global parent-window start
     positions for the (leak-safe, 2026-excluded) train/val split. Each window reserves enough
     bars for its consumers: seq+max_jitter (probe/mask) OR forecast_parent (stage-2 = max context
-    length + max horizon), whichever is larger — so context+future stay in-stream."""
+    length + max horizon), whichever is larger — so context+future stay in-stream.
+
+    ``bar_proportional`` returns the historical flat training-start array. Opt-in
+    ``uniform_stream`` attaches compact source ranges so the trainer chooses a non-empty
+    ticker/timeframe stream uniformly before choosing a legal window from that stream.
+    Validation starts always remain a flat chronological array.
+    """
+    if sampling_mode not in ssl_data.SAMPLING_MODES:
+        raise ValueError(f'unsupported sampling_mode={sampling_mode!r}; '
+                         f'expected one of {ssl_data.SAMPLING_MODES}')
     parent_len = max(seq + max_jitter, int(forecast_parent))
-    bigs, tr_starts, va_starts, base = [], [], [], 0
+    bigs, tr_starts, tr_groups, train_stream_ids, va_starts, base = [], [], [], [], [], 0
     for s in streams:
         oh = s['ohlcv']
         tr_idx, va_idx = ssl_data.time_split(s['ts'], val_frac, holdout_start)
@@ -51,6 +61,8 @@ def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_pare
         vs = ssl_data.window_starts(va_idx, parent_len)
         if len(ts):
             tr_starts.append(ts + base)
+            tr_groups.append(np.full(len(ts), len(train_stream_ids), dtype=np.int32))
+            train_stream_ids.append(s['sid'])
         if len(vs):
             va_starts.append(vs + base)
         bigs.append(oh)
@@ -59,7 +71,12 @@ def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_pare
             print(f"  [assemble] {s['sid']} train_win={len(ts)} val_win={len(vs)}",
                   flush=True)
     big = np.concatenate(bigs, 0).astype(np.float32)
-    tr = np.concatenate(tr_starts) if tr_starts else np.array([], np.int64)
+    tr_values = np.concatenate(tr_starts) if tr_starts else np.array([], np.int64)
+    if sampling_mode == 'uniform_stream':
+        groups = np.concatenate(tr_groups) if tr_groups else np.array([], np.int32)
+        tr = ssl_data.WindowStartPool(tr_values, groups, tuple(train_stream_ids))
+    else:
+        tr = tr_values
     va = np.concatenate(va_starts) if va_starts else np.array([], np.int64)
     return big, tr, va
 
@@ -145,13 +162,14 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
 
 # ------------------------------------------------------------------------------- entrypoints
 def _load_assemble(data_dir, tickers, tfs, seq, max_jitter, val_frac, holdout_start, verbose,
-                   forecast_parent=0):
+                   forecast_parent=0, sampling_mode='bar_proportional'):
     streams = ssl_data.load_ohlcv(data_dir, tickers, tfs, verbose=verbose)
     big, tr, va = assemble(streams, seq=seq, max_jitter=max_jitter, val_frac=val_frac,
-                           holdout_start=holdout_start, forecast_parent=forecast_parent, verbose=verbose)
+                           holdout_start=holdout_start, forecast_parent=forecast_parent,
+                           sampling_mode=sampling_mode, verbose=verbose)
     if verbose:
         print(f"[ssl] bars={len(big)} train_win={len(tr)} val_win={len(va)} "
-              f"streams={len(streams)}", flush=True)
+              f"streams={len(streams)} sampling={sampling_mode}", flush=True)
     if len(tr) == 0 or len(va) == 0:
         raise ValueError("no train/val windows — check seq/max_jitter vs data length")
     return streams, big, tr, va
@@ -165,6 +183,7 @@ def _base_cfg(**kw):
              steps_per_epoch=200, batch=1024, lr=1e-4, weight_decay=0.05, patience=8,
              model_id='paris-noah/Mantis-8M', compile_model=False, device=None,
              seed=0, verbose=True, backbone_ckpt=None,
+             sampling_mode='bar_proportional',
              pretext='mask',                                  # 'mask' (1) | 'forecast' (2) | 'forecast_dist' (2.5) | 'contrastive' (3)
              # mask SpanBERT mode (shared by the mask pretext): span_mean>0 = corrupt CONTIGUOUS
              # multi-bar spans (geometric mean span_mean, clipped span_max); 0 = single-bar masking.
@@ -232,8 +251,10 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     # each pretext task declares how much window to reserve (forecast: ctx+horizon;
     # contrastive: ctx; mask: none) — no pretext if-chain here.
     fc_reserve = get_pretext(pretext).reserve(cfg)
-    streams, big, tr, va = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
-                                           val_frac, holdout_start, verbose, forecast_parent=fc_reserve)
+    streams, big, tr, va = _load_assemble(
+        data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'], val_frac,
+        holdout_start, verbose, forecast_parent=fc_reserve,
+        sampling_mode=cfg.get('sampling_mode', 'bar_proportional'))
     state, hist = _train(big, tr, va, cfg, 'real')
     std = float(hist[-1]['std'])
     best_ep = min(hist, key=lambda h: h['val_loss'])

@@ -57,7 +57,7 @@ class _MaskTrainer(BaseTrainer):
         self.net = net
 
     def make_batch(self, starts):
-        b_idx = torch.randint(0, len(starts), (self.batch,), device=self.dev, generator=self.gen)
+        b_idx = self.sample_indices(starts)
         w = _gather_batch(self.big_t, starts, b_idx, self.seq)        # [B,C,seq] raw
         return _standardize(_apply_control(w, self.control))         # corrupt input per control, z-score
 
