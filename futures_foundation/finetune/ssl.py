@@ -259,14 +259,15 @@ def _base_cfg(**kw):
              # behavior): mse_weight 0 = PURE Chronos loss (no MSE anchor); quantile_taus 'bolt9'
              # = the full 9-level quantile head; bins_k = bin-classification resolution.
              mse_weight=1.0, quantile_taus='lohi', bins_k=41, balance_w=0.02,
-             # stage-3 TEMPORAL-NEIGHBORHOOD contrastive (regime geometry, label-free): positives =
-             # windows at multi-scale time offsets (pos_deltas) + augmented views; negatives =
-             # far-in-time windows (pairs closer than far_min excluded); per-anchor volatility
-             # DOWN-weighting (vol_weight, data-driven — a weight, never a label). Gate = the spec's
-             # A-E structural metrics on the embedding (regime_gate); ship gate stays stage-2.
+             # Contrastive regime geometry. `kaufman` uses only the completed context's
+             # efficiency ratio and direction; `temporal` preserves the historical offset-based
+             # ablation. Both corrupt inputs only for honest shuffle/random controls.
              temperature=0.1, crop_max=0.2, proj_dim=128,
              pos_deltas=(2, 16, 64), far_min=512, aug_noise=0.10, aug_scale=0.20,
              aug_tmask=0.15, vol_weight=1.0, w_clip=4.0, metrics_n=768,
+             # Optional causal regime key. Kaufman ER uses only the completed context window;
+             # the transition band remains instance-only instead of receiving a hard label.
+             regime_key='temporal', kaufman_chop=0.25, kaufman_trend=0.50,
              # stage-4 TURN-ELECTRA (replaced-TURN detection — the discriminative slot): spans are
              # CENTERED ON DETECTED TURNS (local swing highs/lows, neighborhood ±turn_w) with prob
              # turn_bias (0 = uniform span-ELECTRA, the placement ablation); a weak generator

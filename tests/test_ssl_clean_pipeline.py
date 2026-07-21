@@ -29,6 +29,14 @@ def test_clean_pipeline_order_and_parent_chain():
 
 
 def test_clean_pipeline_uses_banked_seq2seq_and_nextleg_recipes():
+    contrastive = pipeline._stage_config('contrastive')
+    assert contrastive['regime_key'] == 'kaufman'
+    assert contrastive['kaufman_chop'] == 0.25
+    assert contrastive['kaufman_trend'] == 0.50
+    assert contrastive['lr'] == 5e-5
+    assert contrastive['vol_weight'] == 0.0
+    assert contrastive['freeze_encoder_layers'] == 2
+    assert contrastive['crop_max'] == 0.0 and contrastive['aug_tmask'] == 0.0
     seq = pipeline._stage_config('seq2seq')
     assert seq['pretext'] == 'forecast'
     assert seq['horizons'] == (5, 10, 20, 25)
@@ -37,9 +45,20 @@ def test_clean_pipeline_uses_banked_seq2seq_and_nextleg_recipes():
     assert seq['lora_r'] == 8 and seq['lora_alpha'] == 16
     assert seq['sampling_mode'] == 'bar_proportional'
     assert seq['log_every_steps'] == 25
+    assert seq['lr'] == 4e-5 and seq['freeze_encoder_layers'] == 2
     leg = pipeline._stage_config('nextleg')
     assert leg['pretext'] == 'nextleg' and leg['leg_k'] == 2 and leg['leg_cap'] == 256
     assert leg['holdout_start'] == '2026-01-01'
+    assert leg['lr'] == 3e-5 and leg['freeze_encoder_layers'] == 2
+
+
+def test_clean_pipeline_stage_learning_rates_are_overridable(monkeypatch):
+    monkeypatch.setenv('CONTRASTIVE_LR', '6e-5')
+    monkeypatch.setenv('SEQ2SEQ_LR', '5e-5')
+    monkeypatch.setenv('NEXTLEG_LR', '4e-5')
+    assert pipeline._stage_config('contrastive')['lr'] == 6e-5
+    assert pipeline._stage_config('seq2seq')['lr'] == 5e-5
+    assert pipeline._stage_config('nextleg')['lr'] == 4e-5
 
 
 def test_clean_pipeline_uniform_stream_is_explicit_opt_in(monkeypatch):
@@ -62,6 +81,27 @@ def test_legacy_report_is_treated_as_bar_proportional(tmp_path):
     pipeline._assert_completed_stage_recipe(report, sampling_mode='bar_proportional')
 
 
+def test_existing_child_must_match_canonical_parent_hash(tmp_path):
+    paths = pipeline._stage_map(tmp_path)
+    parent = paths['contrastive']
+    seq = paths['seq2seq']
+    parent.write_bytes(b'contrastive-parent')
+    seq.write_bytes(b'seq-child')
+    lineage = Path(str(seq) + '.data_provenance.json')
+    lineage.write_text(json.dumps({
+        'stage': 'seq2seq',
+        'parent': {'sha256': pipeline.sha256(parent)},
+    }))
+    pipeline._assert_stage_parent(seq, pipeline.STAGES[2], paths)
+
+    lineage.write_text(json.dumps({
+        'stage': 'seq2seq',
+        'parent': {'sha256': 'stale-contrastive-parent'},
+    }))
+    with pytest.raises(RuntimeError, match='wrong parent'):
+        pipeline._assert_stage_parent(seq, pipeline.STAGES[2], paths)
+
+
 def test_stage_verdict_requires_current_probe_and_both_gates(tmp_path):
     report = tmp_path / 'stage.pt.report.json'
     good = {
@@ -82,7 +122,7 @@ def test_stage_verdict_requires_current_probe_and_both_gates(tmp_path):
 
 def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():
     batches = {stage.name: stage.batch['mps'] for stage in pipeline.STAGES}
-    assert batches == {'mask': 256, 'contrastive': 32, 'seq2seq': 128, 'nextleg': 128}
+    assert batches == {'mask': 256, 'contrastive': 64, 'seq2seq': 128, 'nextleg': 128}
     assert len({stage.filename for stage in pipeline.STAGES}) == len(pipeline.STAGES)
 
 
@@ -113,6 +153,23 @@ def test_probe_atlas_progress_compares_each_completed_stage(tmp_path):
     assert [row['stage'] for row in progress['stages']] == ['mask', 'contrastive']
     assert progress['stages'][1]['deltas_vs_previous'] == {'pred': 0.03, 'ret': 0.02}
     assert (tmp_path / 'probe_atlas_progress.json').is_file()
+
+
+def test_probe_atlas_retention_gate_rejects_broad_or_single_probe_forgetting():
+    base = {'stage': 'mask', 'retention_mean_auc': 0.80,
+            'prediction_mean_auc': 0.70, 'deltas_vs_previous': {}}
+    good = {'stage': 'contrastive', 'retention_mean_auc': 0.795,
+            'prediction_mean_auc': 0.695,
+            'deltas_vs_previous': {'trend_context': -0.02, 'ret_squeeze': 0.01}}
+    pipeline._assert_atlas_retention({'stages': [base, good]}, 'contrastive')
+
+    broad = {**good, 'prediction_mean_auc': 0.68}
+    with pytest.raises(RuntimeError, match='prediction_mean_auc'):
+        pipeline._assert_atlas_retention({'stages': [base, broad]}, 'contrastive')
+
+    narrow = {**good, 'deltas_vs_previous': {'trend_context': -0.04}}
+    with pytest.raises(RuntimeError, match='trend_context'):
+        pipeline._assert_atlas_retention({'stages': [base, narrow]}, 'contrastive')
 
 
 def test_clean_pipeline_probe_dependencies_are_public_scripts():

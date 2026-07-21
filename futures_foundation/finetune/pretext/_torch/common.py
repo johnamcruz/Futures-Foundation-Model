@@ -425,6 +425,10 @@ class BaseTrainer:
         net = self.net
         return net.encoder if not hasattr(net, '_orig_mod') else net._orig_mod.encoder
 
+    def _stateful_net(self):
+        """Unwrapped task network used only for crash-resume trainer state."""
+        return self.net if not hasattr(self.net, '_orig_mod') else self.net._orig_mod
+
     def _params(self):
         return [p for p in self.net.parameters() if p.requires_grad]
 
@@ -452,13 +456,29 @@ class BaseTrainer:
                       f"modules={stats['modules']} trainable={stats['trainable']:,}/"
                       f"{stats['total']:,} ({stats['percent']:.2f}%)", flush=True)
         save_ok = bool(self.ckpt_path) and self.control == 'real'   # controls never touch the ckpt
-        best, best_state = 1e18, None
-        if self.resume and save_ok and os.path.exists(self.ckpt_path):     # resume from saved best
-            self.load_snapshot_state(torch.load(self.ckpt_path, map_location='cpu'))
-            best = _read_meta_best(self.ckpt_path)
-            best_state = self.snapshot_state()
-            if self.verbose:
-                print(f"  [resume] loaded {self.ckpt_path} (best_val={best:.4f})", flush=True)
+        best, best_state, resume_payload, start_epoch = 1e18, None, None, 0
+        trainer_path = str(self.ckpt_path) + '.trainer.pt' if save_ok else None
+        if self.resume and save_ok and os.path.exists(self.ckpt_path):
+            if trainer_path and os.path.exists(trainer_path):
+                resume_payload = torch.load(trainer_path, map_location='cpu')
+                self._stateful_net().load_state_dict(resume_payload['model_state'])
+                best = float(resume_payload['best_val'])
+                start_epoch = int(resume_payload['epoch']) + 1
+                best_state = self.snapshot_state()
+                if 'generator_state' in resume_payload:
+                    self.gen.set_state(resume_payload['generator_state'])
+                if self.verbose:
+                    print(f"  [resume] restored full trainer state from epoch "
+                          f"{start_epoch}/{self.epochs} (best_val={best:.4f})", flush=True)
+            else:
+                # Backward-compatible recovery for checkpoints created before full trainer
+                # sidecars existed. The encoder is safe, but task heads restart from scratch.
+                self.load_snapshot_state(torch.load(self.ckpt_path, map_location='cpu'))
+                best = _read_meta_best(self.ckpt_path)
+                best_state = self.snapshot_state()
+                if self.verbose:
+                    print(f"  [resume] loaded legacy encoder-only checkpoint {self.ckpt_path} "
+                          f"(best_val={best:.4f}; task head restarted)", flush=True)
         nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)   # anti-forgetting
         if nfz and self.verbose:
             ntr = sum(p.requires_grad for p in self.net.parameters())
@@ -466,8 +486,13 @@ class BaseTrainer:
                   flush=True)
         opt = self.make_optimizer()
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.epochs)
-        bad, history = 0, []
-        for ep in range(self.epochs):
+        if resume_payload is not None:
+            opt.load_state_dict(resume_payload['optimizer_state'])
+            sched.load_state_dict(resume_payload['scheduler_state'])
+        bad = int(resume_payload.get('bad_epochs', 0)) if resume_payload else 0
+        history = ([resume_payload['best_history_row']]
+                   if resume_payload and resume_payload.get('best_history_row') else [])
+        for ep in range(start_epoch, self.epochs):
             self.net.train(); tr_tot = 0.0; ep_started = time.monotonic()
             for step in range(self.steps_per_epoch):
                 opt.zero_grad(set_to_none=True)
@@ -518,9 +543,24 @@ class BaseTrainer:
                 if save_ok:                                          # progressive best-save (crash-safe)
                     _atomic_save(best_state, self.ckpt_path)
                     _write_meta(self.ckpt_path, best, ep)
+                    # The public checkpoint remains encoder-only. This separate sidecar retains
+                    # the disposable task head plus optimizer/scheduler/RNG for a true resume.
+                    _atomic_save({
+                        'schema': 'ffm_ssl_trainer_resume_v1',
+                        'model_state': self._stateful_net().state_dict(),
+                        'optimizer_state': opt.state_dict(),
+                        'scheduler_state': sched.state_dict(),
+                        'generator_state': self.gen.get_state(),
+                        'best_val': best,
+                        'epoch': ep,
+                        'bad_epochs': bad,
+                        'best_history_row': history[-1],
+                    }, trainer_path)
             else:
                 bad += 1
             self.log_line(ep, tr_tot / self.steps_per_epoch, vloss, extra, improved)
             if bad >= self.patience:
                 break
+        if best_state is None:
+            raise RuntimeError("training ended without a valid encoder checkpoint")
         return best_state, history

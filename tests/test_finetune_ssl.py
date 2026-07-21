@@ -551,12 +551,16 @@ def test_pretext_reserve_per_task():
     assert ssl.get_pretext('forecast').reserve(cfg) == 200 + 25      # stage-2: ctx + horizon
     # stage-3: a positive starts at anchor+delta and then reads a complete seq-length window
     assert ssl.get_pretext('contrastive').reserve(cfg) == cfg['seq'] + max(cfg['pos_deltas'])
+    kaufman = ssl._base_cfg(pretext='contrastive', regime_key='kaufman')
+    assert ssl.get_pretext('contrastive').reserve(kaufman) == kaufman['seq']
 
 
 def test_base_cfg_has_contrastive_keys():
     cfg = ssl._base_cfg()
     assert cfg['temperature'] == 0.1 and cfg['crop_max'] == 0.2 and cfg['proj_dim'] == 128
     assert cfg['pos_deltas'] == (2, 16, 64) and cfg['far_min'] == 512   # temporal knobs
+    assert cfg['regime_key'] == 'temporal'
+    assert cfg['kaufman_chop'] == 0.25 and cfg['kaufman_trend'] == 0.50
     over = ssl._base_cfg(pretext='contrastive', temperature=0.07, crop_max=0.1,
                          pos_deltas=(1, 8, 32), far_min=256, vol_weight=0.5)
     assert over['pretext'] == 'contrastive' and over['temperature'] == 0.07 and over['crop_max'] == 0.1
@@ -712,6 +716,23 @@ def test_train_multihorizon_runs_variable_context_and_warmstart(tmp_path):
                                          new_channels=4, epochs=1, steps_per_epoch=2, batch=16,
                                          device='cpu', control='real', backbone_ckpt=ckpt, verbose=False)
     assert set(state2.keys()) == set(state.keys()) and np.isfinite(hist2[-1]['val_loss'])
+
+
+@torch_test
+def test_forecast_validation_sampling_is_seeded_and_repeatable():
+    import torch
+    from futures_foundation.finetune.pretext._torch.forecast import _ForecastTrainer
+    rng = np.random.default_rng(7)
+    big = (100 + np.cumsum(rng.standard_normal((600, 5)) * 0.1, 0)).astype(np.float32)
+    starts = np.arange(0, 500, 2)
+    trainer = _ForecastTrainer(
+        big, starts[:180], starts[180:], horizons=(5, 10), context_lengths=(32, 48),
+        new_channels=4, epochs=1, steps_per_epoch=1, batch=8, device='cpu', verbose=False)
+    g1 = torch.Generator(device='cpu'); g1.manual_seed(20260704)
+    g2 = torch.Generator(device='cpu'); g2.manual_seed(20260704)
+    a = trainer.make_batch(trainer.va, gen=g1)
+    b = trainer.make_batch(trainer.va, gen=g2)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
 
@@ -898,6 +919,39 @@ def test_contrastive_snap_and_sigma():
 
 
 @torch_test
+def test_kaufman_regime_is_causal_scale_free_and_leaves_transition_unlabeled():
+    import torch
+    from futures_foundation.finetune.pretext._torch.contrastive import _kaufman_regime
+    raw = torch.zeros(4, 5, 8)
+    raw[:, 3, :] = torch.tensor([
+        [100., 101., 100., 101., 100., 101., 100., 100.],
+        [100., 101., 102., 103., 104., 105., 106., 107.],
+        [107., 106., 105., 104., 103., 102., 101., 100.],
+        [100., 101., 102., 101., 102., 103., 102., 103.],
+    ])
+    regime, er = _kaufman_regime(raw, chop=0.10, trend=0.80)
+    assert regime.tolist() == [0, 1, 2, -1]
+    scaled = raw.clone(); scaled[:, 3, :] *= 10
+    assert torch.allclose(er, _kaufman_regime(scaled, chop=0.10, trend=0.80)[1])
+
+
+@torch_test
+def test_kaufman_supcon_groups_regimes_but_not_transition_windows():
+    import torch
+    import torch.nn.functional as F
+    from futures_foundation.finetune.pretext._torch.contrastive import _regime_supcon
+    instance = torch.tensor([0, 1, 2, 0, 1, 2])
+    regime = torch.tensor([0, 0, -1, 0, 0, -1])
+    aligned = F.normalize(torch.tensor([
+        [1., 0.], [1., 0.], [0., 1.], [1., 0.], [1., 0.], [0., 1.]]), dim=1)
+    split = F.normalize(torch.tensor([
+        [1., 0.], [-1., 0.], [0., 1.], [1., 0.], [-1., 0.], [0., 1.]]), dim=1)
+    weights = torch.ones(6)
+    assert (_regime_supcon(aligned, instance, regime, weights, 0.1)
+            < _regime_supcon(split, instance, regime, weights, 0.1))
+
+
+@torch_test
 def test_weighted_supcon_prefers_temporal_grouping():
     """The sigma-weighted SupCon gives LOWER loss when same-group (anchor views + temporal
     positives) embeddings are aligned than anti-aligned, and EXCLUDES near-but-not-positive
@@ -951,6 +1005,13 @@ def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
                                         batch=8, device='cpu', control='real',
                                         backbone_ckpt=ckpt, verbose=False)
     assert set(state2.keys()) == set(state.keys())                # warm-start same encoder keys
+    state3, khist = S.train_ssl_contrastive(
+        big, starts, starts[-120:], seq=64, regime_key='kaufman',
+        kaufman_chop=0.25, kaufman_trend=0.50, metrics_n=48,
+        new_channels=4, proj_dim=64, epochs=1, steps_per_epoch=1,
+        batch=8, device='cpu', control='real', backbone_ckpt=ckpt, verbose=False)
+    assert set(state3.keys()) == set(state.keys())
+    assert 'kaufman_margin' in khist[-1] and 'kaufman_known_frac' in khist[-1]
 
 
 # --------------------------------------------- save/resume + anti-forgetting freeze (all pretexts)
@@ -988,6 +1049,7 @@ def test_contrastive_save_resume_and_control_guard(tmp_path):
                                     new_channels=4, proj_dim=32, epochs=2, steps_per_epoch=3,
                                     batch=16, device='cpu', control='real', ckpt_path=ck, verbose=False)
     assert os.path.exists(ck) and os.path.exists(ck + '.meta.json')     # progressively saved
+    assert os.path.exists(ck + '.trainer.pt')                           # true task-head resume
     st2, _ = S.train_ssl_contrastive(big, starts, starts[-50:], context_lengths=cl, contrast_horizon=h,
                                      new_channels=4, proj_dim=32, epochs=1, steps_per_epoch=2,
                                      batch=16, device='cpu', control='real', ckpt_path=ck,
