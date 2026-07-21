@@ -94,6 +94,13 @@ continuous-contract OHLCV (9 tickers × 4 timeframes)
 
 `futures_foundation/finetune/ssl.py` provides the task-independent SSL loop. Registered objectives live under `futures_foundation/finetune/pretext/`; each task owns its window reserve, trainer, diagnostics, and verdict additions. `scripts/mantis_ssl_clean_pipeline.py` composes the production lineage while keeping every checkpoint distinct.
 
+The clean runner also executes the public, strategy-agnostic
+`scripts/probe_atlas.py` after each stage. Its balanced 9-ticker × 4-timeframe
+corpus measures causal market-state retention and generic forward
+direction/magnitude/volatility and HH/HL–LH/LL lifecycle information, including
+per-stream and worst-stream results. It contains no entry rules, stop logic,
+position sizing, R targets, or dependency on private strategy repositories.
+
 ### 1. Masked reconstruction
 
 A fraction of each standardized OHLCV window is corrupted. The network reconstructs only the masked positions, forcing the encoder to use surrounding temporal context rather than memorize the visible value.

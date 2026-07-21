@@ -97,6 +97,14 @@ def test_probe_atlas_progress_compares_each_completed_stage(tmp_path):
     assert (tmp_path / 'probe_atlas_progress.json').is_file()
 
 
+def test_clean_pipeline_probe_dependencies_are_public_scripts():
+    source = SCRIPT.read_text()
+    assert 'ROOT / "colabs"' not in source
+    assert 'ROOT / "scripts" / "probe_atlas.py"' in source
+    assert 'ROOT / "scripts" / "generate_trend_labels.py"' in source
+    assert 'ROOT / "colabs"' not in source
+
+
 def test_master_preserves_virtualenv_python_for_children():
     source = SCRIPT.read_text()
     assert 'Path(sys.executable).absolute()' in source
