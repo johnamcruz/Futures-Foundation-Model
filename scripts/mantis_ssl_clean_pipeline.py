@@ -358,7 +358,10 @@ def _run_parent(args: argparse.Namespace) -> None:
     if not atlas_script.is_file():
         raise FileNotFoundError(f"Probe Atlas entrypoint missing: {atlas_script}")
     paths = _stage_map(out_dir)
-    python = Path(sys.executable).resolve()
+    # Do NOT resolve this path: a virtualenv's python is normally a symlink to the base
+    # interpreter. Resolving it silently discards the venv for child stages (and therefore
+    # installed packages such as torch). Keep the exact executable used to launch the master.
+    python = Path(sys.executable).absolute()
     device = args.device or _device()
     lora_r = int(args.lora_r)
     if lora_r < 0:

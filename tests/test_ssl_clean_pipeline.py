@@ -50,3 +50,9 @@ def test_probe_atlas_progress_compares_each_completed_stage(tmp_path):
     assert [row['stage'] for row in progress['stages']] == ['mask', 'contrastive']
     assert progress['stages'][1]['deltas_vs_previous'] == {'pred': 0.03, 'ret': 0.02}
     assert (tmp_path / 'probe_atlas_progress.json').is_file()
+
+
+def test_master_preserves_virtualenv_python_for_children():
+    source = SCRIPT.read_text()
+    assert 'Path(sys.executable).absolute()' in source
+    assert 'Path(sys.executable).resolve()' not in source
