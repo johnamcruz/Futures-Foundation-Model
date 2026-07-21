@@ -41,6 +41,7 @@ from futures_foundation.data_provenance import seal_continuous_streams, sha256
 TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
 TIMEFRAMES = ("1min", "3min", "5min", "15min")
 HOLDOUT_START = "2026-01-01"
+PROBE_SPLIT_SCHEMA = "balanced_stream_purged_temporal_v1"
 STAGE_ORDER = ("mask", "contrastive", "seq2seq", "nextleg")
 
 
@@ -123,7 +124,7 @@ def _stage_config(stage: str) -> dict:
         patience=int(os.environ.get("PATIENCE", "8")), seed=int(os.environ.get("SEED", "0")),
         probe=True, controls=(), compile_model=False,
         log_every_steps=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")), **lora,
-    )
+        )
     if stage == "contrastive":
         return {**common, "pretext": "contrastive", "pos_deltas": (2, 16, 64),
                 "far_min": 512, "temperature": 0.1, "aug_noise": 0.10,
@@ -146,6 +147,21 @@ def _stage_config(stage: str) -> dict:
                 "weight_decay": 0.0, "clamp": 10.0, "grad_clip": 1.0,
                 "freeze_encoder_layers": 2}
     raise KeyError(stage)
+
+
+def _assert_stage_verdict(report_path: Path) -> None:
+    """Fail closed on stale probe methodology or a failed representation/control gate."""
+    report = json.loads(report_path.read_text())
+    schema = report.get("probe", {}).get("split_schema")
+    if schema != PROBE_SPLIT_SCHEMA:
+        raise RuntimeError(
+            f"stale probe split in {report_path}: {schema!r}; expected {PROBE_SPLIT_SCHEMA!r}")
+    verdict = report.get("verdict", {})
+    if not verdict.get("all_pass", False):
+        raise RuntimeError(
+            f"stage validation failed in {report_path}: "
+            f"representation_pass={verdict.get('representation_pass')} "
+            f"beats_controls={verdict.get('beats_controls')}")
 
 
 def _seal(data_dir: Path) -> dict:
@@ -204,6 +220,7 @@ def _run_child(args: argparse.Namespace) -> None:
         resume=resume, **config)
     if not out_path.is_file() or not Path(str(out_path) + ".report.json").is_file():
         raise RuntimeError(f"{stage.name} returned without complete checkpoint/report artifacts")
+    _assert_stage_verdict(Path(str(out_path) + ".report.json"))
     print(f"[{stage.name}] COMPLETE verdict={verdict}", flush=True)
 
 
@@ -430,8 +447,18 @@ def _run_parent(args: argparse.Namespace) -> None:
     for stage in STAGES:
         out_path = paths[stage.name]
         report_path = Path(str(out_path) + ".report.json")
+        # The Mask checkpoint is expensive and independently crash-safe. If its report predates
+        # the balanced per-stream probe, discard only the stale report and re-finalize the exact
+        # checkpoint; never retrain REAL merely to update evaluation methodology.
+        if stage.name == "mask" and out_path.is_file() and report_path.is_file():
+            saved = json.loads(report_path.read_text())
+            if saved.get("probe", {}).get("split_schema") != PROBE_SPLIT_SCHEMA:
+                report_path.unlink()
+                _event(out_dir, "stage_probe_invalidated", stage=stage.name,
+                       reason="stale_split_schema", checkpoint=str(out_path))
         if out_path.is_file() and report_path.is_file():
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
+            _assert_stage_verdict(report_path)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
             _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
                              labels=atlas_labels, data_dir=data_dir)
@@ -491,6 +518,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         if not out_path.is_file() or not report_path.is_file():
             _notify(f"Clean SSL pipeline missing artifacts at {stage.name}")
             raise RuntimeError(f"incomplete stage artifacts: {stage.name}")
+        _assert_stage_verdict(report_path)
         _run_probe_atlas(stage, out_path, out_dir=out_dir, device=device, python=python,
                          labels=atlas_labels, data_dir=data_dir)
         print(f"[{stage.name}] PASS; advancing lineage", flush=True)

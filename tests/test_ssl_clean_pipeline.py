@@ -62,6 +62,24 @@ def test_legacy_report_is_treated_as_bar_proportional(tmp_path):
     pipeline._assert_completed_stage_recipe(report, sampling_mode='bar_proportional')
 
 
+def test_stage_verdict_requires_current_probe_and_both_gates(tmp_path):
+    report = tmp_path / 'stage.pt.report.json'
+    good = {
+        'probe': {'split_schema': pipeline.PROBE_SPLIT_SCHEMA},
+        'verdict': {'all_pass': True, 'representation_pass': True, 'beats_controls': True},
+    }
+    report.write_text(json.dumps(good))
+    pipeline._assert_stage_verdict(report)
+    report.write_text(json.dumps({**good, 'verdict': {
+        'all_pass': False, 'representation_pass': True, 'beats_controls': False,
+    }}))
+    with pytest.raises(RuntimeError, match='beats_controls=False'):
+        pipeline._assert_stage_verdict(report)
+    report.write_text(json.dumps({'probe': {}, 'verdict': {'all_pass': True}}))
+    with pytest.raises(RuntimeError, match='stale probe split'):
+        pipeline._assert_stage_verdict(report)
+
+
 def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():
     batches = {stage.name: stage.batch['mps'] for stage in pipeline.STAGES}
     assert batches == {'mask': 256, 'contrastive': 32, 'seq2seq': 128, 'nextleg': 128}
