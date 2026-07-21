@@ -34,6 +34,9 @@ class PretextTask:
                        'fwd_absmove_delta': float(probe_res.get('fwd_absmove_delta', 0.0)),
                        'fwd_dir_delta': float(probe_res.get('fwd_dir_delta', 0.0)),
                        'forward_score': float(probe_res.get('forward_score', 0.0)),
+                       'stream_win_rate': probe_res.get('stream_win_rate'),
+                       'average_target_win_rate': probe_res.get('average_target_win_rate'),
+                       'worst_stream_win_rate': probe_res.get('worst_stream_win_rate'),
                        'learns_regime_vol_structure': bool(probe_res['learns_regime_vol_structure'])})
         return self._decide(probe_res, no_collapse, margin, dir_margin, detail)
 

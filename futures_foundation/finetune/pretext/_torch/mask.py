@@ -15,9 +15,9 @@ class MaskNetwork(nn.Module):
 
     def __init__(self, C=5, new_channels=8, seq=64, model_id='paris-noah/Mantis-8M'):
         super().__init__()
-        from mantis.architecture import Mantis8M
+        from .common import load_mantis
         from mantis.adapters import LinearChannelCombiner
-        self.encoder = Mantis8M.from_pretrained(model_id)
+        self.encoder = load_mantis(model_id)
         hidden = getattr(self.encoder, 'hidden_dim', 256)
         self.new_c = min(new_channels, C)
         self.adapter = LinearChannelCombiner(num_channels=C, new_num_channels=self.new_c)
@@ -58,20 +58,28 @@ class _MaskTrainer(BaseTrainer):
 
     def make_batch(self, starts):
         b_idx = self.sample_indices(starts)
-        w = _gather_batch(self.big_t, starts, b_idx, self.seq)        # [B,C,seq] raw
-        return _standardize(_apply_control(w, self.control))         # corrupt input per control, z-score
+        raw = _gather_batch(self.big_t, starts, b_idx, self.seq)      # [B,C,seq] raw
+        # Negative controls corrupt INPUT ONLY. The reconstruction target must stay the clean,
+        # ordered market window; otherwise shuffle learns to reconstruct shuffled candles and
+        # random learns to reconstruct noise, turning both controls into valid pretext tasks.
+        target = _standardize(raw)
+        source = target if self.control == 'real' else _standardize(
+            _apply_control(raw, self.control))
+        return source, target
 
-    def compute_loss(self, w):
+    def compute_loss(self, batch):
+        source, target = batch
         if self.span_mean > 0:                                       # SpanBERT: contiguous spans
             m = torch.from_numpy(sample_span_mask(
-                self._nprng, w.shape[0], self.seq, self.mask_ratio,
-                self.span_mean, self.span_max)).to(w.device)
+                self._nprng, source.shape[0], self.seq, self.mask_ratio,
+                self.span_mean, self.span_max)).to(source.device)
         else:                                                        # BERT-style single-bar
-            m = torch.rand(w.shape[0], self.seq, device=self.dev, generator=self.gen) < self.mask_ratio
+            m = torch.rand(source.shape[0], self.seq, device=self.dev,
+                           generator=self.gen) < self.mask_ratio
             none = ~m.any(1); m[none, 0] = True                      # >=1 masked bar per sample
-        me = m[:, None, :].expand_as(w)
-        corrupted = torch.where(me, torch.randn_like(w), w)          # noise-fill masked bars
-        diff = (self.net(corrupted) - w) ** 2
+        me = m[:, None, :].expand_as(source)
+        corrupted = torch.where(me, torch.randn_like(source), source)  # noise-fill masked bars
+        diff = (self.net(corrupted) - target) ** 2
         return diff[me].mean()                                       # MSE on masked positions only
 
     @torch.no_grad()
@@ -80,7 +88,8 @@ class _MaskTrainer(BaseTrainer):
         for _ in range(nb):
             with self.amp_ctx():
                 tot += float(self.compute_loss(self.make_batch(self.va)))
-        estd = float(self.net.embed(self.make_batch(self.va)).std(0).mean())
+        clean, _ = self.make_batch(self.va)
+        estd = float(self.net.embed(clean).std(0).mean())
         self.net.train()
         return tot / nb, {'std': estd}
 

@@ -28,6 +28,7 @@ import os
 import numpy as np
 
 from . import ssl_data
+from .model_identity import evaluation_environment
 from .pretext import PRETEXTS, PretextTask, get_pretext   # noqa: F401 (pluggable pretext registry)
 
 
@@ -105,7 +106,8 @@ def _train(big, tr, va, cfg, control='real'):
     return get_pretext(cfg.get('pretext', 'mask')).train(big, tr, va, cfg, control)
 
 
-def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1, verbose=True):
+def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1,
+                 group_names=None, verbose=True):
     """Probe a trained encoder state vs vanilla -> the probe dict (regime/vol/structure).
     Saves to a temp ckpt so ssl_probe can load it through the normal path. folds>1 -> k-fold CV
     per probe (robust deltas for ranking candidates)."""
@@ -117,7 +119,8 @@ def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1, verbos
     torch.save(plain_encoder_state(state), tmp)
     try:
         return ssl_probe.run_probe(big, va, seq, tmp, model_id=model_id, device=device,
-                                   seed=seed, folds=folds, verbose=verbose)
+                                   seed=seed, folds=folds, group_names=group_names,
+                                   verbose=verbose)
     finally:
         os.remove(tmp)
 
@@ -136,6 +139,11 @@ def _control_cfg(cfg):
     out['patience'] = min(int(cfg['patience']), out['epochs'])
     out['resume'] = False
     return out
+
+
+def _stream_names(streams):
+    """Stable probe labels for production streams and minimal test fixtures."""
+    return [s.get('sid', f"{s['ticker']}@{s['tf']}") for s in streams]
 
 
 # ------------------------------------------------------------------------------- save/probe
@@ -169,14 +177,23 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
         st, _ = _train(big, tr, va, ctrl_cfg, ctrl)
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
                          device=cfg['device'], seed=cfg['seed'],
-                         folds=cfg.get('probe_folds', 1), verbose=verbose)
+                         folds=cfg.get('probe_folds', 1),
+                         group_names=_stream_names(streams), verbose=verbose)
         ctrl_delta[ctrl] = float(r['mean_core_delta'])
 
     real_delta = (None if probe_res is None else float(probe_res['mean_core_delta']))
     temporal = (None if (real_delta is None or 'shuffle' not in ctrl_delta)
                 else real_delta - ctrl_delta['shuffle'])
+    representation_pass = bool(history and history[0].get('gate_ok', False))
+    beats_controls = bool(real_delta is not None and all(
+        real_delta > value for value in ctrl_delta.values()))
     verdict = {
-        'all_pass': bool(probe_res is not None and probe_res['learns_regime_vol_structure']),
+        # Fail closed: the task-specific representation gate must pass and REAL temporal
+        # learning must beat every corrupted-input control. The old verdict only checked that
+        # REAL beat vanilla, allowing checkpoints that lost to shuffle/random to advance.
+        'all_pass': bool(representation_pass and beats_controls),
+        'representation_pass': representation_pass,
+        'beats_controls': beats_controls,
         'learns_regime_vol_structure': (None if probe_res is None
                                         else bool(probe_res['learns_regime_vol_structure'])),
         'real_delta': real_delta,
@@ -184,6 +201,7 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
         'temporal_signal': temporal,        # real - shuffle (>0 => order contributed)
     }
     report = {'verdict': verdict, 'probe': probe_res, 'control_delta': ctrl_delta,
+              'evaluation_environment': evaluation_environment(),
               'config': {k: cfg[k] for k in cfg if not k.startswith('_') and k not in
                          ('verbose', 'device', 'model_id', 'compile_model')},
               'holdout_start': holdout_start, 'val_frac': val_frac, 'bars': int(len(big)),
@@ -339,7 +357,9 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
         state, hist = _train(big, tr, va, cfg, 'real')
     probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
                               device=cfg['device'], seed=cfg['seed'],
-                              folds=cfg.get('probe_folds', 1), verbose=verbose) if probe else None)
+                              folds=cfg.get('probe_folds', 1),
+                              group_names=_stream_names(streams),
+                              verbose=verbose) if probe else None)
     if reuse_real_checkpoint:
         std = float(probe_res['embedding_std'])
         hist[0]['std'] = std

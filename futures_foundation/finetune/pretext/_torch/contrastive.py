@@ -46,9 +46,9 @@ class ContrastiveTrendNet(nn.Module):
 
     def __init__(self, C=5, new_channels=8, proj_dim=128, model_id='paris-noah/Mantis-8M'):
         super().__init__()
-        from mantis.architecture import Mantis8M
+        from .common import load_mantis
         from mantis.adapters import LinearChannelCombiner
-        self.encoder = Mantis8M.from_pretrained(model_id)
+        self.encoder = load_mantis(model_id)
         hidden = getattr(self.encoder, 'hidden_dim', 256)
         self.new_c = min(new_channels, C)
         self.adapter = LinearChannelCombiner(num_channels=C, new_num_channels=self.new_c)

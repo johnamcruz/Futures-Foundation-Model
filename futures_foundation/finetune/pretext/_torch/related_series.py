@@ -161,7 +161,7 @@ def embed_related_windows(windows, mask, *, ckpt, role_ids=None,
     confused with the incumbent primary-only encoder input.
     """
     import numpy as np
-    from mantis.architecture import Mantis8M
+    from .common import load_mantis
 
     state = (torch.load(ckpt, map_location="cpu")
              if isinstance(ckpt, (str, bytes, os.PathLike)) else ckpt)
@@ -171,7 +171,7 @@ def embed_related_windows(windows, mask, *, ckpt, role_ids=None,
     dev = device or ("cuda" if torch.cuda.is_available()
                      else "mps" if torch.backends.mps.is_available() else "cpu")
     model = RelatedMantisEncoder(
-        Mantis8M.from_pretrained(model_id), channels=int(cfg["channels"]),
+        load_mantis(model_id), channels=int(cfg["channels"]),
         num_roles=int(cfg["num_roles"]), num_heads=int(cfg["num_heads"])).to(dev).eval()
     load_related_checkpoint(model, state)
     values = torch.as_tensor(np.asarray(windows, np.float32))

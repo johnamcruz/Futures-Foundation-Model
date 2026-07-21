@@ -16,6 +16,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ...model_identity import MANTIS_MODEL_REVISION
+
+
+def load_mantis(model_id='paris-noah/Mantis-8M'):
+    """Load the exact public base used by training and every vanilla probe baseline."""
+    from mantis.architecture import Mantis8M
+    revision = os.environ.get('MANTIS_MODEL_REVISION', MANTIS_MODEL_REVISION)
+    return Mantis8M.from_pretrained(model_id, revision=revision)
+
 
 class _nullctx:
     def __enter__(self): return None
@@ -90,10 +99,9 @@ def embed_encoder(big, starts, seq, *, ckpt=None, model_id='paris-noah/Mantis-8M
     """Frozen ENCODER-ONLY embeddings of clean (per-window z-scored) windows — the quantity that
     transfers downstream via backbone_ckpt. Each OHLCV channel is encoded independently and
     concatenated -> [M, C*hidden]. ckpt=None -> vanilla Mantis (probe baseline)."""
-    from mantis.architecture import Mantis8M
     dev = device or ('cuda' if torch.cuda.is_available()
                      else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    enc = Mantis8M.from_pretrained(model_id)
+    enc = load_mantis(model_id)
     if ckpt:
         enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(dev).eval()
@@ -120,10 +128,9 @@ def embed_window_chunks(chunks, *, ckpt=None, model_id='paris-noah/Mantis-8M', d
     write each result to a memmap without materializing either full array in RAM.
     """
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
-    from mantis.architecture import Mantis8M
     dev = device or ('cuda' if torch.cuda.is_available()
                      else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    enc = Mantis8M.from_pretrained(model_id)
+    enc = load_mantis(model_id)
     if ckpt:
         enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(dev).eval()
@@ -200,8 +207,7 @@ def export_encoder_onnx(path, *, ckpt=None, C=5, seq=64,
 
     The graph holds ONE encoder (channels batched, see _EncoderONNX) and is post-processed by
     onnxruntime offline optimization (constant folding + transpose elimination + fusion)."""
-    from mantis.architecture import Mantis8M
-    enc = Mantis8M.from_pretrained(model_id)
+    enc = load_mantis(model_id)
     if ckpt:
         enc.load_state_dict(_plain_encoder_state(torch.load(ckpt, map_location='cpu')))
     enc = enc.to(device).eval()

@@ -20,6 +20,27 @@ torch_test = pytest.mark.skipif(
 
 
 @torch_test
+@pytest.mark.parametrize('control,expect_equal', [
+    ('real', True), ('shuffle', False), ('random', False),
+])
+def test_mask_controls_corrupt_input_but_preserve_clean_target(control, expect_equal):
+    import torch
+    from futures_foundation.finetune.pretext._torch.mask import _MaskTrainer
+
+    close = np.linspace(100.0, 120.0, 128, dtype=np.float32)
+    big = np.stack([close, close + 1, close - 1, close + 0.25,
+                    np.linspace(1000, 2000, 128, dtype=np.float32)], axis=1)
+    trainer = _MaskTrainer(big, np.arange(32), np.arange(32, 64), seq=16, batch=4,
+                           epochs=1, steps_per_epoch=1, device='cpu', control=control,
+                           verbose=False)
+    source, target = trainer.make_batch(trainer.va)
+    assert source.shape == target.shape == (4, 5, 16)
+    assert torch.equal(source, target) is expect_equal
+    # Every control target remains an ordered standardized market window.
+    assert torch.all(target[:, 3, 1:] > target[:, 3, :-1])
+
+
+@torch_test
 def test_channel_batch_folding_matches_sequential_encoder_calls():
     """The MPS throughput path must preserve per-sample/channel embedding order."""
     import torch
@@ -239,6 +260,40 @@ def test_probe_embedding_recovers_signal():
     assert ssl_probe.probe_embedding(emb, y_bin, 'bin', seed=0, folds=5) > 0.85
 
 
+def test_probe_balances_and_temporally_splits_each_stream_with_purge():
+    # Three globally-offset streams with very different lengths. Each must contribute equally;
+    # every test row must follow the purged train tail from the same stream.
+    starts = np.concatenate([np.arange(0, 1000), np.arange(5000, 5200),
+                             np.arange(9000, 9100)])
+    used, groups = ssl_probe._balanced_probe_sample(starts, max_windows=90, seed=7)
+    assert len(used) == 90
+    assert np.bincount(groups).tolist() == [30, 30, 30]
+    tr, te = ssl_probe._grouped_temporal_split(used, groups, test_frac=0.3, purge=8)
+    for group in np.unique(groups):
+        gtr, gte = tr[groups[tr] == group], te[groups[te] == group]
+        assert len(gtr) and len(gte)
+        assert used[gtr].max() + 8 < used[gte].min()
+
+
+def test_compare_reports_chronos_style_stream_win_rate():
+    rng = np.random.default_rng(9)
+    groups = np.repeat(np.arange(2), 100)
+    starts = np.r_[np.arange(100), np.arange(1000, 1100)]
+    tr, te = ssl_probe._grouped_temporal_split(starts, groups, purge=0)
+    target = rng.standard_normal(200).astype(np.float32)
+    targets = {name: target for name in ('vol', 'trend_eff', 'range_expand', 'fwd_absmove')}
+    targets.update(direction=(target > 0).astype(int), fwd_dir=(target > 0).astype(int))
+    good = np.c_[target, rng.standard_normal((200, 3))].astype(np.float32)
+    base = rng.standard_normal((200, 4)).astype(np.float32)
+    out = ssl_probe.compare(good, base, targets, split=(tr, te), groups=groups,
+                            group_names=['NQ@1min', 'GC@1min'])
+    assert set(out['per_stream']) == {'NQ@1min', 'GC@1min'}
+    assert out['stream_win_rate'] == 1.0
+    assert out['average_target_win_rate'] == 1.0
+    assert out['worst_stream_win_rate'] == 1.0
+    assert out['worst_stream_delta'] > 0
+
+
 def test_probe_compare_flags_ssl_better():
     rng = np.random.default_rng(1)
     core = ['vol', 'trend_eff', 'range_expand', 'fwd_absmove']     # the gate's core targets
@@ -262,6 +317,10 @@ def test_passes_gate_on_probe_not_loss():
     assert not ssl._passes(bad, std=0.5)[0]
     # collapse -> fail regardless of probe
     assert not ssl._passes(good, std=0.001)[0]
+    # Positive pooled lift is insufficient when it is concentrated in fewer than half of the
+    # streams. Market representation must transfer broadly across the futures universe.
+    concentrated = {**good, 'stream_win_rate': 0.49}
+    assert not ssl._passes(concentrated, std=0.5)[0]
 
 
 def test_passes_forecast_gate_is_forward_centric_anti_shortcut():
@@ -384,12 +443,33 @@ def test_finalize_applies_control_budget_to_each_diagnostic(tmp_path, monkeypatc
         out_path=str(checkpoint), controls=('shuffle', 'random'),
         holdout_start='2026-01-01', val_frac=0.1,
         streams=[{'ticker': 'NQ', 'tf': '3min'}],
-        history=[{'best_val': 0.3, 'std': 0.7}], verbose=False)
+        history=[{'best_val': 0.3, 'std': 0.7, 'gate_ok': True}], verbose=False)
     assert verdict['all_pass'] is True
     assert seen == [('shuffle', 8, 8, False), ('random', 8, 8, False)]
     marker = json.loads((tmp_path / 'mask.pt.real_complete.json').read_text())
     assert marker['schema'] == 'ffm_ssl_real_complete_v1'
     assert marker['checkpoint_sha256'] == ssl._file_sha256(checkpoint)
+
+
+def test_finalize_fails_when_real_representation_loses_to_control(tmp_path, monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        save=lambda _state, path: open(path, 'wb').write(b'checkpoint'))
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setattr(ssl, '_train', lambda *_args, **_kwargs: ({}, []))
+    monkeypatch.setattr(ssl, '_probe_state', lambda *args, **kwargs: {
+        'mean_core_delta': 0.2,
+    })
+    cfg = ssl._base_cfg(control_epochs=1)
+    verdict = ssl._finalize(
+        np.zeros((4, 5)), np.array([0]), np.array([1]), {},
+        {'mean_core_delta': 0.1, 'learns_regime_vol_structure': True}, cfg,
+        out_path=str(tmp_path / 'mask.pt'), controls=('shuffle',),
+        holdout_start='2026-01-01', val_frac=0.1,
+        streams=[{'sid': 'NQ@3min', 'ticker': 'NQ', 'tf': '3min'}],
+        history=[{'best_val': 0.3, 'std': 0.7, 'gate_ok': True}], verbose=False)
+    assert verdict['representation_pass'] is True
+    assert verdict['beats_controls'] is False
+    assert verdict['all_pass'] is False
 
 
 def test_checkpoint_only_finalization_skips_real_optimization(tmp_path, monkeypatch):

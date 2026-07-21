@@ -51,8 +51,8 @@ class RelatedNextLegNet(nn.Module):
     def __init__(self, *, C=5, horizons=(5, 10, 20, 25), model_id="paris-noah/Mantis-8M",
                  num_roles=6, related_heads=4, related_dropout=0.0):
         super().__init__()
-        from mantis.architecture import Mantis8M
-        mantis = Mantis8M.from_pretrained(model_id)
+        from .common import load_mantis
+        mantis = load_mantis(model_id)
         self.related_encoder = RelatedMantisEncoder(
             mantis, channels=C, num_roles=num_roles, num_heads=related_heads,
             dropout=related_dropout)
