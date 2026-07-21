@@ -142,6 +142,16 @@ def test_bar_cache_backend_is_part_of_portable_identity(tmp_path):
     assert 'backend-mps' in mps.name
 
 
+def test_bar_cache_market_data_revision_is_part_of_identity(tmp_path):
+    args = (tmp_path, None, 'NQ', '3min', 500, 128)
+    legacy = bar_embedding_cache_path(
+        *args, device='mps', data_fingerprint='legacy-hash')
+    corrected = bar_embedding_cache_path(
+        *args, device='mps', data_fingerprint='corrected-hash')
+    assert legacy != corrected
+    assert 'data-corrected-hash' in corrected.name
+
+
 def test_cache_off(tmp_path, monkeypatch):
     monkeypatch.setenv('EMBED_CACHE', '0')
     clf = MantisFrozenClassifier(backbone_ckpt=None, with_features=False)

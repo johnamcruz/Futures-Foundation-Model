@@ -5,15 +5,27 @@ Accepts two formats in the databento/ folder:
   - <TICKER>-glbx-mdp3-....ohlcv-1m.csv.zst   (one ticker per file)
   - <any-name>.dbn.zst                          (multi-ticker DBN binary)
 
-Deduplicates roll-overlap bars, resamples to RESAMPLE_PERIOD, writes to data/.
+Selects one liquid outright contract per CME session, resamples to
+RESAMPLE_PERIOD, and writes to data/.  ``--back-adjust`` produces a replay-safe
+continuous series whose historical contracts are translated onto the newest
+contract's price basis.
+
+When extending a back-adjusted history, pass the old and new archives together
+with ``--merge-sources``.  The builder deduplicates their raw symbol bars before
+contract selection and back-adjustment; splicing two already-adjusted outputs
+would mix incompatible price bases.
 
 Valid values: '1min', '3min', '5min', '15min', '30min', '1h', '4h', '1D'
 
 DataBento roll handling:
   - Spread rows (symbol contains '-', e.g. NQM1-NQU1) carry a price diff,
     not a real bar — dropped.
-  - When two contracts trade the same minute during a roll, keep the row
-    with the highest volume (front month).
+  - Contract selection is made from TOTAL CME-session volume, never minute by
+    minute.  Minute-level selection can alternate old/new contracts inside one
+    candle and manufacture impossible 200+ point ranges.
+  - Optional back-adjustment uses the median new-minus-old close spread over
+    their real overlap.  This prevents a simulated position from booking the
+    contract price-basis difference as P&L at the handoff.
 
 Output format: datetime, open, high, low, close, volume
   Compatible with prepare_data.py and all Colab fine-tuning scripts.
@@ -22,9 +34,16 @@ Usage:
     pip install zstandard databento   # one-time
     python databento/build_continuous.py 1min
     python databento/build_continuous.py 5min
+    python databento/build_continuous.py 3min --back-adjust \
+        --output-dir data
+    python databento/build_continuous.py --periods 1min,3min,5min,15min \
+        --back-adjust --output-dir data
     python databento/build_continuous.py        # defaults to 5min
 """
 
+import argparse
+import hashlib
+import json
 import re
 import sys
 from pathlib import Path
@@ -65,8 +84,88 @@ def root_from_symbol(symbol: str) -> str | None:
     return TICKER_REMAP.get(root, root)
 
 
-def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
-    """Drop spreads, bad prices, deduplicate, return indexed 1-min DataFrame."""
+_PRICE_COLUMNS = ('open', 'high', 'low', 'close')
+
+
+def _cme_session_keys(index: pd.DatetimeIndex) -> pd.Index:
+    """Session key with the CME trading day rolling at 17:00 Chicago time."""
+    if index.tz is None:
+        index = index.tz_localize('UTC')
+    local = index.tz_convert('America/Chicago')
+    return pd.Index((local - pd.Timedelta(hours=17)).date, name='_session')
+
+
+def _session_dominant_contract(df: pd.DataFrame) -> pd.Series:
+    """Return ``session -> symbol`` using total outright session volume.
+
+    Selecting the highest-volume row independently at each minute is invalid
+    during a roll: sparse bars from both contracts can alternate and later
+    resampling combines their two price levels into one impossible candle.
+    """
+    work = df[['symbol', 'volume']].copy()
+    work['_session'] = _cme_session_keys(work.index).to_numpy()
+    totals = work.groupby(['_session', 'symbol'], sort=True)['volume'].sum()
+    dominant_pairs = totals.groupby(level=0, sort=True).idxmax()
+    return dominant_pairs.map(lambda pair: pair[1]).rename('symbol')
+
+
+def _overlap_spread(raw: pd.DataFrame, old_symbol: str, new_symbol: str,
+                    switch_ts: pd.Timestamp,
+                    lookback_days: int = 10) -> float:
+    """Robust new-minus-old close spread around a contract handoff."""
+    lo = switch_ts - pd.Timedelta(days=lookback_days)
+    sample = raw.loc[(raw.index >= lo) & (raw.index <= switch_ts)]
+    sample = sample[sample['symbol'].isin([old_symbol, new_symbol])]
+    if not sample.empty:
+        paired = (sample.reset_index()
+                  .pivot_table(index=sample.index.name or 'datetime',
+                               columns='symbol', values='close', aggfunc='last'))
+        if old_symbol in paired and new_symbol in paired:
+            spread = (paired[new_symbol] - paired[old_symbol]).dropna()
+            if len(spread) >= 5:
+                return float(spread.median())
+    old = raw.loc[(raw.index < switch_ts) & (raw['symbol'] == old_symbol), 'close']
+    new = raw.loc[(raw.index >= switch_ts) & (raw['symbol'] == new_symbol), 'close']
+    if old.empty or new.empty:
+        raise ValueError(
+            f'cannot estimate roll spread {old_symbol}->{new_symbol} at {switch_ts}')
+    return float(new.iloc[0] - old.iloc[-1])
+
+
+def _back_adjust_selected(selected: pd.DataFrame, raw: pd.DataFrame,
+                          dominant: pd.Series) -> tuple[pd.DataFrame, list[dict]]:
+    """Translate prior contract segments onto the newest contract basis."""
+    out = selected.copy()
+    adjustments = []
+    sessions = dominant.sort_index()
+    previous = None
+    for session, symbol in sessions.items():
+        if previous is None:
+            previous = symbol
+            continue
+        if symbol == previous:
+            continue
+        switch_rows = out.loc[out['_session'] == session]
+        if switch_rows.empty:
+            previous = symbol
+            continue
+        switch_ts = switch_rows.index.min()
+        spread = _overlap_spread(raw, previous, symbol, switch_ts)
+        for column in _PRICE_COLUMNS:
+            out.loc[out.index < switch_ts, column] += spread
+        adjustments.append({
+            'old_symbol': previous, 'new_symbol': symbol,
+            'switch_timestamp': switch_ts.isoformat(), 'spread': spread,
+        })
+        print(f'    Back-adjusted {previous} -> {symbol} at {switch_ts} '
+              f'by {spread:+.4f}')
+        previous = symbol
+    return out, adjustments
+
+
+def _clean_ohlcv(df: pd.DataFrame, ticker: str,
+                 back_adjust: bool = False) -> pd.DataFrame | None:
+    """Drop invalid instruments and build one-contract-per-session 1m bars."""
     spread_mask = df['symbol'].str.contains('-', na=False)
     if spread_mask.sum():
         print(f'    Dropped {spread_mask.sum():,} spread rows')
@@ -81,33 +180,64 @@ def _clean_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
         print(f'    No valid bars remaining — skipping')
         return None
 
+    raw = df.sort_index().copy()
+    dominant = _session_dominant_contract(raw)
+    df['_session'] = _cme_session_keys(df.index).to_numpy()
+    df['_dominant'] = df['_session'].map(dominant)
+    before = len(df)
+    df = df[df['symbol'] == df['_dominant']].copy()
+    removed = before - len(df)
+    print(f'    Selected one session-dominant contract; dropped '
+          f'{removed:,} overlap rows')
+
+    # Defensive only: a symbol normally has one OHLCV row per minute.  If the
+    # archive repeats one, retain its highest-volume record deterministically.
     before = len(df)
     df = df.sort_values('volume', ascending=False)
     df = df[~df.index.duplicated(keep='first')].sort_index()
-    dupes_removed = before - len(df)
-    if dupes_removed:
-        print(f'    Deduplicated {dupes_removed:,} back-month overlap rows')
+    if before != len(df):
+        print(f'    Deduplicated {before - len(df):,} same-contract rows')
 
+    adjustments = []
+    if back_adjust:
+        df, adjustments = _back_adjust_selected(df, raw, dominant)
+
+    metadata = {
+        'schema': 'ffm_continuous_contract_v1',
+        'selection': 'cme_session_total_volume',
+        'session_boundary': '17:00 America/Chicago',
+        'back_adjusted': bool(back_adjust),
+        'raw_outright_rows': int(len(raw)),
+        'overlap_rows_dropped': int(removed),
+        'dominant_sessions': int(len(dominant)),
+        'roll_adjustments': adjustments,
+    }
     df = df[['open', 'high', 'low', 'close', 'volume']]
+    df.attrs['continuous_contract'] = metadata
     print(f'    {len(df):,} 1-min bars  | {df.index[0]}  →  {df.index[-1]}')
     return df
 
 
-def load_csv_zst(path: Path) -> pd.DataFrame:
-    """Read a single-ticker DataBento .csv.zst file → clean 1-min DataFrame."""
+def load_csv_zst_raw(path: Path) -> pd.DataFrame:
+    """Decode a single-ticker CSV archive without selecting contracts."""
     print(f'  Reading {path.name} ...')
     df = pd.read_csv(path, compression='zstd')
     df['datetime'] = pd.to_datetime(df['ts_event'], utc=True)
-    df = df.set_index('datetime')
-    return _clean_ohlcv(df, ticker_from_path(path))
+    return df.set_index('datetime')
 
 
-def load_dbn_zst(path: Path) -> dict[str, pd.DataFrame]:
-    """
-    Read a multi-ticker DataBento .dbn.zst file.
-    Returns {ticker: clean_1min_df} for every instrument root found.
-    Requires: pip install databento
-    """
+def load_csv_zst(path: Path, back_adjust: bool = False) -> pd.DataFrame:
+    """Read a single-ticker DataBento .csv.zst file → clean 1-min DataFrame."""
+    df = load_csv_zst_raw(path)
+    clean = _clean_ohlcv(df, ticker_from_path(path), back_adjust=back_adjust)
+    if clean is not None:
+        clean.attrs['source_path'] = str(path.resolve())
+        clean.attrs['source_sha256'] = _sha256(path)
+    return clean
+
+
+def load_dbn_zst_raw(path: Path) -> dict[str, pd.DataFrame]:
+    """Decode a multi-ticker DBN archive without selecting contracts."""
     try:
         import databento as db
     except ImportError:
@@ -134,12 +264,60 @@ def load_dbn_zst(path: Path) -> dict[str, pd.DataFrame]:
     result = {}
     for root in sorted(roots):
         sub = df[df['_root'] == root].copy()
+        result[root] = sub
+    return result
+
+
+def load_dbn_zst(path: Path, back_adjust: bool = False) -> dict[str, pd.DataFrame]:
+    """
+    Read a multi-ticker DataBento .dbn.zst file.
+    Returns {ticker: clean_1min_df} for every instrument root found.
+    Requires: pip install databento
+    """
+    raw_map = load_dbn_zst_raw(path)
+    result = {}
+    for root, sub in raw_map.items():
         print(f'  Processing {root} ({len(sub):,} raw rows) ...')
-        clean = _clean_ohlcv(sub, root)
+        clean = _clean_ohlcv(sub, root, back_adjust=back_adjust)
         if clean is not None:
+            clean.attrs['source_path'] = str(path.resolve())
+            clean.attrs['source_sha256'] = _sha256(path)
             result[root] = clean
 
     return result
+
+
+def merge_raw_sources(source_maps: list[tuple[Path, dict[str, pd.DataFrame]]],
+                      wanted: set[str] | None = None) -> dict[str, pd.DataFrame]:
+    """Merge overlapping raw archives, preferring the later source argument.
+
+    Duplicate identity is ``(timestamp, symbol)``.  Keeping symbol in the key
+    preserves simultaneous old/new contracts needed to estimate roll spreads.
+    """
+    wanted = wanted or set()
+    by_ticker: dict[str, list[pd.DataFrame]] = {}
+    provenance: dict[str, list[Path]] = {}
+    for path, ticker_map in source_maps:
+        for ticker, frame in ticker_map.items():
+            if wanted and ticker not in wanted:
+                continue
+            by_ticker.setdefault(ticker, []).append(frame)
+            provenance.setdefault(ticker, []).append(path)
+
+    merged = {}
+    for ticker, frames in by_ticker.items():
+        raw = pd.concat(frames, axis=0)
+        before = len(raw)
+        raw = (raw.reset_index()
+               .drop_duplicates(subset=['datetime', 'symbol'], keep='last')
+               .set_index('datetime').sort_index())
+        print(f'  Merged {ticker}: {len(frames)} source(s), {len(raw):,} raw rows '
+              f'({before - len(raw):,} overlap duplicates replaced)')
+        paths = provenance[ticker]
+        raw.attrs['source_paths'] = [str(path.resolve()) for path in paths]
+        raw.attrs['source_sha256s'] = [_sha256(path) for path in paths]
+        merged[ticker] = raw
+    return merged
 
 
 def resample_ohlcv(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -153,42 +331,134 @@ def resample_ohlcv(df: pd.DataFrame, period: str) -> pd.DataFrame:
     return resampled
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('period', nargs='?', default=_DEFAULT_PERIOD)
+    parser.add_argument('--periods', default='',
+                        help='comma-separated periods to build from one raw '
+                             'load (for example 1min,3min,5min,15min); '
+                             'overrides the positional period')
+    parser.add_argument('--back-adjust', action='store_true',
+                        help='anchor prior contracts to the newest price basis')
+    parser.add_argument('--output-dir', type=Path, default=OUTPUT_DIR)
+    parser.add_argument('--source', action='append', type=Path, default=[],
+                        help='process only this archive (repeatable); default '
+                             'discovers every archive in databento/')
+    parser.add_argument('--merge-sources', action='store_true',
+                        help='merge repeated --source archives at raw '
+                             '(timestamp, symbol) level before cleaning; '
+                             'required for extending back-adjusted history')
+    parser.add_argument('--tickers', default='',
+                        help='comma-separated roots to write (default: all)')
+    args = parser.parse_args()
+    periods = ([item.strip() for item in args.periods.split(',') if item.strip()]
+               if args.periods else [args.period])
+    if len(periods) != len(set(periods)):
+        parser.error('--periods contains duplicates')
+    output_dir = args.output_dir.expanduser().resolve()
     try:
         import zstandard  # noqa: F401
     except ImportError:
         print('ERROR: zstandard not installed.  Run:  pip install zstandard')
         sys.exit(1)
 
-    csv_files = sorted(DATABENTO_DIR.glob('*.csv.zst'))
-    dbn_files = sorted(DATABENTO_DIR.glob('*.dbn.zst'))
+    if args.source:
+        sources = [path.expanduser().resolve() for path in args.source]
+        missing = [path for path in sources if not path.exists()]
+        if missing:
+            parser.error(f'source not found: {missing[0]}')
+        csv_files = sorted(path for path in sources
+                           if path.name.endswith('.csv.zst'))
+        dbn_files = sorted(path for path in sources
+                           if path.name.endswith('.dbn.zst'))
+        unsupported = [path for path in sources
+                       if path not in csv_files and path not in dbn_files]
+        if unsupported:
+            parser.error(f'unsupported source: {unsupported[0]}')
+    else:
+        csv_files = sorted(DATABENTO_DIR.glob('*.csv.zst'))
+        dbn_files = sorted(DATABENTO_DIR.glob('*.dbn.zst'))
+    wanted = {item.strip().upper() for item in args.tickers.split(',')
+              if item.strip()}
+    written: set[str] = set()
+    had_error = False
 
     if not csv_files and not dbn_files:
         print(f'No .csv.zst or .dbn.zst files found in {DATABENTO_DIR}')
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'DataBento dir : {DATABENTO_DIR}')
-    print(f'Output dir    : {OUTPUT_DIR}')
-    print(f'Resample to   : {RESAMPLE_PERIOD}')
+    print(f'Output dir    : {output_dir}')
+    print(f'Resample to   : {", ".join(periods)}')
+    print(f'Back-adjust   : {args.back_adjust}')
     print(f'CSV files     : {len(csv_files)}')
     print(f'DBN files     : {len(dbn_files)}\n')
+
+    if args.merge_sources:
+        ordered_sources = sources if args.source else [*csv_files, *dbn_files]
+        source_maps = []
+        for path in ordered_sources:
+            if path.name.endswith('.csv.zst'):
+                source_maps.append((path, {ticker_from_path(path):
+                                           load_csv_zst_raw(path)}))
+            else:
+                source_maps.append((path, load_dbn_zst_raw(path)))
+        raw_map = merge_raw_sources(source_maps, wanted)
+        for ticker, raw in sorted(raw_map.items()):
+            print(f'{"="*55}\n  {ticker}  (merged raw sources)\n{"="*55}')
+            try:
+                df_1m = _clean_ohlcv(raw, ticker, back_adjust=args.back_adjust)
+            except Exception as error:
+                print(f'  ERROR cleaning merged {ticker}: {error}')
+                had_error = True
+                continue
+            if df_1m is None:
+                had_error = True
+                continue
+            df_1m.attrs['source_paths'] = raw.attrs['source_paths']
+            df_1m.attrs['source_sha256s'] = raw.attrs['source_sha256s']
+            for period in periods:
+                _save(df_1m, ticker, period=period, output_dir=output_dir)
+            written.add(ticker)
+        missing_tickers = wanted - written
+        if missing_tickers:
+            print(f'ERROR: requested tickers not written: {sorted(missing_tickers)}')
+            had_error = True
+        if had_error:
+            print('Completed with errors.')
+            raise SystemExit(1)
+        print('Done.')
+        return
 
     # ── CSV files (one ticker per file) ──
     for path in csv_files:
         ticker = ticker_from_path(path)
+        if wanted and ticker not in wanted:
+            continue
         print(f'{"="*55}')
         print(f'  {ticker}  ({path.name})')
         print(f'{"="*55}')
         try:
-            df_1m = load_csv_zst(path)
+            df_1m = load_csv_zst(path, back_adjust=args.back_adjust)
         except Exception as e:
             print(f'  ERROR loading {path.name}: {e}')
+            had_error = True
             continue
-        _save(df_1m, ticker)
+        for period in periods:
+            _save(df_1m, ticker, period=period, output_dir=output_dir)
+        written.add(ticker)
 
     # ── DBN files (may contain multiple tickers) ──
     for path in dbn_files:
@@ -196,22 +466,53 @@ def main():
         print(f'  (DBN)  {path.name}')
         print(f'{"="*55}')
         try:
-            ticker_map = load_dbn_zst(path)
+            ticker_map = load_dbn_zst(path, back_adjust=args.back_adjust)
         except Exception as e:
             print(f'  ERROR loading {path.name}: {e}')
+            had_error = True
             continue
         for ticker, df_1m in ticker_map.items():
-            _save(df_1m, ticker)
+            if wanted and ticker not in wanted:
+                continue
+            for period in periods:
+                _save(df_1m, ticker, period=period, output_dir=output_dir)
+            written.add(ticker)
 
+    missing_tickers = wanted - written
+    if missing_tickers:
+        print(f'ERROR: requested tickers not written: {sorted(missing_tickers)}')
+        had_error = True
+    if had_error:
+        print('Completed with errors.')
+        raise SystemExit(1)
     print('Done.')
 
 
-def _save(df_1m: pd.DataFrame, ticker: str) -> None:
-    df_out = resample_ohlcv(df_1m, RESAMPLE_PERIOD)
-    out_path = OUTPUT_DIR / f'{ticker}_{RESAMPLE_PERIOD}.csv'
+def _save(df_1m: pd.DataFrame, ticker: str, period: str = RESAMPLE_PERIOD,
+          output_dir: Path = OUTPUT_DIR) -> None:
+    df_out = resample_ohlcv(df_1m, period)
+    out_path = output_dir / f'{ticker}_{period}.csv'
     df_out.index.name = 'datetime'
     df_out.to_csv(out_path)
+    contract_meta = dict(df_1m.attrs.get('continuous_contract', {}))
+    manifest = {
+        **contract_meta,
+        'ticker': ticker,
+        'timeframe': period,
+        'source_path': df_1m.attrs.get('source_path'),
+        'source_sha256': df_1m.attrs.get('source_sha256'),
+        'source_paths': df_1m.attrs.get('source_paths'),
+        'source_sha256s': df_1m.attrs.get('source_sha256s'),
+        'output_path': str(out_path.resolve()),
+        'output_sha256': _sha256(out_path),
+        'rows': int(len(df_out)),
+        'start': df_out.index[0].isoformat(),
+        'end': df_out.index[-1].isoformat(),
+    }
+    manifest_path = out_path.with_suffix(out_path.suffix + '.manifest.json')
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
     print(f'  Saved: {out_path.name}  ({len(df_out):,} bars)')
+    print(f'  Manifest: {manifest_path.name}')
     print(f'  Range: {df_out.index[0]}  →  {df_out.index[-1]}')
     print()
 

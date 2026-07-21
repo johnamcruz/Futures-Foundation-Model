@@ -89,7 +89,8 @@ def _embed_cache_path(cfg, labeler, keys):
 
 def bar_embedding_cache_path(cache_dir, checkpoint, ticker, timeframe, n_bars, seq, *,
                              device='cpu', mv_mode='ohlcv',
-                             model_id='paris-noah/Mantis-8M'):
+                             model_id='paris-noah/Mantis-8M',
+                             data_fingerprint=None):
     """Canonical path for a reusable bar-indexed frozen-Mantis embedding cache.
 
     This public path builder is shared by FFM training and downstream consumers
@@ -106,9 +107,12 @@ def bar_embedding_cache_path(cache_dir, checkpoint, ticker, timeframe, n_bars, s
     mode_tag = '' if mode == 'ohlcv' else f"_{mode}"
     backend = str(device or 'auto').lower()
     model_tag = hashlib.sha1(str(model_id).encode()).hexdigest()[:8]
+    data_tag = (f"_data-{str(data_fingerprint)[:16]}"
+                if data_fingerprint else '')
     return Path(cache_dir) / (
         f"bars_{ticker}_{timeframe}_{ckpt_id}_{int(n_bars)}_{int(seq)}"
-        f"{mode_tag}_{_BAR_CACHE_SCHEMA}_model-{model_tag}_backend-{backend}.npz")
+        f"{mode_tag}_{_BAR_CACHE_SCHEMA}_model-{model_tag}_backend-{backend}"
+        f"{data_tag}.npz")
 
 
 def _bar_cache_path(cfg, labeler, keys):
@@ -133,7 +137,8 @@ def _bar_cache_path(cfg, labeler, keys):
         os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'),
         cfg.get('backbone_ckpt'), tk, tf, nbars, seq,
         device=cfg.get('device') or 'auto', mv_mode=mv_mode,
-        model_id=cfg.get('model_id', 'paris-noah/Mantis-8M'))
+        model_id=cfg.get('model_id', 'paris-noah/Mantis-8M'),
+        data_fingerprint=labeler._b[(tk, tf)].get('source_sha256'))
 
 
 def _load_bar_cache(path):
