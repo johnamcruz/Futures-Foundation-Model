@@ -110,6 +110,39 @@ Variable-length context predicts future OHLCV moves at several horizons. Targets
 
 The final pretraining stage predicts the duration of the developing leg and its counter-leg in bars while retaining the candle-forecasting objective as an anchor. Bar counts keep the target comparable across instruments and timeframes.
 
+### Experimental related-series context
+
+`related_nextleg` is an isolated Mantis-native experiment inspired by the grouped-series
+attention used in universal forecasting models. It does **not** replace the compact Mantis
+encoder. Every OHLCV context is encoded with the same shared weights, then one small gated
+attention block lets the primary embedding consult:
+
+- other configured timeframes of the same ticker; and
+- a same-timeframe correlated sibling, such as NQ with ES.
+
+The primary stream owns every forecast and NextLeg target; related streams are evidence only.
+Alignment compares bar **close** times, so an unfinished higher-timeframe candle is physically
+unreachable. Missing and stale contexts are masked, and the fusion residual starts at exactly
+zero—before training, its output is byte-for-byte the primary-only embedding.
+
+Run it separately from the production lineage and warm-start it from a validated NextLeg encoder:
+
+```bash
+./.venv/bin/python scripts/mantis_ssl_related_nextleg.py \
+  --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
+  --tickers NQ,ES \
+  --tfs 1min,3min,5min,15min \
+  --out temp/related_nextleg/mantis_related_nextleg.pt
+```
+
+Promotion requires matched primary-only, multi-timeframe, and sibling ablations plus shuffled-
+context, missing-context, walk-forward, and temporal-stability controls. The related experiment
+writes a `mantis-related-v1` composite checkpoint containing ordinary Mantis weights and the small
+fusion block; it never overwrites a plain production encoder checkpoint.
+
+Use `--related-control shuffle` (or `drop`) for the incremental-context control: it preserves the
+primary window and every target while corrupting only the related members.
+
 Shared discipline across every stage:
 
 | Guardrail | What it does |
@@ -138,7 +171,7 @@ The production lineage writes four independent encoder artifacts:
 | Seq2seq | `mantis_ssl_ctr_seq2seq.pt` |
 | NextLeg | `mantis_ssl_nextleg.pt` |
 
-Each `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Each checkpoint is accompanied by:
+Each production-lineage `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Opt-in related-series experiments use the explicitly versioned composite format described above. Each checkpoint is accompanied by:
 
 - `<checkpoint>.report.json`: configuration, validation history, and task diagnostics;
 - `<checkpoint>.data_provenance.json`: source hashes, holdout boundary, and parent-checkpoint hash;
@@ -278,6 +311,7 @@ Futures-Foundation-Model/
 ├── futures_foundation/                # Foundation package (torch-free to import)
 │   ├── finetune/                      # ★ The model-agnostic classification pipeline
 │   │   ├── ssl.py / ssl_data.py       #   SSL orchestrator + leakage-safe data assembly
+│   │   ├── related_series.py          #   closed-bar multi-TF/sibling group alignment
 │   │   ├── pretext/                   #   mask / contrastive / forecast / NextLeg tasks
 │   │   │   ├── base.py                #     PretextTask interface (reserve / train / gate)
 │   │   │   └── _torch/                #     per-stage GPU trainers + shared BaseTrainer (save/resume/freeze)

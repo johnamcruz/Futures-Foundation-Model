@@ -30,13 +30,14 @@ from . import ssl_data
 from .pretext import PRETEXTS, PretextTask, get_pretext   # noqa: F401 (pluggable pretext registry)
 
 
-def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0, verbose=True):
+def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0, verbose=True,
+             return_related_layout=False):
     """Concatenate all stream OHLCV into one big [T, 5] array + global parent-window start
     positions for the (leak-safe, 2026-excluded) train/val split. Each window reserves enough
     bars for its consumers: seq+max_jitter (probe/mask) OR forecast_parent (stage-2 = max context
     length + max horizon), whichever is larger — so context+future stay in-stream."""
     parent_len = max(seq + max_jitter, int(forecast_parent))
-    bigs, tr_starts, va_starts, base = [], [], [], 0
+    bigs, tr_starts, va_starts, layout_records, base = [], [], [], [], 0
     for s in streams:
         oh = s['ohlcv']
         tr_idx, va_idx = ssl_data.time_split(s['ts'], val_frac, holdout_start)
@@ -53,6 +54,8 @@ def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_pare
             tr_starts.append(ts + base)
         if len(vs):
             va_starts.append(vs + base)
+        layout_records.append({**{k: s[k] for k in ('sid', 'ticker', 'tf')},
+                               'base': base, 'ts': s['ts'][:usable_end]})
         bigs.append(oh)
         base += len(oh)
         if verbose:
@@ -61,6 +64,9 @@ def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_pare
     big = np.concatenate(bigs, 0).astype(np.float32)
     tr = np.concatenate(tr_starts) if tr_starts else np.array([], np.int64)
     va = np.concatenate(va_starts) if va_starts else np.array([], np.int64)
+    if return_related_layout:
+        from .related_series import RelatedSeriesLayout
+        return big, tr, va, RelatedSeriesLayout.from_assembled(layout_records)
     return big, tr, va
 
 
@@ -81,7 +87,8 @@ def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1, verbos
     import torch
     from . import ssl_probe
     fd, tmp = tempfile.mkstemp(suffix='.pt'); os.close(fd)
-    torch.save(state, tmp)
+    from .pretext._torch.related_series import plain_encoder_state
+    torch.save(plain_encoder_state(state), tmp)
     try:
         return ssl_probe.run_probe(big, va, seq, tmp, model_id=model_id, device=device,
                                    seed=seed, folds=folds, verbose=verbose)
@@ -131,7 +138,7 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
         'temporal_signal': temporal,        # real - shuffle (>0 => order contributed)
     }
     report = {'verdict': verdict, 'probe': probe_res, 'control_delta': ctrl_delta,
-              'config': {k: cfg[k] for k in cfg if k not in
+              'config': {k: cfg[k] for k in cfg if not k.startswith('_') and k not in
                          ('verbose', 'device', 'model_id', 'compile_model')},
               'holdout_start': holdout_start, 'val_frac': val_frac, 'bars': int(len(big)),
               'tickers': sorted({s['ticker'] for s in streams}),
@@ -145,16 +152,18 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
 
 # ------------------------------------------------------------------------------- entrypoints
 def _load_assemble(data_dir, tickers, tfs, seq, max_jitter, val_frac, holdout_start, verbose,
-                   forecast_parent=0):
+                   forecast_parent=0, related=False):
     streams = ssl_data.load_ohlcv(data_dir, tickers, tfs, verbose=verbose)
-    big, tr, va = assemble(streams, seq=seq, max_jitter=max_jitter, val_frac=val_frac,
-                           holdout_start=holdout_start, forecast_parent=forecast_parent, verbose=verbose)
+    assembled = assemble(streams, seq=seq, max_jitter=max_jitter, val_frac=val_frac,
+                         holdout_start=holdout_start, forecast_parent=forecast_parent,
+                         verbose=verbose, return_related_layout=related)
+    big, tr, va = assembled[:3]
     if verbose:
         print(f"[ssl] bars={len(big)} train_win={len(tr)} val_win={len(va)} "
               f"streams={len(streams)}", flush=True)
     if len(tr) == 0 or len(va) == 0:
         raise ValueError("no train/val windows — check seq/max_jitter vs data length")
-    return streams, big, tr, va
+    return (streams, big, tr, va, assembled[3]) if related else (streams, big, tr, va)
 
 
 def _base_cfg(**kw):
@@ -213,6 +222,11 @@ def _base_cfg(**kw):
              ckpt_path=None, resume=False, freeze_encoder_layers=0,
              lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
              log_every_steps=25,
+             # Chronos-2-inspired, Mantis-native related-series experiment. These settings are
+             # inert unless pretext='related_nextleg'. Timestamps are causally aligned by bar CLOSE.
+             related_tfs=('1min', '3min', '5min', '15min'),
+             related_siblings='default', related_heads=4, related_dropout=0.0,
+             related_max_gap_factor=2.0, related_control='real',
              probe_folds=1)                                   # k-fold CV per probe (robust)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
@@ -231,9 +245,15 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     pretext = cfg.get('pretext', 'mask')
     # each pretext task declares how much window to reserve (forecast: ctx+horizon;
     # contrastive: ctx; mask: none) — no pretext if-chain here.
-    fc_reserve = get_pretext(pretext).reserve(cfg)
-    streams, big, tr, va = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
-                                           val_frac, holdout_start, verbose, forecast_parent=fc_reserve)
+    task = get_pretext(pretext)
+    fc_reserve = task.reserve(cfg)
+    loaded = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
+                            val_frac, holdout_start, verbose, forecast_parent=fc_reserve,
+                            related=task.requires_related_series)
+    if task.requires_related_series:
+        streams, big, tr, va, cfg['_related_layout'] = loaded
+    else:
+        streams, big, tr, va = loaded
     state, hist = _train(big, tr, va, cfg, 'real')
     std = float(hist[-1]['std'])
     best_ep = min(hist, key=lambda h: h['val_loss'])
