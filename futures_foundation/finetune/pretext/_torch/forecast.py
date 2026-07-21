@@ -136,7 +136,8 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                        compile_model=False, control='real', seed=0, amp_dtype='fp16',
                        grad_clip=1.0, clamp=10.0, verbose=True,
                        ckpt_path=None, resume=False, freeze_encoder_layers=0,
-                       objective='candle_mse', dir_weight=0.0, dir_close_ch=3, **_ignore):
+                       objective='candle_mse', dir_weight=0.0, dir_close_ch=3,
+                       lora_r=0, lora_alpha=16.0, lora_dropout=0.0, **_ignore):
     """Multi-horizon / variable-context candle seq2seq. Returns (best_encoder_state, history) with
     'val_loss', 'persist_loss', 'skill', 'skill_per_h', 'std' (+ 'dir_acc' if dir_weight>0). Warm-start
     from stage-1. OPTIONAL: dir_weight>0 adds a direction-head BCE term (sign of the fwd close move) to
@@ -149,4 +150,5 @@ def train_ssl_forecast(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25
                             seed=seed, grad_clip=grad_clip, amp_dtype=amp_dtype, verbose=verbose,
                             control=control, ckpt_path=ckpt_path, resume=resume,
                             freeze_encoder_layers=freeze_encoder_layers, objective=objective,
-                            dir_weight=dir_weight, dir_close_ch=dir_close_ch).fit()
+                            dir_weight=dir_weight, dir_close_ch=dir_close_ch, lora_r=lora_r,
+                            lora_alpha=lora_alpha, lora_dropout=lora_dropout).fit()

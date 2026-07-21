@@ -256,11 +256,14 @@ class BaseTrainer:
     def __init__(self, big, train_starts, val_starts, *, epochs=60, steps_per_epoch=200, batch=512,
                  lr=1e-4, weight_decay=0.05, patience=8, device=None, seed=0, grad_clip=None,
                  amp=True, amp_dtype='fp16', verbose=True, control='real',
-                 ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=0.0):
+                 ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=0.0,
+                 lora_r=0, lora_alpha=16.0, lora_dropout=0.0):
         os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
         self.ckpt_path, self.resume = ckpt_path, resume    # progressive best-save + resume (real run only)
         self.freeze_encoder_layers = freeze_encoder_layers  # anti-forgetting: freeze first N enc layers
         self.std_guard = float(std_guard or 0.0)           # >0: HALT when emb_std exceeds it (drift guard)
+        self.lora_r, self.lora_alpha = int(lora_r or 0), float(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
         self.dev = device or ('cuda' if torch.cuda.is_available()
                               else 'mps' if torch.backends.mps.is_available() else 'cpu')
         torch.manual_seed(seed)
@@ -311,12 +314,20 @@ class BaseTrainer:
         ENCODER to ckpt_path (crash-safe) and resumes from it — real run only (controls never
         touch the checkpoint). freeze_encoder_layers anchors early layers against drift."""
         self.build_net()
+        from .lora import inject_mantis_lora, load_plain_state_dict, merged_state_dict
+        if self.lora_r:
+            stats = inject_mantis_lora(self._encoder(), rank=self.lora_r,
+                                       alpha=self.lora_alpha, dropout=self.lora_dropout)
+            if self.verbose:
+                print(f"  [lora] r={self.lora_r} alpha={self.lora_alpha:g} "
+                      f"modules={stats['modules']} trainable={stats['trainable']:,}/"
+                      f"{stats['total']:,} ({stats['percent']:.2f}%)", flush=True)
         save_ok = bool(self.ckpt_path) and self.control == 'real'   # controls never touch the ckpt
         best, best_state = 1e18, None
         if self.resume and save_ok and os.path.exists(self.ckpt_path):     # resume from saved best
-            self._encoder().load_state_dict(torch.load(self.ckpt_path, map_location='cpu'))
+            load_plain_state_dict(self._encoder(), torch.load(self.ckpt_path, map_location='cpu'))
             best = _read_meta_best(self.ckpt_path)
-            best_state = {k: v.detach().cpu().clone() for k, v in self._encoder().state_dict().items()}
+            best_state = merged_state_dict(self._encoder())
             if self.verbose:
                 print(f"  [resume] loaded {self.ckpt_path} (best_val={best:.4f})", flush=True)
         nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)   # anti-forgetting
@@ -364,7 +375,7 @@ class BaseTrainer:
             improved = vloss < best - 1e-5
             if improved:
                 best, bad = vloss, 0
-                best_state = {k: v.detach().cpu().clone() for k, v in self._encoder().state_dict().items()}
+                best_state = merged_state_dict(self._encoder())
                 if save_ok:                                          # progressive best-save (crash-safe)
                     _atomic_save(best_state, self.ckpt_path)
                     _write_meta(self.ckpt_path, best, ep)

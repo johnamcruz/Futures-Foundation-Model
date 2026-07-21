@@ -77,6 +77,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"),
                         default=os.environ.get("DEVICE"))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "0")))
+    parser.add_argument("--lora-r", type=int, default=int(os.environ.get("LORA_R", "0")))
+    parser.add_argument("--lora-alpha", type=float,
+                        default=float(os.environ.get("LORA_ALPHA", "16")))
+    parser.add_argument("--lora-dropout", type=float,
+                        default=float(os.environ.get("LORA_DROPOUT", "0")))
     parser.add_argument("--resume", action="store_true", default=_env_bool("RESUME"))
     parser.add_argument("--compile", action="store_true", default=_env_bool("COMPILE"))
     parser.add_argument("--no-probe", action="store_true", default=_env_bool("NO_PROBE"))
@@ -130,6 +135,8 @@ def main() -> None:
         "stage": "mask",
         "base_model": "paris-noah/Mantis-8M",
         "backbone_ckpt": None,
+        "lora": {"rank": args.lora_r, "alpha": args.lora_alpha,
+                 "dropout": args.lora_dropout},
         "holdout_start": PRODUCTION_HOLDOUT_START,
         "tickers": list(TICKERS),
         "timeframes": list(TIMEFRAMES),
@@ -142,6 +149,8 @@ def main() -> None:
     print(f"  base       : public paris-noah/Mantis-8M (no warm checkpoint)")
     print(f"  holdout    : >= {PRODUCTION_HOLDOUT_START} physically excluded")
     print(f"  device     : {device}")
+    print(f"  adaptation : {'LoRA' if args.lora_r else 'full'}"
+          + (f" r={args.lora_r} alpha={args.lora_alpha:g}" if args.lora_r else ""))
     print(f"  batch      : {batch}")
     print(f"  output     : {out_path}")
     print(f"  provenance : {provenance_path}", flush=True)
@@ -159,6 +168,7 @@ def main() -> None:
         val_frac=args.val_frac, holdout_start=PRODUCTION_HOLDOUT_START,
         controls=controls, probe=not args.no_probe, probe_folds=args.probe_folds,
         resume=args.resume, device=device, compile_model=args.compile, seed=args.seed,
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
     )
 
     print("\n" + "=" * 60)

@@ -26,6 +26,7 @@ def test_clean_pipeline_uses_banked_seq2seq_and_nextleg_recipes():
     assert seq['horizons'] == (5, 10, 20, 25)
     assert seq['context_lengths'] == (64, 100, 150, 200)
     assert seq['holdout_start'] == '2026-01-01'
+    assert seq['lora_r'] == 8 and seq['lora_alpha'] == 16
     leg = pipeline._stage_config('nextleg')
     assert leg['pretext'] == 'nextleg' and leg['leg_k'] == 2 and leg['leg_cap'] == 256
     assert leg['holdout_start'] == '2026-01-01'

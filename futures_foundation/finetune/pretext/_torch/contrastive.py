@@ -337,7 +337,7 @@ def train_ssl_contrastive(big, train_starts, val_starts, *, seq=64, pos_deltas=(
                           patience=8, device=None, model_id='paris-noah/Mantis-8M',
                           backbone_ckpt=None, control='real', seed=0, clamp=10.0, grad_clip=1.0,
                           verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=0,
-                          **_ignore):
+                          lora_r=0, lora_alpha=16.0, lora_dropout=0.0, **_ignore):
     """Temporal-neighborhood contrastive regime refine (multi-scale positives + augmentations,
     far negatives, σ-weighted InfoNCE — label-free). Warm-start from the stage-2 seq2seq base.
     Returns (best_encoder_state, history); history extras carry the spec's A-E regime metrics
@@ -351,4 +351,5 @@ def train_ssl_contrastive(big, train_starts, val_starts, *, seq=64, pos_deltas=(
         steps_per_epoch=steps_per_epoch, batch=batch, lr=lr, weight_decay=weight_decay,
         patience=patience, device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
         control=control, ckpt_path=ckpt_path, resume=resume,
-        freeze_encoder_layers=freeze_encoder_layers).fit()
+        freeze_encoder_layers=freeze_encoder_layers, lora_r=lora_r,
+        lora_alpha=lora_alpha, lora_dropout=lora_dropout).fit()

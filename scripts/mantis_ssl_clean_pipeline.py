@@ -85,11 +85,14 @@ def _stage_map(out_dir: Path) -> dict[str, Path]:
 
 def _stage_config(stage: str) -> dict:
     """Banked, non-experimental recipe for each clean-lineage objective."""
+    lora = dict(lora_r=int(os.environ.get("LORA_R", "8")),
+                lora_alpha=float(os.environ.get("LORA_ALPHA", "16")),
+                lora_dropout=float(os.environ.get("LORA_DROPOUT", "0")))
     common = dict(
         seq=64, max_jitter=16, val_frac=0.1, holdout_start=HOLDOUT_START,
         steps_per_epoch=int(os.environ.get("STEPS_PER_EPOCH", "200")),
         patience=int(os.environ.get("PATIENCE", "8")), seed=int(os.environ.get("SEED", "0")),
-        probe=True, controls=(), compile_model=False,
+        probe=True, controls=(), compile_model=False, **lora,
     )
     if stage == "contrastive":
         return {**common, "pretext": "contrastive", "pos_deltas": (2, 16, 64),
@@ -202,11 +205,19 @@ def _run_parent(args: argparse.Namespace) -> None:
     paths = _stage_map(out_dir)
     python = Path(sys.executable).resolve()
     device = args.device or _device()
+    lora_r = int(args.lora_r)
+    if lora_r < 0:
+        raise SystemExit("--lora-r cannot be negative")
+    os.environ["LORA_R"] = str(lora_r)
+    os.environ["LORA_ALPHA"] = str(args.lora_alpha)
+    os.environ["LORA_DROPOUT"] = str(args.lora_dropout)
 
     print("\nCLEAN SSL PIPELINE PREFLIGHT PASSED")
     print(f"  data    : {data_dir}")
     print(f"  holdout : >= {HOLDOUT_START} excluded from every stage")
     print(f"  device  : {device}")
+    print(f"  tuning  : {'LoRA' if lora_r else 'full'}"
+          + (f" r={lora_r} alpha={args.lora_alpha:g}" if lora_r else ""))
     print(f"  output  : {out_dir}")
     for stage in STAGES:
         print(f"  {stage.name:11s}: batch={stage.batch[device]:4d} max_epochs={stage.epochs:3d} "
@@ -227,7 +238,9 @@ def _run_parent(args: argparse.Namespace) -> None:
             if stage.name == "mask":
                 env.update({"DATA_DIR": str(data_dir), "OUT_PATH": str(out_path),
                             "DEVICE": device, "BATCH": str(batch),
-                            "EPOCHS": str(stage.epochs)})
+                            "EPOCHS": str(stage.epochs), "LORA_R": str(lora_r),
+                            "LORA_ALPHA": str(args.lora_alpha),
+                            "LORA_DROPOUT": str(args.lora_dropout)})
                 if out_path.exists():
                     env["RESUME"] = "1"
                 command = [str(python), str(ROOT / "scripts" / "mantis_ssl_pretrain.py")]
@@ -273,8 +286,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local/MPS clean Mantis SSL pipeline")
     parser.add_argument("--data-dir", default=os.environ.get("DATA_DIR", str(ROOT / "data")))
     parser.add_argument("--out-dir", default=os.environ.get(
-        "SSL_OUT_DIR", str(ROOT / "temp" / "clean_ssl_pre2026")))
+        "SSL_OUT_DIR", str(ROOT / "temp" / "clean_ssl_pre2026_lora")))
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default=None)
+    parser.add_argument("--lora-r", type=int, default=int(os.environ.get("LORA_R", "8")),
+                        help="LoRA rank for every stage; 0 restores full fine-tuning")
+    parser.add_argument("--lora-alpha", type=float,
+                        default=float(os.environ.get("LORA_ALPHA", "16")))
+    parser.add_argument("--lora-dropout", type=float,
+                        default=float(os.environ.get("LORA_DROPOUT", "0")))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--run-stage", choices=STAGE_ORDER, help=argparse.SUPPRESS)
     return parser
