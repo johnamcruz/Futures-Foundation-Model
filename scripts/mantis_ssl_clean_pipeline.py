@@ -294,7 +294,7 @@ def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
         reusable = (saved.get("data_provenance_sha256") == provenance_hash
                     and saved.get("holdout_start") == HOLDOUT_START)
     if not reusable:
-        generator = ROOT / "colabs" / "mantis" / "generate_trend_labels.py"
+        generator = ROOT / "scripts" / "generate_trend_labels.py"
         if not generator.is_file():
             raise FileNotFoundError(f"lifecycle-label generator missing: {generator}")
         labels.parent.mkdir(parents=True, exist_ok=True)
