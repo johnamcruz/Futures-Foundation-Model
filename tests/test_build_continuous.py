@@ -59,3 +59,28 @@ def test_spreads_never_enter_continuous_bars():
     spread[['open', 'high', 'low', 'close']] = -100.0
     clean = bc._clean_ohlcv(pd.concat([raw, spread]), 'NQ')
     assert (clean['close'] > 0).all()
+
+
+def test_merge_raw_sources_prefers_new_overlap_and_preserves_contracts(tmp_path):
+    old_path = tmp_path / 'old.dbn.zst'
+    new_path = tmp_path / 'new.dbn.zst'
+    old_path.write_bytes(b'old')
+    new_path.write_bytes(b'new')
+    old = _roll_frame()
+    new = old.loc[old.index >= pd.Timestamp('2026-03-09', tz='UTC')].copy()
+    first_key = new.index[0]
+    new.loc[first_key, 'close'] += 7.0
+
+    merged = bc.merge_raw_sources([
+        (old_path, {'NQ': old}),
+        (new_path, {'NQ': new}),
+    ])['NQ']
+
+    # Both outright contracts survive at a timestamp, but the newer archive's
+    # duplicate row replaces the old archive's copy.
+    rows = merged.loc[first_key]
+    assert set(rows['symbol']) == {'NQH6', 'NQM6'}
+    symbol = new.loc[first_key, 'symbol'].iloc[0]
+    assert rows.loc[rows['symbol'] == symbol, 'close'].iloc[0] == \
+        new.loc[first_key].loc[new.loc[first_key, 'symbol'] == symbol, 'close'].iloc[0]
+    assert merged.attrs['source_paths'] == [str(old_path), str(new_path)]

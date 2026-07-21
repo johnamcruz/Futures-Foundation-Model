@@ -57,6 +57,7 @@ def seal_continuous_streams(
             "sha256": bars_sha,
             "manifest_sha256": sha256(manifest_path),
             "source_sha256": manifest.get("source_sha256"),
+            "source_sha256s": manifest.get("source_sha256s"),
             "rows": manifest.get("rows"),
             "start": manifest.get("start"),
             "end": manifest.get("end"),

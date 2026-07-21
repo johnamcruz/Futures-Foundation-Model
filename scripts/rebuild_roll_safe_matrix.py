@@ -16,14 +16,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "databento" / "build_continuous.py"
+UPDATE_PATTERN = "NQESGCSIRTYYM-glbx-mdp3-*.ohlcv-1m.dbn.zst"
 SOURCE_GROUPS = (
-    ("NQ-glbx-mdp3-*.ohlcv-1m.csv.zst", "NQ"),
-    ("ES-glbx-mdp3-*.ohlcv-1m.csv.zst", "ES"),
-    ("GC-glbx-mdp3-*.ohlcv-1m.csv.zst", "GC"),
-    ("SIL-glbx-mdp3-*.ohlcv-1m.csv.zst", "SI"),
-    ("CL-glbx-mdp3-*.ohlcv-1m.dbn.zst", "CL"),
-    ("ZB-ZN-glbx-mdp3-*.ohlcv-1m.dbn.zst", "ZB,ZN"),
-    ("glbx-mdp3-*.ohlcv-1m.dbn.zst", "RTY,YM"),
+    (("NQ-glbx-mdp3-*.ohlcv-1m.csv.zst", UPDATE_PATTERN), "NQ"),
+    (("ES-glbx-mdp3-*.ohlcv-1m.csv.zst", UPDATE_PATTERN), "ES"),
+    (("GC-glbx-mdp3-*.ohlcv-1m.csv.zst", UPDATE_PATTERN), "GC"),
+    (("SIL-glbx-mdp3-*.ohlcv-1m.csv.zst", UPDATE_PATTERN), "SI"),
+    (("glbx-mdp3-*.ohlcv-1m.dbn.zst", UPDATE_PATTERN), "RTY,YM"),
+    (("CL-glbx-mdp3-*.ohlcv-1m.dbn.zst",), "CL"),
+    (("ZB-ZN-glbx-mdp3-*.ohlcv-1m.dbn.zst",), "ZB,ZN"),
 )
 
 
@@ -72,13 +73,17 @@ def main() -> int:
     commands: list[list[str]] = []
 
     try:
-        for pattern, tickers in SOURCE_GROUPS:
-            source = _source(pattern)
+        for patterns, tickers in SOURCE_GROUPS:
+            sources = [_source(pattern) for pattern in patterns]
             command = [
                 sys.executable, str(BUILDER), "--periods", args.periods,
                 "--back-adjust", "--output-dir", str(output_dir),
-                "--source", str(source), "--tickers", tickers,
             ]
+            for source in sources:
+                command.extend(["--source", str(source)])
+            if len(sources) > 1:
+                command.append("--merge-sources")
+            command.extend(["--tickers", tickers])
             commands.append(command)
             subprocess.run(command, cwd=ROOT, check=True)
     except Exception as error:

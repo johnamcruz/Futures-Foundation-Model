@@ -10,6 +10,11 @@ RESAMPLE_PERIOD, and writes to data/.  ``--back-adjust`` produces a replay-safe
 continuous series whose historical contracts are translated onto the newest
 contract's price basis.
 
+When extending a back-adjusted history, pass the old and new archives together
+with ``--merge-sources``.  The builder deduplicates their raw symbol bars before
+contract selection and back-adjustment; splicing two already-adjusted outputs
+would mix incompatible price bases.
+
 Valid values: '1min', '3min', '5min', '15min', '30min', '1h', '4h', '1D'
 
 DataBento roll handling:
@@ -213,12 +218,17 @@ def _clean_ohlcv(df: pd.DataFrame, ticker: str,
     return df
 
 
-def load_csv_zst(path: Path, back_adjust: bool = False) -> pd.DataFrame:
-    """Read a single-ticker DataBento .csv.zst file → clean 1-min DataFrame."""
+def load_csv_zst_raw(path: Path) -> pd.DataFrame:
+    """Decode a single-ticker CSV archive without selecting contracts."""
     print(f'  Reading {path.name} ...')
     df = pd.read_csv(path, compression='zstd')
     df['datetime'] = pd.to_datetime(df['ts_event'], utc=True)
-    df = df.set_index('datetime')
+    return df.set_index('datetime')
+
+
+def load_csv_zst(path: Path, back_adjust: bool = False) -> pd.DataFrame:
+    """Read a single-ticker DataBento .csv.zst file → clean 1-min DataFrame."""
+    df = load_csv_zst_raw(path)
     clean = _clean_ohlcv(df, ticker_from_path(path), back_adjust=back_adjust)
     if clean is not None:
         clean.attrs['source_path'] = str(path.resolve())
@@ -226,12 +236,8 @@ def load_csv_zst(path: Path, back_adjust: bool = False) -> pd.DataFrame:
     return clean
 
 
-def load_dbn_zst(path: Path, back_adjust: bool = False) -> dict[str, pd.DataFrame]:
-    """
-    Read a multi-ticker DataBento .dbn.zst file.
-    Returns {ticker: clean_1min_df} for every instrument root found.
-    Requires: pip install databento
-    """
+def load_dbn_zst_raw(path: Path) -> dict[str, pd.DataFrame]:
+    """Decode a multi-ticker DBN archive without selecting contracts."""
     try:
         import databento as db
     except ImportError:
@@ -258,6 +264,19 @@ def load_dbn_zst(path: Path, back_adjust: bool = False) -> dict[str, pd.DataFram
     result = {}
     for root in sorted(roots):
         sub = df[df['_root'] == root].copy()
+        result[root] = sub
+    return result
+
+
+def load_dbn_zst(path: Path, back_adjust: bool = False) -> dict[str, pd.DataFrame]:
+    """
+    Read a multi-ticker DataBento .dbn.zst file.
+    Returns {ticker: clean_1min_df} for every instrument root found.
+    Requires: pip install databento
+    """
+    raw_map = load_dbn_zst_raw(path)
+    result = {}
+    for root, sub in raw_map.items():
         print(f'  Processing {root} ({len(sub):,} raw rows) ...')
         clean = _clean_ohlcv(sub, root, back_adjust=back_adjust)
         if clean is not None:
@@ -266,6 +285,39 @@ def load_dbn_zst(path: Path, back_adjust: bool = False) -> dict[str, pd.DataFram
             result[root] = clean
 
     return result
+
+
+def merge_raw_sources(source_maps: list[tuple[Path, dict[str, pd.DataFrame]]],
+                      wanted: set[str] | None = None) -> dict[str, pd.DataFrame]:
+    """Merge overlapping raw archives, preferring the later source argument.
+
+    Duplicate identity is ``(timestamp, symbol)``.  Keeping symbol in the key
+    preserves simultaneous old/new contracts needed to estimate roll spreads.
+    """
+    wanted = wanted or set()
+    by_ticker: dict[str, list[pd.DataFrame]] = {}
+    provenance: dict[str, list[Path]] = {}
+    for path, ticker_map in source_maps:
+        for ticker, frame in ticker_map.items():
+            if wanted and ticker not in wanted:
+                continue
+            by_ticker.setdefault(ticker, []).append(frame)
+            provenance.setdefault(ticker, []).append(path)
+
+    merged = {}
+    for ticker, frames in by_ticker.items():
+        raw = pd.concat(frames, axis=0)
+        before = len(raw)
+        raw = (raw.reset_index()
+               .drop_duplicates(subset=['datetime', 'symbol'], keep='last')
+               .set_index('datetime').sort_index())
+        print(f'  Merged {ticker}: {len(frames)} source(s), {len(raw):,} raw rows '
+              f'({before - len(raw):,} overlap duplicates replaced)')
+        paths = provenance[ticker]
+        raw.attrs['source_paths'] = [str(path.resolve()) for path in paths]
+        raw.attrs['source_sha256s'] = [_sha256(path) for path in paths]
+        merged[ticker] = raw
+    return merged
 
 
 def resample_ohlcv(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -302,6 +354,10 @@ def main():
     parser.add_argument('--source', action='append', type=Path, default=[],
                         help='process only this archive (repeatable); default '
                              'discovers every archive in databento/')
+    parser.add_argument('--merge-sources', action='store_true',
+                        help='merge repeated --source archives at raw '
+                             '(timestamp, symbol) level before cleaning; '
+                             'required for extending back-adjusted history')
     parser.add_argument('--tickers', default='',
                         help='comma-separated roots to write (default: all)')
     args = parser.parse_args()
@@ -349,6 +405,42 @@ def main():
     print(f'Back-adjust   : {args.back_adjust}')
     print(f'CSV files     : {len(csv_files)}')
     print(f'DBN files     : {len(dbn_files)}\n')
+
+    if args.merge_sources:
+        ordered_sources = sources if args.source else [*csv_files, *dbn_files]
+        source_maps = []
+        for path in ordered_sources:
+            if path.name.endswith('.csv.zst'):
+                source_maps.append((path, {ticker_from_path(path):
+                                           load_csv_zst_raw(path)}))
+            else:
+                source_maps.append((path, load_dbn_zst_raw(path)))
+        raw_map = merge_raw_sources(source_maps, wanted)
+        for ticker, raw in sorted(raw_map.items()):
+            print(f'{"="*55}\n  {ticker}  (merged raw sources)\n{"="*55}')
+            try:
+                df_1m = _clean_ohlcv(raw, ticker, back_adjust=args.back_adjust)
+            except Exception as error:
+                print(f'  ERROR cleaning merged {ticker}: {error}')
+                had_error = True
+                continue
+            if df_1m is None:
+                had_error = True
+                continue
+            df_1m.attrs['source_paths'] = raw.attrs['source_paths']
+            df_1m.attrs['source_sha256s'] = raw.attrs['source_sha256s']
+            for period in periods:
+                _save(df_1m, ticker, period=period, output_dir=output_dir)
+            written.add(ticker)
+        missing_tickers = wanted - written
+        if missing_tickers:
+            print(f'ERROR: requested tickers not written: {sorted(missing_tickers)}')
+            had_error = True
+        if had_error:
+            print('Completed with errors.')
+            raise SystemExit(1)
+        print('Done.')
+        return
 
     # ── CSV files (one ticker per file) ──
     for path in csv_files:
@@ -409,6 +501,8 @@ def _save(df_1m: pd.DataFrame, ticker: str, period: str = RESAMPLE_PERIOD,
         'timeframe': period,
         'source_path': df_1m.attrs.get('source_path'),
         'source_sha256': df_1m.attrs.get('source_sha256'),
+        'source_paths': df_1m.attrs.get('source_paths'),
+        'source_sha256s': df_1m.attrs.get('source_sha256s'),
         'output_path': str(out_path.resolve()),
         'output_sha256': _sha256(out_path),
         'rows': int(len(df_out)),
