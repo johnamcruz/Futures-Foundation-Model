@@ -212,6 +212,7 @@ def _base_cfg(**kw):
              # real run only; controls never touch the ckpt). ckpt_path is set to out_path by loop_ssl.
              ckpt_path=None, resume=False, freeze_encoder_layers=0,
              lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
+             log_every_steps=25,
              probe_folds=1)                                   # k-fold CV per probe (robust)
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d

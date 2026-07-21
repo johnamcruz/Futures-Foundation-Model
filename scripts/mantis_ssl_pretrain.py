@@ -82,6 +82,8 @@ def _parser() -> argparse.ArgumentParser:
                         default=float(os.environ.get("LORA_ALPHA", "16")))
     parser.add_argument("--lora-dropout", type=float,
                         default=float(os.environ.get("LORA_DROPOUT", "0")))
+    parser.add_argument("--log-every-steps", type=int,
+                        default=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")))
     parser.add_argument("--resume", action="store_true", default=_env_bool("RESUME"))
     parser.add_argument("--compile", action="store_true", default=_env_bool("COMPILE"))
     parser.add_argument("--no-probe", action="store_true", default=_env_bool("NO_PROBE"))
@@ -169,6 +171,7 @@ def main() -> None:
         controls=controls, probe=not args.no_probe, probe_folds=args.probe_folds,
         resume=args.resume, device=device, compile_model=args.compile, seed=args.seed,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        log_every_steps=args.log_every_steps,
     )
 
     print("\n" + "=" * 60)

@@ -91,7 +91,7 @@ def train_ssl_mask(big, train_starts, val_starts, *, seq=64, new_channels=8, mas
                    backbone_ckpt=None, compile_model=False, control='real', seed=0,
                    amp_dtype='fp16', verbose=True, ckpt_path=None, resume=False,
                    freeze_encoder_layers=0, lora_r=0, lora_alpha=16.0,
-                   lora_dropout=0.0, **_ignore):
+                   lora_dropout=0.0, log_every_steps=25, **_ignore):
     """BERT-style masked modeling (span_mean>0 = SpanBERT-style contiguous-span reconstruction).
     Returns (best_encoder_state, history) with 'val_loss' (recon MSE) + 'std' (collapse guard)."""
     return _MaskTrainer(big, train_starts, val_starts, seq=seq, new_channels=new_channels,
@@ -102,4 +102,5 @@ def train_ssl_mask(big, train_starts, val_starts, *, seq=64, new_channels=8, mas
                         device=device, seed=seed, grad_clip=None, amp_dtype=amp_dtype,
                         verbose=verbose, control=control, ckpt_path=ckpt_path, resume=resume,
                         freeze_encoder_layers=freeze_encoder_layers, lora_r=lora_r,
-                        lora_alpha=lora_alpha, lora_dropout=lora_dropout).fit()
+                        lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                        log_every_steps=log_every_steps).fit()

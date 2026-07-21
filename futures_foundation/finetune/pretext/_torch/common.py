@@ -8,6 +8,7 @@ compute_loss / val_eval — no copied loops. torch imports live under this subpa
 lazily), so the orchestrator + task registry stay torch-free.
 """
 import os
+import time
 
 import numpy as np
 
@@ -257,13 +258,14 @@ class BaseTrainer:
                  lr=1e-4, weight_decay=0.05, patience=8, device=None, seed=0, grad_clip=None,
                  amp=True, amp_dtype='fp16', verbose=True, control='real',
                  ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=0.0,
-                 lora_r=0, lora_alpha=16.0, lora_dropout=0.0):
+                 lora_r=0, lora_alpha=16.0, lora_dropout=0.0, log_every_steps=25):
         os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
         self.ckpt_path, self.resume = ckpt_path, resume    # progressive best-save + resume (real run only)
         self.freeze_encoder_layers = freeze_encoder_layers  # anti-forgetting: freeze first N enc layers
         self.std_guard = float(std_guard or 0.0)           # >0: HALT when emb_std exceeds it (drift guard)
         self.lora_r, self.lora_alpha = int(lora_r or 0), float(lora_alpha)
         self.lora_dropout = float(lora_dropout)
+        self.log_every_steps = max(0, int(log_every_steps or 0))
         self.dev = device or ('cuda' if torch.cuda.is_available()
                               else 'mps' if torch.backends.mps.is_available() else 'cpu')
         torch.manual_seed(seed)
@@ -339,8 +341,8 @@ class BaseTrainer:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.epochs)
         bad, history = 0, []
         for ep in range(self.epochs):
-            self.net.train(); tr_tot = 0.0
-            for _ in range(self.steps_per_epoch):
+            self.net.train(); tr_tot = 0.0; ep_started = time.monotonic()
+            for step in range(self.steps_per_epoch):
                 opt.zero_grad(set_to_none=True)
                 with self.amp_ctx():
                     loss = self.compute_loss(self.make_batch(self.tr))
@@ -356,6 +358,16 @@ class BaseTrainer:
                         torch.nn.utils.clip_grad_norm_(self._params(), self.grad_clip)
                     opt.step()
                 tr_tot += float(loss.detach())
+                completed = step + 1
+                if (self.verbose and self.log_every_steps and
+                        (completed == 1 or completed % self.log_every_steps == 0
+                         or completed == self.steps_per_epoch)):
+                    elapsed = time.monotonic() - ep_started
+                    rate = completed / max(elapsed, 1e-9)
+                    print(f"  [step] epoch={ep + 1}/{self.epochs} "
+                          f"step={completed}/{self.steps_per_epoch} "
+                          f"loss={tr_tot / completed:.4f} rate={rate:.2f}step/s "
+                          f"elapsed={elapsed:.1f}s", flush=True)
             sched.step()
             if self.dev == 'cuda':
                 torch.cuda.empty_cache()

@@ -167,7 +167,8 @@ def train_ssl_nextleg(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25)
                       control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
                       ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=1.6,
                       leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
-                      lora_r=0, lora_alpha=16.0, lora_dropout=0.0, **_ignore):
+                      lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
+                      log_every_steps=25, **_ignore):
     """NEXT-LEG SSL -> (best_encoder_state, history) with 'val_loss', 'skill' (candle anchor),
     'leg_corr1/2' (bars-to-leg-end / counter-leg correlation — the learning diagnostics), 'std'."""
     t = _NextLegTrainer(big, train_starts, val_starts,
@@ -179,5 +180,6 @@ def train_ssl_nextleg(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25)
                         device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
                         control=control, ckpt_path=ckpt_path, resume=resume,
                         freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
-                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+                        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                        log_every_steps=log_every_steps)
     return t.fit()
