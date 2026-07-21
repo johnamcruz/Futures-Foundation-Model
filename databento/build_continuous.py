@@ -35,9 +35,9 @@ Usage:
     python databento/build_continuous.py 1min
     python databento/build_continuous.py 5min
     python databento/build_continuous.py 3min --back-adjust \
-        --output-dir data/replay
+        --output-dir data
     python databento/build_continuous.py --periods 1min,3min,5min,15min \
-        --back-adjust --output-dir data/replay
+        --back-adjust --output-dir data
     python databento/build_continuous.py        # defaults to 5min
 """
 

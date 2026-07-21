@@ -104,7 +104,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     root = Path(__file__).parents[1]
     parser.add_argument('--legacy-dir', type=Path, default=root / 'data')
-    parser.add_argument('--clean-dir', type=Path, default=root / 'data' / 'replay')
+    parser.add_argument('--clean-dir', type=Path, default=root / 'data')
     parser.add_argument('--algo-root', type=Path,
                         default=root.parent / 'algoTraderAI')
     parser.add_argument('--tickers', default=','.join(TICKERS))

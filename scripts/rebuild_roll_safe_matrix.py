@@ -58,7 +58,7 @@ def _inside_ffm(path: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--periods", default="1min,3min,5min,15min")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "replay")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "data")
     parser.add_argument("--run-dir", type=Path,
                         default=ROOT / "temp" / "roll_audit_9x4_v1")
     parser.add_argument("--no-notify", action="store_true")
