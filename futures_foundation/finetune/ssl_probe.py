@@ -152,6 +152,9 @@ def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
                                           max_windows=len(used), seed=seed)
     tgt = targets_from_windows(big, used, seq, fwd_k=fwd_k)
     out = compare(emb_ssl, emb_van, tgt, seed=seed, folds=folds)
+    # Stable representation-scale measurement used when finalizing an already
+    # completed REAL checkpoint without reconstructing its task-specific decoder.
+    out['embedding_std'] = float(np.std(emb_ssl, axis=0).mean())
     if verbose:
         for name, d in out['per_target'].items():
             print(f"  [probe] {name:>12} ({d['kind']}) ssl={d['ssl']:.4f} "

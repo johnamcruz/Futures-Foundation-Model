@@ -73,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
     parser.add_argument("--patience", type=int, default=int(os.environ.get("PATIENCE", "8")))
     parser.add_argument("--controls", default=os.environ.get("CONTROLS", "shuffle,random"))
+    parser.add_argument("--control-epochs", type=int,
+                        default=int(os.environ.get("CONTROL_EPOCHS", "8")))
+    parser.add_argument("--reuse-real-checkpoint", action="store_true",
+                        default=os.environ.get("REUSE_REAL_CHECKPOINT") == "1",
+                        help="skip REAL optimization and finalize/probe an existing checkpoint")
     parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
                         default=os.environ.get("SAMPLING_MODE", "bar_proportional"),
                         help="Training source mixture; validation always keeps natural chronology")
@@ -170,9 +175,11 @@ def main() -> None:
         pretext="mask", backbone_ckpt=None,
         mask_ratio=args.mask_ratio, seq=args.seq, max_jitter=args.max_jitter,
         new_channels=args.new_channels, batch=batch, epochs=args.epochs,
-        steps_per_epoch=args.steps, lr=args.lr, patience=args.patience,
+        control_epochs=args.control_epochs, steps_per_epoch=args.steps,
+        lr=args.lr, patience=args.patience,
         val_frac=args.val_frac, holdout_start=PRODUCTION_HOLDOUT_START,
         controls=controls, probe=not args.no_probe, probe_folds=args.probe_folds,
+        reuse_real_checkpoint=args.reuse_real_checkpoint,
         resume=args.resume, device=device, compile_model=args.compile, seed=args.seed,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
         sampling_mode=args.sampling_mode,

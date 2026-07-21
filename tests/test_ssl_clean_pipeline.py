@@ -96,3 +96,12 @@ def test_master_preserves_virtualenv_python_for_children():
     source = SCRIPT.read_text()
     assert 'Path(sys.executable).absolute()' in source
     assert 'Path(sys.executable).resolve()' not in source
+
+
+def test_mask_controls_default_to_eight_epochs_and_resume_is_explicit(monkeypatch):
+    parser = pipeline._parser()
+    args = parser.parse_args([])
+    assert args.control_epochs == 8
+    assert args.reuse_mask_real is False
+    monkeypatch.setenv('REUSE_MASK_REAL', '1')
+    assert pipeline._parser().parse_args([]).reuse_mask_real is True

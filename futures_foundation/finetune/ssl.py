@@ -21,6 +21,7 @@ Generalization is PROBE-GATED + OPTUNA-TUNED, mirroring WF/produce:
 Colab usage: see colab/mantis_ssl_pretrain.py.
 """
 import argparse
+import hashlib
 import json
 import os
 
@@ -28,6 +29,14 @@ import numpy as np
 
 from . import ssl_data
 from .pretext import PRETEXTS, PretextTask, get_pretext   # noqa: F401 (pluggable pretext registry)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for block in iter(lambda: source.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_parent=0,
@@ -120,6 +129,15 @@ def _passes(probe_res, std, margin=0.0, dir_margin=0.0, pretext='mask'):
     return get_pretext(pretext).gate(probe_res, std, margin, dir_margin)
 
 
+def _control_cfg(cfg):
+    """Bound diagnostic controls independently from REAL optimization."""
+    out = dict(cfg)
+    out['epochs'] = min(int(cfg['epochs']), int(cfg.get('control_epochs', 8)))
+    out['patience'] = min(int(cfg['patience']), out['epochs'])
+    out['resume'] = False
+    return out
+
+
 # ------------------------------------------------------------------------------- save/probe
 def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout_start,
               val_frac, streams, history, verbose):
@@ -130,6 +148,13 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
     import torch
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
     torch.save(state, out_path)                          # adapted ENCODER state_dict
+    with open(out_path + '.real_complete.json', 'w') as marker:
+        json.dump({
+            'schema': 'ffm_ssl_real_complete_v1',
+            'checkpoint_sha256': _file_sha256(out_path),
+            'best_val': float(history[0]['best_val']),
+            'embedding_std': float(history[0]['std']),
+        }, marker, indent=2)
 
     ctrl_delta = {}
     for ctrl in controls:
@@ -137,7 +162,11 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
             continue
         if verbose:
             print(f"\n=== control={ctrl} (probe-based diagnostic) ===", flush=True)
-        st, _ = _train(big, tr, va, cfg, ctrl)
+        ctrl_cfg = _control_cfg(cfg)
+        if verbose:
+            print(f"  [control-budget] {ctrl}: max_epochs={ctrl_cfg['epochs']} "
+                  f"patience={ctrl_cfg['patience']}", flush=True)
+        st, _ = _train(big, tr, va, ctrl_cfg, ctrl)
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
                          device=cfg['device'], seed=cfg['seed'],
                          folds=cfg.get('probe_folds', 1), verbose=verbose)
@@ -190,6 +219,7 @@ def _base_cfg(**kw):
     context_lengths (variable input). Only known keys are kept."""
     d = dict(seq=64, max_jitter=16, new_channels=8, mask_ratio=0.4, epochs=60,
              steps_per_epoch=200, batch=1024, lr=1e-4, weight_decay=0.05, patience=8,
+             control_epochs=8,
              model_id='paris-noah/Mantis-8M', compile_model=False, device=None,
              seed=0, verbose=True, backbone_ckpt=None,
              sampling_mode='bar_proportional',
@@ -253,12 +283,15 @@ def _base_cfg(**kw):
 
 def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'random'),
              out_path='mantis_ssl_ohlcv.pt', probe=True, probe_margin=0.0, dir_margin=0.0,
-             holdout_start='2026-01-01', val_frac=0.1, **cfg_over):
+             holdout_start='2026-01-01', val_frac=0.1,
+             reuse_real_checkpoint=False, **cfg_over):
     """Train the SSL encoder ONCE and save it (no Optuna). pretext='mask' = stage-1 masked
     modeling; pretext='forecast' = stage-2 multi-horizon / variable-context candle seq2seq
     (warm-started from stage-1 via backbone_ckpt). Then PROBE vs vanilla + shuffle/random controls
     as diagnostics (gate = report-only), and write the encoder + report."""
     cfg = _base_cfg(**cfg_over)
+    if controls and int(cfg.get('control_epochs', 8)) < 1:
+        raise ValueError('control_epochs must be >= 1 when controls are enabled')
     cfg['ckpt_path'] = out_path              # progressive best-save target (crash-safe); real run only
     verbose = cfg['verbose']
     pretext = cfg.get('pretext', 'mask')
@@ -274,13 +307,46 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
         streams, big, tr, va, cfg['_related_layout'] = loaded
     else:
         streams, big, tr, va = loaded
-    state, hist = _train(big, tr, va, cfg, 'real')
-    std = float(hist[-1]['std'])
-    best_ep = min(hist, key=lambda h: h['val_loss'])
-    fc_skill = best_ep.get('skill')                       # forecast skill vs copy-now (None for mask)
+    if reuse_real_checkpoint:
+        if not os.path.isfile(out_path):
+            raise FileNotFoundError(
+                f'cannot reuse REAL checkpoint; file missing: {out_path}')
+        if not probe:
+            raise ValueError('checkpoint-only finalization requires probe=True')
+        marker_path = out_path + '.real_complete.json'
+        if os.path.isfile(marker_path):
+            marker = json.loads(open(marker_path).read())
+            if marker.get('checkpoint_sha256') != _file_sha256(out_path):
+                raise RuntimeError(
+                    f'REAL-complete marker does not match checkpoint: {out_path}')
+        elif verbose:
+            print('[ssl] WARNING: explicit recovery of a pre-marker checkpoint; '
+                  'the representation probe will revalidate it', flush=True)
+        import torch
+        state = torch.load(out_path, map_location='cpu')
+        meta_path = out_path + '.meta.json'
+        meta = json.loads(open(meta_path).read()) if os.path.isfile(meta_path) else {}
+        hist = [{
+            'epoch': int(meta.get('epoch', -1)),
+            'train_loss': None,
+            'val_loss': float(meta.get('best_val', float('nan'))),
+            'resumed_finalization_only': True,
+        }]
+        if verbose:
+            print(f"[ssl] reusing saved REAL checkpoint -> {out_path}; "
+                  "REAL optimization skipped", flush=True)
+    else:
+        state, hist = _train(big, tr, va, cfg, 'real')
     probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
                               device=cfg['device'], seed=cfg['seed'],
                               folds=cfg.get('probe_folds', 1), verbose=verbose) if probe else None)
+    if reuse_real_checkpoint:
+        std = float(probe_res['embedding_std'])
+        hist[0]['std'] = std
+    else:
+        std = float(hist[-1]['std'])
+    best_ep = min(hist, key=lambda h: h['val_loss'])
+    fc_skill = best_ep.get('skill')                       # forecast skill vs copy-now (None for mask)
     ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext)
     history = [{'source': 'default', 'best_val': float(best_ep['val_loss']), 'std': std,
                 'forecast_skill': fc_skill, 'gate_ok': bool(ok), **detail}]
@@ -322,6 +388,10 @@ def main():
     p.add_argument('--val-frac', type=float, default=float(os.environ.get('VAL_FRAC', '0.1')))
     p.add_argument('--holdout-start', default=os.environ.get('HOLDOUT_START', '2026-01-01'))
     p.add_argument('--controls', default=os.environ.get('CONTROLS', 'shuffle,random'))
+    p.add_argument('--control-epochs', type=int,
+                   default=int(os.environ.get('CONTROL_EPOCHS', '8')))
+    p.add_argument('--reuse-real-checkpoint', action='store_true',
+                   default=os.environ.get('REUSE_REAL_CHECKPOINT') == '1')
     p.add_argument('--no-probe', action='store_true', default=os.environ.get('NO_PROBE') == '1')
     p.add_argument('--device', default=os.environ.get('DEVICE'))
     p.add_argument('--compile', action='store_true', default=os.environ.get('COMPILE') == '1')
@@ -331,8 +401,10 @@ def main():
              tickers=(a.tickers.split(',') if a.tickers else None), tfs=a.tfs.split(','),
              controls=tuple(a.controls.split(',')), probe=not a.no_probe,
              holdout_start=a.holdout_start, val_frac=a.val_frac, seq=a.seq, max_jitter=a.max_jitter,
-             new_channels=a.new_channels, batch=a.batch, epochs=a.epochs, steps_per_epoch=a.steps,
+             new_channels=a.new_channels, batch=a.batch, epochs=a.epochs,
+             control_epochs=a.control_epochs, steps_per_epoch=a.steps,
              lr=a.lr, device=a.device, compile_model=a.compile, seed=a.seed, pretext=a.pretext,
+             reuse_real_checkpoint=a.reuse_real_checkpoint,
              backbone_ckpt=a.backbone_ckpt,
              horizons=tuple(int(x) for x in a.horizons.split(',')),
              context_lengths=tuple(int(x) for x in a.context_lengths.split(',')))
