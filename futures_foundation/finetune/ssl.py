@@ -40,6 +40,13 @@ def assemble(streams, *, seq, max_jitter, val_frac, holdout_start, forecast_pare
     for s in streams:
         oh = s['ohlcv']
         tr_idx, va_idx = ssl_data.time_split(s['ts'], val_frac, holdout_start)
+        # time_split already prevents train/val windows from referencing the holdout. Also
+        # truncate the resident array at that boundary so held-out bars cannot enter training
+        # through a future sampler/control change and do not consume accelerator memory. Since
+        # load_ohlcv sorts timestamps, the usable train+val region is always a causal prefix.
+        usable_end = (int(va_idx[-1]) + 1 if len(va_idx)
+                      else int(tr_idx[-1]) + 1 if len(tr_idx) else 0)
+        oh = oh[:usable_end]
         ts = ssl_data.window_starts(tr_idx, parent_len)
         vs = ssl_data.window_starts(va_idx, parent_len)
         if len(ts):

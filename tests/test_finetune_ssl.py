@@ -74,6 +74,20 @@ def test_assemble_windows_stay_within_stream(tmp_path):
         assert bounds[seg] <= s and s + parent <= bounds[seg + 1]
 
 
+def test_assemble_physically_removes_holdout_bars(tmp_path):
+    """The accelerator-resident tensor itself contains no holdout bars, not merely no
+    holdout window starts. This keeps the exclusion fail-safe against future samplers."""
+    _write_csv(tmp_path / 'ES_3min.csv', 20, start='2025-12-31 23:30', freq='3min')
+    streams = ssl_data.load_ohlcv(str(tmp_path), ['ES'], ['3min'], verbose=False)
+    cut = pd.Timestamp('2026-01-01', tz='UTC')
+    expected = int((pd.DatetimeIndex(streams[0]['ts']) < cut).sum())
+    big, tr, va = ssl.assemble(streams, seq=2, max_jitter=1, val_frac=0.4,
+                               holdout_start='2026-01-01', verbose=False)
+    assert len(big) == expected == 10
+    assert len(tr) and len(va)
+    assert max(np.concatenate([tr, va])) + 3 <= len(big)
+
+
 # ---------------------------------------------------------------- probe + gate (torch-free)
 def test_targets_from_windows():
     seq = 8
