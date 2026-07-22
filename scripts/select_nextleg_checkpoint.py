@@ -85,10 +85,17 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         failures.append("Probe Atlas pool identity differs")
     if baseline["manifest"].get("data_provenance") != candidate["manifest"].get("data_provenance"):
         failures.append("sealed data provenance differs")
-    base_parent = ((baseline["manifest"].get("stages") or {}).get("seq2seq") or {}).get("sha256")
-    cand_parent = ((candidate["manifest"].get("stages") or {}).get("seq2seq") or {}).get("sha256")
-    if not base_parent or cand_parent != base_parent:
-        failures.append("candidate does not use the baseline Seq2Seq parent")
+    base_parent_row = ((baseline["manifest"].get("stages") or {}).get("seq2seq") or {})
+    cand_parent_row = ((candidate["manifest"].get("stages") or {}).get("seq2seq") or {})
+    base_parent = base_parent_row.get("sha256")
+    cand_parent = cand_parent_row.get("sha256")
+    parent_source_stage = cand_parent_row.get("source_stage", "seq2seq")
+    refinement = parent_source_stage == "nextleg"
+    expected_parent = baseline["sha256"] if refinement else base_parent
+    if not expected_parent or cand_parent != expected_parent:
+        failures.append(
+            "candidate does not use the exact baseline "
+            + ("NextLeg refinement parent" if refinement else "Seq2Seq parent"))
 
     report = candidate["report"]
     verdict = report.get("verdict") or {}
@@ -111,6 +118,7 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         failures.append("candidate has no positive temporal-order signal")
 
     history = (report.get("history") or [{}])[0]
+    baseline_history = (baseline["report"].get("history") or [{}])[0]
     if float(history.get("forecast_skill") or 0) <= 0:
         failures.append("candidate does not beat candle persistence")
     if float(history.get("leg_corr1") or 0) <= 0 or float(history.get("leg_corr2") or 0) <= 0:
@@ -141,6 +149,18 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
             "baseline": _worst_stream_mean(bp),
             "candidate": _worst_stream_mean(cp),
         },
+        "forecast_skill": {
+            "baseline": float(baseline_history.get("forecast_skill") or 0),
+            "candidate": float(history.get("forecast_skill") or 0),
+        },
+        "leg_corr1": {
+            "baseline": float(baseline_history.get("leg_corr1") or 0),
+            "candidate": float(history.get("leg_corr1") or 0),
+        },
+        "leg_corr2": {
+            "baseline": float(baseline_history.get("leg_corr2") or 0),
+            "candidate": float(history.get("leg_corr2") or 0),
+        },
     }
     for row in metrics.values():
         row["delta"] = row["candidate"] - row["baseline"]
@@ -154,21 +174,36 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     if metrics["worst_stream_mean_auc"]["delta"] < -0.010:
         failures.append("worst-stream mean regressed by more than 0.010 AUC")
 
-    improves = bool(
+    atlas_improves = bool(
         metrics["prediction_mean_auc"]["delta"] >= 0.001
         or metrics["persistent_trend_start_auc"]["delta"] >= 0.005
         or metrics["worst_stream_mean_auc"]["delta"] >= 0.005
     )
+    refinement_improves = bool(
+        refinement
+        and metrics["leg_corr1"]["delta"] >= -0.005
+        and metrics["leg_corr2"]["delta"] >= 0.005
+        and metrics["forecast_skill"]["delta"] >= -0.002
+    )
+    if refinement and metrics["leg_corr1"]["delta"] < -0.005:
+        failures.append("refinement materially regressed first-leg correlation")
+    if refinement and metrics["leg_corr2"]["delta"] < 0.005:
+        failures.append("refinement did not materially improve second-leg correlation")
+    if refinement and metrics["forecast_skill"]["delta"] < -0.002:
+        failures.append("refinement materially regressed forecast skill")
+    improves = atlas_improves or refinement_improves
     if not improves:
         failures.append("uniform candidate has no material predictive/generalization improvement")
 
     return {
         "schema": "ffm_nextleg_checkpoint_selection_v1",
+        "lineage_mode": "nextleg_uniform_refinement" if refinement else "seq2seq_uniform",
         "status": "PROMOTE_CANDIDATE" if not failures else "REJECT_CANDIDATE",
         "winner": str(candidate["checkpoint"]) if not failures else None,
         "baseline_sha256": baseline["sha256"],
         "candidate_sha256": candidate["sha256"],
         "seq2seq_parent_sha256": base_parent,
+        "candidate_parent_sha256": cand_parent,
         "metrics": metrics,
         "candidate_controls": {
             "task_control": task_control,
