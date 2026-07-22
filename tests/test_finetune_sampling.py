@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from futures_foundation.finetune.sampling import sample_epoch_rows
+from futures_foundation.finetune.sampling import (
+    resolve_epoch_sampling_mode, sample_epoch_rows)
 
 
 def test_bar_proportional_is_a_deterministic_without_replacement_shuffle():
@@ -40,3 +41,13 @@ def test_epoch_sampler_rejects_unknown_modes_and_out_of_range_rows():
         sample_epoch_rows([0], ["x"], mode="future_mode")
     with pytest.raises(ValueError, match="outside stream_ids"):
         sample_epoch_rows([1], ["x"], mode="uniform_stream")
+
+
+def test_two_stage_sampling_schedule_switches_at_declared_halfway_point():
+    assert [resolve_epoch_sampling_mode("bar_then_uniform", ep, 6) for ep in range(6)] == [
+        "bar_proportional", "bar_proportional", "bar_proportional",
+        "uniform_stream", "uniform_stream", "uniform_stream",
+    ]
+    assert resolve_epoch_sampling_mode("uniform_stream", 0, 1) == "uniform_stream"
+    with pytest.raises(ValueError, match="unsupported sampling curriculum"):
+        resolve_epoch_sampling_mode("adaptive_oos", 0, 10)

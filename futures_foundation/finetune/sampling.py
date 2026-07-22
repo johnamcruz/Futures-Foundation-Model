@@ -14,6 +14,25 @@ import numpy as np
 SAMPLING_MODES = ("bar_proportional", "uniform_stream")
 
 
+def resolve_epoch_sampling_mode(mode, epoch, total_epochs, *, switch_fraction=0.5):
+    """Resolve a fixed or two-stage sampling curriculum for one epoch.
+
+    ``bar_then_uniform`` first exposes the model to the naturally abundant corpus, then gives
+    every stream equal influence during refinement. The schedule depends only on the declared
+    epoch budget—never validation or OOS outcomes.
+    """
+    if mode in SAMPLING_MODES:
+        return mode
+    if mode != "bar_then_uniform":
+        raise ValueError(f"unsupported sampling curriculum {mode!r}")
+    total_epochs = int(total_epochs)
+    epoch = int(epoch)
+    if total_epochs <= 1 or not 0.0 < float(switch_fraction) < 1.0:
+        raise ValueError("bar_then_uniform requires total_epochs > 1 and 0 < switch_fraction < 1")
+    switch = max(1, min(total_epochs - 1, round(total_epochs * float(switch_fraction))))
+    return "bar_proportional" if epoch < switch else "uniform_stream"
+
+
 def sample_epoch_rows(rows, stream_ids, *, mode="bar_proportional", seed=0, epoch=0):
     """Return deterministic row indices for one training epoch.
 
