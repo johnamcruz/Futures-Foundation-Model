@@ -352,6 +352,10 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     # contrastive: ctx; mask: none) — no pretext if-chain here.
     task = get_pretext(pretext)
     fc_reserve = task.reserve(cfg)
+    # Trainers may gather a much shorter GPU tensor than the split-safety
+    # window. Preserve the actual legal-window reserve so target-side leak
+    # guards validate the split contract, not the batch allocation width.
+    cfg['target_reserve'] = fc_reserve
     loaded = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
                             val_frac, holdout_start, verbose, forecast_parent=fc_reserve,
                             sampling_mode=cfg.get('sampling_mode', 'bar_proportional'),

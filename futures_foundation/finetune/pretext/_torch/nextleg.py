@@ -67,23 +67,42 @@ def _leg_targets(big, k, leg_cap):
             np.asarray(oks, bool))
 
 
+def _validate_target_reserve(tgts, *, max_ctx, target_reserve, batch_parent):
+    """Assert target futures fit the split-safe window, independently of GPU width.
+
+    ``target_reserve`` is the parent length used by ``ssl.assemble`` to build
+    legal train/validation starts. ``batch_parent`` is only the smaller tensor
+    gathered for candle horizons and is included in the error for diagnosis.
+    """
+    horizon = np.expm1(tgts[:, 0]) + np.expm1(tgts[:, 1])
+    max_future = float(horizon.max()) if len(horizon) else 0.0
+    reserved_future = int(target_reserve) - int(max_ctx)
+    assert max_future < reserved_future + 1, (
+        f'TEMPORAL LEAK: target reads {max_future:.0f} bars ahead but only '
+        f'{reserved_future} split-safe future bars were reserved '
+        f'(target_reserve={target_reserve}, ctx={max_ctx}, '
+        f'batch_parent={batch_parent}). reserve() must cover the FULL target '
+        f'horizon (both legs) or boundary anchors leak across the split.')
+
+
 class _NextLegTrainer(_ForecastTrainer):
-    def __init__(self, big, tr, va, *, leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0, **fw):
+    def __init__(self, big, tr, va, *, leg_cap=256, leg_w=1.0, leg_k=2,
+                 mse_weight=1.0, target_reserve=None, **fw):
         super().__init__(big, tr, va, **fw)
         self.leg_w, self.mse_weight = float(leg_w), float(mse_weight)
         confirms, tgts, ok = _leg_targets(np.asarray(big, np.float32), int(leg_k), int(leg_cap))
         confirms, tgts = confirms[ok], tgts[ok]            # resolved-only anchors
         starts = confirms - self.max_ctx + 1               # window start s.t. ctx ENDS at confirm
         # ── LEAK GUARD (2026-07-17): the target reads out to o_nn = confirm + t1 + t2. That index
-        # MUST stay inside the reserved window [start, start+parent) or a boundary anchor's target
-        # peeks across the train/val or pre-2026 split. tgts hold log1p(bars) -> recover t1+t2.
-        _horizon = np.expm1(tgts[:, 0]) + np.expm1(tgts[:, 1])          # o_nn - confirm, in bars
-        _max_future = float(_horizon.max()) if len(_horizon) else 0.0
-        _reserved_future = self.parent - self.max_ctx                   # bars of future in the window
-        assert _max_future < _reserved_future + 1, (
-            f'TEMPORAL LEAK: target reads {_max_future:.0f} bars ahead but only {_reserved_future} '
-            f'reserved (parent={self.parent}, ctx={self.max_ctx}). reserve() must cover the FULL '
-            f'target horizon (both legs) or boundary anchors leak across the split.')
+        # MUST stay inside the split-safe window [start, start+target_reserve) or a boundary
+        # anchor's target peeks across the train/val or pre-2026 split. This is intentionally
+        # distinct from self.parent, the smaller ctx+candle-horizon GPU gather width.
+        # tgts hold log1p(bars) -> recover t1+t2.
+        if target_reserve is None:
+            target_reserve = self.max_ctx + 2 * int(leg_cap)
+        _validate_target_reserve(
+            tgts, max_ctx=self.max_ctx, target_reserve=target_reserve,
+            batch_parent=self.parent)
         # anchor sets = pivot-anchored starts that are LEGAL train/val window starts (leak-safe
         # split + in-stream reserve both inherited from the orchestrator's start sets)
         tr_np, va_np = tr if isinstance(tr, np.ndarray) else np.asarray(tr), \
@@ -167,6 +186,7 @@ def train_ssl_nextleg(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25)
                       control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
                       ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=1.6,
                       leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
+                      target_reserve=None,
                       lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
                       log_every_steps=25, **_ignore):
     """NEXT-LEG SSL -> (best_encoder_state, history) with 'val_loss', 'skill' (candle anchor),
@@ -175,7 +195,8 @@ def train_ssl_nextleg(big, train_starts, val_starts, *, horizons=(5, 10, 20, 25)
                         horizons=horizons, context_lengths=context_lengths,
                         new_channels=new_channels, model_id=model_id, backbone_ckpt=backbone_ckpt,
                         clamp=clamp, leg_cap=leg_cap, leg_w=leg_w, leg_k=leg_k,
-                        mse_weight=mse_weight, epochs=epochs, steps_per_epoch=steps_per_epoch,
+                        mse_weight=mse_weight, target_reserve=target_reserve,
+                        epochs=epochs, steps_per_epoch=steps_per_epoch,
                         batch=batch, lr=lr, weight_decay=weight_decay, patience=patience,
                         device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
                         control=control, ckpt_path=ckpt_path, resume=resume,

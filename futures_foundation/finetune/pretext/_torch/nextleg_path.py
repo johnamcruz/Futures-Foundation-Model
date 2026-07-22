@@ -158,7 +158,8 @@ def train_ssl_nextleg_path(big, train_starts, val_starts, *, horizons=(5, 10, 20
                            control='real', seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
                            ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=1.6,
                            leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
-                           retrace_w=1.0, retrace_cap=2.0, **_ignore):
+                           target_reserve=None, retrace_w=1.0, retrace_cap=2.0,
+                           **_ignore):
     """NEXT-LEG + PATH SSL -> (best_encoder_state, history). History adds 'retrace_corr' (the
     learning diagnostic for the path target) to 2.6's 'skill'/'leg_corr1'/'leg_corr2'/'std'.
 
@@ -179,6 +180,7 @@ def train_ssl_nextleg_path(big, train_starts, val_starts, *, horizons=(5, 10, 20
                             new_channels=new_channels, model_id=model_id,
                             backbone_ckpt=backbone_ckpt, clamp=clamp, leg_cap=leg_cap,
                             leg_w=leg_w, leg_k=leg_k, mse_weight=mse_weight,
+                            target_reserve=target_reserve,
                             retrace_w=retrace_w, retrace_cap=retrace_cap,
                             epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch, lr=lr,
                             weight_decay=weight_decay, patience=patience, device=device,

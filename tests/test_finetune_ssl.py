@@ -1124,3 +1124,18 @@ def test_nextleg_reserve_covers_both_legs_no_target_leak():
     r = NextLegTask().reserve(cfg)
     assert r == 128 + 2 * 256                                   # both legs reserved
     assert r - max(cfg['context_lengths']) >= 2 * cfg['leg_cap']  # reserved future >= full target horizon
+
+
+def test_nextleg_runtime_guard_uses_split_reserve_not_gpu_forecast_width():
+    """The GPU batch only gathers ctx+max candle horizon (200+25), while
+    split legality reserves ctx+two complete legs (200+512).  A 438-bar leg
+    target is safe under the latter and must not be compared with the former.
+    """
+    from futures_foundation.finetune.pretext._torch.nextleg import _validate_target_reserve
+
+    targets = np.log1p(np.asarray([[220.0, 218.0]], np.float32))
+    _validate_target_reserve(targets, max_ctx=200, target_reserve=712,
+                             batch_parent=225)
+    with pytest.raises(AssertionError, match='TEMPORAL LEAK'):
+        _validate_target_reserve(targets, max_ctx=200, target_reserve=225,
+                                 batch_parent=225)
