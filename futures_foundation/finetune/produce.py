@@ -407,12 +407,14 @@ def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
+            'head_training': out.get('head_training'),
         },
         'chop_calibration': ({'method': 'platt', 'baked_into_onnx': True,
                               'A': out['chop_platt'][0], 'B': out['chop_platt'][1]}
                              if out.get('chop_platt') else None),
         'chop_percentiles': out.get('chop_percentiles'),
         'chop_fusion': out.get('chop_fusion'),
+        'head_training': out.get('head_training'),
         'onnx': (Path(onnx_path).name if sha else None), 'content_sha': sha,
     }
 
@@ -728,6 +730,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                chop_percentiles=getattr(clf_real, '_chop_percentiles', None),
                chop_abstention_audit=getattr(clf_real, '_chop_abstention_audit', None),
                chop_fusion=getattr(clf_real, '_chop_fusion', None),
+               head_training=getattr(clf_real, '_head_training', None),
                # HEAD-FIT REPORT (iters/converged/curve/seconds) — the training-side diagnostic:
                # convergence speed on a FROZEN embedding is an encoder signal, and a capped fit
                # is a caveat on every number below it. Ledgered for cross-checkpoint comparison.
