@@ -263,6 +263,42 @@ def ticker_generalization(per_ticker_ops, rates=(5, 3, 2, 1), min_mean_r=0.0):
     }
 
 
+def ticker_shuffle_generalization(per_ticker_ops, per_ticker_shuffle_ops,
+                                  rates=(5, 3, 2, 1), min_lift_r=PASS_LIFT_MARGIN_R):
+    """Matched real-vs-shuffle gate inside each ticker's own candidate distribution."""
+    requested = tuple(int(rate) for rate in rates)
+    rows, failures = {}, []
+    all_tickers = sorted(set(per_ticker_ops or {}) | set(per_ticker_shuffle_ops or {}))
+    for ticker in all_tickers:
+        real = {int(row['rate']): row for row in (per_ticker_ops or {}).get(ticker, [])}
+        shuffled = {
+            int(row['rate']): row for row in (per_ticker_shuffle_ops or {}).get(ticker, [])}
+        ticker_rows = {}
+        for rate in requested:
+            r, s = real.get(rate), shuffled.get(rate)
+            lift = (None if r is None or s is None
+                    else float(r['meanR']) - float(s['meanR']))
+            passed = bool(
+                r and s and r.get('rate_met', False) and s.get('rate_met', False)
+                and lift is not None and np.isfinite(lift) and lift >= float(min_lift_r))
+            ticker_rows[str(rate)] = {
+                'passed': passed,
+                'real_meanR': (float(r['meanR']) if r is not None else None),
+                'shuffle_meanR': (float(s['meanR']) if s is not None else None),
+                'liftR': lift,
+                'rate_met': bool(r and s and r.get('rate_met', False)
+                                 and s.get('rate_met', False)),
+            }
+            if not passed:
+                failures.append(f'{ticker}@{rate}/day')
+        rows[ticker] = ticker_rows
+    return {
+        'passed': bool(rows) and not failures,
+        'rates': list(requested), 'min_liftR_inclusive': float(min_lift_r),
+        'tickers': rows, 'failures': failures,
+    }
+
+
 def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     """OOS WR@3R broken down by MODEL SCORE band (NON-cumulative) — 'is a higher score actually a
     better trade?'. Splits pivots into score quantile bands (top 10% / 10-25% / 25-50% / 50-75% /
@@ -796,7 +832,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             for r, s in zip(ops, ops_sh) if r['rate'] == s['rate'])
     # PER-TICKER operating points (the deploy question is per-instrument: "NQ at N/day") —
     # rank WITHIN each ticker's candidates, same forward-threshold semantics.
-    per_tk, per_stream = {}, {}
+    per_tk, per_tk_sh, per_stream = {}, {}, {}
     if oos_ts is not None and len(Kte):
         _sids = np.array([str(k[0]) for k in Kte])                 # 'NQ@1min' — ticker AND TF
         _tks = np.array([s.split('@')[0] for s in _sids])
@@ -808,6 +844,9 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ks = [k for k, mm in zip(Kte, m) if mm]
             ts_s = [t for t, mm in zip(oos_ts, m) if mm]
             per_tk[_t] = operating_points(eval_lab, ks, _pa[m], ts_s, rates=DEPLOY_RATES)
+            if Rs is not None:
+                per_tk_sh[_t] = operating_points(
+                    eval_lab, ks, np.asarray(ps, float)[m], ts_s, rates=DEPLOY_RATES)
         # PER-STREAM (ticker AND TIMEFRAME). per_ticker_ops SPLITS ON '@' AND THROWS THE TF AWAY,
         # so 'NQ' there is a BLEND of NQ@1min/3min/5min/15min — four different candidate densities
         # (1min ~150/day vs 3min ~51/day) and four different proba distributions averaged into one
@@ -822,6 +861,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ts_s = [t for t, mm in zip(oos_ts, m) if mm]
             per_stream[_s] = operating_points(eval_lab, ks, _pa[m], ts_s, rates=DEPLOY_RATES)
     generalization = ticker_generalization(per_tk)
+    shuffle_generalization = ticker_shuffle_generalization(per_tk, per_tk_sh)
     out = dict(oos_auc=auc, best_val_auc=ba, oos_meanR=_meanR(R),
                shuffle_meanR=(_meanR(Rs) if Rs is not None else None), edge_shuffle=edge,
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
@@ -832,8 +872,10 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                wr_by_alignment=align,
                wr_by_regime=regimes,
                selection_concentration=concentration,
-               per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
+               per_ticker_ops=per_tk, per_ticker_shuffle_ops=per_tk_sh,
+               per_stream_ops=per_stream,   # per_stream keeps the TF
                ticker_generalization=generalization,
+               ticker_shuffle_generalization=shuffle_generalization,
                # PER-STREAM PERCENTILES from the VAL distribution -> the deploy contract's 0-100
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
                # distributional ladder's labels and is None on the single-head path, while this

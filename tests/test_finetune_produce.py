@@ -368,6 +368,21 @@ def test_ticker_generalization_fails_missing_or_unsustainable_rate():
     assert out['failures'] == ['GC@3/day', 'GC@2/day', 'GC@1/day']
 
 
+def test_ticker_shuffle_generalization_matches_rates_inside_each_ticker():
+    def rows(values):
+        return [dict(rate=rate, meanR=value, rate_met=True)
+                for rate, value in zip((5, 3, 2, 1), values)]
+
+    out = produce.ticker_shuffle_generalization(
+        {'NQ': rows((.12, .13, .14, .15)), 'GC': rows((.08, .09, .10, .11))},
+        {'NQ': rows((.01, .02, .03, .04)), 'GC': rows((.01, .02, .20, .03))},
+        min_lift_r=.05)
+    assert out['tickers']['NQ']['5']['passed'] is True
+    assert out['tickers']['NQ']['5']['liftR'] == pytest.approx(.11)
+    assert out['tickers']['GC']['2']['passed'] is False
+    assert out['failures'] == ['GC@2/day']
+
+
 def test_train_final_writes_signal_contract(tmp_path):
     import json
     lab = SyntheticLabeler(n_bars=1600, seed=0)
