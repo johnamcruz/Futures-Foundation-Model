@@ -105,6 +105,41 @@ def test_operating_points_uses_exact_strategy_win_truth():
     assert rows[0]['meanR'] == pytest.approx(1.675)
 
 
+def test_target_operating_points_reports_each_strategy_rung():
+    class _LadderLab(_RLabeler):
+        def evaluate_targets(self, keys, preds):
+            return {
+                2.0: np.array([k[4] for k, p in zip(keys, preds) if p == 1], float),
+                3.0: np.array([k[5] for k, p in zip(keys, preds) if p == 1], float),
+            }
+
+        def target_win_truth(self, keys):
+            return {
+                2.0: np.array([k[6] for k in keys], bool),
+                3.0: np.array([k[7] for k in keys], bool),
+            }
+
+    keys = [
+        ('NQ@3min', 1, 1, 0.0, 1.97, 2.97, True, True),
+        ('NQ@3min', 2, 1, 0.0, 1.97, -1.03, True, False),
+        ('NQ@3min', 3, 1, 0.0, -1.03, -1.03, False, False),
+        ('NQ@3min', 4, 1, 0.0, -1.03, -1.03, False, False),
+    ]
+    score = np.array([.9, .8, .2, .1])
+    ts = pd.to_datetime(['2026-01-02'] * 4, utc=True)
+    rows = produce.target_operating_points(_LadderLab(), keys, score, ts, rates=(2,))
+    assert rows[0]['n'] == 2
+    assert rows[0]['targets']['2']['hit_rate'] == 1.0
+    assert rows[0]['targets']['2']['meanR'] == pytest.approx(1.97)
+    assert rows[0]['targets']['3']['hit_rate'] == .5
+    assert rows[0]['targets']['3']['meanR'] == pytest.approx(.97)
+
+
+def test_target_operating_points_is_optional_for_legacy_labelers():
+    lab, keys, score, ts = _ranked_oos()
+    assert produce.target_operating_points(lab, keys, score, ts) is None
+
+
 def test_wr_by_score_bands_are_monotone():
     lab, keys, proba, ts = _ranked_oos()
     bands = produce.wr_by_score(lab, keys, proba, ts)

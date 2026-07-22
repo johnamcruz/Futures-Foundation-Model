@@ -132,6 +132,57 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     return rows
 
 
+def target_operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
+    """Economics of every strategy-defined target at the same ranked operating points.
+
+    A distributional entry score may intentionally rank 2R bases and 6R/8R runners rather than
+    optimize only the primary ship target.  This optional audit exposes that behavior without
+    changing the primary verdict. Labelers provide parallel realized values through
+    ``evaluate_targets`` and, when available, exact first-touch booleans through
+    ``target_win_truth``. Positive unresolved marks never become hits by inference here.
+    """
+    evaluate = getattr(eval_lab, 'evaluate_targets', None)
+    if evaluate is None:
+        return None
+    score = np.asarray(proba, float)
+    keys = list(keys)
+    if not len(score) or len(keys) != len(score):
+        return []
+    all_targets = evaluate(keys, np.ones(len(keys), int))
+    truths_fn = getattr(eval_lab, 'target_win_truth', None)
+    all_truths = truths_fn(keys) if truths_fn is not None else {}
+    for target, values in all_targets.items():
+        if len(values) != len(keys):
+            raise ValueError(f'evaluate_targets[{target}] must align with keys')
+    days, order, rows = _oos_days(ts), np.argsort(-score), []
+    for rate in rates:
+        n = int(min(len(score), max(1, round(rate * days))))
+        selected = order[:n]
+        targets = {}
+        for target, values in sorted(all_targets.items(), key=lambda item: float(item[0])):
+            realized = np.asarray(values, float)[selected]
+            finite = np.isfinite(realized)
+            truth = all_truths.get(target)
+            hit_rate = None
+            if truth is not None:
+                truth = np.asarray(truth, bool)
+                if len(truth) != len(keys):
+                    raise ValueError(f'target_win_truth[{target}] must align with keys')
+                hit_rate = float(truth[selected][finite].mean()) if finite.any() else None
+            targets[f'{float(target):g}'] = {
+                'n': int(finite.sum()),
+                'hit_rate': hit_rate,
+                'meanR': float(realized[finite].mean()) if finite.any() else None,
+            }
+        rows.append({
+            'rate': rate, 'n': n, 'days': days,
+            'pool': int(len(score)), 'avail_per_day': float(len(score) / days),
+            'rate_met': bool(n >= round(rate * days)),
+            'thresh': float(score[selected[-1]]), 'targets': targets,
+        })
+    return rows
+
+
 def selection_concentration(keys, proba, ts, rates=(5, 3, 2, 1)):
     """Composition of each pooled top-score tier, for hidden stream-dependence audits."""
     if len(keys) == 0:
@@ -662,6 +713,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     probability_bands = (wr_by_probability(eval_lab, Kte, p_te, oos_ts)
                          if oos_ts is not None else [])
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
+    target_ops = (target_operating_points(eval_lab, Kte, p_te, oos_ts)
+                  if oos_ts is not None else None)
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
     regimes = regime_breakdown(eval_lab, Kte, p_te)
     concentration = selection_concentration(Kte, p_te, oos_ts) if oos_ts is not None else []
@@ -711,7 +764,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, wr_by_probability=probability_bands,
-               operating_points=ops, wr_by_alignment=align,
+               operating_points=ops, target_operating_points=target_ops,
+               wr_by_alignment=align,
                wr_by_regime=regimes,
                selection_concentration=concentration,
                per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
