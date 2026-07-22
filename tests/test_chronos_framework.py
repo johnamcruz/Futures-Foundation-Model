@@ -164,6 +164,7 @@ class _DummyLabelerVol(_DummyLabelerFeat):
 
 # ---- XGBoost head (in-process xgboost — isolated from FFM torch) ---------
 
+@pytest.mark.legacy_xgboost
 @iso_only
 def test_xgbriskhead_deterministic_and_bounded():
     """Risk head: predicts max_rr_realized (continuous, R-units). Same
@@ -178,6 +179,7 @@ def test_xgbriskhead_deterministic_and_bounded():
     assert p1.min() >= 0.0 and p1.max() <= 15.0   # clipped to plausible R
 
 
+@pytest.mark.legacy_xgboost
 @iso_only
 @pytest.mark.parametrize('nc', [2, 3])
 def test_xgbhead_deterministic_and_bounded(nc):
@@ -197,6 +199,7 @@ def test_xgbhead_deterministic_and_bounded(nc):
     assert np.allclose(proba.sum(1), 1.0, atol=1e-4)
 
 
+@pytest.mark.legacy_xgboost
 @iso_only
 def test_xgbhead_feature_importances():
     rng = np.random.default_rng(0)

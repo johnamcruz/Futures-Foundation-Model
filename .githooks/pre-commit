@@ -4,8 +4,11 @@
 
 set -e
 
-PYTHON="/Users/johnmcruz/Projects/algoTraderAI/venv/bin/python"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+PYTHON="$REPO_ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    PYTHON="$(command -v python3)"
+fi
 
 echo "Running unit tests..."
 
