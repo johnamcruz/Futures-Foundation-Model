@@ -404,6 +404,7 @@ def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
                         ('oos_auc', 'oos_meanR', 'shuffle_meanR', 'edge_shuffle', 'oos_trades')},
         'auxiliary_metrics': {
             'forecast': out.get('forecast_metrics'),
+            'forecast_entry_economics': out.get('forecast_entry_economics'),
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
@@ -725,6 +726,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None),      # Platt (A,B) -> deploy contract
                forecast_metrics=getattr(clf_real, '_forecast_metrics', None),
+               forecast_entry_economics=getattr(
+                   clf_real, '_forecast_entry_economics', None),
                chop_metrics=getattr(clf_real, '_chop_metrics', None),
                chop_platt=getattr(clf_real, '_chop_platt', None),
                chop_percentiles=getattr(clf_real, '_chop_percentiles', None),
