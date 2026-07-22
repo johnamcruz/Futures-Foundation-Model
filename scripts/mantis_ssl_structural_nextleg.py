@@ -72,7 +72,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--controls", default=os.environ.get("CONTROLS", "shuffle,random"))
     parser.add_argument("--control-epochs", type=int,
                         default=int(os.environ.get("CONTROL_EPOCHS", "8")))
-    parser.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", "20")))
+    # Sixty is a ceiling, not a requirement: validation patience restores the best epoch.
+    # Structural heads were still improving near epoch 20 in the first 9x4 experiment, so a
+    # shorter default could truncate useful learning before the early-stop gate could decide.
+    parser.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", "60")))
     parser.add_argument("--steps", type=int, default=int(os.environ.get("STEPS", "50")))
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-5")))
