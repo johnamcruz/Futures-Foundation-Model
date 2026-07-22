@@ -27,7 +27,13 @@ def main():
     parser.add_argument("--tfs", default=os.environ.get("TFS", "1min,3min,5min,15min"))
     parser.add_argument("--related-tfs", default=os.environ.get(
         "RELATED_TFS", "1min,3min,5min,15min"))
-    parser.add_argument("--siblings", default=os.environ.get("RELATED_SIBLINGS", "NQ:ES,ES:NQ"))
+    parser.add_argument(
+        "--tf-pairs", default=os.environ.get("RELATED_TF_PAIRS", "1min=5min,3min=15min"),
+        help=("paired timeframe contexts; '=' is bidirectional, ':' directional, '+' multiple. "
+              "Example: 1min=5min,3min=15min"))
+    parser.add_argument(
+        "--siblings", default=os.environ.get("RELATED_SIBLINGS", "0"),
+        help="cross-instrument context; disabled by default to isolate timeframe-pair value")
     parser.add_argument("--heads", type=int, default=int(os.environ.get("RELATED_HEADS", "4")))
     parser.add_argument("--dropout", type=float,
                         default=float(os.environ.get("RELATED_DROPOUT", "0")))
@@ -54,13 +60,15 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     print("[related-nextleg] primary targets; causal contexts only", flush=True)
-    print(f"[related-nextleg] tfs={args.related_tfs} siblings={args.siblings} "
+    print(f"[related-nextleg] tfs={args.related_tfs} pairs={args.tf_pairs} "
+          f"siblings={args.siblings} "
           f"heads={args.heads} output={args.out}", flush=True)
     ssl.loop_ssl(
         data_dir=args.data_dir, tickers=_csv(args.tickers), tfs=_csv(args.tfs),
         controls=_csv(args.controls), out_path=args.out, probe=not args.no_probe,
         holdout_start=args.holdout_start, pretext="related_nextleg",
         backbone_ckpt=args.warm_ckpt, related_tfs=_csv(args.related_tfs),
+        related_tf_pairs=args.tf_pairs,
         related_siblings=args.siblings, related_heads=args.heads,
         related_dropout=args.dropout, related_max_gap_factor=args.max_gap_factor,
         related_control=args.related_control,

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from futures_foundation.finetune.related_series import (
-    RelatedSeriesLayout, timeframe_minutes)
+    RelatedSeriesLayout, parse_timeframe_pairs, timeframe_minutes)
 
 
 def _timestamps(minutes):
@@ -42,6 +42,21 @@ def test_timeframe_minutes_is_strict():
         timeframe_minutes(0)
 
 
+def test_timeframe_pair_parser_supports_bidirectional_and_directional_groups():
+    assert parse_timeframe_pairs("1min=5min,3min=15min") == {
+        "1min": ("5min",), "5min": ("1min",),
+        "3min": ("15min",), "15min": ("3min",),
+    }
+    assert parse_timeframe_pairs("1min:3min+5min+15min,3min:5min+15min") == {
+        "1min": ("3min", "5min", "15min"),
+        "3min": ("5min", "15min"),
+    }
+    assert parse_timeframe_pairs("") == {}
+    assert parse_timeframe_pairs(None) is None
+    with pytest.raises(ValueError, match="cannot pair with itself"):
+        parse_timeframe_pairs("3min=3min")
+
+
 def test_alignment_uses_closed_bars_for_lower_and_higher_timeframes():
     layout = _layout()
     primary = _stream(layout, "NQ@3min")
@@ -69,6 +84,22 @@ def test_alignment_uses_closed_bars_for_lower_and_higher_timeframes():
     later_one = layout.align([primary.base + 5], 1, related_tfs=("15min",), siblings="0")
     assert later_one.mask[0, 1]
     assert later_one.starts[0, 1] == nq15.base
+
+
+def test_alignment_enforces_exact_timeframe_pairs_instead_of_all_contexts():
+    layout = _layout()
+    nq3 = _stream(layout, "NQ@3min")
+    nq15 = _stream(layout, "NQ@15min")
+    # The 3m decision at minute 18 may use completed 15m context, but must not receive otherwise
+    # available 1m or 5m context under the declared 3m<->15m / 1m<->5m experiment.
+    plan = layout.align(
+        [nq3.base + 5], 1, related_tfs=("1min", "3min", "5min", "15min"),
+        tf_pairs="1min=5min,3min=15min", siblings="0")
+    roles = {name: i for i, name in enumerate(plan.role_names)}
+    assert plan.mask[0, roles["same_ticker@15min"]]
+    assert plan.starts[0, roles["same_ticker@15min"]] == nq15.base
+    assert not plan.mask[0, roles["same_ticker@1min"]]
+    assert not plan.mask[0, roles["same_ticker@5min"]]
 
 
 def test_alignment_never_uses_future_sibling_and_masks_stale_context():

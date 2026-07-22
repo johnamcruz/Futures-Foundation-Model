@@ -37,6 +37,55 @@ def timeframe_minutes(value: str | int) -> int:
     return minutes
 
 
+def parse_timeframe_pairs(value) -> dict[str, tuple[str, ...]] | None:
+    """Parse optional primary-to-context timeframe mappings.
+
+    ``1min=5min,3min=15min`` is concise bidirectional pairing. Directional mappings use ``:``
+    and may provide multiple contexts with ``+`` (for example ``1min:3min+5min+15min``).
+    ``None`` preserves the historical all-configured-timeframes behavior; an empty string means
+    primary-only context.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        parsed = {
+            str(primary): tuple(dict.fromkeys(
+                (contexts,) if isinstance(contexts, str) else tuple(contexts)))
+            for primary, contexts in value.items()
+        }
+    else:
+        text = str(value).strip()
+        if not text or text.lower() in {"0", "none", "off"}:
+            return {}
+        parsed_lists: dict[str, list[str]] = {}
+        for item in text.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                left, right = (part.strip() for part in item.split("=", 1))
+                if "+" in left or "+" in right:
+                    raise ValueError("bidirectional timeframe pairs must contain one TF per side")
+                parsed_lists.setdefault(left, []).append(right)
+                parsed_lists.setdefault(right, []).append(left)
+            elif ":" in item:
+                left, right = (part.strip() for part in item.split(":", 1))
+                parsed_lists.setdefault(left, []).extend(
+                    part.strip() for part in right.split("+") if part.strip())
+            else:
+                raise ValueError(
+                    f"invalid timeframe pair {item!r}; use 1min=5min or 1min:3min+5min")
+        parsed = {primary: tuple(dict.fromkeys(contexts))
+                  for primary, contexts in parsed_lists.items()}
+    for primary, contexts in parsed.items():
+        timeframe_minutes(primary)
+        for context in contexts:
+            timeframe_minutes(context)
+            if context == primary:
+                raise ValueError(f"timeframe {primary} cannot pair with itself")
+    return parsed
+
+
 def _ns(values) -> np.ndarray:
     """Datetime-like values -> int64 nanoseconds without changing their ordering."""
     return np.asarray(values).astype("datetime64[ns]").astype(np.int64)
@@ -126,7 +175,8 @@ class RelatedSeriesLayout:
 
     def align(self, primary_starts, context_length: int, *,
               related_tfs=("1min", "3min", "5min", "15min"),
-              siblings="default", max_gap_factor: float = 2.0) -> RelatedWindowPlan:
+              tf_pairs=None, siblings="default",
+              max_gap_factor: float = 2.0) -> RelatedWindowPlan:
         """Align causal related windows to each primary window.
 
         A candidate bar is usable only when its close time is at-or-before the primary decision
@@ -138,7 +188,14 @@ class RelatedSeriesLayout:
         seq = int(context_length)
         if seq <= 0:
             raise ValueError("context_length must be positive")
-        tfs = tuple(dict.fromkeys(str(tf) for tf in related_tfs))
+        pair_map_tf = parse_timeframe_pairs(tf_pairs)
+        if pair_map_tf is None:
+            tfs = tuple(dict.fromkeys(str(tf) for tf in related_tfs))
+        else:
+            # Stable absolute-timeframe roles across every primary. A stream only enables the
+            # subset declared for its own timeframe below.
+            requested = {tf for contexts in pair_map_tf.values() for tf in contexts}
+            tfs = tuple(sorted(requested, key=timeframe_minutes))
         for tf in tfs:
             timeframe_minutes(tf)
         pair_map = parse_siblings(siblings) if isinstance(siblings, str) else siblings
@@ -162,8 +219,12 @@ class RelatedSeriesLayout:
                 raise ValueError(f"primary context crosses the {primary.sid} stream boundary")
             decision_close = primary.close_ns[local_end]
 
-            candidates = [by_key.get((primary.ticker, tf)) if tf != primary.tf else None
-                          for tf in tfs]
+            allowed = None if pair_map_tf is None else set(pair_map_tf.get(primary.tf, ()))
+            candidates = [
+                by_key.get((primary.ticker, tf))
+                if tf != primary.tf and (allowed is None or tf in allowed) else None
+                for tf in tfs
+            ]
             sibling_ticker = pair_map.get(primary.ticker)
             candidates.append(by_key.get((sibling_ticker, primary.tf)) if sibling_ticker else None)
             for col, candidate in enumerate(candidates, start=1):
@@ -184,4 +245,4 @@ class RelatedSeriesLayout:
 
 
 __all__ = ["RelatedSeriesLayout", "RelatedStream", "RelatedWindowPlan", "timeframe_minutes",
-           "DEFAULT_SIBLINGS"]
+           "parse_timeframe_pairs", "DEFAULT_SIBLINGS"]

@@ -81,6 +81,7 @@ class RelatedNextLegNet(nn.Module):
 class _RelatedNextLegTrainer(_NextLegTrainer):
     def __init__(self, big, tr, va, *, _related_layout=None,
                  related_tfs=("1min", "3min", "5min", "15min"),
+                 related_tf_pairs=None,
                  related_siblings="default", related_heads=4, related_dropout=0.0,
                  related_max_gap_factor=2.0, related_control="real", **kwargs):
         if _related_layout is None:
@@ -89,15 +90,18 @@ class _RelatedNextLegTrainer(_NextLegTrainer):
         self.related_heads = int(related_heads)
         self.related_dropout = float(related_dropout)
         self.related_tfs = tuple(related_tfs)
+        self.related_tf_pairs = related_tf_pairs
         self.related_siblings = related_siblings
         self.related_max_gap_factor = float(related_max_gap_factor)
         self.related_control = str(related_control)
         self.tr_plan = _related_layout.align(
             self.tr.detach().cpu().numpy(), self.max_ctx, related_tfs=self.related_tfs,
-            siblings=self.related_siblings, max_gap_factor=self.related_max_gap_factor)
+            tf_pairs=self.related_tf_pairs, siblings=self.related_siblings,
+            max_gap_factor=self.related_max_gap_factor)
         self.va_plan = _related_layout.align(
             self.va.detach().cpu().numpy(), self.max_ctx, related_tfs=self.related_tfs,
-            siblings=self.related_siblings, max_gap_factor=self.related_max_gap_factor)
+            tf_pairs=self.related_tf_pairs, siblings=self.related_siblings,
+            max_gap_factor=self.related_max_gap_factor)
         self.tr_related = torch.as_tensor(self.tr_plan.starts, device=self.dev)
         self.va_related = torch.as_tensor(self.va_plan.starts, device=self.dev)
         self.tr_mask = torch.as_tensor(self.tr_plan.mask, device=self.dev)
@@ -123,6 +127,7 @@ class _RelatedNextLegTrainer(_NextLegTrainer):
         state["config"].update({
             "role_names": self.tr_plan.role_names,
             "related_tfs": self.related_tfs,
+            "related_tf_pairs": self.related_tf_pairs,
             "related_siblings": self.related_siblings,
             "max_gap_factor": self.related_max_gap_factor,
             "related_control": self.related_control,
@@ -220,6 +225,7 @@ def train_ssl_related_nextleg(big, train_starts, val_starts, *,
                               lora_alpha=16.0, lora_dropout=0.0, log_every_steps=25,
                               _related_layout=None,
                               related_tfs=("1min", "3min", "5min", "15min"),
+                              related_tf_pairs=None,
                               related_siblings="default", related_heads=4,
                               related_dropout=0.0, related_max_gap_factor=2.0,
                               related_control="real", **_ignore):
@@ -236,7 +242,8 @@ def train_ssl_related_nextleg(big, train_starts, val_starts, *,
         resume=resume, freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         log_every_steps=log_every_steps, _related_layout=_related_layout,
-        related_tfs=related_tfs, related_siblings=related_siblings,
+        related_tfs=related_tfs, related_tf_pairs=related_tf_pairs,
+        related_siblings=related_siblings,
         related_heads=related_heads, related_dropout=related_dropout,
         related_max_gap_factor=related_max_gap_factor, related_control=related_control)
     return trainer.fit()

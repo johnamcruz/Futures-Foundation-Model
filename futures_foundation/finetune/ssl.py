@@ -352,6 +352,7 @@ def _base_cfg(**kw):
              # Chronos-2-inspired, Mantis-native related-series experiment. These settings are
              # inert unless pretext='related_nextleg'. Timestamps are causally aligned by bar CLOSE.
              related_tfs=('1min', '3min', '5min', '15min'),
+             related_tf_pairs=None,
              related_siblings='default', related_heads=4, related_dropout=0.0,
              related_max_gap_factor=2.0, related_control='real',
              probe_folds=1)                                   # k-fold CV per probe (robust)
