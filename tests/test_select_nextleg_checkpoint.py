@@ -2,6 +2,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import select_nextleg_checkpoint as selection
 
 
@@ -119,3 +121,45 @@ def test_uniform_refinement_rejects_second_leg_gain_that_sacrifices_leg1(tmp_pat
     result = selection.select(baseline, candidate)
     assert result["status"] == "REJECT_CANDIDATE"
     assert "refinement materially regressed first-leg correlation" in result["failures"]
+
+
+def test_legacy_report_recovers_selected_leg_metrics_from_trainer_sidecar(tmp_path):
+    torch = pytest.importorskip("torch")
+    baseline = _make_run(tmp_path, "baseline", uniform=False,
+                         task=(0.030, 0.080, 0.030))
+    report_path = Path(str(baseline / "mantis_ssl_nextleg.pt") + ".report.json")
+    report = json.loads(report_path.read_text())
+    report["history"][0].pop("leg_corr1")
+    report["history"][0].pop("leg_corr2")
+    _write(report_path, report)
+    torch.save({"best_history_row": {
+        "epoch": 4, "skill": 0.030, "leg_corr1": 0.080, "leg_corr2": 0.030,
+    }}, baseline / "mantis_ssl_nextleg.pt.trainer.pt")
+
+    digest = hashlib.sha256(b"baseline").hexdigest()
+    candidate = _make_run(tmp_path, "candidate", uniform=True,
+                          task=(0.029, 0.040, 0.041), refinement_parent=digest)
+    result = selection.select(baseline, candidate)
+    assert result["status"] == "REJECT_CANDIDATE"
+    assert result["metrics"]["leg_corr1"]["baseline"] == pytest.approx(0.080)
+    assert result["metric_sources"]["baseline"] == "report+trainer_sidecar"
+    assert "refinement materially regressed first-leg correlation" in result["failures"]
+
+
+def test_missing_legacy_metrics_without_sidecar_fails_closed(tmp_path):
+    baseline = _make_run(tmp_path, "baseline", uniform=False)
+    report_path = Path(str(baseline / "mantis_ssl_nextleg.pt") + ".report.json")
+    report = json.loads(report_path.read_text())
+    report["history"][0].pop("leg_corr1")
+    _write(report_path, report)
+    with pytest.raises(RuntimeError, match="trainer sidecar"):
+        selection.select(baseline, _make_run(tmp_path, "candidate", uniform=True, lift=.006))
+
+
+def test_downloaded_root_probe_layout_is_supported(tmp_path):
+    baseline = _make_run(tmp_path, "baseline", uniform=False)
+    candidate = _make_run(tmp_path, "candidate", uniform=True, lift=.006)
+    for filename in ("nextleg.json", "nextleg_emb.npy.pool.json"):
+        source = candidate / "probe_atlas" / filename
+        source.replace(candidate / filename)
+    assert selection.select(baseline, candidate)["status"] == "PROMOTE_CANDIDATE"
