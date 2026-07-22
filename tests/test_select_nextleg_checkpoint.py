@@ -27,13 +27,25 @@ def _make_run(root: Path, name: str, *, uniform: bool, lift: float = 0.0,
             "per_stream_auc": {"NQ@3min": 0.58 + delta},
             "worst_stream_auc": 0.58 + delta,
         }
-    control_delta = {"shuffle": 0.01, "random": 0.0} if controls else {}
+    task_controls = ({
+        "shuffle": {"forecast_skill": .01, "leg_corr1": .01, "leg_corr2": .005},
+        "random": {"forecast_skill": .008, "leg_corr1": .0, "leg_corr2": -.01},
+    } if controls else {})
+    task_control = {
+        "contract": "nextleg_forecast_and_leg_skill_v1",
+        "real": {"forecast_skill": .03, "leg_corr1": .08, "leg_corr2": .03},
+        "controls": task_controls,
+        "beats_controls": bool(controls),
+    }
     _write(Path(str(checkpoint) + ".real_complete.json"), {"checkpoint_sha256": digest})
     _write(Path(str(checkpoint) + ".report.json"), {
         "config": {"sampling_mode": "uniform_stream" if uniform else "bar_proportional"},
         "verdict": {"all_pass": True, "representation_pass": True,
-                    "real_delta": 0.05, "control_delta": control_delta,
+                    "beats_controls": bool(controls), "real_delta": 0.05,
+                    "control_delta": {"shuffle": .051, "random": .052},
+                    "task_control": task_control,
                     "temporal_signal": 0.04 if controls else None},
+        "task_control": task_control,
         "history": [{"best_epoch": 4, "forecast_skill": 0.03,
                      "leg_corr1": 0.08, "leg_corr2": 0.03, "std": 1.0}],
     })

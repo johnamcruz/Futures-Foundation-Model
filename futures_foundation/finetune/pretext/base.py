@@ -47,3 +47,30 @@ class PretextTask:
     def finalize_verdict(self, verdict, fc_skill, probe_res):
         """Add any pretext-specific fields to the saved verdict (default: none)."""
         return verdict
+
+    @property
+    def control_contract(self):
+        """Evidence contract used to prove REAL learned more than corrupted controls."""
+        return 'representation_probe_v1'
+
+    def control_evidence(self, history_row, probe_res):
+        """Extract control-comparable evidence for this objective.
+
+        Representation objectives use Probe Atlas lift. Forecasting objectives may override this
+        because a warm-started corrupted adapter retains its parent's generic representation even
+        when it cannot learn the stage's temporal target.
+        """
+        return {'mean_core_delta': (None if probe_res is None else
+                                    float(probe_res['mean_core_delta']))}
+
+    def compare_control_evidence(self, real, controls):
+        """Return (pass, per-control margins, temporal-order margin)."""
+        value = real.get('mean_core_delta')
+        margins = {
+            name: (None if value is None or row.get('mean_core_delta') is None else
+                   float(value) - float(row['mean_core_delta']))
+            for name, row in controls.items()
+        }
+        passed = bool(value is not None and controls and
+                      all(margin is not None and margin > 0 for margin in margins.values()))
+        return passed, margins, margins.get('shuffle')

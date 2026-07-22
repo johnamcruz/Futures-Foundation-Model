@@ -223,6 +223,23 @@ def _checkpoint_recovery_flags(out_path: Path) -> tuple[bool, bool]:
             out_path.is_file() and real_complete)
 
 
+def _completed_stage_revalidation_reason(out_path: Path, report_path: Path) -> str | None:
+    """Return a failed-verdict reason only when REAL is safely recoverable.
+
+    Recipe and lineage checks happen before this helper. A passing report returns ``None`` and is
+    skipped normally. A failed report can be retried only when the crash-safe marker proves REAL
+    optimization completed; otherwise the failure remains fatal.
+    """
+    _revalidate_stage_report(report_path)
+    try:
+        _assert_stage_verdict(report_path)
+    except RuntimeError as exc:
+        if not Path(str(out_path) + ".real_complete.json").is_file():
+            raise
+        return str(exc)
+    return None
+
+
 def _seal(data_dir: Path) -> dict:
     streams = ((ticker, timeframe) for ticker in TICKERS for timeframe in TIMEFRAMES)
     result = seal_continuous_streams(data_dir, streams, repo_root=ROOT)
@@ -711,19 +728,27 @@ def _run_parent(args: argparse.Namespace) -> None:
         if out_path.is_file() and report_path.is_file():
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
             _assert_stage_parent(out_path, stage, paths, parent_path=parent_override)
-            _revalidate_stage_report(report_path)
-            _assert_stage_verdict(report_path)
-            print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
-            progress = _run_probe_atlas(
-                stage, out_path, out_dir=out_dir, device=device, python=python,
-                labels=atlas_labels, data_dir=data_dir)
-            if stage.parent and (out_dir / "probe_atlas" /
-                                 f"{stage.parent}_emb.npy.pool.json").is_file():
-                _assert_atlas_pool_match(out_dir, stage.parent, stage.name)
-            _assert_atlas_retention(progress, stage.name)
-            _event(out_dir, "stage_skipped", stage=stage.name, reason="complete",
-                   checkpoint=str(out_path))
-            continue
+            revalidation_reason = _completed_stage_revalidation_reason(out_path, report_path)
+            if revalidation_reason is not None:
+                # A fully saved REAL checkpoint may need controls/reporting repeated after an
+                # evaluation-policy repair. Fall through to the child: its REAL-complete marker
+                # activates checkpoint-only finalization, never optimizer retraining.
+                print(f"\n[{stage.name}] saved REAL requires revalidation; preserving checkpoint",
+                      flush=True)
+                _event(out_dir, "stage_revalidation_required", stage=stage.name,
+                       checkpoint=str(out_path), reason=revalidation_reason)
+            else:
+                print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
+                progress = _run_probe_atlas(
+                    stage, out_path, out_dir=out_dir, device=device, python=python,
+                    labels=atlas_labels, data_dir=data_dir)
+                if stage.parent and (out_dir / "probe_atlas" /
+                                     f"{stage.parent}_emb.npy.pool.json").is_file():
+                    _assert_atlas_pool_match(out_dir, stage.parent, stage.name)
+                _assert_atlas_retention(progress, stage.name)
+                _event(out_dir, "stage_skipped", stage=stage.name, reason="complete",
+                       checkpoint=str(out_path))
+                continue
         env = os.environ.copy()
         # Keep explicit user overrides separate from the per-attempt value we
         # inject below, so an OOM retry can recompute steps for its smaller batch.
