@@ -116,6 +116,16 @@ def test_wr_by_score_bands_are_monotone():
         assert b['per_day'] == pytest.approx(b['n'] / 5)
 
 
+def test_fixed_probability_bands_expose_the_point_eight_to_point_nine_economics():
+    lab, keys, proba, ts = _ranked_oos()
+    rows = produce.wr_by_probability(lab, keys, proba, ts)
+    assert sum(row['n'] for row in rows) == len(keys)
+    band = next(row for row in rows if row['lo'] == .8 and row['hi'] == .9)
+    assert band['n'] == 2
+    assert band['wr3R'] == 1.0 and band['meanR'] == pytest.approx(2.0)
+    assert band['per_day'] == pytest.approx(.4)
+
+
 def test_alignment_breakdown_counter_vs_aligned():
     # counter pivots: model score separates winners (score high -> R=+2) from losers; aligned all
     # mediocre. The readout must show counter's TOP-score WR >> counter's base WR (sighted gating).

@@ -224,6 +224,38 @@ def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     return rows
 
 
+def wr_by_probability(eval_lab, keys, proba, ts,
+                      edges=(0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0000001)):
+    """Exact OOS economics in fixed calibrated-probability bands.
+
+    Quantile bands answer whether ranking is useful; fixed bands answer whether a value such as
+    0.85 retains the same economic meaning over time. Empty bands remain explicit so calibration
+    collapse or an unrealistically restrictive 0.8 threshold cannot hide behind pooled metrics.
+    """
+    proba = np.asarray(proba, float)
+    if len(proba) == 0:
+        return []
+    if len(keys) != len(proba):
+        raise ValueError('keys and probability arrays must align')
+    edges = tuple(float(x) for x in edges)
+    if len(edges) < 2 or any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError('probability edges must be strictly increasing')
+    keys = list(keys)
+    R_all = np.asarray(eval_lab.evaluate(keys, np.ones(len(keys), int)), float)
+    W_all = _win_truth(eval_lab, keys, R_all)
+    days = _oos_days(ts)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (proba >= lo) & (proba < hi)
+        n = int(m.sum())
+        rows.append({
+            'lo': lo, 'hi': min(hi, 1.0), 'n': n, 'per_day': float(n / days),
+            'wr3R': (float(W_all[m].mean()) if n else float('nan')),
+            'meanR': (float(R_all[m].mean()) if n else float('nan')),
+        })
+    return rows
+
+
 def alignment_breakdown(eval_lab, keys, proba, ts):
     """THE sighted-counter-trend readout: split the OOS pivots by HTF alignment (labeler's
     htf_alignment: -1 = counter the HTF trend — the fades a hard gate blindly discards, +1 = with)
@@ -624,6 +656,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     edge = (_meanR(R) - _meanR(Rs)) if Rs is not None else None
     # WR@3R by score band + trades/day at deploy operating points (the '1-2 A+ trades/day' read).
     bands = wr_by_score(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
+    probability_bands = (wr_by_probability(eval_lab, Kte, p_te, oos_ts)
+                         if oos_ts is not None else [])
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
     regimes = regime_breakdown(eval_lab, Kte, p_te)
@@ -673,7 +707,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                shuffle_meanR=(_meanR(Rs) if Rs is not None else None), edge_shuffle=edge,
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
-               wr_by_score=bands, operating_points=ops, wr_by_alignment=align,
+               wr_by_score=bands, wr_by_probability=probability_bands,
+               operating_points=ops, wr_by_alignment=align,
                wr_by_regime=regimes,
                selection_concentration=concentration,
                per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
