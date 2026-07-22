@@ -115,7 +115,8 @@ def _assert_completed_stage_recipe(report_path: Path, *, sampling_mode: str) -> 
 
 
 def _assert_stage_parent(out_path: Path, stage: Stage,
-                         paths: dict[str, Path]) -> None:
+                         paths: dict[str, Path], *,
+                         parent_path: Path | None = None) -> None:
     """Refuse to resume or reuse a child produced from a different parent.
 
     This matters when an output directory survives a curriculum change. A child
@@ -129,7 +130,7 @@ def _assert_stage_parent(out_path: Path, stage: Stage,
             f"cannot establish parent identity for existing {stage.name} checkpoint: "
             f"{provenance_path} is missing; move it aside and restart this stage")
     saved = json.loads(provenance_path.read_text())
-    expected_parent = paths[stage.parent]
+    expected_parent = parent_path or paths[stage.parent]
     expected_hash = sha256(expected_parent)
     parent = saved.get("parent", {})
     if saved.get("stage") != stage.name or parent.get("sha256") != expected_hash:
@@ -144,12 +145,18 @@ def _stage_config(stage: str) -> dict:
     lora = dict(lora_r=int(os.environ.get("LORA_R", "8")),
                 lora_alpha=float(os.environ.get("LORA_ALPHA", "16")),
                 lora_dropout=float(os.environ.get("LORA_DROPOUT", "0")))
+    controls = tuple(value.strip() for value in os.environ.get("SSL_CONTROLS", "").split(",")
+                     if value.strip())
+    unknown_controls = set(controls) - {"shuffle", "random"}
+    if unknown_controls:
+        raise ValueError(f"unsupported SSL controls: {sorted(unknown_controls)}")
     common = dict(
         seq=64, max_jitter=16, val_frac=0.1, holdout_start=HOLDOUT_START,
         sampling_mode=os.environ.get("SAMPLING_MODE", "bar_proportional"),
         steps_per_epoch=int(os.environ.get("STEPS_PER_EPOCH", "200")),
         patience=int(os.environ.get("PATIENCE", "8")), seed=int(os.environ.get("SEED", "0")),
-        probe=True, controls=(), compile_model=False,
+        probe=True, controls=controls,
+        control_epochs=int(os.environ.get("CONTROL_EPOCHS", "8")), compile_model=False,
         log_every_steps=int(os.environ.get("SSL_LOG_EVERY_STEPS", "25")), **lora,
         )
     if stage == "contrastive":
@@ -249,10 +256,12 @@ def _run_child(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     paths = _stage_map(out_dir)
     out_path = paths[stage.name]
-    parent = paths[stage.parent] if stage.parent else None
+    parent = (Path(args.parent_checkpoint).expanduser().resolve()
+              if args.parent_checkpoint else
+              paths[stage.parent] if stage.parent else None)
     if parent is None or not parent.is_file():
         raise FileNotFoundError(f"valid parent checkpoint missing for {stage.name}: {parent}")
-    _assert_stage_parent(out_path, stage, paths)
+    _assert_stage_parent(out_path, stage, paths, parent_path=parent)
     data_dir = Path(args.data_dir).resolve()
     provenance = _seal(data_dir)
     config = _stage_config(stage.name)
@@ -289,6 +298,10 @@ def _notify(message: str) -> None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _provenance_sha256(provenance: dict) -> str:
+    return hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
 
 
 def _event(out_dir: Path, event: str, **fields) -> None:
@@ -426,8 +439,7 @@ def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
     """Generate one checkpoint-independent, pre-2026 lifecycle truth corpus for every atlas."""
     labels = out_dir / "probe_atlas" / "trend_lifecycle_labels_pre2026.npz"
     manifest = labels.with_suffix(".npz.provenance.json")
-    provenance_hash = hashlib.sha256(
-        json.dumps(provenance, sort_keys=True).encode()).hexdigest()
+    provenance_hash = _provenance_sha256(provenance)
     reusable = False
     if labels.is_file() and manifest.is_file():
         saved = json.loads(manifest.read_text())
@@ -470,6 +482,72 @@ def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
     _event(out_dir, "probe_atlas_labels_ready", output=str(labels), rows=rows,
            max_timestamp=max_ts, data_provenance_sha256=provenance_hash)
     return labels
+
+
+def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
+                        checkpoint: Path, provenance: dict) -> Path:
+    """Reuse immutable labels and a hash-matched parent Atlas result.
+
+    Encoder embeddings are checkpoint-specific, so only the exact external parent's
+    result may be reused. The new child always receives a fresh embedding cache. The
+    tiny pool-identity sidecar is copied so the post-run gate can prove both results
+    used the same fixed examples.
+    """
+    import numpy as np
+
+    source_dir = source_dir.expanduser().resolve()
+    source_atlas = source_dir / "probe_atlas"
+    labels = source_atlas / "trend_lifecycle_labels_pre2026.npz"
+    labels_manifest = Path(str(labels) + ".provenance.json")
+    result = source_atlas / f"{stage.name}.json"
+    pool = source_atlas / f"{stage.name}_emb.npy.pool.json"
+    required = (labels, labels_manifest, result, pool)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "reusable Atlas artifacts are incomplete: " + ", ".join(missing))
+
+    saved_labels = json.loads(labels_manifest.read_text())
+    expected_provenance = _provenance_sha256(provenance)
+    if (saved_labels.get("holdout_start") != HOLDOUT_START
+            or saved_labels.get("data_provenance_sha256") != expected_provenance):
+        raise RuntimeError(
+            "reusable Atlas labels have different data provenance or holdout")
+    with np.load(labels, allow_pickle=False) as payload:
+        if "ts" not in payload.files or len(payload["ts"]) == 0:
+            raise RuntimeError("reusable Atlas labels are empty or missing timestamps")
+        if payload["ts"].max() >= np.datetime64(HOLDOUT_START):
+            raise RuntimeError("reusable Atlas labels cross the immutable 2026 holdout")
+
+    saved_result = json.loads(result.read_text())
+    if saved_result.get("checkpoint_sha256") != sha256(checkpoint):
+        raise RuntimeError(
+            f"reusable {stage.name} Atlas result belongs to a different checkpoint")
+    if (saved_result.get("schema") != "ffm_probe_atlas_v2"
+            or saved_result.get("scope") != "9x4_strategy_agnostic"
+            or saved_result.get("fit") != "<2024"
+            or saved_result.get("eval") != "2025"):
+        raise RuntimeError(f"reusable {stage.name} Atlas result uses a stale evaluation contract")
+
+    destination = out_dir / "probe_atlas"
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / f"{stage.name}.json").write_text(result.read_text())
+    (destination / f"{stage.name}_emb.npy.pool.json").write_text(pool.read_text())
+    _event(out_dir, "probe_atlas_parent_reused", stage=stage.name,
+           source=str(source_dir), checkpoint_sha256=sha256(checkpoint))
+    return labels
+
+
+def _assert_atlas_pool_match(out_dir: Path, parent: str, child: str) -> None:
+    """Fail if stage comparison would mix different fixed-corpus examples."""
+    atlas = out_dir / "probe_atlas"
+    parent_path = atlas / f"{parent}_emb.npy.pool.json"
+    child_path = atlas / f"{child}_emb.npy.pool.json"
+    if not parent_path.is_file() or not child_path.is_file():
+        raise RuntimeError(
+            f"missing Probe Atlas pool identity for {parent}->{child}")
+    if json.loads(parent_path.read_text()) != json.loads(child_path.read_text()):
+        raise RuntimeError(f"Probe Atlas pool mismatch for {parent}->{child}")
 
 
 def _run_probe_atlas(stage: Stage, checkpoint: Path, *, out_dir: Path, device: str,
@@ -531,6 +609,19 @@ def _run_parent(args: argparse.Namespace) -> None:
     if not atlas_script.is_file():
         raise FileNotFoundError(f"Probe Atlas entrypoint missing: {atlas_script}")
     paths = _stage_map(out_dir)
+    start_index = STAGE_ORDER.index(args.start_stage)
+    selected_stages = STAGES[start_index:]
+    external_parent = None
+    if start_index:
+        if not args.parent_checkpoint:
+            raise SystemExit(
+                f"--start-stage {args.start_stage} requires --parent-checkpoint for "
+                f"its {selected_stages[0].parent} parent")
+        external_parent = Path(args.parent_checkpoint).expanduser().resolve()
+        if not external_parent.is_file():
+            raise FileNotFoundError(f"external parent checkpoint not found: {external_parent}")
+    elif args.parent_checkpoint:
+        raise SystemExit("--parent-checkpoint is only valid when --start-stage is not mask")
     # Do NOT resolve this path: a virtualenv's python is normally a symlink to the base
     # interpreter. Resolving it silently discards the venv for child stages (and therefore
     # installed packages such as torch). Keep the exact executable used to launch the master.
@@ -544,6 +635,8 @@ def _run_parent(args: argparse.Namespace) -> None:
     os.environ["LORA_DROPOUT"] = str(args.lora_dropout)
     os.environ["SAMPLING_MODE"] = args.sampling_mode
     os.environ["SSL_LOG_EVERY_STEPS"] = str(args.log_every_steps)
+    os.environ["SSL_CONTROLS"] = args.controls
+    os.environ["CONTROL_EPOCHS"] = str(args.control_epochs)
 
     print("\nCLEAN SSL PIPELINE PREFLIGHT PASSED")
     print(f"  data    : {data_dir}")
@@ -552,28 +645,59 @@ def _run_parent(args: argparse.Namespace) -> None:
     print(f"  tuning  : {'LoRA' if lora_r else 'full'}"
           + (f" r={lora_r} alpha={args.lora_alpha:g}" if lora_r else ""))
     print(f"  sampling: {args.sampling_mode}")
+    print(f"  controls: {args.controls or 'none'}"
+          f" (max {args.control_epochs} epochs each)")
     print(f"  output  : {out_dir}")
-    for stage in STAGES:
+    if external_parent is not None:
+        print(f"  parent  : {selected_stages[0].parent} <- {external_parent}")
+    for stage in selected_stages:
         steps = _steps_for(stage, stage.batch[device])
+        epochs = int(os.environ.get(f"{stage.name.upper()}_EPOCHS", str(stage.epochs)))
         adaptation = ""
         if stage.name != "mask":
             cfg = _stage_config(stage.name)
             adaptation = (f" lr={cfg['lr']:.1e}"
                           f" freeze={cfg['freeze_encoder_layers']}")
         print(f"  {stage.name:11s}: batch={stage.batch[device]:4d} steps={steps:3d} "
-              f"samples/epoch={stage.batch[device] * steps:6,d} max_epochs={stage.epochs:3d} "
+              f"samples/epoch={stage.batch[device] * steps:6,d} max_epochs={epochs:3d} "
               f"{adaptation} -> {stage.filename}")
     if args.preflight_only:
         return
 
     _event(out_dir, "pipeline_started", device=device, lora_r=lora_r,
            sampling_mode=args.sampling_mode,
-           holdout_start=HOLDOUT_START, stage_order=STAGE_ORDER)
-    atlas_labels = _ensure_atlas_labels(data_dir=data_dir, out_dir=out_dir,
-                                        provenance=provenance, python=python)
+           holdout_start=HOLDOUT_START,
+           stage_order=tuple(stage.name for stage in selected_stages),
+           external_parent=str(external_parent) if external_parent else None)
+    reuse_dir = (Path(args.reuse_artifacts_from).expanduser().resolve()
+                 if args.reuse_artifacts_from else None)
+    if reuse_dir is not None and external_parent is None:
+        raise SystemExit("--reuse-artifacts-from is only valid for a partial lineage")
+    if reuse_dir is not None:
+        parent_name = selected_stages[0].parent
+        parent_stage = next(stage for stage in STAGES if stage.name == parent_name)
+        atlas_labels = _reuse_atlas_parent(
+            source_dir=reuse_dir, out_dir=out_dir, stage=parent_stage,
+            checkpoint=external_parent, provenance=provenance)
+    else:
+        atlas_labels = _ensure_atlas_labels(data_dir=data_dir, out_dir=out_dir,
+                                            provenance=provenance, python=python)
 
-    for stage in STAGES:
+    # A partial lineage still gets a matched fixed-corpus parent baseline. This is
+    # essential for the uniform-stream NextLeg experiment: the candidate must beat
+    # the exact Seq2Seq parent, not an Atlas result copied from another corpus/run.
+    if external_parent is not None:
+        parent_name = selected_stages[0].parent
+        parent_stage = next(stage for stage in STAGES if stage.name == parent_name)
+        _run_probe_atlas(
+            parent_stage, external_parent, out_dir=out_dir, device=device,
+            python=python, labels=atlas_labels, data_dir=data_dir)
+        _event(out_dir, "external_parent_validated", stage=parent_name,
+               checkpoint=str(external_parent), checkpoint_sha256=sha256(external_parent))
+
+    for stage in selected_stages:
         out_path = paths[stage.name]
+        parent_override = external_parent if stage is selected_stages[0] else None
         report_path = Path(str(out_path) + ".report.json")
         # The Mask checkpoint is expensive and independently crash-safe. If its report predates
         # the balanced per-stream probe, discard only the stale report and re-finalize the exact
@@ -586,13 +710,16 @@ def _run_parent(args: argparse.Namespace) -> None:
                        reason="stale_split_schema", checkpoint=str(out_path))
         if out_path.is_file() and report_path.is_file():
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
-            _assert_stage_parent(out_path, stage, paths)
+            _assert_stage_parent(out_path, stage, paths, parent_path=parent_override)
             _revalidate_stage_report(report_path)
             _assert_stage_verdict(report_path)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
             progress = _run_probe_atlas(
                 stage, out_path, out_dir=out_dir, device=device, python=python,
                 labels=atlas_labels, data_dir=data_dir)
+            if stage.parent and (out_dir / "probe_atlas" /
+                                 f"{stage.parent}_emb.npy.pool.json").is_file():
+                _assert_atlas_pool_match(out_dir, stage.parent, stage.name)
             _assert_atlas_retention(progress, stage.name)
             _event(out_dir, "stage_skipped", stage=stage.name, reason="complete",
                    checkpoint=str(out_path))
@@ -626,6 +753,8 @@ def _run_parent(args: argparse.Namespace) -> None:
                 command = [str(python), str(Path(__file__).resolve()),
                            "--run-stage", stage.name, "--data-dir", str(data_dir),
                            "--out-dir", str(out_dir), "--device", device]
+                if parent_override is not None:
+                    command.extend(["--parent-checkpoint", str(parent_override)])
             print(f"\n[{stage.name}] START batch={batch} steps={steps} "
                   f"samples/epoch={batch * steps:,}", flush=True)
             _event(out_dir, "stage_started", stage=stage.name, batch=batch, steps=steps,
@@ -655,27 +784,40 @@ def _run_parent(args: argparse.Namespace) -> None:
         progress = _run_probe_atlas(
             stage, out_path, out_dir=out_dir, device=device, python=python,
             labels=atlas_labels, data_dir=data_dir)
+        if stage.parent and (out_dir / "probe_atlas" /
+                             f"{stage.parent}_emb.npy.pool.json").is_file():
+            _assert_atlas_pool_match(out_dir, stage.parent, stage.name)
         _assert_atlas_retention(progress, stage.name)
         print(f"[{stage.name}] PASS; advancing lineage", flush=True)
         _event(out_dir, "stage_completed", stage=stage.name, batch=batch,
                checkpoint=str(out_path), checkpoint_sha256=sha256(out_path),
                report=str(report_path))
 
-    final_path = paths["nextleg"]
+    final_stage = selected_stages[-1]
+    final_path = paths[final_stage.name]
+    manifest_stages = {}
+    if external_parent is not None:
+        manifest_stages[selected_stages[0].parent] = {
+            "path": str(external_parent), "sha256": sha256(external_parent),
+            "role": "external_parent",
+        }
+    manifest_stages.update({
+        stage.name: {"path": str(paths[stage.name]), "sha256": sha256(paths[stage.name])}
+        for stage in selected_stages
+    })
     summary = {
         "schema": "ffm_clean_ssl_pipeline_v1",
         "holdout_start": HOLDOUT_START,
         "sampling_mode": args.sampling_mode,
         "data_provenance": provenance,
-        "stages": {stage.name: {"path": str(paths[stage.name]),
-                                  "sha256": sha256(paths[stage.name])} for stage in STAGES},
+        "stages": manifest_stages,
         "final_checkpoint": str(final_path),
     }
     (out_dir / "pipeline_manifest.json").write_text(json.dumps(summary, indent=2) + "\n")
-    _notify("Clean SSL pipeline completed through NextLeg")
+    _notify(f"Clean SSL pipeline completed through {final_stage.name}")
     _event(out_dir, "pipeline_completed", final_checkpoint=str(final_path),
            manifest=str(out_dir / "pipeline_manifest.json"))
-    print(f"\nPIPELINE COMPLETE\n  NextLeg: {final_path}", flush=True)
+    print(f"\nPIPELINE COMPLETE\n  {final_stage.name}: {final_path}", flush=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -699,10 +841,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-epochs", type=int,
                         default=int(os.environ.get("CONTROL_EPOCHS", "8")),
                         help="maximum epochs for each diagnostic shuffle/random control")
+    parser.add_argument(
+        "--controls", default=os.environ.get("SSL_CONTROLS", ""),
+        help="comma-separated diagnostic controls for non-mask stages: shuffle,random")
     parser.add_argument("--reuse-mask-real", action="store_true",
                         default=os.environ.get("REUSE_MASK_REAL") == "1",
                         help="finalize an existing REAL Mask checkpoint without retraining it")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--start-stage", choices=STAGE_ORDER, default="mask",
+        help="start a partial lineage from this stage; non-mask starts require an explicit parent")
+    parser.add_argument(
+        "--parent-checkpoint",
+        help="immutable parent checkpoint for a non-mask --start-stage experiment")
+    parser.add_argument(
+        "--reuse-artifacts-from",
+        help="completed pipeline directory supplying matched labels and parent Atlas artifacts")
     parser.add_argument("--run-stage", choices=STAGE_ORDER, help=argparse.SUPPRESS)
     return parser
 

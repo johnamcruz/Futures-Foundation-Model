@@ -143,6 +143,17 @@ def _control_cfg(cfg):
     return out
 
 
+def _selected_history_row(history):
+    """Return metrics for the encoder that was actually checkpointed.
+
+    The minimum observed validation loss is not always saved: a collapse guard
+    may reject that epoch. New trainers mark the selected row explicitly; old
+    histories fall back to the historical minimum for compatibility.
+    """
+    selected = [row for row in history if row.get('checkpoint_selected')]
+    return selected[-1] if selected else min(history, key=lambda row: row['val_loss'])
+
+
 def revalidate_saved_report(report_path):
     """Reapply the current task gate to a completed checkpoint report without retraining.
 
@@ -407,14 +418,21 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     if reuse_real_checkpoint:
         std = float(probe_res['embedding_std'])
         hist[0]['std'] = std
-    else:
-        std = float(hist[-1]['std'])
-    best_ep = min(hist, key=lambda h: h['val_loss'])
+    best_ep = _selected_history_row(hist)
+    if not reuse_real_checkpoint:
+        # Bind the gate to the exact encoder returned/saved by the trainer, not
+        # the final attempted epoch (which may be worse or collapse-guarded).
+        std = float(best_ep['std'])
     fc_skill = best_ep.get('skill')                       # forecast skill vs copy-now (None for mask)
     ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext,
                          forecast_skill=fc_skill)
-    history = [{'source': 'default', 'best_val': float(best_ep['val_loss']), 'std': std,
-                'forecast_skill': fc_skill, 'gate_ok': bool(ok), **detail}]
+    task_metrics = {key: value for key, value in best_ep.items()
+                    if key not in ('epoch', 'train_loss', 'val_loss', 'std',
+                                   'checkpoint_selected')}
+    history = [{'source': 'default', 'best_epoch': int(best_ep.get('epoch', -1)),
+                'best_val': float(best_ep['val_loss']), 'std': std,
+                'forecast_skill': fc_skill, 'gate_ok': bool(ok),
+                **task_metrics, **detail}]
     verdict = _finalize(big, tr, va, state, probe_res, cfg, out_path=out_path, controls=controls,
                         holdout_start=holdout_start, val_frac=val_frac, streams=streams,
                         history=history, verbose=verbose)

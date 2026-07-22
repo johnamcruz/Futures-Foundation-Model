@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Run CRT sweep unit tests before every commit.
+# Run the FFM unit tests before every commit.
 # Install once with: git config core.hooksPath .githooks
 
 set -e
 
-PYTHON="/Users/johnmcruz/Projects/algoTraderAI/venv/bin/python"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+PYTHON="$REPO_ROOT/.venv/bin/python"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: FFM virtualenv is missing: $PYTHON"
+    echo "Create .venv and install the project test dependencies before committing."
+    exit 1
+fi
 
 echo "Running unit tests..."
 

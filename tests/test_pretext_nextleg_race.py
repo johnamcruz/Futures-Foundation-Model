@@ -128,6 +128,41 @@ def test_trainer_accepts_shared_config_without_forwarding_it():
 
 
 @torch_test
+def test_base_nextleg_validation_is_fixed_and_preserves_training_rng():
+    """Early stopping must compare identical pivots and not consume training draws."""
+    import torch
+    from futures_foundation.finetune.pretext._torch.nextleg import _NextLegTrainer
+
+    class _Net(torch.nn.Module):
+        def forward_all(self, ctx):
+            return ctx[:, :, :2], ctx[:, :1, :2].flatten(1)
+
+        def embed(self, ctx):
+            return torch.cat((ctx.mean((1, 2))[:, None], ctx.std((1, 2))[:, None]), dim=1)
+
+    t = object.__new__(_NextLegTrainer)
+    t.net = _Net()
+    t.dev = 'cpu'
+    t.gen = torch.Generator().manual_seed(17)
+    t.va = torch.arange(64)
+    t.batch = 8
+    t.mse_weight = t.leg_w = 1.0
+
+    def make_batch(_starts, gen=None):
+        x = torch.randn(8, 5, 4, generator=gen)
+        return x, x[:, :, :2] + 0.1, x[:, :1, :2].flatten(1) + 0.2
+
+    t.make_batch = make_batch
+    before = t.gen.get_state().clone()
+    v1, e1 = t.val_eval()
+    v2, e2 = t.val_eval()
+    assert v1 == pytest.approx(v2)
+    assert e1 == pytest.approx(e2)
+    assert torch.equal(t.gen.get_state(), before)
+    assert t.net.training is True
+
+
+@torch_test
 def test_race_validation_is_fixed_and_restores_training_rng():
     """Repeated validation uses identical anchors and must not perturb subsequent training draws."""
     import torch

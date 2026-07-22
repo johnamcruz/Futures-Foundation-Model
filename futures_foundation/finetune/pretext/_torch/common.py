@@ -490,7 +490,7 @@ class BaseTrainer:
             opt.load_state_dict(resume_payload['optimizer_state'])
             sched.load_state_dict(resume_payload['scheduler_state'])
         bad = int(resume_payload.get('bad_epochs', 0)) if resume_payload else 0
-        history = ([resume_payload['best_history_row']]
+        history = ([{**resume_payload['best_history_row'], 'checkpoint_selected': True}]
                    if resume_payload and resume_payload.get('best_history_row') else [])
         for ep in range(start_epoch, self.epochs):
             self.net.train(); tr_tot = 0.0; ep_started = time.monotonic()
@@ -525,7 +525,7 @@ class BaseTrainer:
                 torch.cuda.empty_cache()
             vloss, extra = self.val_eval()
             history.append({'epoch': ep, 'train_loss': tr_tot / self.steps_per_epoch,
-                            'val_loss': vloss, **extra})
+                            'val_loss': vloss, 'checkpoint_selected': False, **extra})
             if self.std_guard and extra.get('std', 0.0) > self.std_guard:
                 # DRIFT GUARD: embedding std past the ceiling = the representation is drifting off
                 # the data (the unanchored-discrimination failure mode). HALT NOW and do NOT save
@@ -539,6 +539,9 @@ class BaseTrainer:
             improved = vloss < best - 1e-5
             if improved:
                 best, bad = vloss, 0
+                for row in history[:-1]:
+                    row['checkpoint_selected'] = False
+                history[-1]['checkpoint_selected'] = True
                 best_state = self.snapshot_state()
                 if save_ok:                                          # progressive best-save (crash-safe)
                     _atomic_save(best_state, self.ckpt_path)
