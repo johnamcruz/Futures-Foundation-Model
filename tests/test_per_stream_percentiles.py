@@ -12,7 +12,8 @@ generic in the stream key, and small-stream safety.
 import numpy as np
 import pytest
 
-from futures_foundation.finetune.produce import per_stream_percentiles
+from futures_foundation.finetune.produce import (
+    per_stream_percentiles, per_stream_val_percentile_scores)
 
 
 def _keys(spec):
@@ -90,3 +91,33 @@ def test_degenerate_inputs_return_empty_not_garbage():
     assert per_stream_percentiles(np.array([0.1, 0.2]), None) == {}
     # length mismatch must NOT silently mis-align probas to keys
     assert per_stream_percentiles(np.array([0.1, 0.2, 0.3]), _keys({'NQ@1min': 2})) == {}
+
+
+def test_validation_only_stream_scores_remove_raw_cross_stream_scale():
+    keys = _keys({'NQ@1min': 200, 'ES@3min': 200})
+    val = np.concatenate([np.linspace(.7, .9, 200), np.linspace(.1, .3, 200)])
+    eva = np.array([.8, .2])
+    eval_keys = [('NQ@1min', 1000), ('ES@3min', 1000)]
+    val_score, eval_score = per_stream_val_percentile_scores(val, keys, eva, eval_keys)
+    assert eval_score == pytest.approx([.5, .5], abs=.01)
+    assert np.median(val_score[:200]) == pytest.approx(.5, abs=.01)
+    assert np.median(val_score[200:]) == pytest.approx(.5, abs=.01)
+
+
+def test_stream_scores_are_defined_only_by_validation_distribution():
+    keys = _keys({'NQ@1min': 200})
+    val = np.linspace(0, 1, 200)
+    eval_keys = [('NQ@1min', i) for i in range(3)]
+    _, first = per_stream_val_percentile_scores(val, keys, [.1, .5, .9], eval_keys)
+    _, second = per_stream_val_percentile_scores(val, keys, [.1, .5, 99.0], eval_keys)
+    assert first[:2] == pytest.approx(second[:2])
+    assert second[2] == 1.0
+
+
+def test_stream_scores_fail_closed_for_missing_or_small_validation_stream():
+    with pytest.raises(ValueError, match='require 200'):
+        per_stream_val_percentile_scores(
+            np.linspace(0, 1, 199), _keys({'NQ@1min': 199}), [.5], [('NQ@1min', 999)])
+    with pytest.raises(ValueError, match='require 200'):
+        per_stream_val_percentile_scores(
+            np.linspace(0, 1, 200), _keys({'NQ@1min': 200}), [.5], [('GC@1min', 999)])

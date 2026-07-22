@@ -410,6 +410,39 @@ def per_stream_percentiles(proba, keys, pcts=(10, 25, 50, 75, 90, 95, 97, 99, 99
     return out
 
 
+def per_stream_val_percentile_scores(val_signal, val_keys, eval_signal, eval_keys,
+                                     min_rows=200):
+    """Map raw signals to comparable [0, 1] ranks using validation data only.
+
+    This is the evaluation-time equivalent of the deployed ``score_scale`` contract. Each OOS
+    value is ranked only against the preceding validation distribution for its opaque stream id;
+    OOS values never define thresholds or the reference distribution. Missing or undersized
+    validation streams fail closed because silently falling back to pooled/raw scores recreates
+    cross-ticker and cross-timeframe selection bias.
+    """
+    val = np.asarray(val_signal, float)
+    eva = np.asarray(eval_signal, float)
+    if (val.ndim != 1 or eva.ndim != 1 or val_keys is None or eval_keys is None
+            or len(val) != len(val_keys) or len(eva) != len(eval_keys)):
+        raise ValueError('stream percentile scoring requires aligned 1-D validation/eval inputs')
+    val_ids = np.asarray([str(key[0]) for key in val_keys], object)
+    eval_ids = np.asarray([str(key[0]) for key in eval_keys], object)
+    val_score = np.full(len(val), np.nan, float)
+    eval_score = np.full(len(eva), np.nan, float)
+    for stream in sorted(set(eval_ids.tolist())):
+        ref = np.sort(val[val_ids == stream])
+        if len(ref) < int(min_rows):
+            raise ValueError(
+                f'stream {stream!r} has {len(ref)} validation rows; require {min_rows}')
+        vm = val_ids == stream
+        em = eval_ids == stream
+        val_score[vm] = np.searchsorted(ref, val[vm], side='left') / len(ref)
+        eval_score[em] = np.searchsorted(ref, eva[em], side='left') / len(ref)
+    if not np.isfinite(val_score).all() or not np.isfinite(eval_score).all():
+        raise ValueError('stream percentile scoring found validation-only or unmapped streams')
+    return val_score, eval_score
+
+
 def _print_operating_points(op_rows, band_rows, title='OOS'):
     if band_rows:
         print(f"  {title} — WR@3R by score band (non-cumulative; monotone WR down the bands = the "
@@ -677,8 +710,14 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     # retain the long-standing fit_predict contract.
     if bool((ck or {}).get('requires_keys')):
         _key_args['keys_eval'] = Kte
-    p_val, p_te, ba = clf_real.fit_predict(
+    p_val_raw, p_te_raw, ba = clf_real.fit_predict(
         Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed, **_key_args)
+    stream_standardized = os.environ.get('WF_STREAM_STANDARDIZE') == '1'
+    if stream_standardized:
+        p_val, p_te = per_stream_val_percentile_scores(
+            p_val_raw, val_keys, p_te_raw, Kte)
+    else:
+        p_val, p_te = np.asarray(p_val_raw), np.asarray(p_te_raw)
     gc.collect()
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(eval_lab, Kte, p_te, thr)
@@ -699,18 +738,23 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
         _shuffle_key_args = dict(keys_tr=Ksh, keys_val=keys_val)
         if bool((ck or {}).get('requires_keys')):
             _shuffle_key_args['keys_eval'] = Kte
-        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(
+        psv_raw, ps_raw, _ = get_classifier(classifier, **ck).fit_predict(
             Xtr, ysh, Xval, Ytr_va, Xte, seed, **_shuffle_key_args)
+        if stream_standardized:
+            psv, ps = per_stream_val_percentile_scores(
+                psv_raw, val_keys, ps_raw, Kte)
+        else:
+            psv, ps = np.asarray(psv_raw), np.asarray(ps_raw)
         gc.collect()
         Rs = _arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE))
     auc = None
     if len(np.unique(Yte)) == 2:
         from sklearn.metrics import roc_auc_score
-        auc = float(roc_auc_score(Yte, p_te))
+        auc = float(roc_auc_score(Yte, p_te_raw))
     edge = (_meanR(R) - _meanR(Rs)) if Rs is not None else None
     # WR@3R by score band + trades/day at deploy operating points (the '1-2 A+ trades/day' read).
     bands = wr_by_score(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
-    probability_bands = (wr_by_probability(eval_lab, Kte, p_te, oos_ts)
+    probability_bands = (wr_by_probability(eval_lab, Kte, p_te_raw, oos_ts)
                          if oos_ts is not None else [])
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     target_ops = (target_operating_points(eval_lab, Kte, p_te, oos_ts)
@@ -774,7 +818,9 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
                # distributional ladder's labels and is None on the single-head path, while this
                # table must exist for EVERY head.
-               val_percentiles=per_stream_percentiles(p_val, val_keys),
+               val_percentiles=per_stream_percentiles(p_val_raw, val_keys),
+               selection_score_scale=(
+                   'per_stream_val_percentile' if stream_standardized else 'raw'),
                shuffle_operating_points=ops_sh,
                beats_shuffle_tiers=beats_shuffle_tiers,
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
