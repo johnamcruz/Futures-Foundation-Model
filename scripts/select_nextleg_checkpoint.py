@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -37,14 +38,72 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _probe_artifact(directory: Path, filename: str) -> Path:
+    """Resolve canonical Probe Atlas output, with the old downloaded-root layout supported."""
+    canonical = directory / "probe_atlas" / filename
+    legacy = directory / filename
+    if canonical.is_file():
+        return canonical
+    if legacy.is_file():
+        return legacy
+    raise FileNotFoundError(canonical)
+
+
+def _task_history(directory: Path, report: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Return complete NextLeg metrics, recovering older reports from their trainer sidecar.
+
+    Early clean-pipeline reports persisted forecast skill but omitted leg correlations even though
+    the exact selected values were present in ``.trainer.pt``. Treating missing values as zero can
+    reverse a checkpoint-selection decision. Missing evidence now fails closed unless the trusted
+    local trainer sidecar supplies it, and overlapping report/sidecar metrics must agree.
+    """
+    history = dict((report.get("history") or [{}])[0])
+    required = ("forecast_skill", "leg_corr1", "leg_corr2")
+    if all(history.get(key) is not None for key in required):
+        return history, "report"
+
+    trainer_path = directory / "mantis_ssl_nextleg.pt.trainer.pt"
+    if not trainer_path.is_file():
+        missing = [key for key in required if history.get(key) is None]
+        raise RuntimeError(
+            f"NextLeg comparison is missing {missing} and trainer sidecar: {trainer_path}")
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - selector runs in the foundation environment
+        raise RuntimeError("torch is required to recover legacy trainer-sidecar metrics") from exc
+    payload = torch.load(trainer_path, map_location="cpu")
+    sidecar = dict(payload.get("best_history_row") or {})
+    if sidecar.get("forecast_skill") is None and sidecar.get("skill") is not None:
+        sidecar["forecast_skill"] = sidecar["skill"]
+    for key in required:
+        report_value, sidecar_value = history.get(key), sidecar.get(key)
+        if sidecar_value is None:
+            raise RuntimeError(f"trainer sidecar is missing selected metric {key}: {trainer_path}")
+        if (report_value is not None
+                and not math.isclose(float(report_value), float(sidecar_value),
+                                     rel_tol=1e-7, abs_tol=1e-9)):
+            raise RuntimeError(
+                f"report/trainer selected metric mismatch for {key} in {directory}")
+        history.setdefault(key, sidecar_value)
+    history.setdefault("best_epoch", sidecar.get("epoch"))
+    return history, "report+trainer_sidecar"
+
+
+def _metric(history: dict[str, Any], key: str, directory: Path) -> float:
+    value = history.get(key)
+    if value is None or not math.isfinite(float(value)):
+        raise RuntimeError(f"missing/non-finite {key} in selected NextLeg history: {directory}")
+    return float(value)
+
+
 def _artifacts(directory: Path) -> dict[str, Any]:
     directory = directory.expanduser().resolve()
     checkpoint = directory / "mantis_ssl_nextleg.pt"
     report = _read(Path(str(checkpoint) + ".report.json"))
     marker = _read(Path(str(checkpoint) + ".real_complete.json"))
     manifest = _read(directory / "pipeline_manifest.json")
-    atlas = _read(directory / "probe_atlas" / "nextleg.json")
-    pool = _read(directory / "probe_atlas" / "nextleg_emb.npy.pool.json")
+    atlas = _read(_probe_artifact(directory, "nextleg.json"))
+    pool = _read(_probe_artifact(directory, "nextleg_emb.npy.pool.json"))
     digest = _sha256(checkpoint)
     if marker.get("checkpoint_sha256") != digest:
         raise RuntimeError(f"REAL-complete marker hash mismatch in {directory}")
@@ -57,8 +116,10 @@ def _artifacts(directory: Path) -> dict[str, Any]:
     if set(probes) != EXPECTED_PROBES:
         raise RuntimeError(
             f"Probe Atlas contract mismatch in {directory}: {sorted(set(probes) ^ EXPECTED_PROBES)}")
+    task_history, task_history_source = _task_history(directory, report)
     return {"directory": directory, "checkpoint": checkpoint, "sha256": digest,
-            "report": report, "manifest": manifest, "atlas": atlas, "pool": pool}
+            "report": report, "manifest": manifest, "atlas": atlas, "pool": pool,
+            "task_history": task_history, "task_history_source": task_history_source}
 
 
 def _family_mean(probes: dict[str, Any], family: str, field: str = "auc") -> float:
@@ -117,11 +178,12 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     if verdict.get("temporal_signal") is None or float(verdict["temporal_signal"]) <= 0:
         failures.append("candidate has no positive temporal-order signal")
 
-    history = (report.get("history") or [{}])[0]
-    baseline_history = (baseline["report"].get("history") or [{}])[0]
-    if float(history.get("forecast_skill") or 0) <= 0:
+    history = candidate["task_history"]
+    baseline_history = baseline["task_history"]
+    if _metric(history, "forecast_skill", candidate["directory"]) <= 0:
         failures.append("candidate does not beat candle persistence")
-    if float(history.get("leg_corr1") or 0) <= 0 or float(history.get("leg_corr2") or 0) <= 0:
+    if (_metric(history, "leg_corr1", candidate["directory"]) <= 0
+            or _metric(history, "leg_corr2", candidate["directory"]) <= 0):
         failures.append("candidate did not learn both future leg-duration targets")
 
     bp, cp = baseline["atlas"]["probes"], candidate["atlas"]["probes"]
@@ -150,16 +212,16 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
             "candidate": _worst_stream_mean(cp),
         },
         "forecast_skill": {
-            "baseline": float(baseline_history.get("forecast_skill") or 0),
-            "candidate": float(history.get("forecast_skill") or 0),
+            "baseline": _metric(baseline_history, "forecast_skill", baseline["directory"]),
+            "candidate": _metric(history, "forecast_skill", candidate["directory"]),
         },
         "leg_corr1": {
-            "baseline": float(baseline_history.get("leg_corr1") or 0),
-            "candidate": float(history.get("leg_corr1") or 0),
+            "baseline": _metric(baseline_history, "leg_corr1", baseline["directory"]),
+            "candidate": _metric(history, "leg_corr1", candidate["directory"]),
         },
         "leg_corr2": {
-            "baseline": float(baseline_history.get("leg_corr2") or 0),
-            "candidate": float(history.get("leg_corr2") or 0),
+            "baseline": _metric(baseline_history, "leg_corr2", baseline["directory"]),
+            "candidate": _metric(history, "leg_corr2", candidate["directory"]),
         },
     }
     for row in metrics.values():
@@ -204,6 +266,10 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         "candidate_sha256": candidate["sha256"],
         "seq2seq_parent_sha256": base_parent,
         "candidate_parent_sha256": cand_parent,
+        "metric_sources": {
+            "baseline": baseline["task_history_source"],
+            "candidate": candidate["task_history_source"],
+        },
         "metrics": metrics,
         "candidate_controls": {
             "task_control": task_control,
