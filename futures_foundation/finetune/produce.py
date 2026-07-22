@@ -22,6 +22,8 @@ import os
 from pathlib import Path
 
 import numpy as np
+
+from .keyed_control import shuffle_training_keys
 import pandas as pd
 
 from .classifier import get_classifier
@@ -744,7 +746,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     else:
         if keyed and keys_tr is not None:
             perm = rng.permutation(len(Ytr_tr))
-            ysh = np.asarray(Ytr_tr)[perm]; Ksh = [keys_tr[i] for i in perm]
+            ysh = np.asarray(Ytr_tr)[perm]
+            Ksh = shuffle_training_keys(eval_lab, keys_tr, perm)
         else:
             ysh = np.asarray(Ytr_tr).copy(); rng.shuffle(ysh); Ksh = None
         if verbose:
@@ -1114,7 +1117,7 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
     R = _arm_R(labeler, Kte, p_te, thr)
     if keyed:
         perm = rng.permutation(len(Ytr_tr))               # permute label + ladder keys together
-        ysh, Ksh = Ytr_tr[perm], [Ktr_tr[i] for i in perm]
+        ysh, Ksh = Ytr_tr[perm], shuffle_training_keys(labeler, Ktr_tr, perm)
     else:
         ysh = Ytr_tr.copy(); rng.shuffle(ysh); Ksh = None
     if verbose:
