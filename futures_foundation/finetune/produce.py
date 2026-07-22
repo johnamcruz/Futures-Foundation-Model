@@ -183,6 +183,18 @@ def target_operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     return rows
 
 
+def selection_target_audit(eval_lab, keys, score, ts):
+    """Run an optional strategy-defined target audit on the exact served ranking.
+
+    ``score`` is the same validation-derived, per-stream-standardized score consumed by the
+    economic operating points. This generic hook lets a strategy connect its target-only teacher
+    labels to final entry selection without exposing those labels as inputs or teaching the public
+    harness private strategy semantics.
+    """
+    audit = getattr(eval_lab, 'selection_target_audit', None)
+    return audit(keys, np.asarray(score, float), ts) if callable(audit) else None
+
+
 def selection_concentration(keys, proba, ts, rates=(5, 3, 2, 1)):
     """Composition of each pooled top-score tier, for hidden stream-dependence audits."""
     if len(keys) == 0:
@@ -489,6 +501,7 @@ def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
         'auxiliary_metrics': {
             'forecast': out.get('forecast_metrics'),
             'forecast_entry_economics': out.get('forecast_entry_economics'),
+            'selection_target_audit': out.get('selection_target_audit'),
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
@@ -597,6 +610,7 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
         # serving the separately calibrated auxiliary output without private-code assumptions.
         'auxiliary_metrics': {
             'forecast': out.get('forecast_metrics'),
+            'selection_target_audit': out.get('selection_target_audit'),
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
@@ -759,6 +773,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
     target_ops = (target_operating_points(eval_lab, Kte, p_te, oos_ts)
                   if oos_ts is not None else None)
+    target_audit = (selection_target_audit(eval_lab, Kte, p_te, oos_ts)
+                    if oos_ts is not None else None)
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
     regimes = regime_breakdown(eval_lab, Kte, p_te)
     concentration = selection_concentration(Kte, p_te, oos_ts) if oos_ts is not None else []
@@ -809,6 +825,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
                wr_by_score=bands, wr_by_probability=probability_bands,
                operating_points=ops, target_operating_points=target_ops,
+               selection_target_audit=target_audit,
                wr_by_alignment=align,
                wr_by_regime=regimes,
                selection_concentration=concentration,

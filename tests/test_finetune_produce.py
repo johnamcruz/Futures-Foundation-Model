@@ -140,6 +140,20 @@ def test_target_operating_points_is_optional_for_legacy_labelers():
     assert produce.target_operating_points(lab, keys, score, ts) is None
 
 
+def test_selection_target_audit_threads_standardized_score_to_strategy_hook():
+    class _AuditLab:
+        def selection_target_audit(self, keys, score, ts):
+            return {'n': len(keys), 'top': int(np.argmax(score)), 'days': len(set(ts))}
+
+    keys = [('NQ@3min', 1), ('NQ@3min', 2)]
+    score = np.array([.2, .9])
+    ts = [np.datetime64('2025-01-02'), np.datetime64('2025-01-03')]
+    assert produce.selection_target_audit(_AuditLab(), keys, score, ts) == {
+        'n': 2, 'top': 1, 'days': 2,
+    }
+    assert produce.selection_target_audit(object(), keys, score, ts) is None
+
+
 def test_wr_by_score_bands_are_monotone():
     lab, keys, proba, ts = _ranked_oos()
     bands = produce.wr_by_score(lab, keys, proba, ts)
