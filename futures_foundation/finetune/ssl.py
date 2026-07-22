@@ -194,10 +194,12 @@ def _stream_names(streams):
 # ------------------------------------------------------------------------------- save/probe
 def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout_start,
               val_frac, streams, history, verbose):
-    """Save the chosen encoder + report. Controls are PROBE-BASED diagnostics: train
-    shuffle/random with the chosen cfg and probe EACH vs vanilla -> real_delta vs
-    control_delta (real - shuffle > 0 => temporal order contributed to the useful
-    representation). The contrastive loss is not used for the verdict."""
+    """Save the chosen encoder + report and evaluate objective-aware corruption controls.
+
+    Representation stages compare Probe Atlas lift. Forecasting tasks can compare their own
+    held-out temporal targets so inherited parent knowledge cannot make shuffled adapters appear
+    equivalent to REAL. The independent representation gate remains mandatory for every task.
+    """
     import torch
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
     torch.save(state, out_path)                          # adapted ENCODER state_dict
@@ -209,7 +211,9 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
             'embedding_std': float(history[0]['std']),
         }, marker, indent=2)
 
+    task = get_pretext(cfg.get('pretext', 'mask'))
     ctrl_delta = {}
+    ctrl_task = {}
     for ctrl in controls:
         if ctrl == 'real':
             continue
@@ -219,19 +223,27 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
         if verbose:
             print(f"  [control-budget] {ctrl}: max_epochs={ctrl_cfg['epochs']} "
                   f"patience={ctrl_cfg['patience']}", flush=True)
-        st, _ = _train(big, tr, va, ctrl_cfg, ctrl)
+        st, ctrl_history = _train(big, tr, va, ctrl_cfg, ctrl)
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
                          device=cfg['device'], seed=cfg['seed'],
                          folds=cfg.get('probe_folds', 1),
                          group_names=_stream_names(streams), verbose=verbose)
         ctrl_delta[ctrl] = float(r['mean_core_delta'])
+        ctrl_best = _selected_history_row(ctrl_history) if ctrl_history else {}
+        ctrl_task[ctrl] = task.control_evidence(ctrl_best, r)
 
     real_delta = (None if probe_res is None else float(probe_res['mean_core_delta']))
-    temporal = (None if (real_delta is None or 'shuffle' not in ctrl_delta)
-                else real_delta - ctrl_delta['shuffle'])
+    real_task = task.control_evidence(history[0] if history else {}, probe_res)
+    beats_controls, task_margins, temporal = task.compare_control_evidence(
+        real_task, ctrl_task)
     representation_pass = bool(history and history[0].get('gate_ok', False))
-    beats_controls = bool(real_delta is not None and all(
-        real_delta > value for value in ctrl_delta.values()))
+    task_control = {
+        'contract': task.control_contract,
+        'real': real_task,
+        'controls': ctrl_task,
+        'margins': task_margins,
+        'beats_controls': beats_controls,
+    }
     verdict = {
         # Fail closed: the task-specific representation gate must pass and REAL temporal
         # learning must beat every corrupted-input control. The old verdict only checked that
@@ -243,9 +255,11 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
                                         else bool(probe_res['learns_regime_vol_structure'])),
         'real_delta': real_delta,
         'control_delta': ctrl_delta,
-        'temporal_signal': temporal,        # real - shuffle (>0 => order contributed)
+        'task_control': task_control,
+        'temporal_signal': temporal,
     }
     report = {'verdict': verdict, 'probe': probe_res, 'control_delta': ctrl_delta,
+              'task_control': task_control,
               'evaluation_environment': evaluation_environment(),
               'config': {k: cfg[k] for k in cfg if not k.startswith('_') and k not in
                          ('verbose', 'device', 'model_id', 'compile_model')},

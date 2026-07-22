@@ -22,6 +22,49 @@ from .forecast import ForecastTask
 class NextLegTask(ForecastTask):
     name, trainer = 'nextleg', 'train_ssl_nextleg'
 
+    @property
+    def control_contract(self):
+        return 'nextleg_forecast_and_leg_skill_v1'
+
+    @staticmethod
+    def _metric(history_row, report_name, trainer_name=None):
+        value = history_row.get(report_name)
+        if value is None and trainer_name is not None:
+            value = history_row.get(trainer_name)
+        return None if value is None else float(value)
+
+    def control_evidence(self, history_row, probe_res):
+        """Measure what NextLeg added, not generic knowledge inherited from Seq2Seq.
+
+        Shuffle/random adapters retain almost all parent representation, so their generic linear
+        probes can tie REAL even when their next-leg targets are unlearnable. REAL must instead
+        beat every corruption on persistence skill and both future leg-duration correlations.
+        The ordinary representation gate remains independently mandatory to catch forgetting.
+        """
+        return {
+            'forecast_skill': self._metric(history_row, 'forecast_skill', 'skill'),
+            'leg_corr1': self._metric(history_row, 'leg_corr1'),
+            'leg_corr2': self._metric(history_row, 'leg_corr2'),
+        }
+
+    def compare_control_evidence(self, real, controls):
+        metrics = ('forecast_skill', 'leg_corr1', 'leg_corr2')
+        margins = {
+            name: {
+                metric: (None if real.get(metric) is None or row.get(metric) is None else
+                         float(real[metric]) - float(row[metric]))
+                for metric in metrics
+            }
+            for name, row in controls.items()
+        }
+        real_positive = all(real.get(metric) is not None and float(real[metric]) > 0
+                            for metric in metrics)
+        passed = bool(real_positive and controls and all(
+            margin is not None and margin > 0
+            for row in margins.values() for margin in row.values()))
+        shuffle = margins.get('shuffle') or {}
+        return passed, margins, shuffle.get('forecast_skill')
+
     def reserve(self, cfg):
         # context + enough future for BOTH legs to RESOLVE (unresolved -> masked, not fabricated).
         # LEAK FIX (2026-07-17): the target reads the pivot TWO ahead (t2 = o_nn - o_n), so the

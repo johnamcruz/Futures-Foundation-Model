@@ -93,18 +93,20 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
     report = candidate["report"]
     verdict = report.get("verdict") or {}
     config = report.get("config") or {}
-    controls = verdict.get("control_delta") or report.get("control_delta") or {}
+    task_control = verdict.get("task_control") or report.get("task_control") or {}
+    controls = task_control.get("controls") or {}
     if candidate["manifest"].get("sampling_mode") != "uniform_stream":
         failures.append("candidate pipeline is not uniform_stream")
     if config.get("sampling_mode") != "uniform_stream":
         failures.append("candidate report is not uniform_stream")
     if verdict.get("all_pass") is not True or verdict.get("representation_pass") is not True:
         failures.append("candidate objective/representation gate failed")
+    if task_control.get("contract") != "nextleg_forecast_and_leg_skill_v1":
+        failures.append("candidate lacks the NextLeg-specific control contract")
     if set(controls) != {"shuffle", "random"}:
-        failures.append("candidate lacks exact shuffle and random controls")
-    real_delta = verdict.get("real_delta")
-    if real_delta is None or any(float(real_delta) <= float(value) for value in controls.values()):
-        failures.append("REAL representation did not beat every corrupted-input control")
+        failures.append("candidate lacks exact shuffle and random task controls")
+    if task_control.get("beats_controls") is not True or verdict.get("beats_controls") is not True:
+        failures.append("REAL NextLeg task metrics did not beat every corrupted-input control")
     if verdict.get("temporal_signal") is None or float(verdict["temporal_signal"]) <= 0:
         failures.append("candidate has no positive temporal-order signal")
 
@@ -168,8 +170,12 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         "candidate_sha256": candidate["sha256"],
         "seq2seq_parent_sha256": base_parent,
         "metrics": metrics,
-        "candidate_controls": {"real_delta": real_delta, **controls,
-                               "temporal_signal": verdict.get("temporal_signal")},
+        "candidate_controls": {
+            "task_control": task_control,
+            "representation_real_delta": verdict.get("real_delta"),
+            "representation_control_delta": verdict.get("control_delta"),
+            "temporal_signal": verdict.get("temporal_signal"),
+        },
         "candidate_task_metrics": {
             key: history.get(key) for key in
             ("best_epoch", "forecast_skill", "leg_corr1", "leg_corr2",

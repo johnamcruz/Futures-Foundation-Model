@@ -502,6 +502,69 @@ def test_finalize_fails_when_real_representation_loses_to_control(tmp_path, monk
     assert verdict['all_pass'] is False
 
 
+def test_nextleg_controls_measure_incremental_task_not_inherited_representation(
+        tmp_path, monkeypatch):
+    """A corrupted adapter may retain stronger parent probes but must lose NextLeg metrics."""
+    fake_torch = types.SimpleNamespace(
+        save=lambda _state, path: open(path, 'wb').write(b'checkpoint'))
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    rows = {
+        'shuffle': {'epoch': 4, 'val_loss': 2.43, 'skill': .010,
+                    'leg_corr1': -.015, 'leg_corr2': .005},
+        'random': {'epoch': 5, 'val_loss': 2.44, 'skill': .009,
+                   'leg_corr1': -.017, 'leg_corr2': -.001},
+    }
+    monkeypatch.setattr(
+        ssl, '_train', lambda _big, _tr, _va, _cfg, control: ({}, [rows[control]]))
+    # Deliberately stronger generic probe lift for controls: inherited Seq2Seq context is not
+    # evidence that the corrupted NextLeg objective learned future leg structure.
+    monkeypatch.setattr(ssl, '_probe_state', lambda *args, **kwargs: {
+        'mean_core_delta': .0563,
+    })
+    cfg = ssl._base_cfg(pretext='nextleg', control_epochs=8)
+    verdict = ssl._finalize(
+        np.zeros((4, 5)), np.array([0]), np.array([1]), {},
+        {'mean_core_delta': .0556, 'learns_regime_vol_structure': True}, cfg,
+        out_path=str(tmp_path / 'nextleg.pt'), controls=('shuffle', 'random'),
+        holdout_start='2026-01-01', val_frac=.1,
+        streams=[{'sid': 'NQ@3min', 'ticker': 'NQ', 'tf': '3min'}],
+        history=[{'best_val': 2.38, 'std': 1., 'gate_ok': True,
+                  'forecast_skill': .030, 'leg_corr1': .052, 'leg_corr2': .033}],
+        verbose=False)
+
+    assert verdict['all_pass'] is True
+    assert verdict['real_delta'] < verdict['control_delta']['shuffle']
+    assert verdict['task_control']['contract'] == 'nextleg_forecast_and_leg_skill_v1'
+    assert verdict['task_control']['margins']['shuffle']['forecast_skill'] == pytest.approx(.02)
+    assert verdict['temporal_signal'] == pytest.approx(.02)
+
+
+def test_nextleg_control_fails_when_real_does_not_beat_each_leg_target(
+        tmp_path, monkeypatch):
+    fake_torch = types.SimpleNamespace(
+        save=lambda _state, path: open(path, 'wb').write(b'checkpoint'))
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setattr(ssl, '_train', lambda *_args, **_kwargs: ({}, [{
+        'val_loss': 2.4, 'skill': .01, 'leg_corr1': .01, 'leg_corr2': .04,
+    }]))
+    monkeypatch.setattr(ssl, '_probe_state', lambda *args, **kwargs: {
+        'mean_core_delta': .01,
+    })
+    verdict = ssl._finalize(
+        np.zeros((4, 5)), np.array([0]), np.array([1]), {},
+        {'mean_core_delta': .05, 'learns_regime_vol_structure': True},
+        ssl._base_cfg(pretext='nextleg', control_epochs=1),
+        out_path=str(tmp_path / 'nextleg.pt'), controls=('shuffle',),
+        holdout_start='2026-01-01', val_frac=.1,
+        streams=[{'sid': 'NQ@3min', 'ticker': 'NQ', 'tf': '3min'}],
+        history=[{'best_val': 2.3, 'std': 1., 'gate_ok': True,
+                  'forecast_skill': .03, 'leg_corr1': .05, 'leg_corr2': .03}],
+        verbose=False)
+    assert verdict['representation_pass'] is True
+    assert verdict['beats_controls'] is False
+    assert verdict['all_pass'] is False
+
+
 def test_checkpoint_only_finalization_skips_real_optimization(tmp_path, monkeypatch):
     checkpoint = tmp_path / 'mask.pt'
     checkpoint.write_bytes(b'checkpoint')
