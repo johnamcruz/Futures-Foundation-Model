@@ -502,7 +502,8 @@ def _ensure_atlas_labels(*, data_dir: Path, out_dir: Path, provenance: dict,
 
 
 def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
-                        checkpoint: Path, provenance: dict) -> Path:
+                        checkpoint: Path, provenance: dict,
+                        source_stage: Stage | None = None) -> Path:
     """Reuse immutable labels and a hash-matched parent Atlas result.
 
     Encoder embeddings are checkpoint-specific, so only the exact external parent's
@@ -516,8 +517,9 @@ def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
     source_atlas = source_dir / "probe_atlas"
     labels = source_atlas / "trend_lifecycle_labels_pre2026.npz"
     labels_manifest = Path(str(labels) + ".provenance.json")
-    result = source_atlas / f"{stage.name}.json"
-    pool = source_atlas / f"{stage.name}_emb.npy.pool.json"
+    source_stage = source_stage or stage
+    result = source_atlas / f"{source_stage.name}.json"
+    pool = source_atlas / f"{source_stage.name}_emb.npy.pool.json"
     required = (labels, labels_manifest, result, pool)
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -539,19 +541,21 @@ def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
     saved_result = json.loads(result.read_text())
     if saved_result.get("checkpoint_sha256") != sha256(checkpoint):
         raise RuntimeError(
-            f"reusable {stage.name} Atlas result belongs to a different checkpoint")
+            f"reusable {source_stage.name} Atlas result belongs to a different checkpoint")
     if (saved_result.get("schema") != "ffm_probe_atlas_v2"
             or saved_result.get("scope") != "9x4_strategy_agnostic"
             or saved_result.get("fit") != "<2024"
             or saved_result.get("eval") != "2025"):
-        raise RuntimeError(f"reusable {stage.name} Atlas result uses a stale evaluation contract")
+        raise RuntimeError(
+            f"reusable {source_stage.name} Atlas result uses a stale evaluation contract")
 
     destination = out_dir / "probe_atlas"
     destination.mkdir(parents=True, exist_ok=True)
     (destination / f"{stage.name}.json").write_text(result.read_text())
     (destination / f"{stage.name}_emb.npy.pool.json").write_text(pool.read_text())
     _event(out_dir, "probe_atlas_parent_reused", stage=stage.name,
-           source=str(source_dir), checkpoint_sha256=sha256(checkpoint))
+           source_stage=source_stage.name, source=str(source_dir),
+           checkpoint_sha256=sha256(checkpoint))
     return labels
 
 
@@ -693,9 +697,12 @@ def _run_parent(args: argparse.Namespace) -> None:
     if reuse_dir is not None:
         parent_name = selected_stages[0].parent
         parent_stage = next(stage for stage in STAGES if stage.name == parent_name)
+        source_stage_name = args.parent_source_stage or parent_name
+        source_stage = next(stage for stage in STAGES if stage.name == source_stage_name)
         atlas_labels = _reuse_atlas_parent(
             source_dir=reuse_dir, out_dir=out_dir, stage=parent_stage,
-            checkpoint=external_parent, provenance=provenance)
+            checkpoint=external_parent, provenance=provenance,
+            source_stage=source_stage)
     else:
         atlas_labels = _ensure_atlas_labels(data_dir=data_dir, out_dir=out_dir,
                                             provenance=provenance, python=python)
@@ -825,6 +832,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         manifest_stages[selected_stages[0].parent] = {
             "path": str(external_parent), "sha256": sha256(external_parent),
             "role": "external_parent",
+            "source_stage": args.parent_source_stage or selected_stages[0].parent,
         }
     manifest_stages.update({
         stage.name: {"path": str(paths[stage.name]), "sha256": sha256(paths[stage.name])}
@@ -882,6 +890,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-artifacts-from",
         help="completed pipeline directory supplying matched labels and parent Atlas artifacts")
+    parser.add_argument(
+        "--parent-source-stage", choices=STAGE_ORDER,
+        help=("stage name of the external parent inside --reuse-artifacts-from; "
+              "use nextleg when uniformly refining an existing NextLeg checkpoint"))
     parser.add_argument("--run-stage", choices=STAGE_ORDER, help=argparse.SUPPRESS)
     return parser
 
