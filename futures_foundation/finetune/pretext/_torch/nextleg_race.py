@@ -177,7 +177,8 @@ def train_ssl_nextleg_race(big, train_starts, val_starts, *,
                            backbone_ckpt=None, control='real', seed=0, clamp=10.0,
                            grad_clip=1.0, verbose=True, ckpt_path=None, resume=False,
                            freeze_encoder_layers=0, std_guard=1.6, leg_cap=256, leg_w=1.0,
-                           leg_k=2, mse_weight=1.0, race_w=0.25, race_cap=2.0,
+                           leg_k=2, mse_weight=1.0, target_reserve=None,
+                           race_w=0.25, race_cap=2.0,
                            race_levels=RACE_LEVELS, **_ignore):
     """Train an encoder on NextLeg plus a future-only ordered adverse path curve."""
     t = _NextLegRaceTrainer(
@@ -185,6 +186,7 @@ def train_ssl_nextleg_race(big, train_starts, val_starts, *,
         horizons=horizons, context_lengths=context_lengths, new_channels=new_channels,
         model_id=model_id, backbone_ckpt=backbone_ckpt, clamp=clamp, leg_cap=leg_cap,
         leg_w=leg_w, leg_k=leg_k, mse_weight=mse_weight, race_w=race_w,
+        target_reserve=target_reserve,
         race_cap=race_cap, race_levels=race_levels, epochs=epochs,
         steps_per_epoch=steps_per_epoch, batch=batch, lr=lr, weight_decay=weight_decay,
         patience=patience, device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
