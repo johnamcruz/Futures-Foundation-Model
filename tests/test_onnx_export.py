@@ -4,6 +4,8 @@ here; its real parity is covered by the produce(export_onnx=True) integration.""
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.legacy_xgboost
+
 pytest.importorskip("onnxmltools")
 pytest.importorskip("onnxruntime")
 
