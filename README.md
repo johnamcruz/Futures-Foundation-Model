@@ -117,6 +117,47 @@ Variable-length context predicts future OHLCV moves at several horizons. Targets
 
 The final pretraining stage predicts the duration of the developing leg and its counter-leg in bars while retaining the candle-forecasting objective as an anchor. Bar counts keep the target comparable across instruments and timeframes.
 
+### Experimental Structural NextLeg
+
+`nextleg_structural` is an opt-in, strategy-agnostic refinement of a validated NextLeg
+encoder. Inputs end at a close-confirmed pivot and targets remain within the same temporal
+split. In addition to the ordinary candle and leg anchors, the temporary training heads learn:
+
+- current and next HH/HL/LH/LL state;
+- the first future close-confirmed structural break and its delay;
+- scale-free next-leg excursion and duration; and
+- reconstruction of a short candle span around the confirmed formation.
+
+The saved artifact remains an ordinary merged **encoder-only** checkpoint named
+`mantis_ssl_structural_nextleg.pt`; none of the temporary structural heads are required by a
+downstream consumer.
+
+The first 9-ticker × 4-timeframe, pre-2026 LoRA run used a 60-epoch ceiling and selected epoch
+53 (report index 52) at validation loss **4.7688**. Its aggregate temporal-control margin was
+**0.1456**, forecast skill was **0.0307**, and embedding standard deviation was **1.0968**
+against a drift ceiling of 1.6. Its task diagnostics were:
+
+| Validation diagnostic | REAL | time-SHUFFLE | RANDOM |
+|---|---:|---:|---:|
+| Forecast skill over persistence | 0.0307 | 0.0120 | 0.0111 |
+| First-leg correlation | 0.1890 | -0.0033 | -0.0046 |
+| Second-leg correlation | 0.1535 | 0.0216 | -0.0226 |
+| Current structure balanced accuracy | 0.4308 | 0.2836 | 0.2496 |
+| Next structure balanced accuracy | 0.4184 | 0.2727 | 0.2522 |
+| Structural-break balanced accuracy | 0.3974 | 0.2235 | 0.1985 |
+| Excursion correlation | 0.2608 | 0.0385 | 0.0053 |
+| Pivot-span reconstruction skill | 0.7763 | 0.0947 | 0.0061 |
+
+The report returned `all_pass=true`, `representation_pass=true`, and `beats_controls=true`.
+
+```bash
+./.venv/bin/python scripts/mantis_ssl_structural_nextleg.py \
+  --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
+  --warm-trainer checkpoints/mantis_ssl_nextleg.pt.trainer.pt \
+  --out temp/structural_nextleg/mantis_ssl_structural_nextleg.pt \
+  --epochs 60 --controls shuffle,random --device mps
+```
+
 ### Experimental related-series context
 
 `related_nextleg` is an isolated Mantis-native experiment inspired by the grouped-series
@@ -190,6 +231,7 @@ The production lineage writes four independent encoder artifacts:
 | Temporal contrastive | `mantis_ssl_regime_from_mask.pt` |
 | Seq2seq | `mantis_ssl_ctr_seq2seq.pt` |
 | NextLeg | `mantis_ssl_nextleg.pt` |
+| Structural NextLeg (experimental) | `mantis_ssl_structural_nextleg.pt` |
 
 Each production-lineage `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Opt-in related-series experiments use the explicitly versioned composite format described above. Each checkpoint is accompanied by:
 
