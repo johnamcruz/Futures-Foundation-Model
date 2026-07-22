@@ -25,5 +25,7 @@ from .pretext._torch.nextleg_race import (                # noqa: F401  stage-2.
     NextLegRaceNet, ordered_adverse_curve, train_ssl_nextleg_race)
 from .pretext._torch.related_nextleg import (             # noqa: F401  grouped related-series refine
     RelatedNextLegNet, train_ssl_related_nextleg)
+from .pretext._torch.nextleg_structural import (          # noqa: F401  HH/HL/LH/LL + BOS/CHOCH SSL
+    StructuralNextLegNet, train_ssl_nextleg_structural)
 from .pretext._torch.electra import (                     # noqa: F401  stage-4 turn-electra (replaced-TURN)
     ElectraNetwork, train_ssl_electra, clamp_valid_ohlc_t)

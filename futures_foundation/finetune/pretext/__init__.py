@@ -19,6 +19,9 @@ its own file keeps ssl.py a clean orchestrator.
                               2.6 untouched, so the A/B stays honest.
   nextleg_race  (stage 2.8) — nextleg + a future-only ORDERED adverse/progress curve. New modules;
                               production nextleg and its checkpoint remain untouched.
+  nextleg_structural        — SpanBERT-style confirmed-pivot reconstruction plus causal
+                              HH/HL/LH/LL, BOS/CHOCH, duration, and excursion prediction. It is
+                              an opt-in encoder refinement; production nextleg stays untouched.
   electra       (stage 4)   — TURN-ELECTRA (replaced-TURN detection): span-mask the regions around
                               DETECTED SWINGS (the event a pivot entry trades), a weak generator
                               fills each masked turn with a plausible alternative development (a
@@ -38,10 +41,12 @@ from .nextleg import NextLegTask
 from .nextleg_path import NextLegPathTask
 from .nextleg_race import NextLegRaceTask
 from .related_nextleg import RelatedNextLegTask
+from .nextleg_structural import StructuralNextLegTask
 
 PRETEXTS = {t.name: t for t in (MaskTask(), ForecastTask(), ForecastDistTask(),
                                 ContrastiveTask(), TurnElectraTask(), NextLegTask(),
-                                NextLegPathTask(), NextLegRaceTask(), RelatedNextLegTask())}
+                                NextLegPathTask(), NextLegRaceTask(), RelatedNextLegTask(),
+                                StructuralNextLegTask())}
 
 
 def get_pretext(name):
@@ -51,4 +56,4 @@ def get_pretext(name):
 
 __all__ = ['PretextTask', 'MaskTask', 'ForecastTask', 'ForecastDistTask', 'ContrastiveTask',
            'TurnElectraTask', 'NextLegTask', 'NextLegPathTask', 'NextLegRaceTask', 'PRETEXTS',
-           'RelatedNextLegTask', 'get_pretext']
+           'RelatedNextLegTask', 'StructuralNextLegTask', 'get_pretext']

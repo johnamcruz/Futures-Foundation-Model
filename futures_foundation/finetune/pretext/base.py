@@ -11,6 +11,7 @@ class PretextTask:
     name = 'base'
     trainer = None                                        # _ssl_torch trainer fn name
     requires_related_series = False
+    requires_stream_layout = False
 
     def reserve(self, cfg):
         """Extra bars reserved per window beyond `seq` (0 = none)."""
