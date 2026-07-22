@@ -198,6 +198,24 @@ def _assert_stage_verdict(report_path: Path) -> None:
             f"beats_controls={verdict.get('beats_controls')}")
 
 
+def _revalidate_stage_report(report_path: Path) -> dict:
+    """Refresh a saved report under the current objective-aware gate, without optimization."""
+    from futures_foundation.finetune import ssl
+    before = json.loads(report_path.read_text()).get("verdict", {})
+    after = ssl.revalidate_saved_report(report_path)
+    if before.get("all_pass") != after.get("all_pass"):
+        print(f"[{report_path.name}] validation refreshed: "
+              f"all_pass={before.get('all_pass')} -> {after.get('all_pass')}", flush=True)
+    return after
+
+
+def _checkpoint_recovery_flags(out_path: Path) -> tuple[bool, bool]:
+    """Return (resume_training, reuse_completed_real) from durable artifact state."""
+    real_complete = Path(str(out_path) + ".real_complete.json").is_file()
+    return (out_path.is_file() and not real_complete,
+            out_path.is_file() and real_complete)
+
+
 def _seal(data_dir: Path) -> dict:
     streams = ((ticker, timeframe) for ticker in TICKERS for timeframe in TIMEFRAMES)
     result = seal_continuous_streams(data_dir, streams, repo_root=ROOT)
@@ -242,7 +260,7 @@ def _run_child(args: argparse.Namespace) -> None:
     batch = int(os.environ.get(f"{stage.name.upper()}_BATCH", str(stage.batch[args.device])))
     steps = _steps_for(stage, batch)
     config["steps_per_epoch"] = steps
-    resume = out_path.exists() and not Path(str(out_path) + ".report.json").exists()
+    resume, reuse_real = _checkpoint_recovery_flags(out_path)
     _write_lineage(out_path, stage.name, parent, provenance,
                    {**config, "epochs": epochs, "batch": batch, "steps_per_epoch": steps,
                     "samples_per_epoch": stage.samples_per_epoch, "device": args.device})
@@ -252,10 +270,12 @@ def _run_child(args: argparse.Namespace) -> None:
     verdict = ssl.loop_ssl(
         data_dir=str(data_dir), out_path=str(out_path), tickers=TICKERS, tfs=TIMEFRAMES,
         backbone_ckpt=str(parent), device=args.device, epochs=epochs, batch=batch,
-        resume=resume, **config)
+        resume=resume, reuse_real_checkpoint=reuse_real, **config)
     if not out_path.is_file() or not Path(str(out_path) + ".report.json").is_file():
         raise RuntimeError(f"{stage.name} returned without complete checkpoint/report artifacts")
-    _assert_stage_verdict(Path(str(out_path) + ".report.json"))
+    report_path = Path(str(out_path) + ".report.json")
+    _revalidate_stage_report(report_path)
+    _assert_stage_verdict(report_path)
     print(f"[{stage.name}] COMPLETE verdict={verdict}", flush=True)
 
 
@@ -567,6 +587,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         if out_path.is_file() and report_path.is_file():
             _assert_completed_stage_recipe(report_path, sampling_mode=args.sampling_mode)
             _assert_stage_parent(out_path, stage, paths)
+            _revalidate_stage_report(report_path)
             _assert_stage_verdict(report_path)
             print(f"\n[{stage.name}] already complete; skipping {out_path}", flush=True)
             progress = _run_probe_atlas(
@@ -629,6 +650,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         if not out_path.is_file() or not report_path.is_file():
             _notify(f"Clean SSL pipeline missing artifacts at {stage.name}")
             raise RuntimeError(f"incomplete stage artifacts: {stage.name}")
+        _revalidate_stage_report(report_path)
         _assert_stage_verdict(report_path)
         progress = _run_probe_atlas(
             stage, out_path, out_dir=out_dir, device=device, python=python,
