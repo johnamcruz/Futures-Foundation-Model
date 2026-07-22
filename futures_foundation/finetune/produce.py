@@ -22,6 +22,8 @@ import os
 from pathlib import Path
 
 import numpy as np
+
+from .keyed_control import shuffle_training_keys
 import pandas as pd
 
 from .classifier import get_classifier
@@ -132,6 +134,69 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
     return rows
 
 
+def target_operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
+    """Economics of every strategy-defined target at the same ranked operating points.
+
+    A distributional entry score may intentionally rank 2R bases and 6R/8R runners rather than
+    optimize only the primary ship target.  This optional audit exposes that behavior without
+    changing the primary verdict. Labelers provide parallel realized values through
+    ``evaluate_targets`` and, when available, exact first-touch booleans through
+    ``target_win_truth``. Positive unresolved marks never become hits by inference here.
+    """
+    evaluate = getattr(eval_lab, 'evaluate_targets', None)
+    if evaluate is None:
+        return None
+    score = np.asarray(proba, float)
+    keys = list(keys)
+    if not len(score) or len(keys) != len(score):
+        return []
+    all_targets = evaluate(keys, np.ones(len(keys), int))
+    truths_fn = getattr(eval_lab, 'target_win_truth', None)
+    all_truths = truths_fn(keys) if truths_fn is not None else {}
+    for target, values in all_targets.items():
+        if len(values) != len(keys):
+            raise ValueError(f'evaluate_targets[{target}] must align with keys')
+    days, order, rows = _oos_days(ts), np.argsort(-score), []
+    for rate in rates:
+        n = int(min(len(score), max(1, round(rate * days))))
+        selected = order[:n]
+        targets = {}
+        for target, values in sorted(all_targets.items(), key=lambda item: float(item[0])):
+            realized = np.asarray(values, float)[selected]
+            finite = np.isfinite(realized)
+            truth = all_truths.get(target)
+            hit_rate = None
+            if truth is not None:
+                truth = np.asarray(truth, bool)
+                if len(truth) != len(keys):
+                    raise ValueError(f'target_win_truth[{target}] must align with keys')
+                hit_rate = float(truth[selected][finite].mean()) if finite.any() else None
+            targets[f'{float(target):g}'] = {
+                'n': int(finite.sum()),
+                'hit_rate': hit_rate,
+                'meanR': float(realized[finite].mean()) if finite.any() else None,
+            }
+        rows.append({
+            'rate': rate, 'n': n, 'days': days,
+            'pool': int(len(score)), 'avail_per_day': float(len(score) / days),
+            'rate_met': bool(n >= round(rate * days)),
+            'thresh': float(score[selected[-1]]), 'targets': targets,
+        })
+    return rows
+
+
+def selection_target_audit(eval_lab, keys, score, ts):
+    """Run an optional strategy-defined target audit on the exact served ranking.
+
+    ``score`` is the same validation-derived, per-stream-standardized score consumed by the
+    economic operating points. This generic hook lets a strategy connect its target-only teacher
+    labels to final entry selection without exposing those labels as inputs or teaching the public
+    harness private strategy semantics.
+    """
+    audit = getattr(eval_lab, 'selection_target_audit', None)
+    return audit(keys, np.asarray(score, float), ts) if callable(audit) else None
+
+
 def selection_concentration(keys, proba, ts, rates=(5, 3, 2, 1)):
     """Composition of each pooled top-score tier, for hidden stream-dependence audits."""
     if len(keys) == 0:
@@ -198,6 +263,42 @@ def ticker_generalization(per_ticker_ops, rates=(5, 3, 2, 1), min_mean_r=0.0):
     }
 
 
+def ticker_shuffle_generalization(per_ticker_ops, per_ticker_shuffle_ops,
+                                  rates=(5, 3, 2, 1), min_lift_r=PASS_LIFT_MARGIN_R):
+    """Matched real-vs-shuffle gate inside each ticker's own candidate distribution."""
+    requested = tuple(int(rate) for rate in rates)
+    rows, failures = {}, []
+    all_tickers = sorted(set(per_ticker_ops or {}) | set(per_ticker_shuffle_ops or {}))
+    for ticker in all_tickers:
+        real = {int(row['rate']): row for row in (per_ticker_ops or {}).get(ticker, [])}
+        shuffled = {
+            int(row['rate']): row for row in (per_ticker_shuffle_ops or {}).get(ticker, [])}
+        ticker_rows = {}
+        for rate in requested:
+            r, s = real.get(rate), shuffled.get(rate)
+            lift = (None if r is None or s is None
+                    else float(r['meanR']) - float(s['meanR']))
+            passed = bool(
+                r and s and r.get('rate_met', False) and s.get('rate_met', False)
+                and lift is not None and np.isfinite(lift) and lift >= float(min_lift_r))
+            ticker_rows[str(rate)] = {
+                'passed': passed,
+                'real_meanR': (float(r['meanR']) if r is not None else None),
+                'shuffle_meanR': (float(s['meanR']) if s is not None else None),
+                'liftR': lift,
+                'rate_met': bool(r and s and r.get('rate_met', False)
+                                 and s.get('rate_met', False)),
+            }
+            if not passed:
+                failures.append(f'{ticker}@{rate}/day')
+        rows[ticker] = ticker_rows
+    return {
+        'passed': bool(rows) and not failures,
+        'rates': list(requested), 'min_liftR_inclusive': float(min_lift_r),
+        'tickers': rows, 'failures': failures,
+    }
+
+
 def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
     """OOS WR@3R broken down by MODEL SCORE band (NON-cumulative) — 'is a higher score actually a
     better trade?'. Splits pivots into score quantile bands (top 10% / 10-25% / 25-50% / 50-75% /
@@ -221,6 +322,38 @@ def wr_by_score(eval_lab, keys, proba, ts, edges=(0.90, 0.75, 0.50, 0.25, 0.0)):
                          wr3R=(float(W_all[m].mean()) if len(Rs) else float('nan')),
                          meanR=(float(Rs.mean()) if len(Rs) else float('nan'))))
         hi = lo
+    return rows
+
+
+def wr_by_probability(eval_lab, keys, proba, ts,
+                      edges=(0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0000001)):
+    """Exact OOS economics in fixed calibrated-probability bands.
+
+    Quantile bands answer whether ranking is useful; fixed bands answer whether a value such as
+    0.85 retains the same economic meaning over time. Empty bands remain explicit so calibration
+    collapse or an unrealistically restrictive 0.8 threshold cannot hide behind pooled metrics.
+    """
+    proba = np.asarray(proba, float)
+    if len(proba) == 0:
+        return []
+    if len(keys) != len(proba):
+        raise ValueError('keys and probability arrays must align')
+    edges = tuple(float(x) for x in edges)
+    if len(edges) < 2 or any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError('probability edges must be strictly increasing')
+    keys = list(keys)
+    R_all = np.asarray(eval_lab.evaluate(keys, np.ones(len(keys), int)), float)
+    W_all = _win_truth(eval_lab, keys, R_all)
+    days = _oos_days(ts)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (proba >= lo) & (proba < hi)
+        n = int(m.sum())
+        rows.append({
+            'lo': lo, 'hi': min(hi, 1.0), 'n': n, 'per_day': float(n / days),
+            'wr3R': (float(W_all[m].mean()) if n else float('nan')),
+            'meanR': (float(R_all[m].mean()) if n else float('nan')),
+        })
     return rows
 
 
@@ -327,6 +460,39 @@ def per_stream_percentiles(proba, keys, pcts=(10, 25, 50, 75, 90, 95, 97, 99, 99
     return out
 
 
+def per_stream_val_percentile_scores(val_signal, val_keys, eval_signal, eval_keys,
+                                     min_rows=200):
+    """Map raw signals to comparable [0, 1] ranks using validation data only.
+
+    This is the evaluation-time equivalent of the deployed ``score_scale`` contract. Each OOS
+    value is ranked only against the preceding validation distribution for its opaque stream id;
+    OOS values never define thresholds or the reference distribution. Missing or undersized
+    validation streams fail closed because silently falling back to pooled/raw scores recreates
+    cross-ticker and cross-timeframe selection bias.
+    """
+    val = np.asarray(val_signal, float)
+    eva = np.asarray(eval_signal, float)
+    if (val.ndim != 1 or eva.ndim != 1 or val_keys is None or eval_keys is None
+            or len(val) != len(val_keys) or len(eva) != len(eval_keys)):
+        raise ValueError('stream percentile scoring requires aligned 1-D validation/eval inputs')
+    val_ids = np.asarray([str(key[0]) for key in val_keys], object)
+    eval_ids = np.asarray([str(key[0]) for key in eval_keys], object)
+    val_score = np.full(len(val), np.nan, float)
+    eval_score = np.full(len(eva), np.nan, float)
+    for stream in sorted(set(eval_ids.tolist())):
+        ref = np.sort(val[val_ids == stream])
+        if len(ref) < int(min_rows):
+            raise ValueError(
+                f'stream {stream!r} has {len(ref)} validation rows; require {min_rows}')
+        vm = val_ids == stream
+        em = eval_ids == stream
+        val_score[vm] = np.searchsorted(ref, val[vm], side='left') / len(ref)
+        eval_score[em] = np.searchsorted(ref, eva[em], side='left') / len(ref)
+    if not np.isfinite(val_score).all() or not np.isfinite(eval_score).all():
+        raise ValueError('stream percentile scoring found validation-only or unmapped streams')
+    return val_score, eval_score
+
+
 def _print_operating_points(op_rows, band_rows, title='OOS'):
     if band_rows:
         print(f"  {title} — WR@3R by score band (non-cumulative; monotone WR down the bands = the "
@@ -372,15 +538,19 @@ def _contract(labeler, classifier, ck, C, seq, mu, sd, out, onnx_path, sha,
                         ('oos_auc', 'oos_meanR', 'shuffle_meanR', 'edge_shuffle', 'oos_trades')},
         'auxiliary_metrics': {
             'forecast': out.get('forecast_metrics'),
+            'forecast_entry_economics': out.get('forecast_entry_economics'),
+            'selection_target_audit': out.get('selection_target_audit'),
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
+            'head_training': out.get('head_training'),
         },
         'chop_calibration': ({'method': 'platt', 'baked_into_onnx': True,
                               'A': out['chop_platt'][0], 'B': out['chop_platt'][1]}
                              if out.get('chop_platt') else None),
         'chop_percentiles': out.get('chop_percentiles'),
         'chop_fusion': out.get('chop_fusion'),
+        'head_training': out.get('head_training'),
         'onnx': (Path(onnx_path).name if sha else None), 'content_sha': sha,
     }
 
@@ -478,6 +648,7 @@ def _emit(out, classifier, ck, eval_lab, mu, sd, C, seq,
         # serving the separately calibrated auxiliary output without private-code assumptions.
         'auxiliary_metrics': {
             'forecast': out.get('forecast_metrics'),
+            'selection_target_audit': out.get('selection_target_audit'),
             'chop': out.get('chop_metrics'),
             'chop_abstention_audit': out.get('chop_abstention_audit'),
             'chop_fusion': out.get('chop_fusion'),
@@ -591,8 +762,14 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     # retain the long-standing fit_predict contract.
     if bool((ck or {}).get('requires_keys')):
         _key_args['keys_eval'] = Kte
-    p_val, p_te, ba = clf_real.fit_predict(
+    p_val_raw, p_te_raw, ba = clf_real.fit_predict(
         Xtr, Ytr_tr, Xval, Ytr_va, Xte, seed, **_key_args)
+    stream_standardized = os.environ.get('WF_STREAM_STANDARDIZE') == '1'
+    if stream_standardized:
+        p_val, p_te = per_stream_val_percentile_scores(
+            p_val_raw, val_keys, p_te_raw, Kte)
+    else:
+        p_val, p_te = np.asarray(p_val_raw), np.asarray(p_te_raw)
     gc.collect()
     thr = _pct_threshold(p_val, OP_PERCENTILE)
     R = _arm_R(eval_lab, Kte, p_te, thr)
@@ -605,7 +782,8 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
     else:
         if keyed and keys_tr is not None:
             perm = rng.permutation(len(Ytr_tr))
-            ysh = np.asarray(Ytr_tr)[perm]; Ksh = [keys_tr[i] for i in perm]
+            ysh = np.asarray(Ytr_tr)[perm]
+            Ksh = shuffle_training_keys(eval_lab, keys_tr, perm)
         else:
             ysh = np.asarray(Ytr_tr).copy(); rng.shuffle(ysh); Ksh = None
         if verbose:
@@ -613,18 +791,29 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
         _shuffle_key_args = dict(keys_tr=Ksh, keys_val=keys_val)
         if bool((ck or {}).get('requires_keys')):
             _shuffle_key_args['keys_eval'] = Kte
-        psv, ps, _ = get_classifier(classifier, **ck).fit_predict(
+        psv_raw, ps_raw, _ = get_classifier(classifier, **ck).fit_predict(
             Xtr, ysh, Xval, Ytr_va, Xte, seed, **_shuffle_key_args)
+        if stream_standardized:
+            psv, ps = per_stream_val_percentile_scores(
+                psv_raw, val_keys, ps_raw, Kte)
+        else:
+            psv, ps = np.asarray(psv_raw), np.asarray(ps_raw)
         gc.collect()
         Rs = _arm_R(eval_lab, Kte, ps, _pct_threshold(psv, OP_PERCENTILE))
     auc = None
     if len(np.unique(Yte)) == 2:
         from sklearn.metrics import roc_auc_score
-        auc = float(roc_auc_score(Yte, p_te))
+        auc = float(roc_auc_score(Yte, p_te_raw))
     edge = (_meanR(R) - _meanR(Rs)) if Rs is not None else None
     # WR@3R by score band + trades/day at deploy operating points (the '1-2 A+ trades/day' read).
     bands = wr_by_score(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
+    probability_bands = (wr_by_probability(eval_lab, Kte, p_te_raw, oos_ts)
+                         if oos_ts is not None else [])
     ops = operating_points(eval_lab, Kte, p_te, oos_ts) if oos_ts is not None else []
+    target_ops = (target_operating_points(eval_lab, Kte, p_te, oos_ts)
+                  if oos_ts is not None else None)
+    target_audit = (selection_target_audit(eval_lab, Kte, p_te, oos_ts)
+                    if oos_ts is not None else None)
     align = alignment_breakdown(eval_lab, Kte, p_te, oos_ts)  # sighted-counter-trend readout
     regimes = regime_breakdown(eval_lab, Kte, p_te)
     concentration = selection_concentration(Kte, p_te, oos_ts) if oos_ts is not None else []
@@ -643,7 +832,7 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             for r, s in zip(ops, ops_sh) if r['rate'] == s['rate'])
     # PER-TICKER operating points (the deploy question is per-instrument: "NQ at N/day") —
     # rank WITHIN each ticker's candidates, same forward-threshold semantics.
-    per_tk, per_stream = {}, {}
+    per_tk, per_tk_sh, per_stream = {}, {}, {}
     if oos_ts is not None and len(Kte):
         _sids = np.array([str(k[0]) for k in Kte])                 # 'NQ@1min' — ticker AND TF
         _tks = np.array([s.split('@')[0] for s in _sids])
@@ -655,6 +844,9 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ks = [k for k, mm in zip(Kte, m) if mm]
             ts_s = [t for t, mm in zip(oos_ts, m) if mm]
             per_tk[_t] = operating_points(eval_lab, ks, _pa[m], ts_s, rates=DEPLOY_RATES)
+            if Rs is not None:
+                per_tk_sh[_t] = operating_points(
+                    eval_lab, ks, np.asarray(ps, float)[m], ts_s, rates=DEPLOY_RATES)
         # PER-STREAM (ticker AND TIMEFRAME). per_ticker_ops SPLITS ON '@' AND THROWS THE TF AWAY,
         # so 'NQ' there is a BLEND of NQ@1min/3min/5min/15min — four different candidate densities
         # (1min ~150/day vs 3min ~51/day) and four different proba distributions averaged into one
@@ -669,30 +861,41 @@ def _fit_score(classifier, ck, eval_lab, Xtr, Ytr_tr, Xval, Ytr_va, Xte, Kte, Yt
             ts_s = [t for t, mm in zip(oos_ts, m) if mm]
             per_stream[_s] = operating_points(eval_lab, ks, _pa[m], ts_s, rates=DEPLOY_RATES)
     generalization = ticker_generalization(per_tk)
+    shuffle_generalization = ticker_shuffle_generalization(per_tk, per_tk_sh)
     out = dict(oos_auc=auc, best_val_auc=ba, oos_meanR=_meanR(R),
                shuffle_meanR=(_meanR(Rs) if Rs is not None else None), edge_shuffle=edge,
                n_train=len(Ytr_tr), n_oos=len(Kte), oos_trades=int(len(R)),
                beats_shuffle=(bool(edge >= PASS_LIFT_MARGIN_R) if edge is not None else None),
-               wr_by_score=bands, operating_points=ops, wr_by_alignment=align,
+               wr_by_score=bands, wr_by_probability=probability_bands,
+               operating_points=ops, target_operating_points=target_ops,
+               selection_target_audit=target_audit,
+               wr_by_alignment=align,
                wr_by_regime=regimes,
                selection_concentration=concentration,
-               per_ticker_ops=per_tk, per_stream_ops=per_stream,   # per_stream keeps the TF
+               per_ticker_ops=per_tk, per_ticker_shuffle_ops=per_tk_sh,
+               per_stream_ops=per_stream,   # per_stream keeps the TF
                ticker_generalization=generalization,
+               ticker_shuffle_generalization=shuffle_generalization,
                # PER-STREAM PERCENTILES from the VAL distribution -> the deploy contract's 0-100
                # scale. val_keys is passed SEPARATELY from keys_val: the latter carries the
                # distributional ladder's labels and is None on the single-head path, while this
                # table must exist for EVERY head.
-               val_percentiles=per_stream_percentiles(p_val, val_keys),
+               val_percentiles=per_stream_percentiles(p_val_raw, val_keys),
+               selection_score_scale=(
+                   'per_stream_val_percentile' if stream_standardized else 'raw'),
                shuffle_operating_points=ops_sh,
                beats_shuffle_tiers=beats_shuffle_tiers,
                entry_thresholds=getattr(clf_real, '_entry_thresholds', None),   # val-derived T's
                platt=getattr(clf_real, '_platt', None),      # Platt (A,B) -> deploy contract
                forecast_metrics=getattr(clf_real, '_forecast_metrics', None),
+               forecast_entry_economics=getattr(
+                   clf_real, '_forecast_entry_economics', None),
                chop_metrics=getattr(clf_real, '_chop_metrics', None),
                chop_platt=getattr(clf_real, '_chop_platt', None),
                chop_percentiles=getattr(clf_real, '_chop_percentiles', None),
                chop_abstention_audit=getattr(clf_real, '_chop_abstention_audit', None),
                chop_fusion=getattr(clf_real, '_chop_fusion', None),
+               head_training=getattr(clf_real, '_head_training', None),
                # HEAD-FIT REPORT (iters/converged/curve/seconds) — the training-side diagnostic:
                # convergence speed on a FROZEN embedding is an encoder signal, and a capped fit
                # is a caveat on every number below it. Ledgered for cross-checkpoint comparison.
@@ -956,7 +1159,7 @@ def train_final(labeler, classifier, clf_kwargs=None, holdout_start='2026-01-01'
     R = _arm_R(labeler, Kte, p_te, thr)
     if keyed:
         perm = rng.permutation(len(Ytr_tr))               # permute label + ladder keys together
-        ysh, Ksh = Ytr_tr[perm], [Ktr_tr[i] for i in perm]
+        ysh, Ksh = Ytr_tr[perm], shuffle_training_keys(labeler, Ktr_tr, perm)
     else:
         ysh = Ytr_tr.copy(); rng.shuffle(ysh); Ksh = None
     if verbose:

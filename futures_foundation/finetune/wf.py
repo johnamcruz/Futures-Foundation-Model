@@ -11,6 +11,8 @@ The labeler satisfies the pipeline StrategyLabeler protocol (calendar/build/eval
 plus whatever featurization the chosen Classifier needs (e.g. mv_contexts).
 """
 import numpy as np
+
+from .keyed_control import shuffle_training_keys
 import pandas as pd
 
 from futures_foundation.pipeline.data import walk_forward_folds
@@ -121,7 +123,7 @@ def run(labeler, classifier, clf_kwargs=None, seeds=(0,), train_m=3, val_m=1,
             # SHUFFLE — permute label + ladder keys together (dist) so the control isn't a no-op
             if keyed:
                 perm = rng.permutation(len(Ytr))
-                ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
+                ysh, Ksh = Ytr[perm], shuffle_training_keys(labeler, Ktr, perm)
             else:
                 ysh = Ytr.copy(); rng.shuffle(ysh); Ksh = None
             psv, ps, _ = clf.fit_predict(Xtr, ysh, Xval, Yval, Xte, seed,
@@ -351,7 +353,7 @@ def _run_folds(classifier, ck, Xall, Y, keys, eval_lab, rundir, folds, seed, ver
         res['valm'].append(_meanR(_arm_R(eval_lab, Kva, p_val, thr))); res['testm'].append(_meanR(R_te))
         if keyed:
             perm = rng.permutation(len(Ytr))              # permute label + ladder-keys together
-            ysh, Ksh = Ytr[perm], [Ktr[i] for i in perm]
+            ysh, Ksh = Ytr[perm], shuffle_training_keys(labeler, Ktr, perm)
         else:
             ysh = Ytr.copy(); rng.shuffle(ysh); Ksh = None
         psv, ps, _ = clf_run.fit_predict(ftr, ysh, fva, Yva, fte, seed,

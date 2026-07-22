@@ -81,7 +81,14 @@ def _embed_cache_path(cfg, labeler, keys):
     # serve on MPS must pass device='mps'; portable ONNX/CPU bundles must pass
     # device='cpu'. Never allow an implicit cross-backend cache hit.
     backend = str(cfg.get('device') or 'auto').lower()
-    h.update(f"{ckpt_id}|{sid}|{mv_mode}|{seq}|{nbars}|{len(keys)}|{backend}".encode())
+    extractor = str(cfg.get('feature_extractor') or 'encoder_only')
+    trainer = cfg.get('structural_trainer_ckpt')
+    trainer_id = (_ckpt_fingerprint(Path(trainer)) if trainer and Path(trainer).is_file()
+                  else str(trainer or 'none'))
+    identity = f"{ckpt_id}|{sid}|{mv_mode}|{seq}|{nbars}|{len(keys)}|{backend}"
+    if extractor != 'encoder_only' or trainer_id != 'none':
+        identity += f"|{extractor}|{trainer_id}"
+    h.update(identity.encode())
     h.update(bi.tobytes()); h.update(di.tobytes())
     cache_dir = Path(os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'))
     return cache_dir / f"{tk}_{tf}_{h.hexdigest()[:16]}.npy"
@@ -90,7 +97,8 @@ def _embed_cache_path(cfg, labeler, keys):
 def bar_embedding_cache_path(cache_dir, checkpoint, ticker, timeframe, n_bars, seq, *,
                              device='cpu', mv_mode='ohlcv',
                              model_id='paris-noah/Mantis-8M',
-                             data_fingerprint=None):
+                             data_fingerprint=None, feature_extractor='encoder_only',
+                             extractor_fingerprint=None):
     """Canonical path for a reusable bar-indexed frozen-Mantis embedding cache.
 
     This public path builder is shared by FFM training and downstream consumers
@@ -109,10 +117,14 @@ def bar_embedding_cache_path(cache_dir, checkpoint, ticker, timeframe, n_bars, s
     model_tag = hashlib.sha1(str(model_id).encode()).hexdigest()[:8]
     data_tag = (f"_data-{str(data_fingerprint)[:16]}"
                 if data_fingerprint else '')
+    extractor_tag = ('' if feature_extractor == 'encoder_only' and not extractor_fingerprint
+                     else '_extractor-' + hashlib.sha1(
+                         f"{feature_extractor}|{extractor_fingerprint or ''}".encode()
+                     ).hexdigest()[:12])
     return Path(cache_dir) / (
         f"bars_{ticker}_{timeframe}_{ckpt_id}_{int(n_bars)}_{int(seq)}"
         f"{mode_tag}_{_BAR_CACHE_SCHEMA}_model-{model_tag}_backend-{backend}"
-        f"{data_tag}.npz")
+        f"{extractor_tag}{data_tag}.npz")
 
 
 def _bar_cache_path(cfg, labeler, keys):
@@ -133,12 +145,17 @@ def _bar_cache_path(cfg, labeler, keys):
         nbars = int(len(labeler._b[(tk, tf)]['c']))
     except Exception:
         nbars = -1
+    trainer = cfg.get('structural_trainer_ckpt')
+    trainer_fp = (_ckpt_fingerprint(Path(trainer))
+                  if trainer and Path(trainer).is_file() else trainer)
     return bar_embedding_cache_path(
         os.environ.get('EMBED_CACHE_DIR', 'temp/embed_cache'),
         cfg.get('backbone_ckpt'), tk, tf, nbars, seq,
         device=cfg.get('device') or 'auto', mv_mode=mv_mode,
         model_id=cfg.get('model_id', 'paris-noah/Mantis-8M'),
-        data_fingerprint=labeler._b[(tk, tf)].get('source_sha256'))
+        data_fingerprint=labeler._b[(tk, tf)].get('source_sha256'),
+        feature_extractor=cfg.get('feature_extractor') or 'encoder_only',
+        extractor_fingerprint=trainer_fp)
 
 
 def _load_bar_cache(path):
@@ -291,10 +308,18 @@ def _bake_platt_into_head(head_path, platt):
 def _export_encoder_onnx(cfg, enc_path):
     """Export the frozen Mantis encoder (raw OHLCV window -> embedding) to ONNX via the isolated
     subprocess worker (parent stays torch-free). Shared by the single-head and ladder bundles."""
+    structural = cfg.get('feature_extractor') == 'structural_nextleg'
     ecfg = dict(_export_encoder=enc_path, ckpt=cfg.get('backbone_ckpt'),
                 C=int(cfg.get('raw_C', 5)), seq=int(cfg.get('raw_seq', 64)),
                 model_id=cfg.get('model_id', 'paris-noah/Mantis-8M'))
-    cmd = [sys.executable, '-u', '-m', 'futures_foundation.finetune.classifiers.mantis._embed_worker']
+    worker = 'futures_foundation.finetune.classifiers.mantis._embed_worker'
+    if structural:
+        trainer = cfg.get('structural_trainer_ckpt')
+        if not trainer:
+            raise ValueError('structural_nextleg export requires structural_trainer_ckpt')
+        ecfg['trainer_ckpt'] = trainer
+        worker = 'futures_foundation.finetune.classifiers.mantis._structural_embed_worker'
+    cmd = [sys.executable, '-u', '-m', worker]
     with tempfile.TemporaryDirectory() as d:
         d = Path(d); (d / 'cfg.json').write_text(json.dumps(ecfg))
         r = subprocess.run(cmd + [str(d)], capture_output=True, text=True)
@@ -381,8 +406,15 @@ class MantisFrozenClassifier(Classifier):
         windows = np.asarray(labeler.mv_contexts(keys), np.float32)        # [N, C, seq]
         ecfg = {k: self.cfg[k] for k in _EMBED_KEYS if k in self.cfg}
         ecfg['ckpt'] = self.cfg.get('backbone_ckpt')                       # SSL ckpt or None
-        cmd = [sys.executable, '-u', '-m',
-               'futures_foundation.finetune.classifiers.mantis._embed_worker']
+        worker = 'futures_foundation.finetune.classifiers.mantis._embed_worker'
+        if self.cfg.get('feature_extractor') == 'structural_nextleg':
+            trainer = self.cfg.get('structural_trainer_ckpt')
+            if not trainer or not Path(trainer).is_file():
+                raise FileNotFoundError(
+                    f'structural_nextleg feature extractor requires trainer sidecar: {trainer}')
+            ecfg['trainer_ckpt'] = trainer
+            worker = 'futures_foundation.finetune.classifiers.mantis._structural_embed_worker'
+        cmd = [sys.executable, '-u', '-m', worker]
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             np.save(d / 'w.npy', windows)

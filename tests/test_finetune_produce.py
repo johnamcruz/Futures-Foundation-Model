@@ -105,6 +105,55 @@ def test_operating_points_uses_exact_strategy_win_truth():
     assert rows[0]['meanR'] == pytest.approx(1.675)
 
 
+def test_target_operating_points_reports_each_strategy_rung():
+    class _LadderLab(_RLabeler):
+        def evaluate_targets(self, keys, preds):
+            return {
+                2.0: np.array([k[4] for k, p in zip(keys, preds) if p == 1], float),
+                3.0: np.array([k[5] for k, p in zip(keys, preds) if p == 1], float),
+            }
+
+        def target_win_truth(self, keys):
+            return {
+                2.0: np.array([k[6] for k in keys], bool),
+                3.0: np.array([k[7] for k in keys], bool),
+            }
+
+    keys = [
+        ('NQ@3min', 1, 1, 0.0, 1.97, 2.97, True, True),
+        ('NQ@3min', 2, 1, 0.0, 1.97, -1.03, True, False),
+        ('NQ@3min', 3, 1, 0.0, -1.03, -1.03, False, False),
+        ('NQ@3min', 4, 1, 0.0, -1.03, -1.03, False, False),
+    ]
+    score = np.array([.9, .8, .2, .1])
+    ts = pd.to_datetime(['2026-01-02'] * 4, utc=True)
+    rows = produce.target_operating_points(_LadderLab(), keys, score, ts, rates=(2,))
+    assert rows[0]['n'] == 2
+    assert rows[0]['targets']['2']['hit_rate'] == 1.0
+    assert rows[0]['targets']['2']['meanR'] == pytest.approx(1.97)
+    assert rows[0]['targets']['3']['hit_rate'] == .5
+    assert rows[0]['targets']['3']['meanR'] == pytest.approx(.97)
+
+
+def test_target_operating_points_is_optional_for_legacy_labelers():
+    lab, keys, score, ts = _ranked_oos()
+    assert produce.target_operating_points(lab, keys, score, ts) is None
+
+
+def test_selection_target_audit_threads_standardized_score_to_strategy_hook():
+    class _AuditLab:
+        def selection_target_audit(self, keys, score, ts):
+            return {'n': len(keys), 'top': int(np.argmax(score)), 'days': len(set(ts))}
+
+    keys = [('NQ@3min', 1), ('NQ@3min', 2)]
+    score = np.array([.2, .9])
+    ts = [np.datetime64('2025-01-02'), np.datetime64('2025-01-03')]
+    assert produce.selection_target_audit(_AuditLab(), keys, score, ts) == {
+        'n': 2, 'top': 1, 'days': 2,
+    }
+    assert produce.selection_target_audit(object(), keys, score, ts) is None
+
+
 def test_wr_by_score_bands_are_monotone():
     lab, keys, proba, ts = _ranked_oos()
     bands = produce.wr_by_score(lab, keys, proba, ts)
@@ -114,6 +163,16 @@ def test_wr_by_score_bands_are_monotone():
     assert bands[0]['wr3R'] == 1.0                           # top decile = pure winners here
     for b in bands:                                          # trades/day = n / days(=5)
         assert b['per_day'] == pytest.approx(b['n'] / 5)
+
+
+def test_fixed_probability_bands_expose_the_point_eight_to_point_nine_economics():
+    lab, keys, proba, ts = _ranked_oos()
+    rows = produce.wr_by_probability(lab, keys, proba, ts)
+    assert sum(row['n'] for row in rows) == len(keys)
+    band = next(row for row in rows if row['lo'] == .8 and row['hi'] == .9)
+    assert band['n'] == 2
+    assert band['wr3R'] == 1.0 and band['meanR'] == pytest.approx(2.0)
+    assert band['per_day'] == pytest.approx(.4)
 
 
 def test_alignment_breakdown_counter_vs_aligned():
@@ -307,6 +366,21 @@ def test_ticker_generalization_fails_missing_or_unsustainable_rate():
     })
     assert out['passed'] is False
     assert out['failures'] == ['GC@3/day', 'GC@2/day', 'GC@1/day']
+
+
+def test_ticker_shuffle_generalization_matches_rates_inside_each_ticker():
+    def rows(values):
+        return [dict(rate=rate, meanR=value, rate_met=True)
+                for rate, value in zip((5, 3, 2, 1), values)]
+
+    out = produce.ticker_shuffle_generalization(
+        {'NQ': rows((.12, .13, .14, .15)), 'GC': rows((.08, .09, .10, .11))},
+        {'NQ': rows((.01, .02, .03, .04)), 'GC': rows((.01, .02, .20, .03))},
+        min_lift_r=.05)
+    assert out['tickers']['NQ']['5']['passed'] is True
+    assert out['tickers']['NQ']['5']['liftR'] == pytest.approx(.11)
+    assert out['tickers']['GC']['2']['passed'] is False
+    assert out['failures'] == ['GC@2/day']
 
 
 def test_train_final_writes_signal_contract(tmp_path):
