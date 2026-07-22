@@ -255,6 +255,36 @@ def test_checkpoint_recovery_distinguishes_interrupted_training_from_finalizatio
     assert pipeline._checkpoint_recovery_flags(checkpoint) == (False, True)
 
 
+def test_failed_report_with_completed_real_falls_through_to_revalidation(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'nextleg.pt'
+    report = tmp_path / 'nextleg.pt.report.json'
+    checkpoint.write_bytes(b'checkpoint')
+    report.write_text('{}')
+    Path(str(checkpoint) + '.real_complete.json').write_text('{}')
+    monkeypatch.setattr(pipeline, '_revalidate_stage_report', lambda _path: {})
+    monkeypatch.setattr(
+        pipeline, '_assert_stage_verdict',
+        lambda _path: (_ for _ in ()).throw(RuntimeError('beats_controls=False')))
+
+    reason = pipeline._completed_stage_revalidation_reason(checkpoint, report)
+
+    assert reason == 'beats_controls=False'
+
+
+def test_failed_report_without_completed_real_remains_fatal(tmp_path, monkeypatch):
+    checkpoint = tmp_path / 'nextleg.pt'
+    report = tmp_path / 'nextleg.pt.report.json'
+    checkpoint.write_bytes(b'partial')
+    report.write_text('{}')
+    monkeypatch.setattr(pipeline, '_revalidate_stage_report', lambda _path: {})
+    monkeypatch.setattr(
+        pipeline, '_assert_stage_verdict',
+        lambda _path: (_ for _ in ()).throw(RuntimeError('failed verdict')))
+
+    with pytest.raises(RuntimeError, match='failed verdict'):
+        pipeline._completed_stage_revalidation_reason(checkpoint, report)
+
+
 def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():
     batches = {stage.name: stage.batch['mps'] for stage in pipeline.STAGES}
     assert batches == {'mask': 256, 'contrastive': 64, 'seq2seq': 128, 'nextleg': 128}
