@@ -51,3 +51,33 @@ def test_two_stage_sampling_schedule_switches_at_declared_halfway_point():
     assert resolve_epoch_sampling_mode("uniform_stream", 0, 1) == "uniform_stream"
     with pytest.raises(ValueError, match="unsupported sampling curriculum"):
         resolve_epoch_sampling_mode("adaptive_oos", 0, 10)
+
+
+def test_three_stage_schedule_reserves_final_epochs_for_primary_stream_refinement():
+    assert [
+        resolve_epoch_sampling_mode("bar_then_uniform_then_primary", ep, 10)
+        for ep in range(10)
+    ] == [
+        "bar_proportional", "bar_proportional", "bar_proportional",
+        "bar_proportional", "bar_proportional",
+        "uniform_stream", "uniform_stream", "uniform_stream",
+        "uniform_primary_stream", "uniform_primary_stream",
+    ]
+
+
+def test_primary_stream_refinement_is_train_only_and_balanced_within_primary_group():
+    streams = np.asarray(
+        ["NQ@1min"] * 8 + ["NQ@15min"] * 2 + ["GC@1min"] * 9)
+    rows = np.arange(len(streams), dtype=np.int64)
+    sampled = sample_epoch_rows(
+        rows, streams, mode="uniform_primary_stream",
+        primary_streams=("NQ@1min", "NQ@15min"), seed=7, epoch=8)
+    assert len(sampled) == 10
+    assert set(streams[sampled]) == {"NQ@1min", "NQ@15min"}
+    counts = [int((streams[sampled] == stream).sum())
+              for stream in ("NQ@1min", "NQ@15min")]
+    assert counts == [5, 5]
+    with pytest.raises(ValueError, match="no represented primary streams"):
+        sample_epoch_rows(
+            rows, streams, mode="uniform_primary_stream",
+            primary_streams=("ES@3min",), seed=7, epoch=8)

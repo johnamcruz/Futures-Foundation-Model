@@ -11,11 +11,12 @@ from __future__ import annotations
 import numpy as np
 
 
-SAMPLING_MODES = ("bar_proportional", "uniform_stream")
+SAMPLING_MODES = ("bar_proportional", "uniform_stream", "uniform_primary_stream")
 
 
-def resolve_epoch_sampling_mode(mode, epoch, total_epochs, *, switch_fraction=0.5):
-    """Resolve a fixed or two-stage sampling curriculum for one epoch.
+def resolve_epoch_sampling_mode(mode, epoch, total_epochs, *, switch_fraction=0.5,
+                                primary_fraction=0.8):
+    """Resolve a fixed, two-stage, or three-stage sampling curriculum for one epoch.
 
     ``bar_then_uniform`` first exposes the model to the naturally abundant corpus, then gives
     every stream equal influence during refinement. The schedule depends only on the declared
@@ -23,6 +24,22 @@ def resolve_epoch_sampling_mode(mode, epoch, total_epochs, *, switch_fraction=0.
     """
     if mode in SAMPLING_MODES:
         return mode
+    if mode == "bar_then_uniform_then_primary":
+        total_epochs = int(total_epochs)
+        epoch = int(epoch)
+        if (total_epochs < 3 or not 0.0 < float(switch_fraction)
+                < float(primary_fraction) < 1.0):
+            raise ValueError(
+                "bar_then_uniform_then_primary requires total_epochs >= 3 and "
+                "0 < switch_fraction < primary_fraction < 1")
+        uniform_at = max(
+            1, min(total_epochs - 2, round(total_epochs * float(switch_fraction))))
+        primary_at = max(
+            uniform_at + 1,
+            min(total_epochs - 1, round(total_epochs * float(primary_fraction))))
+        if epoch < uniform_at:
+            return "bar_proportional"
+        return "uniform_stream" if epoch < primary_at else "uniform_primary_stream"
     if mode != "bar_then_uniform":
         raise ValueError(f"unsupported sampling curriculum {mode!r}")
     total_epochs = int(total_epochs)
@@ -33,13 +50,16 @@ def resolve_epoch_sampling_mode(mode, epoch, total_epochs, *, switch_fraction=0.
     return "bar_proportional" if epoch < switch else "uniform_stream"
 
 
-def sample_epoch_rows(rows, stream_ids, *, mode="bar_proportional", seed=0, epoch=0):
+def sample_epoch_rows(rows, stream_ids, *, mode="bar_proportional", primary_streams=(),
+                      seed=0, epoch=0):
     """Return deterministic row indices for one training epoch.
 
     ``bar_proportional`` is an ordinary without-replacement shuffle. ``uniform_stream`` assigns
-    equal counts (within one row) to each stream represented by ``rows``. Small streams are
-    cycled with reshuffling when necessary, while large streams are downsampled for that epoch;
-    subsequent epochs change the draw so the complete corpus remains reachable.
+    equal counts (within one row) to each stream represented by ``rows``. The primary variant
+    first restricts the supplied training rows to explicitly declared streams, then balances
+    within that group. Validation and OOS rows are never inputs to this function. Small streams
+    are cycled with reshuffling when necessary, while large streams are downsampled for that
+    epoch; subsequent epochs change the draw so the complete corpus remains reachable.
     """
     rows = np.asarray(rows, dtype=np.int64)
     stream_ids = np.asarray(stream_ids, dtype=object)
@@ -57,6 +77,13 @@ def sample_epoch_rows(rows, stream_ids, *, mode="bar_proportional", seed=0, epoc
         return rows[rng.permutation(len(rows))]
 
     row_streams = stream_ids[rows]
+    if mode == "uniform_primary_stream":
+        primary = {str(value) for value in primary_streams}
+        keep = np.asarray([str(value) in primary for value in row_streams], dtype=bool)
+        rows = rows[keep]
+        row_streams = row_streams[keep]
+        if not len(rows):
+            raise ValueError("uniform_primary_stream has no represented primary streams")
     streams = np.asarray(sorted(set(str(value) for value in row_streams)), dtype=object)
     if not len(streams):
         raise ValueError("uniform_stream requires at least one represented stream")
