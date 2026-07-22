@@ -179,7 +179,9 @@ def train_ssl_nextleg_race(big, train_starts, val_starts, *,
                            freeze_encoder_layers=0, std_guard=1.6, leg_cap=256, leg_w=1.0,
                            leg_k=2, mse_weight=1.0, target_reserve=None,
                            race_w=0.25, race_cap=2.0,
-                           race_levels=RACE_LEVELS, **_ignore):
+                           race_levels=RACE_LEVELS,
+                           lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
+                           log_every_steps=25, **_ignore):
     """Train an encoder on NextLeg plus a future-only ordered adverse path curve."""
     t = _NextLegRaceTrainer(
         big, train_starts, val_starts,
@@ -191,5 +193,7 @@ def train_ssl_nextleg_race(big, train_starts, val_starts, *,
         steps_per_epoch=steps_per_epoch, batch=batch, lr=lr, weight_decay=weight_decay,
         patience=patience, device=device, seed=seed, grad_clip=grad_clip, verbose=verbose,
         control=control, ckpt_path=ckpt_path, resume=resume,
-        freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard)
+        freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
+        lora_r=lora_r, lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout, log_every_steps=log_every_steps)
     return t.fit()

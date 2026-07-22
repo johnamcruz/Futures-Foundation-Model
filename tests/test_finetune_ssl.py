@@ -437,6 +437,20 @@ def test_diagnostic_controls_are_capped_at_eight_epochs():
     assert cfg['epochs'] == 60 and cfg['resume'] is True
 
 
+def test_selected_history_row_wins_over_rejected_lower_loss():
+    """A collapse-guarded epoch must not describe a different saved encoder."""
+    history = [
+        {'epoch': 2, 'val_loss': 0.30, 'std': 0.9, 'checkpoint_selected': True},
+        {'epoch': 3, 'val_loss': 0.20, 'std': 2.0, 'checkpoint_selected': False},
+    ]
+    assert ssl._selected_history_row(history) is history[0]
+
+
+def test_legacy_history_selection_falls_back_to_minimum_validation_loss():
+    history = [{'val_loss': 0.4}, {'val_loss': 0.3}]
+    assert ssl._selected_history_row(history) is history[1]
+
+
 def test_finalize_applies_control_budget_to_each_diagnostic(tmp_path, monkeypatch):
     checkpoint = tmp_path / 'mask.pt'
     fake_torch = types.SimpleNamespace(

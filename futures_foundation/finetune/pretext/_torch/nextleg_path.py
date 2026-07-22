@@ -159,6 +159,8 @@ def train_ssl_nextleg_path(big, train_starts, val_starts, *, horizons=(5, 10, 20
                            ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=1.6,
                            leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
                            target_reserve=None, retrace_w=1.0, retrace_cap=2.0,
+                           lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
+                           log_every_steps=25,
                            **_ignore):
     """NEXT-LEG + PATH SSL -> (best_encoder_state, history). History adds 'retrace_corr' (the
     learning diagnostic for the path target) to 2.6's 'skill'/'leg_corr1'/'leg_corr2'/'std'.
@@ -186,5 +188,7 @@ def train_ssl_nextleg_path(big, train_starts, val_starts, *, horizons=(5, 10, 20
                             weight_decay=weight_decay, patience=patience, device=device,
                             seed=seed, grad_clip=grad_clip, verbose=verbose, control=control,
                             ckpt_path=ckpt_path, resume=resume,
-                            freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard)
+                            freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
+                            lora_r=lora_r, lora_alpha=lora_alpha,
+                            lora_dropout=lora_dropout, log_every_steps=log_every_steps)
     return t.fit()

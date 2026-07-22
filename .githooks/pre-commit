@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run CRT sweep unit tests before every commit.
+# Run the FFM unit tests before every commit.
 # Install once with: git config core.hooksPath .githooks
 
 set -e

@@ -128,12 +128,13 @@ class _NextLegTrainer(_ForecastTrainer):
             net.encoder.load_state_dict(torch.load(self.backbone_ckpt, map_location='cpu'))
         self.net = net
 
-    def make_batch(self, starts):
+    def make_batch(self, starts, gen=None):
+        gen = gen or self.gen
         tgt_all = self._tgt_tr if starts is self.tr else self._tgt_va
-        b_idx = self.sample_indices(starts)
+        b_idx = self.sample_indices(starts, generator=gen)
         w = _gather_batch(self.big_t, starts, b_idx, self.parent)
         L = int(self.clens_t[torch.randint(0, len(self.clens_t), (1,), device=self.dev,
-                                           generator=self.gen)].item())
+                                           generator=gen)].item())
         ctx_raw = w[:, :, self.max_ctx - L:self.max_ctx]   # ends at the CONFIRM bar
         fut_raw = w[:, :, self.max_ctx:]
         m = ctx_raw.mean(2, keepdim=True); s = ctx_raw.std(2, keepdim=True) + 1e-6
@@ -151,12 +152,24 @@ class _NextLegTrainer(_ForecastTrainer):
 
     @torch.no_grad()
     def val_eval(self):
+        """Evaluate on fixed pivot/context draws without perturbing training sampling.
+
+        Pivot duration varies enough that redrawing validation anchors each epoch
+        makes early stopping compare batch difficulty rather than model quality.
+        A validation-only generator keeps the comparison stable and leaves
+        ``self.gen`` exclusively responsible for training draws.
+        """
         self.net.eval()
         tot_c = tot_p = tot_l = 0.0
         preds, tgts = [], []
         nb = min(20, max(1, len(self.va) // self.batch))
+        vgen = torch.Generator(device=self.dev)
+        vgen.manual_seed(20260718)
+        embed_ctx = None
         for _ in range(nb):
-            ctx, cand_t, leg_t = self.make_batch(self.va)
+            ctx, cand_t, leg_t = self.make_batch(self.va, gen=vgen)
+            if embed_ctx is None:
+                embed_ctx = ctx
             candles, legs = self.net.forward_all(ctx)
             tot_c += float(F.mse_loss(candles.float(), cand_t))
             tot_p += float((cand_t ** 2).mean())
@@ -166,9 +179,10 @@ class _NextLegTrainer(_ForecastTrainer):
         corr = [float(np.corrcoef(P[:, j].numpy(), T[:, j].numpy())[0, 1]) for j in (0, 1)]
         mae = [float(np.expm1(P[:, j].numpy()).mean() - np.expm1(T[:, j].numpy()).mean())
                for j in (0, 1)]                                     # bars, bias diagnostic
-        estd = float(self.net.embed(self.make_batch(self.va)[0]).std(0).mean())
+        estd = float(self.net.embed(embed_ctx).std(0).mean())
         skill = 1.0 - (tot_c / nb) / max(tot_p / nb, 1e-12)
         vloss = self.mse_weight * (tot_c / nb) + self.leg_w * (tot_l / nb)
+        self.net.train()
         return vloss, {'skill': skill, 'leg_corr1': corr[0], 'leg_corr2': corr[1],
                        'leg_bias1': mae[0], 'leg_bias2': mae[1], 'std': estd}
 

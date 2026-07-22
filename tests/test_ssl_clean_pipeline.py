@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -67,6 +68,20 @@ def test_clean_pipeline_uniform_stream_is_explicit_opt_in(monkeypatch):
         assert pipeline._stage_config(name)['sampling_mode'] == 'uniform_stream'
 
 
+def test_non_mask_controls_are_explicit_and_bounded(monkeypatch):
+    monkeypatch.setenv('SSL_CONTROLS', 'shuffle,random')
+    monkeypatch.setenv('CONTROL_EPOCHS', '8')
+    cfg = pipeline._stage_config('nextleg')
+    assert cfg['controls'] == ('shuffle', 'random')
+    assert cfg['control_epochs'] == 8
+
+
+def test_unknown_non_mask_control_fails_closed(monkeypatch):
+    monkeypatch.setenv('SSL_CONTROLS', 'shuffle,oracle')
+    with pytest.raises(ValueError, match='unsupported SSL controls'):
+        pipeline._stage_config('nextleg')
+
+
 def test_completed_checkpoint_cannot_cross_sampling_recipes(tmp_path):
     report = tmp_path / 'stage.pt.report.json'
     report.write_text(json.dumps({'config': {'sampling_mode': 'bar_proportional'}}))
@@ -100,6 +115,93 @@ def test_existing_child_must_match_canonical_parent_hash(tmp_path):
     }))
     with pytest.raises(RuntimeError, match='wrong parent'):
         pipeline._assert_stage_parent(seq, pipeline.STAGES[2], paths)
+
+
+def test_existing_child_can_be_bound_to_an_explicit_external_parent(tmp_path):
+    """A partial NextLeg lineage must record and recheck the exact supplied Seq2Seq hash."""
+    paths = pipeline._stage_map(tmp_path)
+    canonical_parent = paths['seq2seq']
+    canonical_parent.write_bytes(b'wrong-local-parent')
+    external_parent = tmp_path / 'downloaded-seq2seq.pt'
+    external_parent.write_bytes(b'exact-external-parent')
+    child = paths['nextleg']
+    child.write_bytes(b'uniform-nextleg-child')
+    lineage = Path(str(child) + '.data_provenance.json')
+    lineage.write_text(json.dumps({
+        'stage': 'nextleg',
+        'parent': {'sha256': pipeline.sha256(external_parent)},
+    }))
+
+    pipeline._assert_stage_parent(
+        child, pipeline.STAGES[-1], paths, parent_path=external_parent)
+    with pytest.raises(RuntimeError, match='wrong parent'):
+        pipeline._assert_stage_parent(child, pipeline.STAGES[-1], paths)
+
+
+def test_partial_lineage_cli_requires_explicit_parent_surface():
+    args = pipeline._parser().parse_args([
+        '--start-stage', 'nextleg',
+        '--parent-checkpoint', '/tmp/seq2seq.pt',
+        '--sampling-mode', 'uniform_stream',
+        '--controls', 'shuffle,random',
+    ])
+    assert args.start_stage == 'nextleg'
+    assert args.parent_checkpoint == '/tmp/seq2seq.pt'
+    assert args.sampling_mode == 'uniform_stream'
+    assert args.controls == 'shuffle,random'
+
+
+def test_partial_lineage_reuses_only_hash_and_provenance_matched_atlas(tmp_path):
+    source = tmp_path / 'source'
+    atlas = source / 'probe_atlas'
+    atlas.mkdir(parents=True)
+    output = tmp_path / 'candidate'
+    output.mkdir()
+    parent = tmp_path / 'seq2seq.pt'
+    parent.write_bytes(b'fixed-seq2seq')
+    provenance = {'schema': 'test', 'streams': {'NQ@3min': {'sha256': 'abc'}}}
+    labels = atlas / 'trend_lifecycle_labels_pre2026.npz'
+    np.savez(labels, ts=np.array(['2025-06-01'], dtype='datetime64[ns]'))
+    Path(str(labels) + '.provenance.json').write_text(json.dumps({
+        'holdout_start': pipeline.HOLDOUT_START,
+        'data_provenance_sha256': pipeline._provenance_sha256(provenance),
+    }))
+    (atlas / 'seq2seq.json').write_text(json.dumps({
+        'schema': 'ffm_probe_atlas_v2',
+        'scope': '9x4_strategy_agnostic',
+        'fit': '<2024', 'eval': '2025',
+        'checkpoint_sha256': pipeline.sha256(parent),
+    }))
+    pool = {'schema': 'ffm_probe_atlas_pool_v1', 'rows': 1, 'pool_sha256': 'pool'}
+    (atlas / 'seq2seq_emb.npy.pool.json').write_text(json.dumps(pool))
+
+    reused = pipeline._reuse_atlas_parent(
+        source_dir=source, out_dir=output, stage=pipeline.STAGES[2],
+        checkpoint=parent, provenance=provenance)
+    assert reused == labels
+    assert json.loads((output / 'probe_atlas/seq2seq.json').read_text())[
+        'checkpoint_sha256'] == pipeline.sha256(parent)
+    assert json.loads((output / 'probe_atlas/seq2seq_emb.npy.pool.json').read_text()) == pool
+
+    wrong_parent = tmp_path / 'wrong.pt'
+    wrong_parent.write_bytes(b'not-seq2seq')
+    with pytest.raises(RuntimeError, match='different checkpoint'):
+        pipeline._reuse_atlas_parent(
+            source_dir=source, out_dir=tmp_path / 'wrong-output',
+            stage=pipeline.STAGES[2], checkpoint=wrong_parent, provenance=provenance)
+
+
+def test_atlas_parent_child_pool_identity_must_match(tmp_path):
+    atlas = tmp_path / 'probe_atlas'
+    atlas.mkdir()
+    parent = atlas / 'seq2seq_emb.npy.pool.json'
+    child = atlas / 'nextleg_emb.npy.pool.json'
+    parent.write_text(json.dumps({'pool_sha256': 'same', 'rows': 12}))
+    child.write_text(parent.read_text())
+    pipeline._assert_atlas_pool_match(tmp_path, 'seq2seq', 'nextleg')
+    child.write_text(json.dumps({'pool_sha256': 'different', 'rows': 12}))
+    with pytest.raises(RuntimeError, match='pool mismatch'):
+        pipeline._assert_atlas_pool_match(tmp_path, 'seq2seq', 'nextleg')
 
 
 def test_stage_verdict_requires_current_probe_and_both_gates(tmp_path):
