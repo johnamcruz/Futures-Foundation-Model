@@ -337,6 +337,11 @@ def _base_cfg(**kw):
              rtd_weight=5.0, recon_weight=1.0, gen_width=48, turn_w=3, turn_bias=0.85,
              # stage-2.6 NEXT-LEG forecasting (bars; pure-fractal pivots, NO ATR):
              leg_cap=256, leg_w=1.0, leg_k=2,
+             # Structural NextLeg: generic confirmed-pivot HH/HL/LH/LL SSL targets.
+             structure_current_w=0.25, structure_next_w=0.75, excursion_w=0.25,
+             structure_event_w=0.75, structure_event_horizon=128,
+             structure_span_w=0.25, structure_span_width=5, structure_span_prob=0.5,
+             head_lr=None, warm_trainer_ckpt=None,
              # stage-2.8 NEXT-LEG-RACE (future-only ordered candle path; no ATR/R/strategy data):
              race_w=0.25, race_cap=2.0, race_levels=(0.25, 0.50, 0.75, 1.00),
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
@@ -384,9 +389,14 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     loaded = _load_assemble(data_dir, tickers, tfs, cfg['seq'], cfg['max_jitter'],
                             val_frac, holdout_start, verbose, forecast_parent=fc_reserve,
                             sampling_mode=cfg.get('sampling_mode', 'bar_proportional'),
-                            related=task.requires_related_series)
-    if task.requires_related_series:
-        streams, big, tr, va, cfg['_related_layout'] = loaded
+                            related=(task.requires_related_series
+                                     or task.requires_stream_layout))
+    if task.requires_related_series or task.requires_stream_layout:
+        streams, big, tr, va, layout = loaded
+        if task.requires_related_series:
+            cfg['_related_layout'] = layout
+        if task.requires_stream_layout:
+            cfg['_stream_layout'] = layout
     else:
         streams, big, tr, va = loaded
     if reuse_real_checkpoint:
