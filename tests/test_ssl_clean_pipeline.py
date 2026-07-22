@@ -191,6 +191,39 @@ def test_partial_lineage_reuses_only_hash_and_provenance_matched_atlas(tmp_path)
             stage=pipeline.STAGES[2], checkpoint=wrong_parent, provenance=provenance)
 
 
+def test_partial_lineage_can_alias_existing_nextleg_as_refinement_parent(tmp_path):
+    source = tmp_path / 'source'
+    atlas = source / 'probe_atlas'
+    atlas.mkdir(parents=True)
+    output = tmp_path / 'candidate'
+    output.mkdir()
+    parent = tmp_path / 'original-nextleg.pt'
+    parent.write_bytes(b'original-nextleg')
+    provenance = {'schema': 'test', 'streams': {'NQ@3min': {'sha256': 'abc'}}}
+    labels = atlas / 'trend_lifecycle_labels_pre2026.npz'
+    np.savez(labels, ts=np.array(['2025-06-01'], dtype='datetime64[ns]'))
+    Path(str(labels) + '.provenance.json').write_text(json.dumps({
+        'holdout_start': pipeline.HOLDOUT_START,
+        'data_provenance_sha256': pipeline._provenance_sha256(provenance),
+    }))
+    (atlas / 'nextleg.json').write_text(json.dumps({
+        'schema': 'ffm_probe_atlas_v2', 'scope': '9x4_strategy_agnostic',
+        'fit': '<2024', 'eval': '2025',
+        'checkpoint_sha256': pipeline.sha256(parent),
+    }))
+    pool = {'schema': 'ffm_probe_atlas_pool_v1', 'rows': 1, 'pool_sha256': 'pool'}
+    (atlas / 'nextleg_emb.npy.pool.json').write_text(json.dumps(pool))
+
+    reused = pipeline._reuse_atlas_parent(
+        source_dir=source, out_dir=output, stage=pipeline.STAGES[2],
+        source_stage=pipeline.STAGES[3], checkpoint=parent, provenance=provenance)
+
+    assert reused == labels
+    copied = json.loads((output / 'probe_atlas/seq2seq.json').read_text())
+    assert copied['checkpoint_sha256'] == pipeline.sha256(parent)
+    assert json.loads((output / 'probe_atlas/seq2seq_emb.npy.pool.json').read_text()) == pool
+
+
 def test_atlas_parent_child_pool_identity_must_match(tmp_path):
     atlas = tmp_path / 'probe_atlas'
     atlas.mkdir()

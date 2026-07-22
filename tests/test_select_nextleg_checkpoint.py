@@ -11,7 +11,8 @@ def _write(path, value):
 
 
 def _make_run(root: Path, name: str, *, uniform: bool, lift: float = 0.0,
-              controls: bool = True):
+              controls: bool = True, task=(0.03, 0.08, 0.03),
+              refinement_parent: str | None = None):
     directory = root / name
     checkpoint = directory / "mantis_ssl_nextleg.pt"
     checkpoint.parent.mkdir(parents=True)
@@ -31,9 +32,11 @@ def _make_run(root: Path, name: str, *, uniform: bool, lift: float = 0.0,
         "shuffle": {"forecast_skill": .01, "leg_corr1": .01, "leg_corr2": .005},
         "random": {"forecast_skill": .008, "leg_corr1": .0, "leg_corr2": -.01},
     } if controls else {})
+    forecast_skill, leg_corr1, leg_corr2 = task
     task_control = {
         "contract": "nextleg_forecast_and_leg_skill_v1",
-        "real": {"forecast_skill": .03, "leg_corr1": .08, "leg_corr2": .03},
+        "real": {"forecast_skill": forecast_skill, "leg_corr1": leg_corr1,
+                 "leg_corr2": leg_corr2},
         "controls": task_controls,
         "beats_controls": bool(controls),
     }
@@ -46,13 +49,16 @@ def _make_run(root: Path, name: str, *, uniform: bool, lift: float = 0.0,
                     "task_control": task_control,
                     "temporal_signal": 0.04 if controls else None},
         "task_control": task_control,
-        "history": [{"best_epoch": 4, "forecast_skill": 0.03,
-                     "leg_corr1": 0.08, "leg_corr2": 0.03, "std": 1.0}],
+        "history": [{"best_epoch": 4, "forecast_skill": forecast_skill,
+                     "leg_corr1": leg_corr1, "leg_corr2": leg_corr2, "std": 1.0}],
     })
+    parent_row = {"sha256": refinement_parent or "parent"}
+    if refinement_parent:
+        parent_row["source_stage"] = "nextleg"
     _write(directory / "pipeline_manifest.json", {
         "sampling_mode": "uniform_stream" if uniform else "bar_proportional",
         "data_provenance": {"streams": "same"},
-        "stages": {"seq2seq": {"sha256": "parent"},
+        "stages": {"seq2seq": parent_row,
                    "nextleg": {"sha256": digest}},
     })
     _write(directory / "probe_atlas" / "nextleg.json", {
@@ -89,3 +95,27 @@ def test_candidate_with_different_probe_pool_is_rejected(tmp_path):
     result = selection.select(baseline, candidate)
     assert result["status"] == "REJECT_CANDIDATE"
     assert "Probe Atlas pool identity differs" in result["failures"]
+
+
+def test_uniform_refinement_can_promote_when_it_preserves_leg1_and_improves_leg2(tmp_path):
+    baseline = _make_run(tmp_path, "baseline", uniform=False,
+                         task=(0.030, 0.080, 0.030))
+    digest = hashlib.sha256(b"baseline").hexdigest()
+    candidate = _make_run(tmp_path, "candidate", uniform=True,
+                          task=(0.031, 0.078, 0.041), refinement_parent=digest)
+    result = selection.select(baseline, candidate)
+    assert result["status"] == "PROMOTE_CANDIDATE"
+    assert result["lineage_mode"] == "nextleg_uniform_refinement"
+    assert result["metrics"]["leg_corr1"]["delta"] >= -0.005
+    assert result["metrics"]["leg_corr2"]["delta"] >= 0.005
+
+
+def test_uniform_refinement_rejects_second_leg_gain_that_sacrifices_leg1(tmp_path):
+    baseline = _make_run(tmp_path, "baseline", uniform=False,
+                         task=(0.030, 0.080, 0.030))
+    digest = hashlib.sha256(b"baseline").hexdigest()
+    candidate = _make_run(tmp_path, "candidate", uniform=True,
+                          task=(0.031, 0.060, 0.045), refinement_parent=digest)
+    result = selection.select(baseline, candidate)
+    assert result["status"] == "REJECT_CANDIDATE"
+    assert "refinement materially regressed first-leg correlation" in result["failures"]
