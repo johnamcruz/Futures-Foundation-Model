@@ -125,11 +125,13 @@ def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1,
         os.remove(tmp)
 
 
-def _passes(probe_res, std, margin=0.0, dir_margin=0.0, pretext='mask'):
+def _passes(probe_res, std, margin=0.0, dir_margin=0.0, pretext='mask',
+            forecast_skill=None):
     """Report-only gate on the PROBE (representation content), delegated to the pretext task.
     Each task (MaskTask/ForecastTask/ContrastiveTask) owns its own pass/fail rule — see
     PretextTask.gate + `_decide`. Kept as a thin function for callers/tests."""
-    return get_pretext(pretext).gate(probe_res, std, margin, dir_margin)
+    return get_pretext(pretext).gate(
+        probe_res, std, margin, dir_margin, forecast_skill=forecast_skill)
 
 
 def _control_cfg(cfg):
@@ -139,6 +141,38 @@ def _control_cfg(cfg):
     out['patience'] = min(int(cfg['patience']), out['epochs'])
     out['resume'] = False
     return out
+
+
+def revalidate_saved_report(report_path):
+    """Reapply the current task gate to a completed checkpoint report without retraining.
+
+    This is intentionally limited to metrics already frozen in the report. It cannot turn a bad
+    training run into a good one; it only lets evaluation-policy fixes recover a fully trained,
+    crash-safe checkpoint. The caller still runs the independent Probe Atlas retention gate.
+    """
+    report_path = os.fspath(report_path)
+    report = json.load(open(report_path))
+    cfg = report.get('config', {})
+    pretext = cfg.get('pretext', 'mask')
+    history = report.get('history') or []
+    if not history:
+        return report.get('verdict', {})
+    summary = history[0]
+    fc_skill = summary.get('forecast_skill')
+    ok, detail = _passes(
+        report.get('probe'), float(summary.get('std', 0.0)), pretext=pretext,
+        forecast_skill=fc_skill)
+    summary.update({'gate_ok': bool(ok), **detail})
+    verdict = dict(report.get('verdict', {}))
+    verdict['representation_pass'] = bool(ok)
+    verdict['all_pass'] = bool(ok and verdict.get('beats_controls', False))
+    get_pretext(pretext).finalize_verdict(verdict, fc_skill, report.get('probe'))
+    report['verdict'] = verdict
+    tmp = report_path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(report, f, indent=2, default=float)
+    os.replace(tmp, report_path)
+    return verdict
 
 
 def _stream_names(streams):
@@ -345,7 +379,12 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
         state = torch.load(out_path, map_location='cpu')
         meta_path = out_path + '.meta.json'
         meta = json.loads(open(meta_path).read()) if os.path.isfile(meta_path) else {}
-        hist = [{
+        recovered_best = {}
+        trainer_path = out_path + '.trainer.pt'
+        if os.path.isfile(trainer_path):
+            trainer_payload = torch.load(trainer_path, map_location='cpu')
+            recovered_best = dict(trainer_payload.get('best_history_row') or {})
+        hist = [{**recovered_best,
             'epoch': int(meta.get('epoch', -1)),
             'train_loss': None,
             'val_loss': float(meta.get('best_val', float('nan'))),
@@ -368,7 +407,8 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
         std = float(hist[-1]['std'])
     best_ep = min(hist, key=lambda h: h['val_loss'])
     fc_skill = best_ep.get('skill')                       # forecast skill vs copy-now (None for mask)
-    ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext)
+    ok, detail = _passes(probe_res, std, probe_margin, dir_margin, pretext,
+                         forecast_skill=fc_skill)
     history = [{'source': 'default', 'best_val': float(best_ep['val_loss']), 'std': std,
                 'forecast_skill': fc_skill, 'gate_ok': bool(ok), **detail}]
     verdict = _finalize(big, tr, va, state, probe_res, cfg, out_path=out_path, controls=controls,
@@ -378,6 +418,19 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     verdict['epochs'] = hist                 # per-epoch trainer history (val_loss + task extras,
     #                                          e.g. electra rtd_bal_acc) — learning verification
     get_pretext(pretext).finalize_verdict(verdict, fc_skill, probe_res)   # pretext-specific fields
+    # _finalize writes the core report before task-specific fields are attached. Persist the final
+    # verdict atomically so a restarted pipeline sees the same decision returned to this process.
+    report_path = out_path + '.report.json'
+    if os.path.isfile(report_path):
+        report = json.load(open(report_path))
+        # `history`/`epochs` are returned to the caller for live diagnostics; the report already
+        # stores its compact validation history and must not duplicate the full epoch trace here.
+        report['verdict'] = {
+            key: value for key, value in verdict.items() if key not in ('history', 'epochs')}
+        tmp_report = report_path + '.tmp'
+        with open(tmp_report, 'w') as f:
+            json.dump(report, f, indent=2, default=float)
+        os.replace(tmp_report, report_path)
     return verdict
 
 

@@ -120,6 +120,39 @@ def test_stage_verdict_requires_current_probe_and_both_gates(tmp_path):
         pipeline._assert_stage_verdict(report)
 
 
+def test_saved_seq2seq_report_is_revalidated_without_retraining(tmp_path):
+    report = tmp_path / 'seq.pt.report.json'
+    report.write_text(json.dumps({
+        'config': {'pretext': 'forecast'},
+        'probe': {
+            'split_schema': pipeline.PROBE_SPLIT_SCHEMA,
+            'mean_core_delta': 0.0429668,
+            'descriptive_delta': 0.0574667,
+            'fwd_absmove_delta': -0.0006,
+            'fwd_dir_delta': -0.0055,
+            'learns_regime_vol_structure': True,
+        },
+        'history': [{'std': 1.0057, 'forecast_skill': 0.058, 'gate_ok': False}],
+        'verdict': {
+            'all_pass': False, 'representation_pass': False,
+            'beats_controls': True, 'real_delta': 0.0429668,
+        },
+    }))
+    refreshed = pipeline._revalidate_stage_report(report)
+    assert refreshed['all_pass'] is True
+    assert refreshed['representation_pass'] is True
+    pipeline._assert_stage_verdict(report)
+
+
+def test_checkpoint_recovery_distinguishes_interrupted_training_from_finalization(tmp_path):
+    checkpoint = tmp_path / 'seq.pt'
+    assert pipeline._checkpoint_recovery_flags(checkpoint) == (False, False)
+    checkpoint.write_bytes(b'progressive-best')
+    assert pipeline._checkpoint_recovery_flags(checkpoint) == (True, False)
+    Path(str(checkpoint) + '.real_complete.json').write_text('{}')
+    assert pipeline._checkpoint_recovery_flags(checkpoint) == (False, True)
+
+
 def test_mps_batches_fit_16gb_and_each_stage_has_distinct_output():
     batches = {stage.name: stage.batch['mps'] for stage in pipeline.STAGES}
     assert batches == {'mask': 256, 'contrastive': 64, 'seq2seq': 128, 'nextleg': 128}

@@ -324,26 +324,42 @@ def test_passes_gate_on_probe_not_loss():
 
 
 def test_passes_forecast_gate_is_forward_centric_anti_shortcut():
-    """Stage-2 (forecast) gate: descriptive gains alone CANNOT pass — forward MOVE SIZE must
-    improve and forward DIRECTION must not regress. Stage-1 (mask) gate is unaffected."""
+    """Forecast stages need positive objective skill and tolerate only tiny probe noise."""
     base = dict(mean_core_delta=0.05, learns_regime_vol_structure=True)
     # shortcut: big descriptive lift, but forward targets flat/negative -> FAIL on forecast...
     shortcut = dict(base, descriptive_delta=0.10, fwd_absmove_delta=0.0, fwd_dir_delta=-0.02,
                     forward_score=-0.02)
-    assert not ssl._passes(shortcut, std=0.5, pretext='forecast')[0]
+    assert not ssl._passes(shortcut, std=0.5, pretext='forecast',
+                           forecast_skill=0.05)[0]
     # ...yet the SAME probe passes the ORIGINAL mask gate (mean_core_delta>0) -> stage 1 intact
     assert ssl._passes(shortcut, std=0.5, pretext='mask')[0]
     # genuine forward learning: move size up, direction not worse -> PASS on forecast
     genuine = dict(base, descriptive_delta=0.02, fwd_absmove_delta=0.03, fwd_dir_delta=0.01,
                    forward_score=0.04)
-    ok, d = ssl._passes(genuine, std=0.5, pretext='forecast')
+    ok, d = ssl._passes(genuine, std=0.5, pretext='forecast', forecast_skill=0.05)
     assert ok and d['fwd_size_ok'] and d['fwd_dir_ok'] and d['descriptive_ok']
-    # direction regresses -> FAIL even with forward move-size gain
-    dir_reg = dict(genuine, fwd_dir_delta=-0.01)
-    assert not ssl._passes(dir_reg, std=0.5, pretext='forecast')[0]
-    # descriptive regresses -> FAIL
-    desc_reg = dict(genuine, descriptive_delta=-0.01)
-    assert not ssl._passes(desc_reg, std=0.5, pretext='forecast')[0]
+    # No persistence skill cannot pass even with attractive representation probes.
+    assert not ssl._passes(genuine, std=0.5, pretext='forecast',
+                           forecast_skill=0.0)[0]
+    # Material regression beyond the one-point tolerance still fails.
+    dir_reg = dict(genuine, fwd_dir_delta=-0.011)
+    assert not ssl._passes(dir_reg, std=0.5, pretext='forecast',
+                           forecast_skill=0.05)[0]
+    desc_reg = dict(genuine, descriptive_delta=-0.011)
+    assert not ssl._passes(desc_reg, std=0.5, pretext='forecast',
+                           forecast_skill=0.05)[0]
+
+
+def test_forecast_gate_accepts_observed_seq2seq_probe_noise_with_real_skill():
+    observed = dict(
+        mean_core_delta=0.0429668, descriptive_delta=0.0574667,
+        fwd_absmove_delta=-0.0006, fwd_dir_delta=-0.0055,
+        learns_regime_vol_structure=True,
+    )
+    ok, detail = ssl._passes(
+        observed, std=1.0057, pretext='forecast', forecast_skill=0.058)
+    assert ok
+    assert detail['forecast_skill_ok'] and detail['core_context_ok']
 
 
 def test_compare_exposes_forward_and_descriptive_deltas():

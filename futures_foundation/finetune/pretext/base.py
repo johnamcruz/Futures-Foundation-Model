@@ -22,9 +22,10 @@ class PretextTask:
         kw = {k: v for k, v in cfg.items() if k != 'pretext'}
         return getattr(_ssl_torch, self.trainer)(big, tr, va, control=control, **kw)
 
-    def gate(self, probe_res, std, margin, dir_margin):
+    def gate(self, probe_res, std, margin, dir_margin, forecast_skill=None):
         """Report-only gate on the PROBE (representation content), NOT the loss. Builds the shared
-        detail dict, then defers the pass/fail to `_decide`."""
+        detail dict, then defers the pass/fail to `_decide`. ``forecast_skill`` is available to
+        forecasting subclasses; representation-only stages deliberately ignore it."""
         no_collapse = bool(std > 0.01)
         detail = {'no_collapse': no_collapse}
         if probe_res is None:
