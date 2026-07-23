@@ -39,7 +39,8 @@ def test_torch_targets_match_public_numpy_reference():
     joined = torch.cat((context, future), dim=2)[0].numpy()
     expected = momentum_volatility_targets(
         joined[1], joined[2], joined[3], 63)
-    np.testing.assert_allclose(momentum[0], expected.momentum, rtol=1e-6)
+    np.testing.assert_allclose(
+        momentum[0], expected.momentum_strength, rtol=1e-6)
     np.testing.assert_allclose(volatility[0], expected.volatility, rtol=1e-6)
     np.testing.assert_array_equal(coupling[0], expected.coupling)
 
@@ -140,7 +141,7 @@ def test_transition_classification_is_balanced_and_handles_absent_state():
     assert torch.isfinite(logits.grad).all()
 
 
-def test_tiny_mv_v2_training_returns_encoder_only_state(monkeypatch):
+def test_tiny_mv_v3_training_returns_encoder_only_state(monkeypatch, tmp_path):
     import torch
     from futures_foundation.finetune.pretext._torch import momentum_volatility as module
 
@@ -156,6 +157,8 @@ def test_tiny_mv_v2_training_returns_encoder_only_state(monkeypatch):
             return self.projection(value.mean(dim=2))
 
     monkeypatch.setattr(module, "load_mantis", lambda *_args, **_kwargs: FakeEncoder())
+    parent = tmp_path / "parent.pt"
+    torch.save(FakeEncoder().state_dict(), parent)
     rng = np.random.default_rng(7)
     close = 100 + np.cumsum(rng.normal(0, .2, 420)).astype(np.float32)
     width = rng.uniform(.1, .8, len(close)).astype(np.float32)
@@ -166,12 +169,56 @@ def test_tiny_mv_v2_training_returns_encoder_only_state(monkeypatch):
         bars, np.arange(0, 200), np.arange(250, 340),
         horizons=(5,), context_lengths=(64,), epochs=1, steps_per_epoch=1,
         batch=4, device="cpu", lora_r=0, freeze_encoder_layers=0,
-        scale_lookback=64, momentum_lookback=20, verbose=False)
+        scale_lookback=64, momentum_lookback=20, verbose=False,
+        backbone_ckpt=str(parent))
 
     assert state
     assert all(not key.startswith(("mv_head.", "decoder."))
                for key in state)
     assert "mv_transition_auc" in history[-1]
+    assert "mv_parent_cosine" in history[-1]
+    assert "mv_parent_relative_rmse" in history[-1]
+
+
+def test_parent_retention_compares_student_to_frozen_same_input_teacher(
+    monkeypatch, tmp_path,
+):
+    import torch
+    from futures_foundation.finetune.pretext._torch import momentum_volatility as module
+
+    class FakeEncoder(torch.nn.Module):
+        hidden_dim = 4
+        seq_len = 16
+
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(1, self.hidden_dim)
+
+        def forward(self, value):
+            return self.projection(value.mean(dim=2))
+
+    monkeypatch.setattr(module, "load_mantis", lambda *_args, **_kwargs: FakeEncoder())
+    parent = tmp_path / "parent.pt"
+    torch.save(FakeEncoder().state_dict(), parent)
+    context, future = _bars(batch=8, context=64, future=25)
+    bars = torch.cat((context, future), dim=2).permute(0, 2, 1)
+    big = bars.reshape(-1, 5).numpy()
+    starts = np.arange(0, len(big) - 90)
+    trainer = module._MomentumVolatilityTrainer(
+        big, starts, starts, horizons=(5,), context_lengths=(64,),
+        batch=4, epochs=1, steps_per_epoch=1, device="cpu",
+        backbone_ckpt=str(parent), lora_r=0, verbose=False)
+    trainer.build_net()
+    _, _, parts = trainer._losses(trainer.make_batch(trainer.tr))
+
+    assert float(parts["retention"].detach()) == pytest.approx(0.0, abs=1e-8)
+    assert float(parts["parent_cosine"].detach()) == pytest.approx(1.0, abs=1e-6)
+    assert all(not parameter.requires_grad
+               for parameter in trainer.parent_encoder.parameters())
+    with torch.no_grad():
+        trainer.net.encoder.projection.weight.add_(.1)
+    _, _, shifted = trainer._losses(trainer.make_batch(trainer.tr))
+    assert float(shifted["retention"].detach()) > 0
 
 
 def test_public_trainer_requires_warm_lora_defaults():
@@ -184,6 +231,7 @@ def test_public_trainer_requires_warm_lora_defaults():
     assert signature.parameters["freeze_encoder_layers"].default == 2
     assert signature.parameters["backbone_ckpt"].default is None
     assert signature.parameters["scale_lookback"].default == 64
-    assert signature.parameters["lr"].default == 3e-5
-    assert signature.parameters["head_lr"].default == 3e-5
-    assert signature.parameters["transition_contrastive_weight"].default == 1.0
+    assert signature.parameters["lr"].default == 1e-5
+    assert signature.parameters["head_lr"].default == 1e-4
+    assert signature.parameters["transition_contrastive_weight"].default == .1
+    assert signature.parameters["parent_retention_weight"].default == .5

@@ -61,10 +61,11 @@ def test_targets_are_price_scale_and_direction_invariant():
         200 - low, 200 - high, 200 - close, 4, horizons=(2, 4),
         scale_lookback=4, momentum_lookback=3)
 
-    np.testing.assert_allclose(original.momentum, scaled.momentum)
+    np.testing.assert_allclose(original.momentum_strength, scaled.momentum_strength)
     np.testing.assert_allclose(original.volatility, scaled.volatility)
     np.testing.assert_array_equal(original.coupling, scaled.coupling)
-    np.testing.assert_allclose(original.momentum, -mirrored.momentum)
+    np.testing.assert_allclose(
+        original.momentum_strength, mirrored.momentum_strength)
     np.testing.assert_allclose(original.volatility, mirrored.volatility)
     np.testing.assert_array_equal(original.coupling, mirrored.coupling)
 
@@ -79,7 +80,8 @@ def test_future_after_largest_horizon_cannot_change_any_target():
         high, low, close, 4, horizons=(2,),
         scale_lookback=4, momentum_lookback=3)
 
-    np.testing.assert_allclose(original.momentum, changed.momentum)
+    np.testing.assert_allclose(
+        original.momentum_strength, changed.momentum_strength)
     np.testing.assert_allclose(original.volatility, changed.volatility)
     np.testing.assert_array_equal(original.coupling, changed.coupling)
 
@@ -115,7 +117,7 @@ def test_path_efficiency_distinguishes_persistent_move_from_round_trip():
         high, low, round_trip_close, 4, horizons=(2,),
         scale_lookback=4, momentum_lookback=3)
 
-    assert abs(persistent.momentum[0]) > abs(round_trip.momentum[0])
+    assert persistent.momentum_strength[0] > round_trip.momentum_strength[0]
 
 
 def test_insufficient_history_or_future_fails_closed():
@@ -129,7 +131,7 @@ def test_insufficient_history_or_future_fails_closed():
 
     assert not insufficient_history.valid.any()
     assert not insufficient_future.valid.any()
-    assert np.isnan(insufficient_history.momentum).all()
+    assert np.isnan(insufficient_history.momentum_strength).all()
     assert np.isnan(insufficient_future.volatility).all()
     assert (insufficient_history.coupling == -1).all()
 
@@ -138,8 +140,8 @@ def test_task_is_registered_with_own_control_contract_and_split_reserve():
     assert "momentum_volatility" in PRETEXTS
     task = get_pretext("momentum_volatility")
     assert isinstance(task, MomentumVolatilityTask)
-    assert task.control_contract == "momentum_volatility_transition_v2"
-    assert MOMENTUM_VOLATILITY_SCHEMA == "causal_momentum_volatility_v2"
+    assert task.control_contract == "momentum_volatility_transition_v3"
+    assert MOMENTUM_VOLATILITY_SCHEMA == "causal_momentum_volatility_v3"
     cfg = {
         "context_lengths": (64, 100, 150, 200),
         "horizons": (5, 10, 20, 25),
@@ -147,16 +149,18 @@ def test_task_is_registered_with_own_control_contract_and_split_reserve():
     assert task.reserve(cfg) == 225
 
 
-def test_shared_ssl_config_preserves_mv_v2_encoder_objective_knobs():
+def test_shared_ssl_config_preserves_mv_v3_encoder_objective_knobs():
     from futures_foundation.finetune.ssl import _base_cfg
 
     cfg = _base_cfg(
         transition_contrastive_weight=2.0,
+        parent_retention_weight=.75,
         contrastive_temperature=.2,
         scale_lookback=48,
         probe_baseline_ckpt="parent.pt",
     )
     assert cfg["transition_contrastive_weight"] == 2.0
+    assert cfg["parent_retention_weight"] == .75
     assert cfg["contrastive_temperature"] == .2
     assert cfg["scale_lookback"] == 48
     assert cfg["probe_baseline_ckpt"] == "parent.pt"
@@ -165,20 +169,20 @@ def test_shared_ssl_config_preserves_mv_v2_encoder_objective_knobs():
 def test_control_gate_requires_real_momentum_volatility_and_coupling_edge():
     task = MomentumVolatilityTask()
     real = {
-        "mv_momentum_corr": .2,
+        "mv_momentum_strength_corr": .2,
         "mv_volatility_corr": .3,
         "mv_transition_auc": .65,
         "mv_transition_worst_auc": .58,
     }
     controls = {
         "shuffle": {
-            "mv_momentum_corr": .01,
+            "mv_momentum_strength_corr": .01,
             "mv_volatility_corr": .02,
             "mv_transition_auc": .51,
             "mv_transition_worst_auc": .50,
         },
         "random": {
-            "mv_momentum_corr": -.01,
+            "mv_momentum_strength_corr": -.01,
             "mv_volatility_corr": .0,
             "mv_transition_auc": .49,
             "mv_transition_worst_auc": .48,
@@ -194,3 +198,24 @@ def test_control_gate_requires_real_momentum_volatility_and_coupling_edge():
     assert not failed
 
     assert task.control_evidence(real, None) == real
+
+
+def test_mv_gate_retains_parent_context_without_demanding_unrelated_probe_lift():
+    task = MomentumVolatilityTask()
+    retained = {
+        "mean_core_delta": -.001,
+        "descriptive_delta": -.002,
+        "fwd_absmove_delta": .001,
+        "fwd_dir_delta": -.003,
+        "learns_regime_vol_structure": True,
+    }
+    passed, detail = task.gate(
+        retained, std=.8, margin=.002, dir_margin=0.0, forecast_skill=.05)
+    assert passed
+    assert detail["mv_parent_retention_ok"]
+
+    regressed = {**retained, "fwd_dir_delta": -.006}
+    passed, detail = task.gate(
+        regressed, std=.8, margin=.002, dir_margin=0.0, forecast_skill=.05)
+    assert not passed
+    assert not detail["mv_parent_retention_ok"]

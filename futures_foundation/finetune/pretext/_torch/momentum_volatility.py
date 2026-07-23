@@ -1,4 +1,4 @@
-"""Torch trainer for the causal momentum-volatility coupling SSL objective."""
+"""Torch trainer for causal momentum-strength/volatility transition SSL."""
 from __future__ import annotations
 
 import numpy as np
@@ -106,28 +106,28 @@ def _momentum_volatility_targets_torch(
         - context_raw[:, low_channel, -scale_lookback:])
     scale = median(causal_ranges).clamp_min(1e-6)
     now = context_raw[:, close_channel, -1]
-    momentum, volatility, coupling = [], [], []
+    momentum_strength, volatility, coupling = [], [], []
     for offset in horizon_offsets.tolist():
         endpoint = future_raw[:, close_channel, offset]
         future_close = future_raw[:, close_channel, :offset + 1]
         path = torch.cat((now[:, None], future_close), dim=1)
         steps = path[:, 1:] - path[:, :-1]
-        move = (endpoint - now) / steps.abs().sum(dim=1).clamp_min(1e-6)
+        strength = (endpoint - now).abs() / steps.abs().sum(dim=1).clamp_min(1e-6)
         future_ranges = (
             future_raw[:, high_channel, :offset + 1]
             - future_raw[:, low_channel, :offset + 1])
         ratio = median(future_ranges).clamp_min(1e-6) / scale
         expanding = ratio >= float(expansion_threshold)
-        directional = move.abs() >= float(momentum_threshold)
-        state = torch.full_like(move, 3, dtype=torch.long)
+        directional = strength >= float(momentum_threshold)
+        state = torch.full_like(strength, 3, dtype=torch.long)
         state = torch.where(~directional & expanding, 2, state)
         state = torch.where(directional & ~expanding, 1, state)
         state = torch.where(directional & expanding, 0, state)
-        momentum.append(move)
+        momentum_strength.append(strength)
         volatility.append(ratio.log())
         coupling.append(state)
     return (
-        torch.stack(momentum, dim=1),
+        torch.stack(momentum_strength, dim=1),
         torch.stack(volatility, dim=1),
         torch.stack(coupling, dim=1),
     )
@@ -138,8 +138,9 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
             self, big, tr, va, *, scale_lookback=64, momentum_lookback=20,
             momentum_threshold=.5, expansion_threshold=1.1,
             candle_weight=.25, momentum_weight=1.0, volatility_weight=.5,
-            coupling_weight=.5, transition_contrastive_weight=1.0,
-            contrastive_temperature=.1, head_lr=None, **forecast):
+            coupling_weight=.5, transition_contrastive_weight=.1,
+            parent_retention_weight=.5, contrastive_temperature=.1,
+            head_lr=None, **forecast):
         super().__init__(big, tr, va, **forecast)
         self.scale_lookback = int(scale_lookback)
         self.momentum_lookback = int(momentum_lookback)
@@ -151,21 +152,31 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
         self.expansion_threshold = float(expansion_threshold)
         self.weights = tuple(float(value) for value in (
             candle_weight, momentum_weight, volatility_weight, coupling_weight,
-            transition_contrastive_weight))
+            transition_contrastive_weight, parent_retention_weight))
         if any(value < 0 for value in self.weights) or sum(self.weights) <= 0:
             raise ValueError("loss weights must be non-negative and not all zero")
         self.contrastive_temperature = float(contrastive_temperature)
         if self.contrastive_temperature <= 0:
             raise ValueError("contrastive_temperature must be positive")
         self.head_lr = float(head_lr) if head_lr is not None else self.lr
+        self.parent_encoder = None
 
     def build_net(self):
+        if not self.backbone_ckpt:
+            raise ValueError(
+                "momentum-volatility v3 requires a frozen parent encoder checkpoint")
+        parent_state = torch.load(
+            self.backbone_ckpt, map_location="cpu", weights_only=False)
         net = MomentumVolatilityNet(
             C=self.C, new_channels=self.new_channels, horizons=self.hlist,
             model_id=self.model_id, aux_dim=0).to(self.dev)
-        if self.backbone_ckpt:
-            net.encoder.load_state_dict(torch.load(
-                self.backbone_ckpt, map_location="cpu", weights_only=False))
+        net.encoder.load_state_dict(parent_state)
+        teacher = load_mantis(self.model_id).to(self.dev)
+        teacher.load_state_dict(parent_state)
+        teacher.eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad = False
+        self.parent_encoder = teacher
         self.net = net
 
     def make_optimizer(self):
@@ -192,7 +203,7 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
         context = ((context_raw - mean) / std).clamp(-self.clamp, self.clamp)
         future = ((future_raw - mean) / std).clamp(-self.clamp, self.clamp)
         candle_target = future[:, :, self.h_off] - context[:, :, -1:]
-        momentum, volatility, coupling = _momentum_volatility_targets_torch(
+        momentum_strength, volatility, coupling = _momentum_volatility_targets_torch(
             context_raw, future_raw, self.h_off,
             scale_lookback=self.scale_lookback,
             momentum_lookback=self.momentum_lookback,
@@ -200,26 +211,38 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
             expansion_threshold=self.expansion_threshold)
         return (
             _apply_control(context, self.control),
-            candle_target, momentum, volatility, coupling)
+            candle_target, momentum_strength, volatility, coupling)
 
     def _losses(self, batch):
-        context, candle_truth, momentum_truth, volatility_truth, coupling_truth = batch
-        candles, momentum, volatility, coupling, embedding = self.net.forward_mv(
+        context, candle_truth, strength_truth, volatility_truth, coupling_truth = batch
+        candles, strength, volatility, coupling, embedding = self.net.forward_mv(
             context, return_embedding=True)
+        if self.parent_encoder is None:
+            raise RuntimeError("frozen parent encoder was not initialized")
+        with torch.no_grad():
+            parent_embedding = _encode_channels(self.parent_encoder, context)
+        parent_energy = parent_embedding.float().square().mean().clamp_min(1e-6)
+        parent_relative_mse = F.mse_loss(
+            embedding.float(), parent_embedding.float()) / parent_energy
         parts = {
             "candle": F.mse_loss(candles.float(), candle_truth),
-            "momentum": F.smooth_l1_loss(momentum.float(), momentum_truth),
+            "momentum_strength": F.smooth_l1_loss(
+                strength.float(), strength_truth),
             "volatility": F.smooth_l1_loss(volatility.float(), volatility_truth),
             "coupling": _balanced_transition_cross_entropy(
                 coupling, coupling_truth),
             "contrastive": _transition_contrastive_loss(
                 embedding, coupling_truth[:, -1],
                 temperature=self.contrastive_temperature),
+            "retention": parent_relative_mse,
+            "parent_cosine": F.cosine_similarity(
+                embedding.float(), parent_embedding.float(), dim=1).mean(),
         }
         total = sum(weight * parts[name] for weight, name in zip(
             self.weights,
-            ("candle", "momentum", "volatility", "coupling", "contrastive")))
-        return total, (candles, momentum, volatility, coupling), parts
+            ("candle", "momentum_strength", "volatility", "coupling",
+             "contrastive", "retention")))
+        return total, (candles, strength, volatility, coupling), parts
 
     def compute_loss(self, batch):
         return self._losses(batch)[0]
@@ -228,9 +251,9 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
     def val_eval(self):
         self.net.eval()
         generator = torch.Generator(device=self.dev); generator.manual_seed(20260723)
-        prediction = {"momentum": [], "volatility": [], "coupling": []}
+        prediction = {"momentum_strength": [], "volatility": [], "coupling": []}
         truth = {key: [] for key in prediction}
-        total = candle = persist = 0.0
+        total = candle = persist = retention = parent_cosine = 0.0
         batches = min(20, max(1, len(self.va) // self.batch))
         embedding_context = None
         for _ in range(batches):
@@ -238,20 +261,24 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
             if embedding_context is None:
                 embedding_context = batch[0]
             loss, output, parts = self._losses(batch)
-            _candles, momentum, volatility, coupling = output
+            _candles, momentum_strength, volatility, coupling = output
             total += float(loss)
             candle += float(parts["candle"])
             persist += float((batch[1] ** 2).mean())
+            retention += float(parts["retention"])
+            parent_cosine += float(parts["parent_cosine"])
             for name, pred, target in (
-                    ("momentum", momentum, batch[2]),
+                    ("momentum_strength", momentum_strength, batch[2]),
                     ("volatility", volatility, batch[3]),
                     ("coupling", coupling.softmax(-1), batch[4])):
                 prediction[name].append(pred.float().cpu())
                 truth[name].append(target.cpu())
         prediction = {key: torch.cat(value).numpy() for key, value in prediction.items()}
         truth = {key: torch.cat(value).numpy() for key, value in truth.items()}
-        momentum_corr = np.mean([
-            _correlation(prediction["momentum"][:, i], truth["momentum"][:, i])
+        momentum_strength_corr = np.mean([
+            _correlation(
+                prediction["momentum_strength"][:, i],
+                truth["momentum_strength"][:, i])
             for i in range(len(self.hlist))])
         volatility_corr = np.mean([
             _correlation(prediction["volatility"][:, i], truth["volatility"][:, i])
@@ -267,12 +294,15 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
             per_class_rate[name] = float(np.mean(truth["coupling"] == label))
         extra = {
             "skill": 1.0 - candle / max(persist, 1e-12),
-            "mv_momentum_corr": float(momentum_corr),
+            "mv_momentum_strength_corr": float(momentum_strength_corr),
             "mv_volatility_corr": float(volatility_corr),
             "mv_transition_auc": float(np.mean(list(per_class_auc.values()))),
             "mv_transition_worst_auc": float(min(per_class_auc.values())),
             "mv_transition_auc_per_class": per_class_auc,
             "mv_transition_class_rate": per_class_rate,
+            "mv_parent_relative_rmse": float(
+                np.sqrt(max(retention / batches, 0.0))),
+            "mv_parent_cosine": float(parent_cosine / batches),
             "std": float(self.net.embed(embedding_context).std(0).mean()),
         }
         self.net.train()
@@ -283,10 +313,12 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
             print(
                 f"  ep{epoch:>3} train={train_loss:.4f} val={val_loss:.4f} "
                 f"skill={extra['skill']:+.3f} "
-                f"momentumR={extra['mv_momentum_corr']:+.3f} "
+                f"strengthR={extra['mv_momentum_strength_corr']:+.3f} "
                 f"volatilityR={extra['mv_volatility_corr']:+.3f} "
                 f"transitionAUC={extra['mv_transition_auc']:.3f}/"
                 f"{extra['mv_transition_worst_auc']:.3f}worst "
+                f"parent={extra['mv_parent_cosine']:.4f}/"
+                f"{extra['mv_parent_relative_rmse']:.4f}rmse "
                 f"std={extra['std']:.4f}{'  *' if improved else ''}",
                 flush=True)
 
@@ -294,7 +326,7 @@ class _MomentumVolatilityTrainer(_ForecastTrainer):
 def train_ssl_momentum_volatility(
         big, train_starts, val_starts, *, horizons=(5, 10, 20, 25),
         context_lengths=(64, 100, 150, 200), new_channels=3, epochs=60,
-        steps_per_epoch=50, batch=512, lr=3e-5, head_lr=3e-5,
+        steps_per_epoch=50, batch=512, lr=1e-5, head_lr=1e-4,
         weight_decay=0.0, patience=8, device=None,
         model_id="paris-noah/Mantis-8M", backbone_ckpt=None,
         control="real", seed=0, clamp=10.0, grad_clip=1.0, verbose=True,
@@ -302,11 +334,11 @@ def train_ssl_momentum_volatility(
         scale_lookback=64, momentum_lookback=20,
         momentum_threshold=.5, expansion_threshold=1.1,
         candle_weight=.25, momentum_weight=1.0, volatility_weight=.5,
-        coupling_weight=.5, transition_contrastive_weight=1.0,
-        contrastive_temperature=.1,
+        coupling_weight=.5, transition_contrastive_weight=.1,
+        parent_retention_weight=.5, contrastive_temperature=.1,
         lora_r=8, lora_alpha=16.0, lora_dropout=0.0,
         log_every_steps=25, **_ignore):
-    """Refine a warm FFM encoder on causal momentum-volatility coupling."""
+    """Refine a warm FFM encoder on causal momentum-strength/volatility transitions."""
     return _MomentumVolatilityTrainer(
         big, train_starts, val_starts, horizons=horizons,
         context_lengths=context_lengths, new_channels=new_channels,
@@ -316,6 +348,7 @@ def train_ssl_momentum_volatility(
         candle_weight=candle_weight, momentum_weight=momentum_weight,
         volatility_weight=volatility_weight, coupling_weight=coupling_weight,
         transition_contrastive_weight=transition_contrastive_weight,
+        parent_retention_weight=parent_retention_weight,
         contrastive_temperature=contrastive_temperature,
         epochs=epochs, steps_per_epoch=steps_per_epoch, batch=batch,
         lr=lr, head_lr=head_lr, weight_decay=weight_decay, patience=patience,

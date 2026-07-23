@@ -26,6 +26,7 @@ from futures_foundation.data_provenance import seal_continuous_streams, sha256
 from futures_foundation.finetune import ssl
 from futures_foundation.finetune.pretext.momentum_volatility import (
     MOMENTUM_VOLATILITY_SCHEMA,
+    PARENT_RETENTION_TOLERANCE,
 )
 
 
@@ -54,7 +55,7 @@ def _parser():
         "WARM_CKPT", str(ROOT / "checkpoints" / "mantis_ssl_nextleg_race_v2.pt")))
     parser.add_argument("--out", default=os.environ.get(
         "OUT_PATH", str(ROOT / "temp" / "momentum_volatility" /
-                        "mantis_ssl_mv_v2.pt")))
+                        "mantis_ssl_mv_v3.pt")))
     parser.add_argument("--atlas-labels", default=os.environ.get("TREND_LABELS"))
     parser.add_argument("--tickers", default=",".join(TICKERS))
     parser.add_argument("--tfs", default=",".join(TIMEFRAMES))
@@ -65,9 +66,9 @@ def _parser():
     parser.add_argument("--epochs", type=int, default=int(os.environ.get("MV_EPOCHS", "60")))
     parser.add_argument("--steps", type=int, default=int(os.environ.get("MV_STEPS", "50")))
     parser.add_argument("--batch", type=int)
-    parser.add_argument("--lr", type=float, default=float(os.environ.get("MV_LR", "3e-5")))
+    parser.add_argument("--lr", type=float, default=float(os.environ.get("MV_LR", "1e-5")))
     parser.add_argument("--head-lr", type=float,
-                        default=float(os.environ.get("MV_HEAD_LR", "3e-5")))
+                        default=float(os.environ.get("MV_HEAD_LR", "1e-4")))
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--scale-lookback", type=int, default=64)
     parser.add_argument("--momentum-lookback", type=int, default=20)
@@ -77,7 +78,8 @@ def _parser():
     parser.add_argument("--momentum-weight", type=float, default=1.0)
     parser.add_argument("--volatility-weight", type=float, default=.5)
     parser.add_argument("--coupling-weight", type=float, default=.5)
-    parser.add_argument("--transition-contrastive-weight", type=float, default=1.0)
+    parser.add_argument("--transition-contrastive-weight", type=float, default=.1)
+    parser.add_argument("--parent-retention-weight", type=float, default=.5)
     parser.add_argument("--contrastive-temperature", type=float, default=.1)
     parser.add_argument("--encoder-transfer-margin", type=float, default=.002)
     parser.add_argument("--lora-r", type=int, default=8)
@@ -140,8 +142,8 @@ def _probe_auc(payload, name, stream=None):
     return float(row["auc"] if stream is None else row["per_stream_auc"][stream])
 
 
-def _assert_encoder_transfer(*, output, parent, margin, child_atlas=None,
-                             parent_atlas=None):
+def _assert_encoder_transfer(*, output, parent, margin, retention_tolerance,
+                             child_atlas=None, parent_atlas=None):
     """Fail closed unless the exported encoder—not a disposable head—improves."""
     report = json.loads(Path(str(output) + ".report.json").read_text())
     probe = report.get("probe") or {}
@@ -151,29 +153,36 @@ def _assert_encoder_transfer(*, output, parent, margin, child_atlas=None,
     failures = []
     if probe.get("comparison_baseline") != expected_parent:
         failures.append("probe baseline is not the immediate parent")
-    if core_delta < float(margin):
+    if core_delta < -float(retention_tolerance):
         failures.append(
-            f"parent-relative core {core_delta:+.6f} < {float(margin):+.6f}")
-    if forward_delta <= 0:
-        failures.append(f"parent-relative forward score {forward_delta:+.6f} <= 0")
+            f"parent-relative core {core_delta:+.6f} < "
+            f"{-float(retention_tolerance):+.6f}")
+    if forward_delta < -float(retention_tolerance):
+        failures.append(
+            f"parent-relative forward score {forward_delta:+.6f} < "
+            f"{-float(retention_tolerance):+.6f}")
     transfer = {
-        "schema": "ffm_encoder_transfer_gate_v1",
+        "schema": "ffm_mv_encoder_transfer_gate_v3",
         "child": {"path": str(output), "sha256": sha256(output)},
         "parent": {"path": str(parent), "sha256": sha256(parent)},
         "heads_available_to_gate": False,
         "parent_relative_probe": {
             "core_delta": core_delta,
             "forward_delta": forward_delta,
-            "minimum_core_delta": float(margin),
+            "retention_tolerance": float(retention_tolerance),
         },
     }
-    if child_atlas is not None and parent_atlas is not None:
+    if child_atlas is None or parent_atlas is None:
+        failures.append(
+            "headless MV Probe Atlas comparison is required for promotion")
+    else:
         child = json.loads(Path(child_atlas).read_text())
         base = json.loads(Path(parent_atlas).read_text())
         predictive = (
-            "pred_fwd_large_move",
-            "pred_vol_expand",
-            "pred_persistent_trend_start",
+            "pred_mv_trend_expansion",
+            "pred_mv_trend_weakening",
+            "pred_mv_noisy_expansion",
+            "pred_mv_compression",
         )
         retention = (
             "ret_vol_regime",
@@ -207,7 +216,7 @@ def _assert_encoder_transfer(*, output, parent, margin, child_atlas=None,
     destination.write_text(json.dumps(transfer, indent=2) + "\n")
     if failures:
         raise RuntimeError(
-            "MV-v2 encoder transfer failed: " + "; ".join(failures))
+            "MV-v3 encoder transfer failed: " + "; ".join(failures))
     return destination
 
 
@@ -229,7 +238,7 @@ def main():
 
     contract = {
         **provenance,
-        "stage": "momentum_volatility_v2",
+        "stage": "momentum_volatility_v3",
         "schema": MOMENTUM_VOLATILITY_SCHEMA,
         "parent": {"path": str(parent), "sha256": sha256(parent)},
         "holdout_start": HOLDOUT_START,
@@ -249,12 +258,15 @@ def main():
     print(f"  holdout    : >= {HOLDOUT_START} physically excluded")
     print(f"  parent     : {parent}")
     print(f"  sampling   : {args.sampling_mode} (equal opportunity across 36 streams)")
-    print("  targets    : path efficiency x volatility transition (complete 2x2 matrix)")
+    print("  targets    : momentum strength x volatility transition (complete 2x2 matrix)")
     print("  ATR/R/IP   : none")
     print(f"  tuning     : LoRA r={args.lora_r} alpha={args.lora_alpha:g} "
           f"freeze={args.freeze_encoder_layers}")
     print("  artifact   : encoder only; task heads are discarded")
-    print(f"  gate       : child must beat Race-v2 parent by {args.encoder_transfer_margin:g}")
+    print(f"  retention  : weight={args.parent_retention_weight:g} "
+          f"tolerance={PARENT_RETENTION_TOLERANCE:g}")
+    print(f"  gate       : MV Probe Atlas must beat Race-v2 by "
+          f"{args.encoder_transfer_margin:g}")
     print(f"  training   : {device} batch={batch} epochs={args.epochs} steps={args.steps}")
     print(f"  controls   : {controls}")
     print(f"  output     : {output}")
@@ -282,6 +294,7 @@ def main():
         volatility_weight=args.volatility_weight,
         coupling_weight=args.coupling_weight,
         transition_contrastive_weight=args.transition_contrastive_weight,
+        parent_retention_weight=args.parent_retention_weight,
         contrastive_temperature=args.contrastive_temperature,
         freeze_encoder_layers=args.freeze_encoder_layers,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
@@ -293,7 +306,7 @@ def main():
     if not args.skip_atlas:
         child_atlas = _run_atlas(
             data=data, checkpoint=output, labels=labels, device=device, batch=batch,
-            stem="momentum_volatility_v2",
+            stem="momentum_volatility_v3",
             artifact_dir=output.parent / "probe_atlas")
         parent_atlas = _run_atlas(
             data=data, checkpoint=parent, labels=labels, device=device, batch=batch,
@@ -301,6 +314,7 @@ def main():
             artifact_dir=output.parent / "probe_atlas")
     transfer = _assert_encoder_transfer(
         output=output, parent=parent, margin=args.encoder_transfer_margin,
+        retention_tolerance=PARENT_RETENTION_TOLERANCE,
         child_atlas=child_atlas, parent_atlas=parent_atlas)
     print("\nMOMENTUM-VOLATILITY SSL COMPLETE")
     print(f"  encoder : {output}")
