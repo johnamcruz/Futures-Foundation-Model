@@ -59,7 +59,7 @@ def _parser():
     parser.add_argument("--tickers", default=",".join(TICKERS))
     parser.add_argument("--tfs", default=",".join(TIMEFRAMES))
     parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
-                        default=os.environ.get("SAMPLING_MODE", "bar_proportional"))
+                        default=os.environ.get("SAMPLING_MODE", "uniform_stream"))
     parser.add_argument("--controls", default=os.environ.get("SSL_CONTROLS", "shuffle,random"))
     parser.add_argument("--control-epochs", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=int(os.environ.get("MV_EPOCHS", "60")))
@@ -248,6 +248,7 @@ def main():
     print(f"  streams    : {len(tickers)} x {len(timeframes)} = {len(expected)}")
     print(f"  holdout    : >= {HOLDOUT_START} physically excluded")
     print(f"  parent     : {parent}")
+    print(f"  sampling   : {args.sampling_mode} (equal opportunity across 36 streams)")
     print("  targets    : path efficiency x volatility transition (complete 2x2 matrix)")
     print("  ATR/R/IP   : none")
     print(f"  tuning     : LoRA r={args.lora_r} alpha={args.lora_alpha:g} "

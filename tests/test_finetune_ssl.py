@@ -1110,7 +1110,8 @@ def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
 # --------------------------------------------- save/resume + anti-forgetting freeze (all pretexts)
 def test_base_cfg_has_ckpt_resume_freeze_keys():
     cfg = ssl._base_cfg()
-    assert cfg['ckpt_path'] is None and cfg['resume'] is False and cfg['freeze_encoder_layers'] == 0
+    assert cfg['ckpt_path'] is None and cfg['resume'] is False
+    assert cfg['freeze_encoder_layers'] == 0
     over = ssl._base_cfg(resume=True, freeze_encoder_layers=4)
     assert over['resume'] is True and over['freeze_encoder_layers'] == 4
 

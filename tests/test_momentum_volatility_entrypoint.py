@@ -38,6 +38,7 @@ def test_entrypoint_defaults_to_race_v2_parent_and_full_stream_matrix():
     assert 'TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")' in source
     assert 'TIMEFRAMES = ("1min", "3min", "5min", "15min")' in source
     assert 'HOLDOUT_START = "2026-01-01"' in source
+    assert 'default=os.environ.get("SAMPLING_MODE", "uniform_stream")' in source
 
 
 def test_entrypoint_seals_data_and_runs_probe_atlas():

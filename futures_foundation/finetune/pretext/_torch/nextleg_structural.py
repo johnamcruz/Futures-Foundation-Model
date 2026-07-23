@@ -149,9 +149,14 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
         encoder_ids = {id(parameter) for parameter in self._encoder().parameters()}
         encoder = [p for p in self.net.parameters() if p.requires_grad and id(p) in encoder_ids]
         heads = [p for p in self.net.parameters() if p.requires_grad and id(p) not in encoder_ids]
-        return torch.optim.AdamW(
-            [{"params": encoder, "lr": self.lr}, {"params": heads, "lr": self.head_lr}],
-            weight_decay=self.weight_decay)
+        groups = []
+        if encoder:
+            groups.append({"params": encoder, "lr": self.lr})
+        if heads:
+            groups.append({"params": heads, "lr": self.head_lr})
+        if not groups:
+            raise RuntimeError("Structural NextLeg has no trainable parameters")
+        return torch.optim.AdamW(groups, weight_decay=self.weight_decay)
 
     def make_batch(self, starts, gen=None):
         gen = gen or self.gen
