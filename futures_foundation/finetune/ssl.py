@@ -342,8 +342,10 @@ def _base_cfg(**kw):
              structure_event_w=0.75, structure_event_horizon=128,
              structure_span_w=0.25, structure_span_width=5, structure_span_prob=0.5,
              head_lr=None, warm_trainer_ckpt=None,
-             # stage-2.8 NEXT-LEG-RACE (future-only ordered candle path; no ATR/R/strategy data):
-             race_w=0.25, race_cap=2.0, race_levels=(0.25, 0.50, 0.75, 1.00),
+             # stage-2.8 v2 NEXT-LEG-RACE: reach/adverse/time at fixed multiples of the causal
+             # median candle range. Raw bars only: no ATR, R, stop, cost, or strategy target.
+             race_w=0.5, race_cap=8.0, race_levels=(1.0, 2.0, 3.0, 4.0),
+             race_scale_lookback=64,
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
              # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination
              # runs against slow drift that val loss rewards (val micro-improves while the

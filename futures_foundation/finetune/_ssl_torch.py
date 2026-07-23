@@ -21,8 +21,8 @@ from .pretext._torch.contrastive import (                 # noqa: F401  stage-3 
 from .pretext._torch.nextleg import NextLegNet, train_ssl_nextleg              # noqa: F401
 from .pretext._torch.nextleg_path import (                # noqa: F401  stage-2.7 nextleg + PATH
     NextLegPathNet, leg_retrace, train_ssl_nextleg_path)
-from .pretext._torch.nextleg_race import (                # noqa: F401  stage-2.8 ordered path race
-    NextLegRaceNet, ordered_adverse_curve, train_ssl_nextleg_race)
+from .pretext._torch.nextleg_race import (                # noqa: F401  causal-range path race
+    NextLegRaceNet, train_ssl_nextleg_race)
 from .pretext._torch.related_nextleg import (             # noqa: F401  grouped related-series refine
     RelatedNextLegNet, train_ssl_related_nextleg)
 from .pretext._torch.nextleg_structural import (          # noqa: F401  HH/HL/LH/LL + BOS/CHOCH SSL
