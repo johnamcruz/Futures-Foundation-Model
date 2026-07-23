@@ -17,8 +17,10 @@ the task heads exist only in the crash-resume trainer sidecar.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -53,6 +55,14 @@ def _default_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -95,6 +105,9 @@ def _parser() -> argparse.ArgumentParser:
                         default=float(os.environ.get("SPAN_PROB", "0.5")))
     parser.add_argument("--freeze-encoder-layers", type=int,
                         default=int(os.environ.get("FREEZE_ENCODER_LAYERS", "2")))
+    parser.add_argument(
+        "--head-only", action="store_true",
+        help="Freeze the complete parent encoder and refit only matched Structural task heads")
     parser.add_argument("--lora-r", type=int, default=int(os.environ.get("LORA_R", "8")))
     parser.add_argument("--lora-alpha", type=float,
                         default=float(os.environ.get("LORA_ALPHA", "16")))
@@ -161,6 +174,7 @@ def main() -> None:
           f"event_horizon={args.event_horizon} span={args.span_width}")
     print(f"  training   : {device} batch={batch} epochs={args.epochs} steps={args.steps} "
           f"encoder_lr={args.lr:g} head_lr={args.head_lr:g}")
+    print(f"  head only  : {args.head_only}")
     print(f"  controls   : {controls or 'none'}")
     print(f"  output     : {out}")
     if args.preflight_only:
@@ -182,8 +196,40 @@ def main() -> None:
         new_channels=3, batch=batch, epochs=args.epochs, steps_per_epoch=args.steps,
         lr=args.lr, head_lr=args.head_lr, weight_decay=0.0, patience=args.patience,
         freeze_encoder_layers=args.freeze_encoder_layers,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+        freeze_encoder=args.head_only,
+        lora_r=0 if args.head_only else args.lora_r,
+        lora_alpha=args.lora_alpha, lora_dropout=0.0,
         clamp=10.0, grad_clip=1.0, resume=args.resume, device=device, seed=args.seed)
+
+    if args.head_only:
+        import torch
+        parent_state = torch.load(warm, map_location="cpu", weights_only=False)
+        output_state = torch.load(out, map_location="cpu", weights_only=False)
+        if (
+            parent_state.keys() != output_state.keys()
+            or any(not torch.equal(parent_state[key], output_state[key])
+                   for key in parent_state)
+        ):
+            raise RuntimeError(
+                "head-only Structural refit changed at least one frozen encoder tensor")
+        # Preserve byte-identical artifact identity so the sidecar binding can be
+        # checked cheaply by every downstream loader.
+        shutil.copyfile(warm, out)
+        parent_sha = _sha256(warm)
+        trainer_path = Path(str(out) + ".trainer.pt")
+        payload = torch.load(trainer_path, map_location="cpu", weights_only=False)
+        payload["head_only"] = True
+        payload["matched_encoder_sha256"] = parent_sha
+        temporary = trainer_path.with_suffix(trainer_path.suffix + ".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(trainer_path)
+        Path(str(out) + ".matched_head.json").write_text(json.dumps({
+            "schema": "ffm_structural_matched_head_v1",
+            "head_only": True,
+            "encoder_sha256": parent_sha,
+            "encoder": str(warm),
+            "trainer": str(trainer_path),
+        }, indent=2, sort_keys=True) + "\n")
 
     print("\nSPAN-STRUCTURAL NEXTLEG COMPLETE")
     for key, value in verdict.items():

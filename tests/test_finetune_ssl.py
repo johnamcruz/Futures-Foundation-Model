@@ -1110,9 +1110,50 @@ def test_contrastive_net_shape_and_trainer_smoke(tmp_path):
 # --------------------------------------------- save/resume + anti-forgetting freeze (all pretexts)
 def test_base_cfg_has_ckpt_resume_freeze_keys():
     cfg = ssl._base_cfg()
-    assert cfg['ckpt_path'] is None and cfg['resume'] is False and cfg['freeze_encoder_layers'] == 0
-    over = ssl._base_cfg(resume=True, freeze_encoder_layers=4)
-    assert over['resume'] is True and over['freeze_encoder_layers'] == 4
+    assert (cfg['ckpt_path'] is None and cfg['resume'] is False
+            and cfg['freeze_encoder_layers'] == 0 and cfg['freeze_encoder'] is False)
+    over = ssl._base_cfg(resume=True, freeze_encoder_layers=4, freeze_encoder=True)
+    assert (over['resume'] is True and over['freeze_encoder_layers'] == 4
+            and over['freeze_encoder'] is True)
+
+
+@torch_test
+def test_complete_encoder_freeze_updates_head_without_encoder_drift():
+    import torch
+    from futures_foundation.finetune.pretext._torch.common import BaseTrainer
+
+    class Net(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(2, 2)
+            self.head = torch.nn.Linear(2, 1)
+
+    class Trainer(BaseTrainer):
+        def build_net(self):
+            self.net = Net()
+            self.initial_encoder = {
+                key: value.detach().clone()
+                for key, value in self.net.encoder.state_dict().items()}
+            self.initial_head = self.net.head.weight.detach().clone()
+
+        def make_batch(self, starts, gen=None):
+            return torch.ones(8, 2)
+
+        def compute_loss(self, batch):
+            return self.net.head(self.net.encoder(batch)).square().mean()
+
+        def val_eval(self):
+            with torch.no_grad():
+                return float(self.compute_loss(self.make_batch(self.va))), {"std": 0.1}
+
+    trainer = Trainer(
+        np.ones((32, 2), np.float32), np.arange(8), np.arange(8),
+        epochs=2, steps_per_epoch=2, batch=8, device="cpu",
+        freeze_encoder=True, verbose=False)
+    state, _ = trainer.fit()
+    assert all(torch.equal(state[key], trainer.initial_encoder[key]) for key in state)
+    assert all(not parameter.requires_grad for parameter in trainer.net.encoder.parameters())
+    assert not torch.equal(trainer.net.head.weight, trainer.initial_head)
 
 
 @torch_test

@@ -299,13 +299,17 @@ class BaseTrainer:
                  lr=1e-4, weight_decay=0.05, patience=8, device=None, seed=0, grad_clip=None,
                  amp=True, amp_dtype='fp16', verbose=True, control='real',
                  ckpt_path=None, resume=False, freeze_encoder_layers=0, std_guard=0.0,
-                 lora_r=0, lora_alpha=16.0, lora_dropout=0.0, log_every_steps=25):
+                 freeze_encoder=False, lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
+                 log_every_steps=25):
         os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
         self.ckpt_path, self.resume = ckpt_path, resume    # progressive best-save + resume (real run only)
         self.freeze_encoder_layers = freeze_encoder_layers  # anti-forgetting: freeze first N enc layers
+        self.freeze_encoder = bool(freeze_encoder)
         self.std_guard = float(std_guard or 0.0)           # >0: HALT when emb_std exceeds it (drift guard)
         self.lora_r, self.lora_alpha = int(lora_r or 0), float(lora_alpha)
         self.lora_dropout = float(lora_dropout)
+        if self.freeze_encoder and self.lora_r:
+            raise ValueError("freeze_encoder head-only mode is incompatible with encoder LoRA")
         self.log_every_steps = max(0, int(log_every_steps or 0))
         self.dev = device or ('cuda' if torch.cuda.is_available()
                               else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -479,7 +483,16 @@ class BaseTrainer:
                 if self.verbose:
                     print(f"  [resume] loaded legacy encoder-only checkpoint {self.ckpt_path} "
                           f"(best_val={best:.4f}; task head restarted)", flush=True)
-        nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)   # anti-forgetting
+        if self.freeze_encoder:
+            for parameter in self._encoder().parameters():
+                parameter.requires_grad = False
+            if any(parameter.requires_grad for parameter in self._encoder().parameters()):
+                raise RuntimeError("head-only mode failed to freeze every encoder parameter")
+            nfz = 0
+            if self.verbose:
+                print("  [freeze] complete encoder frozen; task heads only", flush=True)
+        else:
+            nfz = _freeze_encoder(self._encoder(), self.freeze_encoder_layers)
         if nfz and self.verbose:
             ntr = sum(p.requires_grad for p in self.net.parameters())
             print(f"  [freeze] tokenizer + first {nfz} encoder layers frozen ({ntr} trainable tensors)",
