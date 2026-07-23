@@ -8,4 +8,4 @@ from .frozen import MantisFrozenClassifier         # noqa: F401  registers 'mant
 # This backbone's default SSL foundation (the checkpoint a new strategy finetunes on top of).
 # Single source of truth for the Mantis base — generic code reads it via the DI accessor, never
 # by importing this constant.
-BASE_CKPT = 'checkpoints/mantis_ssl_nextleg.pt'   # stage-2.6 next-leg — PROMOTED 2026-07-16 (beat ctr_seq2seq on all 3 gates: 6/6 scorecard, 10/10 dry-run op points, mini 3/4)
+BASE_CKPT = 'checkpoints/mantis_ssl_mv.pt'  # causal Momentum-Volatility — PROMOTED 2026-07-23 after leakage controls and parent-retention Probe Atlas

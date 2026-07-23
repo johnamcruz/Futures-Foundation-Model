@@ -199,10 +199,19 @@ def main():
     if not verdict.get("all_pass"):
         raise RuntimeError(f"momentum-volatility SSL/control gates failed: {verdict}")
 
+    from futures_foundation.finetune.pretext._torch.momentum_volatility_inference import (
+        export_mv_readout,
+    )
+    readout = export_mv_readout(
+        str(output) + ".readout.pt",
+        trainer_ckpt=str(output) + ".trainer.pt",
+        encoder_ckpt=output,
+        horizons=(5, 10, 20, 25))
     atlas = None if args.skip_atlas else _run_atlas(
         data=data, checkpoint=output, labels=labels, device=device, batch=batch)
     print("\nMOMENTUM-VOLATILITY SSL COMPLETE")
     print(f"  encoder : {output}")
+    print(f"  readout : {readout}")
     print(f"  report  : {output}.report.json")
     print(f"  atlas   : {atlas or 'skipped'}")
 

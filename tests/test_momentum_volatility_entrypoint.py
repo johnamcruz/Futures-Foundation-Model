@@ -36,6 +36,8 @@ def test_entrypoint_defaults_to_race_v2_parent_and_full_stream_matrix():
 def test_entrypoint_seals_data_and_runs_probe_atlas():
     source = SCRIPT.read_text()
     assert "seal_continuous_streams" in source
+    assert "export_mv_readout" in source
+    assert '".readout.pt"' in source
     assert "probe_atlas.py" in source
     assert "checkpoint_sha256" in source
     assert ".data_provenance.json" in source
