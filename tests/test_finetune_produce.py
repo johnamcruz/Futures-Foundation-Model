@@ -84,6 +84,8 @@ def test_operating_points_top_slice_is_all_winners():
     by = {r['rate']: r for r in rows}
     assert by[1]['days'] == 5
     assert by[1]['n'] == 5 and by[1]['wr3R'] == 1.0 and by[1]['meanR'] == pytest.approx(2.0)
+    assert by[1]['avgWinR'] == pytest.approx(2.0)
+    assert by[1]['avgWinRGross'] == pytest.approx(2.0)
     assert by[2]['n'] == 10 and by[2]['wr3R'] == pytest.approx(0.5)   # 2/day*5 -> all 10
     # tighter rate = higher (or equal) WR — the whole point of the operating-point view
     assert by[1]['wr3R'] >= by[2]['wr3R']
@@ -91,6 +93,8 @@ def test_operating_points_top_slice_is_all_winners():
 
 def test_operating_points_uses_exact_strategy_win_truth():
     class _ExactLab(_RLabeler):
+        COST_R = .03
+
         def win_truth(self, keys):
             return np.array([k[5] for k in keys], bool)
 
@@ -103,6 +107,8 @@ def test_operating_points_uses_exact_strategy_win_truth():
                                     rates=(2,))
     assert rows[0]['wr3R'] == pytest.approx(.5)
     assert rows[0]['meanR'] == pytest.approx(1.675)
+    assert rows[0]['avgWinR'] == pytest.approx(1.675)
+    assert rows[0]['avgWinRGross'] == pytest.approx(1.705)
 
 
 def test_target_operating_points_reports_each_strategy_rung():
