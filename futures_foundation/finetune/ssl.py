@@ -353,7 +353,7 @@ def _base_cfg(**kw):
              std_guard=1.6,
              # crash-safe progressive best-save + resume + anti-forgetting layer-freeze (ALL pretexts,
              # real run only; controls never touch the ckpt). ckpt_path is set to out_path by loop_ssl.
-             ckpt_path=None, resume=False, freeze_encoder_layers=0,
+             ckpt_path=None, resume=False, freeze_encoder_layers=0, freeze_encoder=False,
              lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
              log_every_steps=25,
              # Chronos-2-inspired, Mantis-native related-series experiment. These settings are

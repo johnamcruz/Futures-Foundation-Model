@@ -196,7 +196,7 @@ def test_shared_config_and_trainer_signature_keep_every_structural_knob():
         pretext="nextleg_structural", structure_current_w=.1, structure_next_w=.8,
         excursion_w=.3, structure_event_w=.9, structure_event_horizon=96,
         structure_span_w=.4, structure_span_width=3, structure_span_prob=.75,
-        head_lr=2e-4, warm_trainer_ckpt="parent.trainer.pt")
+        head_lr=2e-4, warm_trainer_ckpt="parent.trainer.pt", freeze_encoder=True)
     cfg = ssl._base_cfg(**overrides)
     assert all(cfg[key] == value for key, value in overrides.items())
     signature = inspect.signature(train_ssl_nextleg_structural).parameters

@@ -75,3 +75,23 @@ def test_loader_fails_closed_for_partial_task_sidecar(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='architecture-defining'):
         inference.load_structural_forecaster(
             encoder_ckpt=tmp_path / 'missing.pt', trainer_ckpt=sidecar, model_id='unused')
+
+
+def test_loader_rejects_matched_sidecar_with_different_encoder(tmp_path, monkeypatch):
+    import torch
+    from futures_foundation.finetune.pretext._torch import structural_inference as inference
+
+    sidecar = tmp_path / "task.pt"
+    encoder = tmp_path / "encoder.pt"
+    encoder.write_bytes(b"new encoder")
+    torch.save({
+        "matched_encoder_sha256": "0" * 64,
+        "model_state": {
+            "adapter.transformation.weight": torch.zeros(3, 5),
+            "decoder.2.weight": torch.zeros(20, 1),
+            "span_decoder.2.weight": torch.zeros(25, 1),
+        },
+    }, sidecar)
+    with pytest.raises(ValueError, match="bound to a different encoder"):
+        inference.load_structural_forecaster(
+            encoder_ckpt=encoder, trainer_ckpt=sidecar, model_id="unused")

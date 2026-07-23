@@ -13,6 +13,7 @@ training.  Future labels are never read at inference time.
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 
 import numpy as np
 import torch
@@ -26,12 +27,20 @@ from .nextleg_structural import StructuralNextLegNet
 DEFAULT_HORIZONS = (5, 10, 20, 25)
 
 
-def _task_state(path):
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _task_payload(path):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     state = payload.get("model_state") if isinstance(payload, dict) else None
     if not isinstance(state, dict):
         raise ValueError(f"Structural NextLeg sidecar has no model_state: {path}")
-    return state
+    return payload, state
 
 
 def load_structural_forecaster(*, encoder_ckpt, trainer_ckpt,
@@ -42,7 +51,12 @@ def load_structural_forecaster(*, encoder_ckpt, trainer_ckpt,
     already-merged public encoder checkpoint and copies only the trained task tensors.  Exact key
     and shape checks fail closed if an unrelated or partial sidecar is supplied.
     """
-    state = _task_state(trainer_ckpt)
+    payload, state = _task_payload(trainer_ckpt)
+    matched = payload.get("matched_encoder_sha256")
+    if matched is not None and matched != _sha256(encoder_ckpt):
+        raise ValueError(
+            "Structural NextLeg sidecar is bound to a different encoder: "
+            f"expected={matched} actual={_sha256(encoder_ckpt)}")
     adapter = state.get("adapter.transformation.weight")
     decoder = state.get("decoder.2.weight")
     span = state.get("span_decoder.2.weight")

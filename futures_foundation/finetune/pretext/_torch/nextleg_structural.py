@@ -175,9 +175,14 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
         encoder_ids = {id(parameter) for parameter in self._encoder().parameters()}
         encoder = [p for p in self.net.parameters() if p.requires_grad and id(p) in encoder_ids]
         heads = [p for p in self.net.parameters() if p.requires_grad and id(p) not in encoder_ids]
-        return torch.optim.AdamW(
-            [{"params": encoder, "lr": self.lr}, {"params": heads, "lr": self.head_lr}],
-            weight_decay=self.weight_decay)
+        groups = []
+        if encoder:
+            groups.append({"params": encoder, "lr": self.lr})
+        if heads:
+            groups.append({"params": heads, "lr": self.head_lr})
+        if not groups:
+            raise RuntimeError("Structural NextLeg has no trainable parameters")
+        return torch.optim.AdamW(groups, weight_decay=self.weight_decay)
 
     def make_batch(self, starts, gen=None):
         gen = gen or self.gen
@@ -307,7 +312,8 @@ def train_ssl_nextleg_structural(
         steps_per_epoch=50, batch=512, lr=1e-5, head_lr=1e-4, weight_decay=0.0,
         patience=8, device=None, model_id="paris-noah/Mantis-8M", backbone_ckpt=None,
         warm_trainer_ckpt=None, control="real", seed=0, clamp=10.0, grad_clip=1.0,
-        verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=2, std_guard=1.6,
+        verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=2,
+        freeze_encoder=False, std_guard=1.6,
         leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
         structure_current_w=.25, structure_next_w=.75, excursion_w=.25,
         structure_event_w=.75, structure_event_horizon=128, target_reserve=None,
@@ -327,7 +333,8 @@ def train_ssl_nextleg_structural(
         steps_per_epoch=steps_per_epoch, batch=batch, lr=lr, head_lr=head_lr,
         weight_decay=weight_decay, patience=patience, device=device, seed=seed,
         grad_clip=grad_clip, verbose=verbose, control=control, ckpt_path=ckpt_path,
-        resume=resume, freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
+        resume=resume, freeze_encoder_layers=freeze_encoder_layers,
+        freeze_encoder=freeze_encoder, std_guard=std_guard,
         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         log_every_steps=log_every_steps)
     return trainer.fit()
