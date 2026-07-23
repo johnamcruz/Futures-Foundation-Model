@@ -1,6 +1,9 @@
 """Stage-2.8 v2 NEXT-LEG causal-range path-race trainer."""
 from __future__ import annotations
 
+import time
+import weakref
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,7 +12,10 @@ import torch.nn.functional as F
 from ..nextleg_race import RACE_LEVELS, scaled_path_race
 from .common import _apply_control, _gather_batch
 from .forecast import _ForecastTrainer
-from .nextleg import NextLegNet, _alternating_fractals
+from .nextleg import NextLegNet
+
+
+_RACE_TARGET_CACHE = {}
 
 
 def _correlation(prediction, truth) -> float:
@@ -39,54 +45,179 @@ def _binary_auc(truth, score) -> float:
     return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
+def _alternating_fractals_vectorized(high, low, k):
+    """Vectorized exact equivalent of NextLeg's pure keep-first fractal sequence."""
+    high, low, k = np.asarray(high, np.float64), np.asarray(low, np.float64), int(k)
+    if len(high) < 2 * k + 2:
+        empty = np.empty(0, np.int64)
+        return empty, empty, np.empty(0, np.int8)
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    high_window = sliding_window_view(high, 2 * k + 1)[:-1]
+    low_window = sliding_window_view(low, 2 * k + 1)[:-1]
+    center_high, center_low = high_window[:, k], low_window[:, k]
+    is_low = ((center_low == low_window.min(1))
+              & ((low_window == center_low[:, None]).sum(1) == 1))
+    is_high = ((center_high == high_window.max(1))
+               & ((high_window == center_high[:, None]).sum(1) == 1))
+    direction_all = np.where(is_low, 1, np.where(is_high, -1, 0)).astype(np.int8)
+    rows = np.flatnonzero(direction_all)
+    if not len(rows):
+        empty = np.empty(0, np.int64)
+        return empty, empty, np.empty(0, np.int8)
+    directions = direction_all[rows]
+    # NextLeg keep-first semantics skip every repeated same-direction pivot until the opposite
+    # type appears. In chronological order this is precisely run-length compression.
+    keep = np.r_[True, directions[1:] != directions[:-1]]
+    origins = rows[keep].astype(np.int64) + k
+    directions = directions[keep]
+    return origins, origins + k, directions
+
+
 def _leg_race_targets(big, k, leg_cap, *, race_levels=RACE_LEVELS,
-                      race_scale_lookback=64, race_cap=8.0):
-    """Resolved NextLeg duration plus fixed-scale reach/adverse/delay targets for one stream."""
+                      race_scale_lookback=64, race_cap=8.0, chunk_size=8192):
+    """Vectorized NextLeg duration and causal-range race targets for one stream."""
     high, low, close = big[:, 1], big[:, 2], big[:, 3]
-    sequence = _alternating_fractals(high, low, k)
-    confirms, targets, valid = [], [], []
-    for index in range(len(sequence) - 2):
-        _origin, confirm, direction = sequence[index]
-        next_origin, _, _ = sequence[index + 1]
-        following_origin, _, _ = sequence[index + 2]
-        first, second = next_origin - confirm, following_origin - next_origin
-        race = scaled_path_race(
-            high, low, close, confirm, next_origin, direction,
-            levels=race_levels, lookback=race_scale_lookback, cap=race_cap)
-        ok = ((first > 0) and (second > 0)
-              and (first <= leg_cap) and (second <= leg_cap)
-              and bool(np.isfinite(race).all()))
-        confirms.append(confirm)
-        targets.append((
-            np.log1p(max(first, 0)), np.log1p(max(second, 0)),
-            *np.nan_to_num(race, nan=0.0).reshape(-1).tolist(),
-        ))
-        valid.append(ok)
-    width = 2 + 3 * len(tuple(race_levels))
+    levels = np.asarray(tuple(float(value) for value in race_levels), np.float64)
+    if not len(levels) or (levels <= 0).any() or (np.diff(levels) <= 0).any():
+        raise ValueError("race_levels must be non-empty, positive, and strictly increasing")
+    if int(race_scale_lookback) < 2 or int(chunk_size) < 1:
+        raise ValueError("race_scale_lookback >= 2 and chunk_size >= 1 are required")
+    origins, pivot_confirms, directions = _alternating_fractals_vectorized(high, low, k)
+    count, width = max(0, len(origins) - 2), 2 + 3 * len(levels)
+    if not count:
+        return (
+            np.empty(0, np.int64), np.empty((0, width), np.float32),
+            np.empty(0, bool))
+
+    confirms = pivot_confirms[:-2]
+    next_origins, following_origins = origins[1:-1], origins[2:]
+    directions = directions[:-2]
+    first = next_origins - confirms
+    second = following_origins - next_origins
+    valid = ((first > 0) & (second > 0)
+             & (first <= int(leg_cap)) & (second <= int(leg_cap))
+             & (confirms >= int(race_scale_lookback) - 1))
+    targets = np.zeros((count, width), np.float32)
+    targets[:, 0] = np.log1p(np.maximum(first, 0))
+    targets[:, 1] = np.log1p(np.maximum(second, 0))
+    candidate_rows = np.flatnonzero(valid)
+    candle_range = np.asarray(high - low, np.float64)
+    step_axis = np.arange(int(leg_cap), dtype=np.int64)
+    history_axis = np.arange(int(race_scale_lookback) - 1, -1, -1, dtype=np.int64)
+
+    for start in range(0, len(candidate_rows), int(chunk_size)):
+        rows = candidate_rows[start:start + int(chunk_size)]
+        confirmation = confirms[rows]
+        duration = first[rows]
+        scale_index = confirmation[:, None] - history_axis[None, :]
+        scale = np.median(candle_range[scale_index], axis=1)
+        finite_scale = np.isfinite(scale) & (scale > np.finfo(np.float32).eps)
+        valid[rows[~finite_scale]] = False
+        rows = rows[finite_scale]
+        if not len(rows):
+            continue
+        confirmation = confirms[rows]
+        duration = first[rows]
+        scale = scale[finite_scale]
+        positions = confirmation[:, None] + 1 + step_axis[None, :]
+        active = step_axis[None, :] < duration[:, None]
+        # Clip only inactive positions so every gather remains in-stream. Active positions end at
+        # the next pivot origin by construction.
+        positions = np.minimum(positions, next_origins[rows, None])
+        reference = close[confirmation, None]
+        segment_high, segment_low = high[positions], low[positions]
+        long = directions[rows, None] == 1
+        favourable = np.where(long, segment_high - reference, reference - segment_low)
+        adverse = np.where(long, reference - segment_low, segment_high - reference)
+        finite_path = (
+            np.where(active, np.isfinite(favourable), True).all(1)
+            & np.where(active, np.isfinite(adverse), True).all(1))
+        valid[rows[~finite_path]] = False
+        rows = rows[finite_path]
+        if not len(rows):
+            continue
+        favourable = favourable[finite_path]
+        adverse = np.maximum(adverse[finite_path], 0.0)
+        active = active[finite_path]
+        duration = duration[finite_path]
+        scale = scale[finite_path]
+        favourable = np.where(active, favourable, -np.inf)
+        adverse = np.where(active, adverse, 0.0)
+        hit = favourable[:, :, None] >= scale[:, None, None] * levels[None, None, :]
+        reached = hit.any(1)
+        first_hit = hit.argmax(1)
+        stops = np.where(reached, first_hit, duration[:, None] - 1)
+        cumulative_adverse = np.maximum.accumulate(adverse, axis=1)
+        risk = np.take_along_axis(cumulative_adverse, stops, axis=1) / scale[:, None]
+        delay = np.log1p(stops + 1)
+        offset = 2
+        targets[rows, offset:offset + len(levels)] = reached.astype(np.float32)
+        offset += len(levels)
+        targets[rows, offset:offset + len(levels)] = np.minimum(risk, race_cap)
+        offset += len(levels)
+        targets[rows, offset:offset + len(levels)] = delay
+    return confirms.astype(np.int64), targets, valid
+
+
+def _target_cache_key(big, segments, k, leg_cap, race):
+    bars = np.asarray(big)
+    levels = tuple(float(value) for value in race.get("race_levels", RACE_LEVELS))
+    lookback = int(race.get("race_scale_lookback", 64))
+    cap = float(race.get("race_cap", 8.0))
     return (
-        np.asarray(confirms, np.int64),
-        np.asarray(targets, np.float32).reshape(-1, width),
-        np.asarray(valid, bool),
+        int(bars.__array_interface__["data"][0]), bars.shape, bars.strides,
+        tuple((int(base), int(size)) for base, size in segments),
+        int(k), int(leg_cap), levels, lookback, cap,
     )
 
 
-def _leg_race_targets_by_segments(big, segments, k, leg_cap, **race):
+def _leg_race_targets_by_segments(big, segments, k, leg_cap, *, verbose=False, **race):
     """Construct pivots independently inside every ticker/timeframe stream."""
+    key = _target_cache_key(big, segments, k, leg_cap, race)
+    entry = _RACE_TARGET_CACHE.get(key)
+    if entry is not None and entry[0]() is np.asarray(big):
+        cached = entry[1]
+        if verbose:
+            print(f"  [nextleg_race:targets] cache hit anchors={len(cached[0]):,}", flush=True)
+        return cached
+    _RACE_TARGET_CACHE.pop(key, None)
     confirms, targets = [], []
     bars = np.asarray(big, np.float32)
-    for base, size in segments:
+    total_start = time.perf_counter()
+    for stream_index, (base, size) in enumerate(segments, start=1):
         base, size = int(base), int(size)
         if base < 0 or size < 0 or base + size > len(bars):
             raise ValueError("stream segment lies outside assembled bars")
+        stream_start = time.perf_counter()
         local_confirm, local_target, valid = _leg_race_targets(
             bars[base:base + size], k, leg_cap, **race)
         if valid.any():
             confirms.append(local_confirm[valid] + base)
             targets.append(local_target[valid])
+        if verbose:
+            print(
+                f"  [nextleg_race:targets] stream={stream_index}/{len(segments)} "
+                f"bars={size:,} anchors={int(valid.sum()):,} "
+                f"elapsed={time.perf_counter() - stream_start:.1f}s",
+                flush=True)
     if not targets:
         levels = tuple(race.get("race_levels", RACE_LEVELS))
         return np.empty(0, np.int64), np.empty((0, 2 + 3 * len(levels)), np.float32)
-    return np.concatenate(confirms), np.concatenate(targets)
+    result = np.concatenate(confirms), np.concatenate(targets)
+    def _evict(reference, cache_key=key):
+        current = _RACE_TARGET_CACHE.get(cache_key)
+        if current is not None and current[0] is reference:
+            _RACE_TARGET_CACHE.pop(cache_key, None)
+
+    bars_ref = weakref.ref(bars, _evict)
+    _RACE_TARGET_CACHE[key] = (bars_ref, result)
+    if verbose:
+        print(
+            f"  [nextleg_race:targets] complete anchors={len(result[0]):,} "
+            f"elapsed={time.perf_counter() - total_start:.1f}s",
+            flush=True)
+    return result
 
 
 class NextLegRaceNet(NextLegNet):
@@ -182,7 +313,7 @@ class _NextLegRaceTrainer(_ForecastTrainer):
         confirms, targets = _leg_race_targets_by_segments(
             np.asarray(big, np.float32), segments, int(leg_k), int(leg_cap),
             race_levels=self.race_levels, race_scale_lookback=self.race_scale_lookback,
-            race_cap=self.race_cap)
+            race_cap=self.race_cap, verbose=self.verbose)
         reserve = (self.max_ctx + 2 * int(leg_cap) + int(leg_k)
                    if target_reserve is None else int(target_reserve))
         _validate_race_target_reserve(
