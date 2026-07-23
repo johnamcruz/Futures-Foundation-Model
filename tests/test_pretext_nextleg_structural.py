@@ -285,3 +285,42 @@ def test_combined_objective_backpropagates_through_every_head():
     assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
                and parameter.grad.abs().sum() > 0
                for parameter in trainer.net.parameters())
+
+
+def test_structural_regression_losses_materialize_contiguous_pairs(monkeypatch):
+    import torch
+    import torch.nn.functional as functional
+    from futures_foundation.finetune.pretext._torch import nextleg_structural as structural
+
+    observed = []
+    original = functional.smooth_l1_loss
+
+    def checked(left, right, *args, **kwargs):
+        observed.append((left.is_contiguous(), right.is_contiguous()))
+        return original(left, right, *args, **kwargs)
+
+    class Heads(torch.nn.Module):
+        def forward_structural(self, context):
+            n = len(context)
+            return (
+                torch.zeros(n, 5, 2), torch.zeros(n, 2),
+                torch.zeros(n, 2, 4), torch.zeros(n, 2),
+                torch.zeros(n, 5), torch.zeros(n), torch.zeros(n, 5, 5),
+            )
+
+    monkeypatch.setattr(structural.F, "smooth_l1_loss", checked)
+    trainer = object.__new__(structural._StructuralNextLegTrainer)
+    trainer.net = Heads()
+    trainer.mse_weight = trainer.leg_w = 1.0
+    trainer.structure_current_w = trainer.structure_next_w = 1.0
+    trainer.excursion_w = trainer.structure_event_w = trainer.structure_span_w = 1.0
+    trainer.event_weights = torch.ones(5)
+    targets = torch.zeros(4, 8)
+    targets[:, 6] = 0
+    batch = (
+        torch.zeros(4, 5, 64), torch.zeros(4, 5, 2), targets,
+        torch.zeros(4, 5, 5), torch.ones(4, dtype=torch.bool),
+    )
+    trainer.compute_loss(batch)
+    assert len(observed) >= 2
+    assert all(left and right for left, right in observed[:2])

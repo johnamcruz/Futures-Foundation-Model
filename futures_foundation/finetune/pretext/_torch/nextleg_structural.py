@@ -216,10 +216,15 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
         candles, duration, structure, excursion, breaks, break_delay, span = \
             self.net.forward_structural(context)
         candle_loss = F.mse_loss(candles.float(), candle_target)
-        duration_loss = F.smooth_l1_loss(duration.float(), target[:, :2])
+        # MPS smooth_l1 internally views its operands and rejects strided column
+        # slices. Materialize both regression pairs so CPU, MPS, and CUDA share
+        # the exact same objective.
+        duration_loss = F.smooth_l1_loss(
+            duration.float().contiguous(), target[:, :2].contiguous())
         current_loss = F.cross_entropy(structure[:, 0].float(), target[:, 2].long())
         next_loss = F.cross_entropy(structure[:, 1].float(), target[:, 3].long())
-        excursion_loss = F.smooth_l1_loss(excursion.float(), target[:, 4:6])
+        excursion_loss = F.smooth_l1_loss(
+            excursion.float().contiguous(), target[:, 4:6].contiguous())
         event_truth = target[:, 6].long()
         event_rows = event_truth >= 0
         event_loss = (F.cross_entropy(
