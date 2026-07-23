@@ -23,6 +23,8 @@ from .pretext._torch.nextleg_path import (                # noqa: F401  stage-2.
     NextLegPathNet, leg_retrace, train_ssl_nextleg_path)
 from .pretext._torch.nextleg_race import (                # noqa: F401  causal-range path race
     NextLegRaceNet, train_ssl_nextleg_race)
+from .pretext._torch.momentum_volatility import (         # noqa: F401  momentum/range coupling
+    MomentumVolatilityNet, train_ssl_momentum_volatility)
 from .pretext._torch.related_nextleg import (             # noqa: F401  grouped related-series refine
     RelatedNextLegNet, train_ssl_related_nextleg)
 from .pretext._torch.nextleg_structural import (          # noqa: F401  HH/HL/LH/LL + BOS/CHOCH SSL

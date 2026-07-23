@@ -18,6 +18,7 @@ its own file keeps ssl.py a clean orchestrator.
                               leg / that leg's own extent — unitless, pure candles). Own modules;
                               2.6 untouched, so the A/B stays honest.
   nextleg_race  (stage 2.8) — nextleg + causal-range reach/adverse/delay path forecasts.
+  momentum_volatility      — raw-OHLCV future displacement/range coupling refinement.
   nextleg_structural        — SpanBERT-style confirmed-pivot reconstruction plus causal
                               HH/HL/LH/LL, BOS/CHOCH, duration, and excursion prediction. It is
                               an opt-in encoder refinement; production nextleg stays untouched.
@@ -39,13 +40,14 @@ from .electra import TurnElectraTask
 from .nextleg import NextLegTask
 from .nextleg_path import NextLegPathTask
 from .nextleg_race import NextLegRaceTask
+from .momentum_volatility import MomentumVolatilityTask
 from .related_nextleg import RelatedNextLegTask
 from .nextleg_structural import StructuralNextLegTask
 
 PRETEXTS = {t.name: t for t in (MaskTask(), ForecastTask(), ForecastDistTask(),
                                 ContrastiveTask(), TurnElectraTask(), NextLegTask(),
                                 NextLegPathTask(), NextLegRaceTask(), RelatedNextLegTask(),
-                                StructuralNextLegTask())}
+                                StructuralNextLegTask(), MomentumVolatilityTask())}
 
 
 def get_pretext(name):
@@ -55,4 +57,4 @@ def get_pretext(name):
 
 __all__ = ['PretextTask', 'MaskTask', 'ForecastTask', 'ForecastDistTask', 'ContrastiveTask',
            'TurnElectraTask', 'NextLegTask', 'NextLegPathTask', 'NextLegRaceTask', 'PRETEXTS',
-           'RelatedNextLegTask', 'StructuralNextLegTask', 'get_pretext']
+           'RelatedNextLegTask', 'StructuralNextLegTask', 'MomentumVolatilityTask', 'get_pretext']
