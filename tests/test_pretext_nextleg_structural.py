@@ -196,53 +196,12 @@ def test_shared_config_and_trainer_signature_keep_every_structural_knob():
         pretext="nextleg_structural", structure_current_w=.1, structure_next_w=.8,
         excursion_w=.3, structure_event_w=.9, structure_event_horizon=96,
         structure_span_w=.4, structure_span_width=3, structure_span_prob=.75,
-        head_lr=2e-4, warm_trainer_ckpt="parent.trainer.pt", freeze_encoder=True)
+        head_lr=2e-4)
     cfg = ssl._base_cfg(**overrides)
     assert all(cfg[key] == value for key, value in overrides.items())
     signature = inspect.signature(train_ssl_nextleg_structural).parameters
     assert set(overrides) - {"pretext"} <= set(signature)
     assert any(value.kind is inspect.Parameter.VAR_KEYWORD for value in signature.values())
-
-
-def test_warm_loader_requires_complete_matching_nextleg_heads(tmp_path):
-    import torch
-    from futures_foundation.finetune.pretext._torch.nextleg_structural import (
-        _load_warm_nextleg_heads)
-
-    class TinyNet(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.adapter = torch.nn.Linear(2, 2)
-            self.decoder = torch.nn.Linear(2, 2)
-            self.leg_head = torch.nn.Linear(2, 2)
-            self.structure_head = torch.nn.Linear(2, 2)
-
-    source, target = TinyNet(), TinyNet()
-    with torch.no_grad():
-        for parameter in source.parameters():
-            parameter.fill_(7.0)
-        for parameter in target.parameters():
-            parameter.fill_(1.0)
-    path = tmp_path / "nextleg.trainer.pt"
-    torch.save({"model_state": source.state_dict()}, path)
-    loaded = _load_warm_nextleg_heads(target, path)
-    assert loaded and all(key.startswith(("adapter.", "decoder.", "leg_head."))
-                          for key in loaded)
-    assert all(torch.allclose(target.state_dict()[key], source.state_dict()[key])
-               for key in loaded)
-    assert torch.all(target.structure_head.weight == 1.0)  # structural head stays new
-
-    broken = dict(source.state_dict())
-    broken.pop("leg_head.bias")
-    torch.save({"model_state": broken}, path)
-    try:
-        _load_warm_nextleg_heads(target, path)
-    except RuntimeError as exc:
-        assert "missing task tensors" in str(exc)
-    else:
-        raise AssertionError("partial parent task state was silently accepted")
-
-
 def test_combined_objective_backpropagates_through_every_head():
     import torch
     from futures_foundation.finetune.pretext._torch.nextleg_structural import (

@@ -182,7 +182,7 @@ def test_trainer_signature_requires_v2_inputs_and_supports_lora():
     signature = inspect.signature(train_ssl_nextleg_race).parameters
     required = {
         "race_w", "race_cap", "race_levels", "race_scale_lookback",
-        "_stream_layout", "warm_trainer_ckpt", "head_lr",
+        "_stream_layout", "head_lr",
         "lora_r", "lora_alpha", "freeze_encoder_layers",
     }
     assert required <= set(signature)

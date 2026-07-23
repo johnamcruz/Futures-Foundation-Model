@@ -107,6 +107,7 @@ def _train(big, tr, va, cfg, control='real'):
 
 
 def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1,
+                 baseline_ckpt=None,
                  group_names=None, verbose=True):
     """Probe a trained encoder state vs vanilla -> the probe dict (regime/vol/structure).
     Saves to a temp ckpt so ssl_probe can load it through the normal path. folds>1 -> k-fold CV
@@ -118,7 +119,8 @@ def _probe_state(big, va, seq, state, *, model_id, device, seed, folds=1,
     from .pretext._torch.related_series import plain_encoder_state
     torch.save(plain_encoder_state(state), tmp)
     try:
-        return ssl_probe.run_probe(big, va, seq, tmp, model_id=model_id, device=device,
+        return ssl_probe.run_probe(big, va, seq, tmp, baseline_ckpt=baseline_ckpt,
+                                   model_id=model_id, device=device,
                                    seed=seed, folds=folds, group_names=group_names,
                                    verbose=verbose)
     finally:
@@ -227,6 +229,7 @@ def _finalize(big, tr, va, state, probe_res, cfg, *, out_path, controls, holdout
         r = _probe_state(big, va, cfg['seq'], st, model_id=cfg['model_id'],
                          device=cfg['device'], seed=cfg['seed'],
                          folds=cfg.get('probe_folds', 1),
+                         baseline_ckpt=cfg.get('probe_baseline_ckpt'),
                          group_names=_stream_names(streams), verbose=verbose)
         ctrl_delta[ctrl] = float(r['mean_core_delta'])
         ctrl_best = _selected_history_row(ctrl_history) if ctrl_history else {}
@@ -341,11 +344,20 @@ def _base_cfg(**kw):
              structure_current_w=0.25, structure_next_w=0.75, excursion_w=0.25,
              structure_event_w=0.75, structure_event_horizon=128,
              structure_span_w=0.25, structure_span_width=5, structure_span_prob=0.5,
-             head_lr=None, warm_trainer_ckpt=None,
+             head_lr=None,
              # stage-2.8 v2 NEXT-LEG-RACE: reach/adverse/time at fixed multiples of the causal
              # median candle range. Raw bars only: no ATR, R, stop, cost, or strategy target.
              race_w=0.5, race_cap=8.0, race_levels=(1.0, 2.0, 3.0, 4.0),
              race_scale_lookback=64,
+             # Encoder-only momentum/volatility transition refinement. The direct contrastive
+             # term operates on the exact per-channel embedding exported downstream; its
+             # disposable linear heads are never part of the foundation checkpoint.
+             scale_lookback=64, momentum_lookback=20,
+             momentum_threshold=0.5, expansion_threshold=1.1,
+             candle_weight=0.25, momentum_weight=1.0,
+             volatility_weight=0.5, coupling_weight=0.5,
+             transition_contrastive_weight=1.0,
+             contrastive_temperature=0.1,
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
              # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination
              # runs against slow drift that val loss rewards (val micro-improves while the
@@ -353,7 +365,7 @@ def _base_cfg(**kw):
              std_guard=1.6,
              # crash-safe progressive best-save + resume + anti-forgetting layer-freeze (ALL pretexts,
              # real run only; controls never touch the ckpt). ckpt_path is set to out_path by loop_ssl.
-             ckpt_path=None, resume=False, freeze_encoder_layers=0, freeze_encoder=False,
+             ckpt_path=None, resume=False, freeze_encoder_layers=0,
              lora_r=0, lora_alpha=16.0, lora_dropout=0.0,
              log_every_steps=25,
              # Chronos-2-inspired, Mantis-native related-series experiment. These settings are
@@ -362,6 +374,7 @@ def _base_cfg(**kw):
              related_siblings='default', related_heads=4, related_dropout=0.0,
              related_max_gap_factor=2.0, related_control='real',
              probe_folds=1)                                   # k-fold CV per probe (robust)
+    d['probe_baseline_ckpt'] = None
     d.update({k: v for k, v in kw.items() if v is not None and k in d})
     return d
 
@@ -439,6 +452,7 @@ def loop_ssl(data_dir=None, *, tickers=None, tfs=None, controls=('shuffle', 'ran
     probe_res = (_probe_state(big, va, cfg['seq'], state, model_id=cfg['model_id'],
                               device=cfg['device'], seed=cfg['seed'],
                               folds=cfg.get('probe_folds', 1),
+                              baseline_ckpt=cfg.get('probe_baseline_ckpt'),
                               group_names=_stream_names(streams),
                               verbose=verbose) if probe else None)
     if reuse_real_checkpoint:

@@ -231,8 +231,8 @@ class NextLegRaceNet(NextLegNet):
             nn.Linear(embedding, embedding // 4), nn.GELU(),
             nn.Linear(embedding // 4, 3 * len(self.race_levels)))
 
-    def readouts(self, embedding):
-        """Decode every task head from one already-computed embedding."""
+    def task_outputs(self, embedding):
+        """Decode disposable SSL task outputs from one already-computed embedding."""
         candles = self.decoder(embedding).view(-1, self.C, self.nH)
         durations = self.leg_head(embedding)
         raw = self.race_head(embedding).view(-1, 3, len(self.race_levels))
@@ -247,7 +247,7 @@ class NextLegRaceNet(NextLegNet):
         return candles, durations, reach, adverse, delay
 
     def forward_race(self, context):
-        return self.readouts(self.embed(context))
+        return self.task_outputs(self.embed(context))
 
 
 def _validate_race_target_reserve(targets, *, max_ctx, target_reserve,
@@ -269,31 +269,11 @@ def _validate_race_target_reserve(targets, *, max_ctx, target_reserve,
         f"confirmation_lag={confirmation_lag}, batch_parent={batch_parent}).")
 
 
-def _load_warm_heads(net, path):
-    """Warm the common adapter/candle/duration heads from a matched trainer sidecar."""
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    saved = payload.get("model_state") if isinstance(payload, dict) else None
-    if not isinstance(saved, dict):
-        raise ValueError(f"warm trainer sidecar has no model_state: {path}")
-    own = net.state_dict()
-    prefixes = ("adapter.", "decoder.", "leg_head.")
-    required = [key for key in own if key.startswith(prefixes)]
-    missing = [key for key in required if key not in saved]
-    shapes = [key for key in required if key in saved and own[key].shape != saved[key].shape]
-    if missing or shapes:
-        raise ValueError(f"warm trainer mismatch: missing={missing[:8]} shape={shapes[:8]}")
-    with torch.no_grad():
-        for key in required:
-            own[key].copy_(saved[key])
-    net.load_state_dict(own)
-
-
 class _NextLegRaceTrainer(_ForecastTrainer):
     def __init__(self, big, tr, va, *, leg_cap=256, leg_w=1.0, leg_k=2,
                  mse_weight=1.0, race_w=0.5, race_cap=8.0,
                  race_levels=RACE_LEVELS, race_scale_lookback=64,
-                 target_reserve=None, _stream_layout=None, head_lr=None,
-                 warm_trainer_ckpt=None, **forecast):
+                 target_reserve=None, _stream_layout=None, head_lr=None, **forecast):
         if _stream_layout is None:
             raise ValueError("nextleg_race requires exact assembled stream layout")
         _ForecastTrainer.__init__(self, big, tr, va, **forecast)
@@ -303,7 +283,6 @@ class _NextLegRaceTrainer(_ForecastTrainer):
         self.race_levels = tuple(float(value) for value in race_levels)
         self.race_scale_lookback = int(race_scale_lookback)
         self.head_lr = float(head_lr) if head_lr is not None else 10.0 * float(self.lr)
-        self.warm_trainer_ckpt = warm_trainer_ckpt
         if self.race_w <= 0 or self.head_lr <= 0:
             raise ValueError("race_w and head_lr must be positive")
         if self.race_scale_lookback > min(self.clens):
@@ -351,8 +330,6 @@ class _NextLegRaceTrainer(_ForecastTrainer):
         if self.backbone_ckpt:
             net.encoder.load_state_dict(torch.load(
                 self.backbone_ckpt, map_location="cpu", weights_only=False))
-        if self.warm_trainer_ckpt:
-            _load_warm_heads(net, self.warm_trainer_ckpt)
         self.net = net
 
     def make_optimizer(self):
@@ -477,7 +454,7 @@ def train_ssl_nextleg_race(
         context_lengths=(64, 100, 150, 200), new_channels=8, epochs=60,
         steps_per_epoch=50, batch=512, lr=1e-5, head_lr=1e-4, weight_decay=0.0,
         patience=8, device=None, model_id="paris-noah/Mantis-8M", backbone_ckpt=None,
-        warm_trainer_ckpt=None, control="real", seed=0, clamp=10.0, grad_clip=1.0,
+        control="real", seed=0, clamp=10.0, grad_clip=1.0,
         verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=2, std_guard=1.6,
         leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0, target_reserve=None,
         race_w=0.5, race_cap=8.0, race_levels=RACE_LEVELS, race_scale_lookback=64,
@@ -487,7 +464,7 @@ def train_ssl_nextleg_race(
     trainer = _NextLegRaceTrainer(
         big, train_starts, val_starts, horizons=horizons, context_lengths=context_lengths,
         new_channels=new_channels, model_id=model_id, backbone_ckpt=backbone_ckpt,
-        warm_trainer_ckpt=warm_trainer_ckpt, clamp=clamp, leg_cap=leg_cap, leg_w=leg_w,
+        clamp=clamp, leg_cap=leg_cap, leg_w=leg_w,
         leg_k=leg_k, mse_weight=mse_weight, race_w=race_w, race_cap=race_cap,
         race_levels=race_levels, race_scale_lookback=race_scale_lookback,
         target_reserve=target_reserve, _stream_layout=_stream_layout,

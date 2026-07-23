@@ -153,7 +153,6 @@ The report returned `all_pass=true`, `representation_pass=true`, and `beats_cont
 ```bash
 ./.venv/bin/python scripts/mantis_ssl_structural_nextleg.py \
   --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
-  --warm-trainer checkpoints/mantis_ssl_nextleg.pt.trainer.pt \
   --out temp/structural_nextleg/mantis_ssl_structural_nextleg.pt \
   --epochs 60 --controls shuffle,random --device mps
 ```
@@ -232,7 +231,7 @@ The production lineage writes four independent encoder artifacts:
 | Seq2seq | `mantis_ssl_ctr_seq2seq.pt` |
 | NextLeg | `mantis_ssl_nextleg.pt` |
 | Structural NextLeg (experimental) | `mantis_ssl_structural_nextleg.pt` |
-| Momentum-Volatility (promoted base) | `mantis_ssl_mv.pt` |
+| Momentum-Volatility v1 (historical experiment) | `mantis_ssl_mv.pt` |
 
 Each production-lineage `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Opt-in related-series experiments use the explicitly versioned composite format described above. Each checkpoint is accompanied by:
 

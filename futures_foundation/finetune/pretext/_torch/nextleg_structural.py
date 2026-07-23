@@ -31,28 +31,6 @@ def _correlation(pred, truth):
     return float(np.corrcoef(pred, truth)[0, 1])
 
 
-def _load_warm_nextleg_heads(net, path):
-    """Load only parent NextLeg adapter/forecast/duration tensors from a trainer sidecar.
-
-    Structural heads are intentionally new.  Requiring every inherited tensor and exact shape
-    prevents silently starting from a partial or unrelated sidecar.
-    """
-    payload = torch.load(path, map_location="cpu")
-    saved = payload.get("model_state") or {}
-    own = net.state_dict()
-    prefixes = ("adapter.", "decoder.", "leg_head.")
-    required = [key for key in own if key.startswith(prefixes)]
-    missing = [key for key in required if key not in saved]
-    if missing:
-        raise RuntimeError(f"warm NextLeg trainer is missing task tensors: {missing}")
-    for key in required:
-        if own[key].shape != saved[key].shape:
-            raise RuntimeError(f"warm task tensor shape mismatch: {key}")
-        own[key].copy_(saved[key])
-    net.load_state_dict(own)
-    return tuple(required)
-
-
 class StructuralNextLegNet(NextLegNet):
     """NextLeg anchor heads plus generic structural/event heads; checkpoint remains encoder-only."""
 
@@ -91,8 +69,7 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
                  mse_weight=1.0, structure_current_w=.25, structure_next_w=.75,
                  excursion_w=.25, structure_event_w=.75, structure_event_horizon=128,
                  structure_span_w=.25, structure_span_width=5, structure_span_prob=.5,
-                 target_reserve=None, _stream_layout=None, head_lr=None,
-                 warm_trainer_ckpt=None, **base):
+                 target_reserve=None, _stream_layout=None, head_lr=None, **base):
         if _stream_layout is None:
             raise ValueError("nextleg_structural requires exact assembled stream layout")
         super().__init__(big, tr, va, **base)
@@ -125,7 +102,6 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
         self.head_lr = float(head_lr) if head_lr is not None else 10.0 * float(self.lr)
         if self.head_lr <= 0:
             raise ValueError("head_lr must be positive")
-        self.warm_trainer_ckpt = warm_trainer_ckpt
         segments = tuple((stream.base, stream.size) for stream in _stream_layout.streams)
         targets = structural_targets_by_segments(
             np.asarray(big, np.float32), segments, k=int(leg_k), leg_cap=int(leg_cap),
@@ -167,8 +143,6 @@ class _StructuralNextLegTrainer(_ForecastTrainer):
             model_id=self.model_id, aux_dim=0, span_width=self.span_width).to(self.dev)
         if self.backbone_ckpt:
             net.encoder.load_state_dict(torch.load(self.backbone_ckpt, map_location="cpu"))
-        if self.warm_trainer_ckpt:
-            _load_warm_nextleg_heads(net, self.warm_trainer_ckpt)
         self.net = net
 
     def make_optimizer(self):
@@ -311,9 +285,8 @@ def train_ssl_nextleg_structural(
         context_lengths=(64, 100, 150, 200), new_channels=8, epochs=20,
         steps_per_epoch=50, batch=512, lr=1e-5, head_lr=1e-4, weight_decay=0.0,
         patience=8, device=None, model_id="paris-noah/Mantis-8M", backbone_ckpt=None,
-        warm_trainer_ckpt=None, control="real", seed=0, clamp=10.0, grad_clip=1.0,
-        verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=2,
-        freeze_encoder=False, std_guard=1.6,
+        control="real", seed=0, clamp=10.0, grad_clip=1.0,
+        verbose=True, ckpt_path=None, resume=False, freeze_encoder_layers=2, std_guard=1.6,
         leg_cap=256, leg_w=1.0, leg_k=2, mse_weight=1.0,
         structure_current_w=.25, structure_next_w=.75, excursion_w=.25,
         structure_event_w=.75, structure_event_horizon=128, target_reserve=None,
@@ -323,8 +296,8 @@ def train_ssl_nextleg_structural(
     trainer = _StructuralNextLegTrainer(
         big, train_starts, val_starts, horizons=horizons, context_lengths=context_lengths,
         new_channels=new_channels, model_id=model_id, backbone_ckpt=backbone_ckpt,
-        warm_trainer_ckpt=warm_trainer_ckpt, clamp=clamp, leg_cap=leg_cap, leg_w=leg_w,
-        leg_k=leg_k, mse_weight=mse_weight, structure_current_w=structure_current_w,
+        clamp=clamp, leg_cap=leg_cap, leg_w=leg_w, leg_k=leg_k,
+        mse_weight=mse_weight, structure_current_w=structure_current_w,
         structure_next_w=structure_next_w, excursion_w=excursion_w,
         structure_event_w=structure_event_w, structure_event_horizon=structure_event_horizon,
         structure_span_w=structure_span_w, structure_span_width=structure_span_width,
@@ -333,12 +306,10 @@ def train_ssl_nextleg_structural(
         steps_per_epoch=steps_per_epoch, batch=batch, lr=lr, head_lr=head_lr,
         weight_decay=weight_decay, patience=patience, device=device, seed=seed,
         grad_clip=grad_clip, verbose=verbose, control=control, ckpt_path=ckpt_path,
-        resume=resume, freeze_encoder_layers=freeze_encoder_layers,
-        freeze_encoder=freeze_encoder, std_guard=std_guard,
+        resume=resume, freeze_encoder_layers=freeze_encoder_layers, std_guard=std_guard,
         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         log_every_steps=log_every_steps)
     return trainer.fit()
 
 
-__all__ = ["StructuralNextLegNet", "train_ssl_nextleg_structural",
-           "_load_warm_nextleg_heads"]
+__all__ = ["StructuralNextLegNet", "train_ssl_nextleg_structural"]
