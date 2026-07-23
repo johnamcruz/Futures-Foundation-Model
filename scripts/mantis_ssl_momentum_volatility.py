@@ -53,7 +53,7 @@ def _parser():
         "WARM_CKPT", str(ROOT / "checkpoints" / "mantis_ssl_nextleg_race_v2.pt")))
     parser.add_argument("--out", default=os.environ.get(
         "OUT_PATH", str(ROOT / "temp" / "momentum_volatility" /
-                        "mantis_ssl_ma.pt")))
+                        "mantis_ssl_mv.pt")))
     parser.add_argument("--atlas-labels", default=os.environ.get("TREND_LABELS"))
     parser.add_argument("--tickers", default=",".join(TICKERS))
     parser.add_argument("--tfs", default=",".join(TIMEFRAMES))

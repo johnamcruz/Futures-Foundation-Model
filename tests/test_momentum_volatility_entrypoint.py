@@ -27,7 +27,7 @@ def test_entrypoint_is_public_strategy_agnostic_and_calls_canonical_task():
 def test_entrypoint_defaults_to_race_v2_parent_and_full_stream_matrix():
     source = SCRIPT.read_text()
     assert "mantis_ssl_nextleg_race_v2.pt" in source
-    assert "mantis_ssl_ma.pt" in source
+    assert "mantis_ssl_mv.pt" in source
     assert 'TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")' in source
     assert 'TIMEFRAMES = ("1min", "3min", "5min", "15min")' in source
     assert 'HOLDOUT_START = "2026-01-01"' in source
