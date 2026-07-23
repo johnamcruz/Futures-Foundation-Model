@@ -100,7 +100,15 @@ def load_race_forecaster(*, encoder_ckpt, readout_ckpt,
 def race_feature_names(hidden=256, adapted_channels=3, channels=5,
                        horizons=DEFAULT_HORIZONS, levels=RACE_LEVELS):
     names = [f"race_emb_{index}" for index in range(int(hidden) * int(adapted_channels))]
-    names += [
+    names += race_readout_feature_names(
+        channels=channels, horizons=horizons, levels=levels)
+    return names
+
+
+def race_readout_feature_names(channels=5, horizons=DEFAULT_HORIZONS,
+                               levels=RACE_LEVELS):
+    """Ordered deployable task outputs, excluding the intermediate embedding."""
+    names = [
         f"forecast_{field}_h{horizon}"
         for field in ("open", "high", "low", "close", "volume")[:int(channels)]
         for horizon in horizons
@@ -128,6 +136,22 @@ class NextLegRaceFeatureEncoder(nn.Module):
         ), dim=1)
 
 
+class NextLegRaceReadoutEncoder(nn.Module):
+    """Raw causal OHLCV windows -> compact candle, leg, and path-race forecasts."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, windows):
+        context = _standardize(windows).clamp(-10.0, 10.0)
+        embedding = self.net.embed(context)
+        candles, durations, reach, adverse, delay = self.net.readouts(embedding)
+        return torch.cat((
+            candles.flatten(1), durations, reach.sigmoid(), adverse, delay,
+        ), dim=1)
+
+
 @torch.no_grad()
 def race_features(windows, *, encoder_ckpt, readout_ckpt,
                   model_id="paris-noah/Mantis-8M", device=None, batch=512):
@@ -149,7 +173,29 @@ def race_features(windows, *, encoder_ckpt, readout_ckpt,
     return np.concatenate(output) if output else np.empty((0, width), np.float32)
 
 
+@torch.no_grad()
+def race_readout_features(windows, *, encoder_ckpt, readout_ckpt,
+                          model_id="paris-noah/Mantis-8M", device=None, batch=512):
+    """Extract only the compact causal task readouts from raw ``[N,5,L]`` windows."""
+    selected = device or ("cuda" if torch.cuda.is_available()
+                          else "mps" if torch.backends.mps.is_available() else "cpu")
+    net = load_race_forecaster(
+        encoder_ckpt=encoder_ckpt, readout_ckpt=readout_ckpt,
+        model_id=model_id, device=selected)
+    module = NextLegRaceReadoutEncoder(net).to(selected).eval()
+    values = np.asarray(windows, np.float32)
+    output = []
+    for start in range(0, len(values), int(batch)):
+        tensor = torch.as_tensor(values[start:start + int(batch)], device=selected)
+        output.append(module(tensor).float().cpu().numpy())
+    width = len(race_readout_feature_names(
+        channels=net.C, horizons=net.horizons, levels=net.race_levels))
+    return np.concatenate(output) if output else np.empty((0, width), np.float32)
+
+
 __all__ = [
     "DEFAULT_HORIZONS", "READOUT_SCHEMA", "NextLegRaceFeatureEncoder",
-    "export_race_readout", "load_race_forecaster", "race_feature_names", "race_features",
+    "NextLegRaceReadoutEncoder", "export_race_readout", "load_race_forecaster",
+    "race_feature_names", "race_features", "race_readout_feature_names",
+    "race_readout_features",
 ]

@@ -111,3 +111,40 @@ def test_feature_encoder_runs_encoder_once_and_preserves_monotone_probabilities(
     assert output.shape == (4, 13)
     reach = output[:, 7:9]
     assert torch.all(torch.diff(reach, dim=1) <= 0)
+
+
+def test_readout_encoder_excludes_embedding_and_preserves_ordered_contract():
+    import torch
+    from futures_foundation.finetune.pretext._torch.race_inference import (
+        NextLegRaceReadoutEncoder,
+        race_readout_feature_names,
+    )
+
+    class FakeNet(torch.nn.Module):
+        def embed(self, context):
+            return torch.ones(len(context), 3)
+
+        def readouts(self, embedding):
+            batch = len(embedding)
+            return (
+                torch.arange(2.0).reshape(1, 1, 2).repeat(batch, 1, 1),
+                torch.tensor([[3.0, 4.0]]).repeat(batch, 1),
+                torch.tensor([[2.0, 1.0]]).repeat(batch, 1),
+                torch.tensor([[.2, .8]]).repeat(batch, 1),
+                torch.tensor([[.5, 1.0]]).repeat(batch, 1),
+            )
+
+    output = NextLegRaceReadoutEncoder(FakeNet())(torch.randn(4, 5, 64))
+    names = race_readout_feature_names(
+        channels=1, horizons=(2, 7), levels=(.5, 1.5))
+
+    assert output.shape == (4, len(names)) == (4, 10)
+    assert names == [
+        "forecast_open_h2", "forecast_open_h7",
+        "leg1_logbars", "leg2_logbars",
+        "reach_0.5bar_range_prob", "reach_1.5bar_range_prob",
+        "adverse_before_0.5bar_range", "adverse_before_1.5bar_range",
+        "delay_to_0.5bar_range_logbars", "delay_to_1.5bar_range_logbars",
+    ]
+    reach = output[:, 4:6]
+    assert torch.all(torch.diff(reach, dim=1) <= 0)
