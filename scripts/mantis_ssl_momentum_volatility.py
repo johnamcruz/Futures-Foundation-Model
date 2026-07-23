@@ -205,13 +205,12 @@ def main():
     readout = export_mv_readout(
         str(output) + ".readout.pt",
         trainer_ckpt=str(output) + ".trainer.pt",
-        encoder_ckpt=output,
-        horizons=(5, 10, 20, 25))
+        encoder_ckpt=output)
     atlas = None if args.skip_atlas else _run_atlas(
         data=data, checkpoint=output, labels=labels, device=device, batch=batch)
     print("\nMOMENTUM-VOLATILITY SSL COMPLETE")
     print(f"  encoder : {output}")
-    print(f"  readout : {readout}")
+    print(f"  readout : {readout} (optional diagnostics only)")
     print(f"  report  : {output}.report.json")
     print(f"  atlas   : {atlas or 'skipped'}")
 
