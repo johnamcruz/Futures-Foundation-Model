@@ -1,101 +1,234 @@
-# ==============================================================================
-# MANTIS SSL STAGE 2.8 — NEXT-LEG + ORDERED FUTURE PATH RACE (Colab GPU)
-# ==============================================================================
-# New additive experiment. Production nextleg code/checkpoint are never overwritten.
-# The target is a four-point, candle-only curve:
-#   adverse excursion BEFORE the newborn leg first reaches 25/50/75/100% of its own extent.
-# It begins strictly after pivot confirmation, preserves event ordering, and contains no ATR,
-# stop, target, R multiple, cost, or strategy label.
+#!/usr/bin/env python3
+"""Train causal-range NextLeg race v2 from a frozen Structural NextLeg parent.
 
-# ======================================= CELL 1 — SETUP ========================================
+This is an independent public SSL stage.  It consumes the clean 9x4 continuous-bar corpus and
+exports three matched artifacts:
+
+* ``*.pt``: merged LoRA encoder checkpoint;
+* ``*.readout.pt``: compact adapter/candle/duration/reach/adverse/time readout; and
+* ``*.report.json`` plus Probe Atlas output: leakage/control/retention evidence.
+
+The objective uses raw candle geometry only.  There is no ATR, entry, stop, R multiple, cost, or
+strategy label.  Inputs end at a confirmed fractal pivot; every future target is fully contained
+inside one source stream, one train/validation split, and the pre-2026 region.
+"""
+from __future__ import annotations
+
+import argparse
+import json
 import os
+from pathlib import Path
 import subprocess
+import sys
 
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-os.chdir('/content')
-FFM_BRANCH = os.environ.get('FFM_BRANCH', 'ssl/stage-2.8-nextleg-race')
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from google.colab import drive
-drive.mount('/content/drive', force_remount=True)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-print(f'Cloning FFM repo ({FFM_BRANCH})...')
-os.system('rm -rf /content/Futures-Foundation-Model')
-r = subprocess.run(['git', 'clone', '--branch', FFM_BRANCH,
-                    'https://github.com/johnamcruz/Futures-Foundation-Model.git',
-                    '/content/Futures-Foundation-Model'], capture_output=True, text=True)
-if r.returncode:
-    print(r.stderr)
-    raise RuntimeError(f'git clone failed for {FFM_BRANCH!r}')
-os.chdir('/content/Futures-Foundation-Model')
-os.system('pip install -e . -q 2>&1 | tail -1')
-os.system('pip install mantis-tsfm -q 2>&1 | tail -1')
-import sympy.printing  # noqa: F401
-from futures_foundation.finetune import ssl  # noqa: E402
+from futures_foundation.data_provenance import seal_continuous_streams, sha256
+from futures_foundation.finetune import ssl
+from futures_foundation.finetune.pretext.nextleg_race import RACE_SCHEMA
 
 
-# ======================================= CELL 2 — CONFIG =======================================
-import torch
-
-DATA_DIR = os.environ.get('DATA_DIR', '/content/drive/MyDrive/Futures Data')
-WARM_CKPT = os.environ.get(
-    'WARM_CKPT', '/content/drive/MyDrive/AI_Models/mantis_ssl_nextleg.pt')
-OUT_PATH = os.environ.get(
-    'OUT_PATH', '/content/drive/MyDrive/AI_Models/mantis_ssl_nextleg_race.pt')
-TICKERS = ['ES', 'NQ', 'RTY', 'YM', 'GC', 'SI', 'CL', 'ZB', 'ZN']
-TFS = ['1min', '3min', '5min', '15min']
-HOLDOUT_START = '2026-01-01'
-
-LEG_K = int(os.environ.get('LEG_K', '2'))
-LEG_CAP = int(os.environ.get('LEG_CAP', '256'))
-LEG_W = float(os.environ.get('LEG_W', '1.0'))
-# Stage-2.7's weight 1.0 damaged retained regime/volatility capabilities. Begin conservatively;
-# raceR must still learn, and a later A/B may raise this only if retention remains intact.
-RACE_W = float(os.environ.get('RACE_W', '0.25'))
-RACE_CAP = float(os.environ.get('RACE_CAP', '2.0'))
-RACE_LEVELS = tuple(float(x) for x in os.environ.get(
-    'RACE_LEVELS', '0.25,0.50,0.75,1.00').split(','))
-HORIZONS = (5, 10, 20, 25)
-CONTEXT_LENGTHS = (64, 100, 150, 200)
-NEW_CHANNELS = int(os.environ.get('NEW_CHANNELS', '3'))
-BATCH = int(os.environ.get('BATCH', '512'))
-EPOCHS = int(os.environ.get('EPOCHS', '120'))
-STEPS = int(os.environ.get('STEPS', '200'))
-LR = float(os.environ.get('LR', '0.0001188117389055629'))
-WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', '0.0'))
-PATIENCE = int(os.environ.get('PATIENCE', '8'))
-FREEZE_ENCODER_LAYERS = int(os.environ.get('FREEZE_ENCODER_LAYERS', '2'))
-RESUME = os.environ.get('RESUME', '0') == '1'
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-if not os.path.isdir(DATA_DIR):
-    raise FileNotFoundError(DATA_DIR)
-if not os.path.isfile(WARM_CKPT):
-    raise FileNotFoundError(WARM_CKPT)
-assert os.path.abspath(OUT_PATH) != os.path.abspath(WARM_CKPT)
-assert not OUT_PATH.endswith('/mantis_ssl_nextleg.pt'), 'production checkpoint is protected'
-assert RACE_W > 0 and tuple(sorted(RACE_LEVELS)) == RACE_LEVELS
-print(f'Device={DEVICE} | warm={WARM_CKPT} | output={OUT_PATH}')
-print(f'nextleg k={LEG_K} cap={LEG_CAP} | race levels={RACE_LEVELS} w={RACE_W}')
-print(f'holdout >= {HOLDOUT_START} excluded; reserve covers both future legs')
+TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
+TIMEFRAMES = ("1min", "3min", "5min", "15min")
+HOLDOUT_START = "2026-01-01"
 
 
-# ======================================= CELL 3 — TRAIN ========================================
-verdict = ssl.loop_ssl(
-    data_dir=DATA_DIR, out_path=OUT_PATH, tickers=TICKERS, tfs=TFS,
-    pretext='nextleg_race', backbone_ckpt=WARM_CKPT,
-    horizons=HORIZONS, context_lengths=CONTEXT_LENGTHS,
-    leg_k=LEG_K, leg_cap=LEG_CAP, leg_w=LEG_W, mse_weight=1.0,
-    race_w=RACE_W, race_cap=RACE_CAP, race_levels=RACE_LEVELS,
-    new_channels=NEW_CHANNELS, batch=BATCH, epochs=EPOCHS,
-    steps_per_epoch=STEPS, lr=LR, weight_decay=WEIGHT_DECAY, patience=PATIENCE,
-    clamp=10.0, grad_clip=1.0, val_frac=0.1, holdout_start=HOLDOUT_START,
-    controls=(), probe=True, resume=RESUME,
-    freeze_encoder_layers=FREEZE_ENCODER_LAYERS, device=DEVICE, seed=0)
+def _csv(value):
+    return tuple(part.strip() for part in str(value).split(",") if part.strip())
 
-print('\n' + '=' * 64 + '\nSTAGE 2.8 NEXTLEG_RACE VERDICT\n' + '=' * 64)
-for key, value in verdict.items():
-    if key not in ('history', 'epochs'):
-        print(f'{key:>24}: {value}')
-print(f'candidate encoder -> {OUT_PATH}')
-print('Do not promote unless: raceR learns; NextLeg retention is preserved; exact stop-race probe,')
-print('trend lifecycle, and anchored Pivot Trend all beat mantis_ssl_nextleg.pt.')
+
+def _floats(value):
+    return tuple(float(part) for part in _csv(value))
+
+
+def _default_device():
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=os.environ.get(
+        "DATA_DIR", "/content/drive/MyDrive/Futures Data" if Path("/content").is_dir()
+        else str(ROOT / "data")))
+    parser.add_argument("--warm-ckpt", default=os.environ.get(
+        "WARM_CKPT", "/content/drive/MyDrive/AI_Models/clean_ssl_pre2026_lora/"
+        "mantis_ssl_structural_nextleg.pt" if Path("/content").is_dir()
+        else str(ROOT / "checkpoints" / "mantis_ssl_structural_nextleg.pt")))
+    parser.add_argument("--warm-trainer", default=os.environ.get("WARM_TRAINER_CKPT"),
+                        help="matched Structural NextLeg .trainer.pt; defaults beside --warm-ckpt")
+    parser.add_argument("--out", default=os.environ.get(
+        "OUT_PATH", "/content/drive/MyDrive/AI_Models/nextleg_race_v2/"
+        "mantis_ssl_nextleg_race_v2.pt" if Path("/content").is_dir()
+        else str(ROOT / "temp" / "nextleg_race_v2" / "mantis_ssl_nextleg_race_v2.pt")))
+    parser.add_argument("--atlas-labels", default=os.environ.get("TREND_LABELS"),
+                        help="existing Probe Atlas lifecycle labels; defaults beside parent")
+    parser.add_argument("--tickers", default=",".join(TICKERS))
+    parser.add_argument("--tfs", default=",".join(TIMEFRAMES))
+    parser.add_argument("--sampling-mode", choices=("bar_proportional", "uniform_stream"),
+                        default=os.environ.get("SAMPLING_MODE", "bar_proportional"))
+    parser.add_argument("--controls", default=os.environ.get("SSL_CONTROLS", "shuffle,random"))
+    parser.add_argument("--control-epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=int(os.environ.get("RACE_EPOCHS", "60")))
+    parser.add_argument("--steps", type=int, default=int(os.environ.get("RACE_STEPS", "50")))
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=float(os.environ.get("RACE_LR", "1e-5")))
+    parser.add_argument("--head-lr", type=float,
+                        default=float(os.environ.get("RACE_HEAD_LR", "1e-4")))
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--leg-k", type=int, default=2)
+    parser.add_argument("--leg-cap", type=int, default=256)
+    parser.add_argument("--race-levels", default=os.environ.get("RACE_LEVELS", "1,2,3,4"))
+    parser.add_argument("--race-scale-lookback", type=int, default=64)
+    parser.add_argument("--race-cap", type=float, default=8.0)
+    parser.add_argument("--race-w", type=float, default=.5)
+    parser.add_argument("--lora-r", type=int, default=int(os.environ.get("LORA_R", "8")))
+    parser.add_argument("--lora-alpha", type=float,
+                        default=float(os.environ.get("LORA_ALPHA", "16")))
+    parser.add_argument("--freeze-encoder-layers", type=int, default=2)
+    parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--resume", action="store_true", default=os.environ.get("RESUME") == "1")
+    parser.add_argument("--skip-atlas", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    return parser
+
+
+def _resolve(args):
+    data = Path(args.data_dir).expanduser().resolve()
+    parent = Path(args.warm_ckpt).expanduser().resolve()
+    trainer = (Path(args.warm_trainer).expanduser().resolve() if args.warm_trainer
+               else Path(str(parent) + ".trainer.pt"))
+    output = Path(args.out).expanduser().resolve()
+    labels = (Path(args.atlas_labels).expanduser().resolve() if args.atlas_labels else
+              parent.parent / "probe_atlas" / "trend_lifecycle_labels_pre2026.npz")
+    if not data.is_dir():
+        raise FileNotFoundError(f"data directory not found: {data}")
+    if not parent.is_file():
+        raise FileNotFoundError(f"Structural NextLeg parent not found: {parent}")
+    if not trainer.is_file():
+        raise FileNotFoundError(f"matched Structural NextLeg trainer sidecar not found: {trainer}")
+    if output == parent:
+        raise SystemExit("--out must differ from the immutable parent checkpoint")
+    if output.exists() and not args.resume:
+        raise SystemExit(f"output already exists: {output}; pass --resume to continue")
+    if not args.skip_atlas and not labels.is_file():
+        raise FileNotFoundError(
+            f"existing Probe Atlas labels not found: {labels}; pass --atlas-labels or --skip-atlas")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return data, parent, trainer, output, labels
+
+
+def _run_atlas(*, data, checkpoint, labels, output, device, batch):
+    atlas_dir = output.parent / "probe_atlas"
+    atlas_dir.mkdir(parents=True, exist_ok=True)
+    result = atlas_dir / "nextleg_race_v2.json"
+    cache = atlas_dir / "nextleg_race_v2_emb.npy"
+    env = os.environ.copy()
+    env.update({
+        "FFM_ROOT": str(ROOT), "DATA_DIR": str(data),
+        "CKPT_NAME": checkpoint.name, "CKPT_PATH": str(checkpoint),
+        "CKPT_SHA256": sha256(checkpoint), "TREND_LABELS": str(labels),
+        "EMB_CACHE": str(cache), "ATLAS_OUT": str(result),
+        "ATLAS_BATCH": str(batch), "DEVICE": device,
+    })
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "probe_atlas.py")],
+        cwd=ROOT, env=env, check=True)
+    payload = json.loads(result.read_text())
+    if payload.get("checkpoint_sha256") != sha256(checkpoint):
+        raise RuntimeError("Probe Atlas result is not bound to the race checkpoint")
+    return result
+
+
+def main():
+    args = _parser().parse_args()
+    data, parent, trainer, output, labels = _resolve(args)
+    device = args.device or _default_device()
+    batch = args.batch or {"cuda": 512, "mps": 128, "cpu": 32}[device]
+    tickers, timeframes = _csv(args.tickers), _csv(args.tfs)
+    expected = tuple((ticker, timeframe) for ticker in tickers for timeframe in timeframes)
+    provenance = seal_continuous_streams(data, expected, repo_root=ROOT)
+    if len(provenance["streams"]) != len(expected):
+        raise RuntimeError("data provenance did not seal the requested stream matrix")
+    levels = _floats(args.race_levels)
+    controls = _csv(args.controls)
+    if set(controls) - {"shuffle", "random"}:
+        raise ValueError(f"unsupported controls: {controls}")
+    if args.lora_r <= 0:
+        raise ValueError("NextLeg race v2 requires LoRA; --lora-r must be positive")
+    if args.race_scale_lookback > 64:
+        raise ValueError("race scale lookback must fit the shortest 64-bar context")
+
+    run_contract = {
+        **provenance, "stage": "nextleg_race", "race_schema": RACE_SCHEMA,
+        "parent": {"path": str(parent), "sha256": sha256(parent)},
+        "warm_trainer": str(trainer), "holdout_start": HOLDOUT_START,
+        "sampling_mode": args.sampling_mode, "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha, "race_levels": levels,
+        "race_scale": "median_completed_candle_high_minus_low",
+        "uses_atr": False,
+    }
+    print("\nNEXTLEG RACE V2 PREFLIGHT PASSED")
+    print(f"  data       : {data}")
+    print(f"  streams    : {len(tickers)} x {len(timeframes)} = {len(expected)}")
+    print(f"  holdout    : >= {HOLDOUT_START} physically excluded")
+    print(f"  parent     : {parent}")
+    print(f"  task heads : {trainer}")
+    print(f"  target     : reach/adverse/time @ {levels} median candle-range units")
+    print("  ATR/R      : none (raw completed candle high-low scale)")
+    print(f"  tuning     : LoRA r={args.lora_r} alpha={args.lora_alpha:g} "
+          f"freeze={args.freeze_encoder_layers}")
+    print(f"  training   : {device} batch={batch} epochs={args.epochs} steps={args.steps} "
+          f"encoder_lr={args.lr:g} head_lr={args.head_lr:g}")
+    print(f"  controls   : {controls}")
+    print(f"  output     : {output}")
+    if args.preflight_only:
+        return
+    Path(str(output) + ".data_provenance.json").write_text(
+        json.dumps(run_contract, indent=2, default=list) + "\n")
+
+    verdict = ssl.loop_ssl(
+        data_dir=str(data), tickers=tickers, tfs=timeframes, out_path=str(output),
+        holdout_start=HOLDOUT_START, val_frac=.1, pretext="nextleg_race",
+        backbone_ckpt=str(parent), warm_trainer_ckpt=str(trainer),
+        sampling_mode=args.sampling_mode, controls=controls,
+        control_epochs=args.control_epochs, probe=True,
+        horizons=(5, 10, 20, 25), context_lengths=(64, 100, 150, 200),
+        leg_k=args.leg_k, leg_cap=args.leg_cap, leg_w=1.0, mse_weight=1.0,
+        race_w=args.race_w, race_cap=args.race_cap, race_levels=levels,
+        race_scale_lookback=args.race_scale_lookback,
+        new_channels=3, batch=batch, epochs=args.epochs, steps_per_epoch=args.steps,
+        lr=args.lr, head_lr=args.head_lr, weight_decay=0.0, patience=args.patience,
+        freeze_encoder_layers=args.freeze_encoder_layers,
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+        clamp=10.0, grad_clip=1.0, resume=args.resume, device=device, seed=args.seed)
+
+    if not verdict.get("all_pass"):
+        raise RuntimeError(f"NextLeg race v2 failed SSL/control gates: {verdict}")
+
+    from futures_foundation.finetune.pretext._torch.race_inference import export_race_readout
+    readout = export_race_readout(
+        str(output) + ".readout.pt", trainer_ckpt=str(output) + ".trainer.pt",
+        encoder_ckpt=output, horizons=(5, 10, 20, 25), race_levels=levels)
+    atlas = None if args.skip_atlas else _run_atlas(
+        data=data, checkpoint=output, labels=labels, output=output,
+        device=device, batch=batch)
+    print("\nNEXTLEG RACE V2 COMPLETE")
+    print(f"  encoder : {output}")
+    print(f"  readout : {readout}")
+    print(f"  report  : {output}.report.json")
+    print(f"  atlas   : {atlas or 'skipped'}")
+
+
+if __name__ == "__main__":
+    main()

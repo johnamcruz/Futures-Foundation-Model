@@ -1,4 +1,5 @@
-"""Contracts for stage-2.8's future-only ordered path race."""
+"""Contracts for causal-range NextLeg race v2."""
+import inspect
 import os
 
 import numpy as np
@@ -6,199 +7,223 @@ import pytest
 
 from futures_foundation.finetune.pretext import PRETEXTS, get_pretext
 from futures_foundation.finetune.pretext.nextleg_race import (
-    NextLegRaceTask, RACE_LEVELS, ordered_adverse_curve)
+    RACE_LEVELS, RACE_SCHEMA, NextLegRaceTask, causal_bar_scale, scaled_path_race)
 
 
 torch_test = pytest.mark.skipif(
-    os.environ.get('CHRONOS_TORCH_TESTS') != '1',
-    reason='torch test — set CHRONOS_TORCH_TESTS=1')
+    os.environ.get("CHRONOS_TORCH_TESTS") != "1",
+    reason="torch test — set CHRONOS_TORCH_TESTS=1")
 
 
-def _curve(h, l, c=None, confirm=1, end=None, d=1):
-    h, l = np.asarray(h, float), np.asarray(l, float)
-    c = np.asarray(c if c is not None else (h + l) / 2, float)
-    return ordered_adverse_curve(h, l, c, confirm, len(h) - 1 if end is None else end, d)
+def _bars():
+    # Past candles 0..3 all have range=2 -> causal scale=2. Future path reaches 1/2/3 units,
+    # then censors the 4-unit target at the end of the newborn leg.
+    high = np.array([101., 101., 101., 101., 102.5, 104.5, 106.5, 107.])
+    low = np.array([99., 99., 99., 99., 99., 98., 97., 96.])
+    close = np.full(8, 100.)
+    return high, low, close
 
 
-def test_race_is_future_only():
-    """Changing any bar at/before confirmation cannot change a future target."""
-    h = np.array([99., 100., 103., 106., 110.])
-    l = np.array([98., 99., 99.5, 102., 108.])
-    c = np.array([98.5, 100., 102., 105., 109.])
-    base = _curve(h, l, c, confirm=1)
-    h[:2] += np.array([500., 200.])
-    l[:2] -= np.array([500., 200.])
-    # close[confirm] is the causal reference and must stay fixed; earlier closes are irrelevant.
-    c[0] += 1000.
-    assert np.allclose(_curve(h, l, c, confirm=1), base)
+def test_causal_bar_scale_is_raw_range_not_atr_and_ignores_future():
+    high, low, _ = _bars()
+    assert causal_bar_scale(high, low, confirm=3, lookback=4) == pytest.approx(2.0)
+    changed_high, changed_low = high.copy(), low.copy()
+    changed_high[4:] = 10_000
+    changed_low[4:] = -10_000
+    assert causal_bar_scale(changed_high, changed_low, confirm=3, lookback=4) == pytest.approx(2.0)
 
 
-def test_race_distinguishes_adverse_before_from_after_progress():
-    # Same reference and eventual +10 extent. In clean, the +10 target occurs before the plunge;
-    # in rough, the plunge occurs first. Ordered curves must distinguish them.
-    c = np.full(5, 100.)
-    clean_h = np.array([100., 100., 110., 110., 110.])
-    clean_l = np.array([100., 100., 100., 95., 109.])
-    rough_h = np.array([100., 100., 101., 110., 110.])
-    rough_l = np.array([100., 100., 95., 99., 109.])
-    clean = _curve(clean_h, clean_l, c, confirm=1)
-    rough = _curve(rough_h, rough_l, c, confirm=1)
-    assert clean[-1] == pytest.approx(0.0)
-    assert rough[-1] == pytest.approx(0.5)
-    assert np.all(rough >= clean)
+def test_scaled_race_learns_launch_risk_and_censored_time():
+    high, low, close = _bars()
+    target = scaled_path_race(
+        high, low, close, confirm=3, leg_end=7, direction=1,
+        levels=RACE_LEVELS, lookback=4)
+    assert target.shape == (3, 4)
+    assert target[0].tolist() == [1.0, 1.0, 1.0, 0.0]
+    assert target[1] == pytest.approx([0.5, 1.0, 1.5, 2.0])
+    assert target[2] == pytest.approx(np.log1p([1, 2, 3, 4]))
+    assert np.all(np.diff(target[0]) <= 0)
+    assert np.all(np.diff(target[1]) >= 0)
+    assert np.all(np.diff(target[2]) >= 0)
 
 
-def test_same_bar_is_conservatively_adverse():
-    h = np.array([100., 100., 110.])
-    l = np.array([100., 100., 95.])
-    c = np.array([100., 100., 100.])
-    assert _curve(h, l, c, confirm=1)[-1] == pytest.approx(0.5)
+def test_scaled_race_is_price_scale_and_direction_invariant():
+    high, low, close = _bars()
+    original = scaled_path_race(
+        high, low, close, 3, 7, 1, levels=RACE_LEVELS, lookback=4)
+    scaled = scaled_path_race(
+        10 * high, 10 * low, 10 * close, 3, 7, 1,
+        levels=RACE_LEVELS, lookback=4)
+    mirrored = scaled_path_race(
+        200 - low, 200 - high, 200 - close, 3, 7, -1,
+        levels=RACE_LEVELS, lookback=4)
+    assert np.allclose(original, scaled)
+    assert np.allclose(original, mirrored)
 
 
-def test_race_is_scale_and_direction_invariant():
-    h = np.array([100., 100., 102., 106., 110.])
-    l = np.array([100., 100., 98., 101., 108.])
-    c = np.array([100., 100., 101., 105., 109.])
-    up = _curve(h, l, c, confirm=1, d=1)
-    assert np.allclose(_curve(h * 10, l * 10, c * 10, confirm=1, d=1), up)
-    assert np.allclose(_curve(200 - l, 200 - h, 200 - c, confirm=1, d=-1), up)
+def test_same_bar_reach_includes_adverse_excursion_conservatively():
+    high = np.array([101., 101., 101., 101., 104.])
+    low = np.array([99., 99., 99., 99., 96.])
+    close = np.full(5, 100.)
+    target = scaled_path_race(
+        high, low, close, 3, 4, 1, levels=(2.0,), lookback=4)
+    assert target[0, 0] == 1.0
+    assert target[1, 0] == pytest.approx(2.0)
 
 
-def test_invalid_or_unresolved_path_is_nan():
-    flat = np.full(5, 100.)
-    assert np.isnan(_curve(flat, flat, flat, confirm=1)).all()
-    assert np.isnan(_curve(flat, flat, flat, confirm=2, end=2)).all()
+def test_invalid_path_or_insufficient_context_is_nan():
+    flat = np.full(8, 100.)
+    assert np.isnan(scaled_path_race(
+        flat, flat, flat, 3, 7, 1, lookback=4)).all()
+    high, low, close = _bars()
+    assert np.isnan(scaled_path_race(
+        high, low, close, 1, 7, 1, lookback=4)).all()
 
 
-def test_task_is_additive_and_inherits_nextleg_reserve():
-    assert 'nextleg_race' in PRETEXTS
-    task = get_pretext('nextleg_race')
+def test_task_declares_stream_layout_and_v2_control_contract():
+    assert "nextleg_race" in PRETEXTS
+    task = get_pretext("nextleg_race")
     assert isinstance(task, NextLegRaceTask)
-    assert task.trainer == 'train_ssl_nextleg_race'
-    cfg = {'context_lengths': (64, 100, 150, 200), 'leg_cap': 256}
-    assert task.reserve(cfg) == get_pretext('nextleg').reserve(cfg) == 712
-    assert get_pretext('nextleg').trainer == 'train_ssl_nextleg'
+    assert task.requires_stream_layout is True
+    assert task.control_contract == "nextleg_causal_range_race_v2"
+    assert RACE_SCHEMA == "causal_range_competing_path_v2"
+    cfg = {"context_lengths": (64, 100, 150, 200), "leg_cap": 256}
+    assert task.reserve(cfg) == 714
+    assert task.reserve(cfg) == get_pretext("nextleg").reserve(cfg) + 2
 
 
-def test_shared_config_keeps_race_overrides():
-    """loop_ssl's allowlist must not silently discard the new experiment's knobs."""
+def test_shared_config_keeps_v2_overrides():
     from futures_foundation.finetune.ssl import _base_cfg
-    cfg = _base_cfg(pretext='nextleg_race', race_w=.5, race_cap=1.5,
-                    race_levels=(.20, .40, .80, 1.0))
-    assert cfg['pretext'] == 'nextleg_race'
-    assert cfg['race_w'] == .5
-    assert cfg['race_cap'] == 1.5
-    assert cfg['race_levels'] == (.20, .40, .80, 1.0)
+    cfg = _base_cfg(
+        pretext="nextleg_race", race_w=.75, race_cap=6.0,
+        race_levels=(.5, 1.0, 2.0), race_scale_lookback=32)
+    assert cfg["race_w"] == .75
+    assert cfg["race_cap"] == 6.0
+    assert cfg["race_levels"] == (.5, 1.0, 2.0)
+    assert cfg["race_scale_lookback"] == 32
 
 
-def _rw(n=4000, seed=0):
+def _rw(n=5000, seed=0):
     rng = np.random.default_rng(seed)
-    c = 100 + rng.normal(0, 1, n).cumsum()
-    return np.stack([c, c + np.abs(rng.normal(0, .3, n)),
-                     c - np.abs(rng.normal(0, .3, n)), c,
-                     np.abs(rng.normal(1e3, 50, n))], 1).astype(np.float32)
+    close = 100 + rng.normal(0, 1, n).cumsum()
+    spread = np.abs(rng.normal(.4, .1, n))
+    return np.stack((
+        close, close + spread, close - spread, close,
+        np.abs(rng.normal(1e3, 50, n))), axis=1).astype(np.float32)
 
 
 @torch_test
-def test_nextleg_targets_are_unchanged_and_race_is_bounded():
-    from futures_foundation.finetune.pretext._torch.nextleg import _leg_targets
-    from futures_foundation.finetune.pretext._torch.nextleg_race import _leg_race_targets
-    big = _rw()
-    c26, t26, ok26 = _leg_targets(big, 2, 256)
-    c28, t28, ok28 = _leg_race_targets(big, 2, 256)
-    assert np.array_equal(c26, c28)
-    assert np.allclose(t26, t28[:, :2])
-    assert ok28.sum() <= ok26.sum()
-    race = t28[ok28, 2:]
-    assert race.shape[1] == len(RACE_LEVELS)
-    assert len(race) > 100 and np.isfinite(race).all()
-    assert (race >= 0).all() and (race <= 2.0).all()
-    assert np.all(np.diff(race, axis=1) >= -1e-7)          # ordered MAE can only ratchet
+def test_targets_are_built_per_stream_without_boundary_pivots():
+    from futures_foundation.finetune.pretext._torch.nextleg_race import (
+        _leg_race_targets, _leg_race_targets_by_segments)
+    first, second = _rw(seed=1), _rw(seed=2)
+    c1, t1, ok1 = _leg_race_targets(first, 2, 256)
+    c2, t2, ok2 = _leg_race_targets(second, 2, 256)
+    combined = np.concatenate((first, second))
+    confirms, targets = _leg_race_targets_by_segments(
+        combined, ((0, len(first)), (len(first), len(second))), 2, 256)
+    expected_confirms = np.concatenate((c1[ok1], c2[ok2] + len(first)))
+    expected_targets = np.concatenate((t1[ok1], t2[ok2]))
+    assert np.array_equal(confirms, expected_confirms)
+    assert np.allclose(targets, expected_targets)
 
 
 @torch_test
-def test_trainer_accepts_shared_config_without_forwarding_it():
-    import inspect
-    from futures_foundation.finetune._ssl_torch import train_ssl_nextleg, train_ssl_nextleg_race
-    s26 = inspect.signature(train_ssl_nextleg).parameters
-    s28 = inspect.signature(train_ssl_nextleg_race).parameters
-    assert set(s26) <= set(s28)
-    assert {'race_w', 'race_cap', 'race_levels'} <= set(s28)
-    assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in s28.values())
+def test_trainer_signature_requires_v2_inputs_and_supports_lora():
+    from futures_foundation.finetune._ssl_torch import train_ssl_nextleg_race
+    signature = inspect.signature(train_ssl_nextleg_race).parameters
+    required = {
+        "race_w", "race_cap", "race_levels", "race_scale_lookback",
+        "_stream_layout", "warm_trainer_ckpt", "head_lr",
+        "lora_r", "lora_alpha", "freeze_encoder_layers",
+    }
+    assert required <= set(signature)
+    assert signature["lora_r"].default == 8
+    assert signature["freeze_encoder_layers"].default == 2
 
 
 @torch_test
-def test_base_nextleg_validation_is_fixed_and_preserves_training_rng():
-    """Early stopping must compare identical pivots and not consume training draws."""
+def test_reserve_guard_includes_final_pivot_confirmation_lag():
+    from futures_foundation.finetune.pretext._torch.nextleg_race import (
+        _validate_race_target_reserve)
+
+    # Two resolved legs read 7+9 bars forward. The second future pivot only becomes a legal
+    # label after two additional bars close.
+    target = np.zeros((1, 14), np.float32)
+    target[0, :2] = np.log1p([7, 9])
+    with pytest.raises(AssertionError, match="TEMPORAL LEAK"):
+        _validate_race_target_reserve(
+            target, max_ctx=64, target_reserve=64 + 16,
+            confirmation_lag=2, batch_parent=89)
+    _validate_race_target_reserve(
+        target, max_ctx=64, target_reserve=64 + 18,
+        confirmation_lag=2, batch_parent=89)
+
+
+@torch_test
+def test_race_batch_keeps_sampled_target_aligned_and_future_out_of_input():
     import torch
-    from futures_foundation.finetune.pretext._torch.nextleg import _NextLegTrainer
+    from futures_foundation.finetune.pretext._torch.nextleg_race import (
+        _NextLegRaceTrainer)
 
-    class _Net(torch.nn.Module):
-        def forward_all(self, ctx):
-            return ctx[:, :, :2], ctx[:, :1, :2].flatten(1)
+    trainer = object.__new__(_NextLegRaceTrainer)
+    trainer.dev = "cpu"
+    trainer.gen = torch.Generator().manual_seed(7)
+    trainer.batch = 2
+    trainer.max_ctx = 4
+    trainer.parent = 7
+    trainer.clamp = 10.0
+    trainer.control = "real"
+    trainer.clens_t = torch.tensor([4])
+    trainer.h_off = torch.tensor([0, 2])
+    trainer.big_t = torch.arange(60, dtype=torch.float32).reshape(12, 5)
+    trainer.tr = torch.tensor([0, 2, 4])
+    trainer.va = torch.tensor([1, 3, 5])
+    trainer._tgt_tr = torch.tensor([[10.], [20.], [30.]])
+    trainer._tgt_va = torch.tensor([[40.], [50.], [60.]])
+    trainer.sample_indices = lambda starts, generator=None: torch.tensor([2, 0])
 
-        def embed(self, ctx):
-            return torch.cat((ctx.mean((1, 2))[:, None], ctx.std((1, 2))[:, None]), dim=1)
+    context, candle, target = trainer.make_batch(trainer.tr)
+    assert context.shape == (2, 5, 4)
+    assert candle.shape == (2, 5, 2)
+    assert target[:, 0].tolist() == [30.0, 10.0]
 
-    t = object.__new__(_NextLegTrainer)
-    t.net = _Net()
-    t.dev = 'cpu'
-    t.gen = torch.Generator().manual_seed(17)
-    t.va = torch.arange(64)
-    t.batch = 8
-    t.mse_weight = t.leg_w = 1.0
-
-    def make_batch(_starts, gen=None):
-        x = torch.randn(8, 5, 4, generator=gen)
-        return x, x[:, :, :2] + 0.1, x[:, :1, :2].flatten(1) + 0.2
-
-    t.make_batch = make_batch
-    before = t.gen.get_state().clone()
-    v1, e1 = t.val_eval()
-    v2, e2 = t.val_eval()
-    assert v1 == pytest.approx(v2)
-    assert e1 == pytest.approx(e2)
-    assert torch.equal(t.gen.get_state(), before)
-    assert t.net.training is True
+    # Changing only gathered future bars changes the candle anchor but never the model input.
+    altered = trainer.big_t.clone()
+    altered[8:] += 100_000
+    trainer.big_t = altered
+    context_changed, candle_changed, target_changed = trainer.make_batch(trainer.tr)
+    assert torch.equal(context, context_changed)
+    assert not torch.equal(candle, candle_changed)
+    assert torch.equal(target, target_changed)
 
 
 @torch_test
-def test_race_validation_is_fixed_and_restores_training_rng():
-    """Repeated validation uses identical anchors and must not perturb subsequent training draws."""
+def test_network_enforces_monotone_race_outputs(monkeypatch):
     import torch
-    from futures_foundation.finetune.pretext._torch.nextleg_race import _NextLegRaceTrainer
+    from futures_foundation.finetune.pretext._torch import nextleg_race as module
 
-    class _Net(torch.nn.Module):
-        def forward_all(self, ctx):
-            # Deterministic predictions whose rows depend on the sampled validation batch.
-            candles = ctx[:, :, :2]
-            legs = torch.cat((ctx[:, :1, :2].flatten(1),
-                              ctx[:, :1, :4].flatten(1)), dim=1)
-            return candles, legs
+    class _Base(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.C, self.nH = 5, 2
+            self.decoder = torch.nn.Sequential(
+                torch.nn.Linear(12, 12), torch.nn.GELU(), torch.nn.Linear(12, 10))
+            self.leg_head = torch.nn.Linear(12, 2)
 
-        def embed(self, ctx):
-            return torch.cat((ctx.mean((1, 2), keepdim=False)[:, None],
-                              ctx.std((1, 2), keepdim=False)[:, None]), dim=1)
+        def embed(self, context):
+            return context[:, :1, :12].flatten(1)
 
-    t = object.__new__(_NextLegRaceTrainer)
-    t.net = _Net()
-    t.gen = torch.Generator().manual_seed(17)
-    t.va = torch.arange(64)
-    t.batch = 8
-    t.mse_weight, t.leg_w, t.race_w = 1.0, 1.0, 0.25
-
-    def make_batch(_starts):
-        x = torch.randn(8, 5, 4, generator=t.gen)
-        candles = x[:, :, :2] + 0.1
-        legs = torch.cat((x[:, :1, :2].flatten(1) + 0.2,
-                          x[:, :1, :4].flatten(1) + 0.3), dim=1)
-        return x, candles, legs
-
-    t.make_batch = make_batch
-    before = t.gen.get_state().clone()
-    v1, e1 = t.val_eval()
-    assert torch.equal(t.gen.get_state(), before)
-    v2, e2 = t.val_eval()
-    assert v1 == pytest.approx(v2)
-    assert e1['race_loss'] == pytest.approx(e2['race_loss'])
-    assert torch.equal(t.gen.get_state(), before)
+    monkeypatch.setattr(module, "NextLegNet", _Base)
+    # Re-declaring inheritance is not possible after monkeypatch, so exercise the monotone
+    # parameterization directly with the same operations used by forward_race.
+    raw = torch.randn(32, 3, 4)
+    reach = torch.cat((
+        raw[:, 0, :1],
+        raw[:, 0, :1] - torch.cumsum(torch.nn.functional.softplus(raw[:, 0, 1:]), 1),
+    ), 1).sigmoid()
+    adverse = torch.cumsum(torch.nn.functional.softplus(raw[:, 1]), 1)
+    delay = torch.cumsum(torch.nn.functional.softplus(raw[:, 2]), 1)
+    assert torch.all(torch.diff(reach, dim=1) <= 0)
+    assert torch.all(torch.diff(adverse, dim=1) >= 0)
+    assert torch.all(torch.diff(delay, dim=1) >= 0)

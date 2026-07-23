@@ -17,8 +17,7 @@ its own file keeps ssl.py a clean orchestrator.
   nextleg_path  (stage 2.7) — nextleg + the leg's PATH ROUGHNESS (deepest pullback within the
                               leg / that leg's own extent — unitless, pure candles). Own modules;
                               2.6 untouched, so the A/B stays honest.
-  nextleg_race  (stage 2.8) — nextleg + a future-only ORDERED adverse/progress curve. New modules;
-                              production nextleg and its checkpoint remain untouched.
+  nextleg_race  (stage 2.8) — nextleg + causal-range reach/adverse/delay path forecasts.
   nextleg_structural        — SpanBERT-style confirmed-pivot reconstruction plus causal
                               HH/HL/LH/LL, BOS/CHOCH, duration, and excursion prediction. It is
                               an opt-in encoder refinement; production nextleg stays untouched.
