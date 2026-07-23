@@ -129,6 +129,54 @@ def test_targets_are_built_per_stream_without_boundary_pivots():
 
 
 @torch_test
+def test_vectorized_targets_match_the_causal_reference_exactly():
+    from futures_foundation.finetune.pretext._torch.nextleg import _alternating_fractals
+    from futures_foundation.finetune.pretext._torch.nextleg_race import _leg_race_targets
+
+    bars = _rw(n=20_000, seed=31)
+    high, low, close = bars[:, 1], bars[:, 2], bars[:, 3]
+    confirms, targets, valid = [], [], []
+    sequence = _alternating_fractals(high, low, 2)
+    for index in range(len(sequence) - 2):
+        _, confirmation, direction = sequence[index]
+        next_origin = sequence[index + 1][0]
+        following_origin = sequence[index + 2][0]
+        first = next_origin - confirmation
+        second = following_origin - next_origin
+        race = scaled_path_race(
+            high, low, close, confirmation, next_origin, direction,
+            levels=RACE_LEVELS, lookback=64, cap=8.0)
+        confirms.append(confirmation)
+        targets.append((
+            np.log1p(max(first, 0)), np.log1p(max(second, 0)),
+            *np.nan_to_num(race, nan=0.0).reshape(-1).tolist()))
+        valid.append(
+            first > 0 and second > 0 and first <= 256 and second <= 256
+            and np.isfinite(race).all())
+
+    actual = _leg_race_targets(bars, 2, 256)
+    assert np.array_equal(actual[0], np.asarray(confirms, np.int64))
+    assert np.array_equal(actual[2], np.asarray(valid, bool))
+    assert np.allclose(actual[1], np.asarray(targets, np.float32), rtol=1e-6, atol=1e-6)
+
+
+@torch_test
+def test_segment_target_cache_is_reused_across_control_trainers():
+    from futures_foundation.finetune.pretext._torch import nextleg_race as module
+
+    module._RACE_TARGET_CACHE.clear()
+    bars = _rw(n=20_000, seed=41)
+    arguments = dict(
+        big=bars, segments=((0, len(bars)),), k=2, leg_cap=256,
+        race_levels=RACE_LEVELS, race_scale_lookback=64, race_cap=8.0)
+    first = module._leg_race_targets_by_segments(**arguments)
+    second = module._leg_race_targets_by_segments(**arguments)
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    assert len(module._RACE_TARGET_CACHE) == 1
+
+
+@torch_test
 def test_trainer_signature_requires_v2_inputs_and_supports_lora():
     from futures_foundation.finetune._ssl_torch import train_ssl_nextleg_race
     signature = inspect.signature(train_ssl_nextleg_race).parameters
