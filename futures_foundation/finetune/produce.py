@@ -122,8 +122,16 @@ def operating_points(eval_lab, keys, proba, ts, rates=(5, 3, 2, 1)):
         n = int(min(len(proba), max(1, round(r * days))))
         sel = order[:n]
         Rs = R_all[sel]
+        winning = Rs[Rs > 0]
+        cost_r = float(getattr(eval_lab, 'COST_R', 0.0))
         rows.append(dict(rate=r, n=n, days=days, wr3R=float(W_all[sel].mean()),
                          meanR=float(Rs.mean()),
+                         # Keep net expectancy and payoff magnitude separate. ``avgWinR`` is
+                         # after costs; ``avgWinRGross`` restores a labeler's declared round-trip
+                         # R cost so trend systems can be judged against a gross-R payoff target.
+                         avgWinR=(float(winning.mean()) if winning.size else None),
+                         avgWinRGross=(float(winning.mean() + cost_r)
+                                       if winning.size else None),
                          # pool = candidates AVAILABLE (n is the TAKEN count, capped by the pool).
                          # n < rate*days => the stream CANNOT sustain that rate: its frequency
                          # ceiling. Without this, a starved stream silently reports its best-N as
