@@ -25,7 +25,7 @@ class MultiHorizonForecastNet(nn.Module):
         self.nH = len(self.horizons)
         emb = hidden * self.new_c
         self.decoder = nn.Sequential(nn.Linear(emb, emb), nn.GELU(), nn.Linear(emb, C * self.nH))
-        # OPTIONAL aux head sized by the forecast OBJECTIVE (e.g. direction logits) — a LINEAR readout
+        # OPTIONAL aux head sized by the forecast OBJECTIVE (e.g. direction logits) — a LINEAR task head
         # off the same embedding, so the objective's gradient shapes the ENCODER. Discarded after
         # training. aux_dim=0 = candle-only (original stage-2).
         self.aux_head = nn.Linear(emb, aux_dim) if aux_dim > 0 else None

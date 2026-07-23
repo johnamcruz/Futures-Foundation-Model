@@ -249,20 +249,23 @@ def compare(emb_ssl, emb_vanilla, targets, seed=0, folds=1, split=None,
             'learns_regime_vol_structure': bool(mean_core > 0.0)}
 
 
-def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
+def run_probe(big, starts, seq, ssl_ckpt, *, baseline_ckpt=None,
+              model_id='paris-noah/Mantis-8M',
               device=None, max_windows=20000, batch=512, seed=0, fwd_k=16, folds=1,
               group_names=None, verbose=True):
-    """Extract SSL-adapted vs vanilla encoder embeddings for held-out windows and
+    """Extract child vs baseline encoder embeddings for held-out windows and
     compare on the probe targets (regime/vol/structure + forward buy/sell move). Returns
-    the compare() dict. folds>1 -> k-fold CV per probe (robust deltas for ranking candidates)."""
+    the compare() dict. ``baseline_ckpt=None`` preserves the historical vanilla-Mantis
+    comparison; incremental refinement stages must pass their immediate parent checkpoint.
+    folds>1 -> k-fold CV per probe (robust deltas for ranking candidates)."""
     from . import _ssl_torch
     used, groups = _balanced_probe_sample(starts, max_windows, seed)
     emb_ssl, used = _ssl_torch.embed_encoder(big, used, seq, ckpt=ssl_ckpt,
                                              model_id=model_id, device=device,
                                              batch=batch, max_windows=len(used), seed=seed)
-    emb_van, _ = _ssl_torch.embed_encoder(big, used, seq, ckpt=None, model_id=model_id,
-                                          device=device, batch=batch,
-                                          max_windows=len(used), seed=seed)
+    emb_van, _ = _ssl_torch.embed_encoder(
+        big, used, seq, ckpt=baseline_ckpt, model_id=model_id,
+        device=device, batch=batch, max_windows=len(used), seed=seed)
     tgt = targets_from_windows(big, used, seq, fwd_k=fwd_k)
     split = _grouped_temporal_split(used, groups, purge=seq + fwd_k)
     out = compare(emb_ssl, emb_van, tgt, seed=seed, folds=folds, split=split,
@@ -270,6 +273,8 @@ def run_probe(big, starts, seq, ssl_ckpt, *, model_id='paris-noah/Mantis-8M',
     out['split_schema'] = 'balanced_stream_purged_temporal_v1'
     out['probe_streams'] = int(len(np.unique(groups)))
     out['probe_windows'] = int(len(used))
+    out['comparison_baseline'] = (
+        'vanilla_mantis' if baseline_ckpt is None else str(baseline_ckpt))
     # Stable representation-scale measurement used when finalizing an already
     # completed REAL checkpoint without reconstructing its task-specific decoder.
     out['embedding_std'] = float(np.std(emb_ssl, axis=0).mean())

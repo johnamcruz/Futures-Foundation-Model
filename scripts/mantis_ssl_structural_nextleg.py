@@ -60,8 +60,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", default=os.environ.get("DATA_DIR", str(ROOT / "data")))
     parser.add_argument("--warm-ckpt", default=os.environ.get(
         "BACKBONE_CKPT", str(ROOT / "checkpoints" / "mantis_ssl_nextleg.pt")))
-    parser.add_argument("--warm-trainer", default=os.environ.get("WARM_TRAINER_CKPT"),
-                        help="Optional parent NextLeg .trainer.pt for forecast/leg head reuse")
     parser.add_argument("--out", default=os.environ.get(
         "OUT_PATH", str(ROOT / "temp" / "structural_nextleg" /
                         "mantis_ssl_structural_nextleg.pt")))
@@ -119,23 +117,20 @@ def _resolve(args):
         raise SystemExit("--out must differ from --warm-ckpt; the parent is immutable")
     if out.exists() and not args.resume:
         raise SystemExit(f"output already exists: {out}; pass --resume to continue it")
-    warm_trainer = Path(args.warm_trainer).expanduser().resolve() if args.warm_trainer else None
-    if warm_trainer is not None and not warm_trainer.is_file():
-        raise FileNotFoundError(f"warm NextLeg trainer sidecar not found: {warm_trainer}")
     tickers, tfs = _csv(args.tickers), _csv(args.tfs)
     expected = tuple((ticker, timeframe) for ticker in tickers for timeframe in tfs)
     provenance = seal_continuous_streams(data_dir, expected, repo_root=ROOT)
     if len(provenance["streams"]) != len(expected):
         raise RuntimeError("data provenance did not seal the requested stream matrix")
     out.parent.mkdir(parents=True, exist_ok=True)
-    return data_dir, warm, warm_trainer, out, tickers, tfs, provenance
+    return data_dir, warm, out, tickers, tfs, provenance
 
 
 def main() -> None:
     args = _parser().parse_args()
     device = args.device or _default_device()
     batch = args.batch or {"cuda": 512, "mps": 128, "cpu": 32}[device]
-    data_dir, warm, warm_trainer, out, tickers, tfs, provenance = _resolve(args)
+    data_dir, warm, out, tickers, tfs, provenance = _resolve(args)
     controls = _csv(args.controls)
 
     run_contract = {
@@ -143,7 +138,6 @@ def main() -> None:
         "stage": "nextleg_structural",
         "objective": "pivot_span_reconstruction+structure+bos_choch+nextleg+candle_anchor",
         "backbone_ckpt": str(warm),
-        "warm_trainer_ckpt": str(warm_trainer) if warm_trainer else None,
         "holdout_start": HOLDOUT_START,
         "tickers": list(tickers), "timeframes": list(tfs),
         "sampling_mode": args.sampling_mode,
@@ -156,7 +150,7 @@ def main() -> None:
     print(f"  streams    : {len(tickers)} x {len(tfs)} = {len(tickers) * len(tfs)}")
     print(f"  holdout    : >= {HOLDOUT_START} physically excluded")
     print(f"  parent     : {warm}")
-    print(f"  task heads : {warm_trainer or 'new (encoder-only parent)'}")
+    print("  task heads : new and disposable (encoder-only parent)")
     print(f"  target     : k={args.leg_k} cap={args.leg_cap} "
           f"event_horizon={args.event_horizon} span={args.span_width}")
     print(f"  training   : {device} batch={batch} epochs={args.epochs} steps={args.steps} "
@@ -170,7 +164,6 @@ def main() -> None:
         data_dir=str(data_dir), tickers=tickers, tfs=tfs, out_path=str(out),
         holdout_start=HOLDOUT_START, val_frac=.1, pretext="nextleg_structural",
         backbone_ckpt=str(warm),
-        warm_trainer_ckpt=str(warm_trainer) if warm_trainer else None,
         sampling_mode=args.sampling_mode, controls=controls,
         control_epochs=args.control_epochs, probe=not args.no_probe,
         context_lengths=_ints(args.context_lengths), horizons=_ints(args.horizons),

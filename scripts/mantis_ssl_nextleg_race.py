@@ -2,10 +2,9 @@
 """Train causal-range NextLeg race v2 from a frozen Structural NextLeg parent.
 
 This is an independent public SSL stage.  It consumes the clean 9x4 continuous-bar corpus and
-exports three matched artifacts:
+exports two matched artifacts:
 
 * ``*.pt``: merged LoRA encoder checkpoint;
-* ``*.readout.pt``: compact adapter/candle/duration/reach/adverse/time readout; and
 * ``*.report.json`` plus Probe Atlas output: leakage/control/retention evidence.
 
 The objective uses raw candle geometry only.  There is no ATR, entry, stop, R multiple, cost, or
@@ -24,18 +23,178 @@ import sys
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-ROOT = Path(__file__).resolve().parents[1]
+SOURCE_PATH = (Path(__file__).resolve() if "__file__" in globals() else None)
+ROOT = SOURCE_PATH.parents[1] if SOURCE_PATH is not None else Path.cwd()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from futures_foundation.data_provenance import seal_continuous_streams, sha256
-from futures_foundation.finetune import ssl
-from futures_foundation.finetune.pretext.nextleg_race import RACE_SCHEMA
-
+if (ROOT / "futures_foundation").is_dir():
+    from futures_foundation.data_provenance import seal_continuous_streams, sha256
+    from futures_foundation.finetune import ssl
+    from futures_foundation.finetune.pretext.nextleg_race import RACE_SCHEMA
 
 TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
 TIMEFRAMES = ("1min", "3min", "5min", "15min")
 HOLDOUT_START = "2026-01-01"
+GITHUB_REPOSITORY = "https://github.com/johnamcruz/Futures-Foundation-Model.git"
+COLAB_CHECKOUT = Path("/content/ffm")
+
+
+def _stream_command(command, *, cwd=None, log_path=None, env=None):
+    """Run one visible command and optionally mirror its combined output to Drive."""
+    print("[colab] $ " + " ".join(str(part) for part in command), flush=True)
+    handle = None
+    code = None
+    try:
+        if log_path is not None:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            handle = open(log_path, "a", buffering=1)
+        process = subprocess.Popen(
+            [str(part) for part in command], cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            if handle is not None:
+                handle.write(line)
+        code = process.wait()
+    finally:
+        if handle is not None:
+            handle.close()
+    if code:
+        raise subprocess.CalledProcessError(code, command)
+
+
+def _discover_probe_labels(ai_models):
+    """Resolve the existing pre-2026 Probe Atlas labels from Google Drive."""
+    ai_models = Path(ai_models)
+    requested_labels = os.environ.get("TREND_LABELS")
+    if requested_labels:
+        labels = Path(requested_labels)
+        if not labels.is_file():
+            raise FileNotFoundError(f"TREND_LABELS does not exist: {labels}")
+    else:
+        label_candidates = sorted(
+            ai_models.glob("**/trend_lifecycle_labels_pre2026.npz"),
+            key=lambda path: (
+                1 if "clean_ssl_pre2026_lora" in str(path).lower() else 0,
+                path.stat().st_mtime),
+            reverse=True)
+        labels = label_candidates[0] if label_candidates else None
+    return labels
+
+
+def _require_materialized_checkpoint(path):
+    """Reject a missing Git LFS download before torch reports an opaque unpickling error."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint is missing: {path}")
+    with open(path, "rb") as handle:
+        prefix = handle.read(64)
+    if prefix.startswith(b"version https://git-lfs.github.com/spec/"):
+        raise RuntimeError(
+            f"checkpoint is still a Git LFS pointer: {path}; run `git lfs pull`")
+    if path.stat().st_size < 1024 * 1024:
+        raise RuntimeError(f"checkpoint is unexpectedly small: {path}")
+
+
+def _run_canonical_from_github_if_needed():
+    """Bootstrap a blank Colab cell, then invoke this script from the GitHub checkout.
+
+    The function returns ``True`` only for the outer pasted/uploaded Colab copy.  The canonical
+    script inside ``/content/ffm`` sees a real repository root and proceeds directly to ``main``.
+    """
+    if not Path("/content").is_dir() or (ROOT / "futures_foundation").is_dir():
+        return False
+
+    from google.colab import drive
+
+    drive.mount("/content/drive", force_remount=False)
+    branch = os.environ.get("FFM_BRANCH", "main")
+    if COLAB_CHECKOUT.exists():
+        if not (COLAB_CHECKOUT / ".git").is_dir():
+            raise RuntimeError(
+                f"{COLAB_CHECKOUT} exists but is not an FFM git checkout")
+        status = subprocess.run(
+            ["git", "-C", str(COLAB_CHECKOUT), "status", "--porcelain"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        if status:
+            raise RuntimeError(
+                f"{COLAB_CHECKOUT} has local changes; refusing to overwrite them:\n{status}")
+        _stream_command(["git", "-C", str(COLAB_CHECKOUT), "fetch", "origin", branch])
+        _stream_command(["git", "-C", str(COLAB_CHECKOUT), "checkout", branch])
+        _stream_command([
+            "git", "-C", str(COLAB_CHECKOUT), "pull", "--ff-only", "origin", branch])
+    else:
+        _stream_command([
+            "git", "clone", "--branch", branch, "--single-branch",
+            GITHUB_REPOSITORY, str(COLAB_CHECKOUT)])
+    _stream_command([
+        sys.executable, "-m", "pip", "install", "-q",
+        "-e", str(COLAB_CHECKOUT), "mantis-tsfm"])
+    _stream_command([
+        sys.executable, "-c",
+        "import safetensors; from mantis.architecture import Mantis8M; "
+        "print('[colab] Mantis import OK; safetensors=' + safetensors.__version__)",
+    ])
+
+    canonical = COLAB_CHECKOUT / "scripts" / "mantis_ssl_nextleg_race.py"
+    atlas = COLAB_CHECKOUT / "scripts" / "probe_atlas.py"
+    parent = COLAB_CHECKOUT / "checkpoints" / "mantis_ssl_structural_nextleg.pt"
+    missing = [
+        path for path in (canonical, atlas, parent) if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "GitHub checkout is missing required canonical scripts/checkpoints: "
+            + ", ".join(str(path) for path in missing))
+    _require_materialized_checkpoint(parent)
+    output_dir = Path(os.environ.get(
+        "RACE_OUTPUT_DIR", "/content/drive/MyDrive/AI_Models/nextleg_race_v2"))
+    output = Path(os.environ.get(
+        "OUT_PATH", str(output_dir / "mantis_ssl_nextleg_race_v2.pt")))
+    data_dir = Path(os.environ.get(
+        "DATA_DIR", "/content/drive/MyDrive/Futures Data"))
+    labels = _discover_probe_labels("/content/drive/MyDrive/AI_Models")
+    log = Path(os.environ.get(
+        "LOG_PATH", str(output_dir / "logs" / "colab_pipeline.log")))
+    completed, failed = output_dir / ".completed", output_dir / ".failed"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    completed.unlink(missing_ok=True)
+    failed.unlink(missing_ok=True)
+    # A pasted notebook cell inherits IPython's ``-f kernel.json`` arguments. Only forward
+    # command-line arguments when this outer bootstrap was executed as an actual .py file.
+    forwarded = sys.argv[1:] if SOURCE_PATH is not None else []
+    print(f"[colab] repository Structural parent -> {parent}", flush=True)
+    print(f"[colab] Probe Atlas labels -> {labels or 'not found'}", flush=True)
+    command = [
+        sys.executable, str(canonical),
+        "--data-dir", str(data_dir),
+        "--warm-ckpt", str(parent),
+        "--out", str(output),
+        "--device", "cuda",
+        "--resume",
+    ]
+    if labels is not None:
+        command += ["--atlas-labels", str(labels)]
+    elif os.environ.get("SKIP_ATLAS") == "1":
+        command.append("--skip-atlas")
+    else:
+        raise FileNotFoundError(
+            "Probe Atlas labels were not found under MyDrive/AI_Models. "
+            "Set TREND_LABELS to the existing trend_lifecycle_labels_pre2026.npz, "
+            "or set SKIP_ATLAS=1 only for an intentional training-only run.")
+    command += forwarded
+    try:
+        _stream_command(
+            command,
+            cwd=COLAB_CHECKOUT, log_path=log)
+    except BaseException:
+        failed.touch()
+        print(f"[colab] FAILED; durable log: {log}", flush=True)
+        raise
+    completed.touch()
+    print(f"[colab] COMPLETE; durable log: {log}", flush=True)
+    return True
 
 
 def _csv(value):
@@ -64,8 +223,6 @@ def _parser():
         "WARM_CKPT", "/content/drive/MyDrive/AI_Models/clean_ssl_pre2026_lora/"
         "mantis_ssl_structural_nextleg.pt" if Path("/content").is_dir()
         else str(ROOT / "checkpoints" / "mantis_ssl_structural_nextleg.pt")))
-    parser.add_argument("--warm-trainer", default=os.environ.get("WARM_TRAINER_CKPT"),
-                        help="matched Structural NextLeg .trainer.pt; defaults beside --warm-ckpt")
     parser.add_argument("--out", default=os.environ.get(
         "OUT_PATH", "/content/drive/MyDrive/AI_Models/nextleg_race_v2/"
         "mantis_ssl_nextleg_race_v2.pt" if Path("/content").is_dir()
@@ -106,8 +263,6 @@ def _parser():
 def _resolve(args):
     data = Path(args.data_dir).expanduser().resolve()
     parent = Path(args.warm_ckpt).expanduser().resolve()
-    trainer = (Path(args.warm_trainer).expanduser().resolve() if args.warm_trainer
-               else Path(str(parent) + ".trainer.pt"))
     output = Path(args.out).expanduser().resolve()
     labels = (Path(args.atlas_labels).expanduser().resolve() if args.atlas_labels else
               parent.parent / "probe_atlas" / "trend_lifecycle_labels_pre2026.npz")
@@ -115,8 +270,6 @@ def _resolve(args):
         raise FileNotFoundError(f"data directory not found: {data}")
     if not parent.is_file():
         raise FileNotFoundError(f"Structural NextLeg parent not found: {parent}")
-    if not trainer.is_file():
-        raise FileNotFoundError(f"matched Structural NextLeg trainer sidecar not found: {trainer}")
     if output == parent:
         raise SystemExit("--out must differ from the immutable parent checkpoint")
     if output.exists() and not args.resume:
@@ -125,7 +278,7 @@ def _resolve(args):
         raise FileNotFoundError(
             f"existing Probe Atlas labels not found: {labels}; pass --atlas-labels or --skip-atlas")
     output.parent.mkdir(parents=True, exist_ok=True)
-    return data, parent, trainer, output, labels
+    return data, parent, output, labels
 
 
 def _run_atlas(*, data, checkpoint, labels, output, device, batch):
@@ -152,7 +305,7 @@ def _run_atlas(*, data, checkpoint, labels, output, device, batch):
 
 def main():
     args = _parser().parse_args()
-    data, parent, trainer, output, labels = _resolve(args)
+    data, parent, output, labels = _resolve(args)
     device = args.device or _default_device()
     batch = args.batch or {"cuda": 512, "mps": 128, "cpu": 32}[device]
     tickers, timeframes = _csv(args.tickers), _csv(args.tfs)
@@ -172,7 +325,7 @@ def main():
     run_contract = {
         **provenance, "stage": "nextleg_race", "race_schema": RACE_SCHEMA,
         "parent": {"path": str(parent), "sha256": sha256(parent)},
-        "warm_trainer": str(trainer), "holdout_start": HOLDOUT_START,
+        "holdout_start": HOLDOUT_START,
         "sampling_mode": args.sampling_mode, "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha, "race_levels": levels,
         "race_scale": "median_completed_candle_high_minus_low",
@@ -183,7 +336,7 @@ def main():
     print(f"  streams    : {len(tickers)} x {len(timeframes)} = {len(expected)}")
     print(f"  holdout    : >= {HOLDOUT_START} physically excluded")
     print(f"  parent     : {parent}")
-    print(f"  task heads : {trainer}")
+    print("  task heads : disposable; not inherited or exported")
     print(f"  target     : reach/adverse/time @ {levels} median candle-range units")
     print("  ATR/R      : none (raw completed candle high-low scale)")
     print(f"  tuning     : LoRA r={args.lora_r} alpha={args.lora_alpha:g} "
@@ -200,7 +353,7 @@ def main():
     verdict = ssl.loop_ssl(
         data_dir=str(data), tickers=tickers, tfs=timeframes, out_path=str(output),
         holdout_start=HOLDOUT_START, val_frac=.1, pretext="nextleg_race",
-        backbone_ckpt=str(parent), warm_trainer_ckpt=str(trainer),
+        backbone_ckpt=str(parent),
         sampling_mode=args.sampling_mode, controls=controls,
         control_epochs=args.control_epochs, probe=True,
         horizons=(5, 10, 20, 25), context_lengths=(64, 100, 150, 200),
@@ -216,19 +369,16 @@ def main():
     if not verdict.get("all_pass"):
         raise RuntimeError(f"NextLeg race v2 failed SSL/control gates: {verdict}")
 
-    from futures_foundation.finetune.pretext._torch.race_inference import export_race_readout
-    readout = export_race_readout(
-        str(output) + ".readout.pt", trainer_ckpt=str(output) + ".trainer.pt",
-        encoder_ckpt=output, horizons=(5, 10, 20, 25), race_levels=levels)
     atlas = None if args.skip_atlas else _run_atlas(
         data=data, checkpoint=output, labels=labels, output=output,
         device=device, batch=batch)
     print("\nNEXTLEG RACE V2 COMPLETE")
     print(f"  encoder : {output}")
-    print(f"  readout : {readout}")
+    print("  heads   : discarded; foundation contract is encoder-only")
     print(f"  report  : {output}.report.json")
     print(f"  atlas   : {atlas or 'skipped'}")
 
 
 if __name__ == "__main__":
-    main()
+    if not _run_canonical_from_github_if_needed():
+        main()

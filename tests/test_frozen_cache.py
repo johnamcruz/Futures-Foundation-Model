@@ -152,21 +152,6 @@ def test_bar_cache_market_data_revision_is_part_of_identity(tmp_path):
     assert 'data-corrected-hash' in corrected.name
 
 
-def test_structural_forecaster_sidecar_is_part_of_cache_identity(tmp_path):
-    """Task readouts may change while the merged encoder stays fixed; caches must not collide."""
-    args = (tmp_path, None, 'NQ', '3min', 500, 128)
-    encoder_only = bar_embedding_cache_path(*args, device='mps')
-    first = bar_embedding_cache_path(
-        *args, device='mps', feature_extractor='structural_nextleg',
-        extractor_fingerprint='trainer-a')
-    second = bar_embedding_cache_path(
-        *args, device='mps', feature_extractor='structural_nextleg',
-        extractor_fingerprint='trainer-b')
-    assert len({encoder_only, first, second}) == 3
-    assert '_extractor-' not in encoder_only.name  # incumbent cache names remain reusable
-    assert '_extractor-' in first.name
-
-
 def test_cache_off(tmp_path, monkeypatch):
     monkeypatch.setenv('EMBED_CACHE', '0')
     clf = MantisFrozenClassifier(backbone_ckpt=None, with_features=False)

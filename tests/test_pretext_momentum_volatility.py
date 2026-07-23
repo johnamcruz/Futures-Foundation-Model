@@ -6,13 +6,14 @@ import pytest
 
 from futures_foundation.finetune.pretext import PRETEXTS, get_pretext
 from futures_foundation.finetune.pretext.momentum_volatility import (
-    COUPLING_CHOP,
-    COUPLING_CONTINUATION,
-    COUPLING_LAUNCH,
-    COUPLING_REVERSAL,
+    MV_COMPRESSION,
+    MV_NOISY_EXPANSION,
+    MV_TREND_EXPANSION,
+    MV_TREND_WEAKENING,
     MOMENTUM_VOLATILITY_SCHEMA,
     MomentumVolatilityTask,
     momentum_volatility_targets,
+    transition_class,
 )
 
 
@@ -84,25 +85,37 @@ def test_future_after_largest_horizon_cannot_change_any_target():
 
 
 @pytest.mark.parametrize(
-    "past,future,volatility,expected",
+    "momentum_strength,volatility_ratio,expected",
     [
-        (1.0, 1.0, 1.5, COUPLING_CONTINUATION),
-        (1.0, -1.0, 1.5, COUPLING_REVERSAL),
-        (0.1, 1.0, 1.5, COUPLING_LAUNCH),
-        (1.0, 1.0, .8, COUPLING_CHOP),
-        (1.0, .1, 1.5, COUPLING_CHOP),
+        (0.8, 1.5, MV_TREND_EXPANSION),
+        (0.8, .8, MV_TREND_WEAKENING),
+        (0.1, 1.5, MV_NOISY_EXPANSION),
+        (0.1, .8, MV_COMPRESSION),
     ],
 )
-def test_coupling_class_is_explicit_and_auditable(
-    past, future, volatility, expected,
+def test_transition_class_preserves_all_four_economic_states(
+    momentum_strength, volatility_ratio, expected,
 ):
-    from futures_foundation.finetune.pretext.momentum_volatility import coupling_class
-
-    assert coupling_class(
-        past, future, volatility,
+    assert transition_class(
+        momentum_strength, volatility_ratio,
         momentum_threshold=.5,
         expansion_threshold=1.1,
     ) == expected
+
+
+def test_path_efficiency_distinguishes_persistent_move_from_round_trip():
+    high, low, close = _bars()
+    persistent = momentum_volatility_targets(
+        high, low, close, 4, horizons=(2,),
+        scale_lookback=4, momentum_lookback=3)
+
+    round_trip_close = close.copy()
+    round_trip_close[5:7] = [103.0, 101.0]
+    round_trip = momentum_volatility_targets(
+        high, low, round_trip_close, 4, horizons=(2,),
+        scale_lookback=4, momentum_lookback=3)
+
+    assert abs(persistent.momentum[0]) > abs(round_trip.momentum[0])
 
 
 def test_insufficient_history_or_future_fails_closed():
@@ -125,8 +138,8 @@ def test_task_is_registered_with_own_control_contract_and_split_reserve():
     assert "momentum_volatility" in PRETEXTS
     task = get_pretext("momentum_volatility")
     assert isinstance(task, MomentumVolatilityTask)
-    assert task.control_contract == "momentum_volatility_coupling_v1"
-    assert MOMENTUM_VOLATILITY_SCHEMA == "causal_momentum_volatility_v1"
+    assert task.control_contract == "momentum_volatility_transition_v2"
+    assert MOMENTUM_VOLATILITY_SCHEMA == "causal_momentum_volatility_v2"
     cfg = {
         "context_lengths": (64, 100, 150, 200),
         "horizons": (5, 10, 20, 25),
@@ -134,32 +147,50 @@ def test_task_is_registered_with_own_control_contract_and_split_reserve():
     assert task.reserve(cfg) == 225
 
 
+def test_shared_ssl_config_preserves_mv_v2_encoder_objective_knobs():
+    from futures_foundation.finetune.ssl import _base_cfg
+
+    cfg = _base_cfg(
+        transition_contrastive_weight=2.0,
+        contrastive_temperature=.2,
+        scale_lookback=48,
+        probe_baseline_ckpt="parent.pt",
+    )
+    assert cfg["transition_contrastive_weight"] == 2.0
+    assert cfg["contrastive_temperature"] == .2
+    assert cfg["scale_lookback"] == 48
+    assert cfg["probe_baseline_ckpt"] == "parent.pt"
+
+
 def test_control_gate_requires_real_momentum_volatility_and_coupling_edge():
     task = MomentumVolatilityTask()
     real = {
         "mv_momentum_corr": .2,
         "mv_volatility_corr": .3,
-        "mv_coupling_auc": .65,
+        "mv_transition_auc": .65,
+        "mv_transition_worst_auc": .58,
     }
     controls = {
         "shuffle": {
             "mv_momentum_corr": .01,
             "mv_volatility_corr": .02,
-            "mv_coupling_auc": .51,
+            "mv_transition_auc": .51,
+            "mv_transition_worst_auc": .50,
         },
         "random": {
             "mv_momentum_corr": -.01,
             "mv_volatility_corr": .0,
-            "mv_coupling_auc": .49,
+            "mv_transition_auc": .49,
+            "mv_transition_worst_auc": .48,
         },
     }
     passed, margins, temporal = task.compare_control_evidence(real, controls)
     assert passed
-    assert margins["shuffle"]["mv_coupling_auc"] == pytest.approx(.14)
+    assert margins["shuffle"]["mv_transition_auc"] == pytest.approx(.14)
     assert temporal == pytest.approx(.14)
 
     failed, _, _ = task.compare_control_evidence(
-        {**real, "mv_coupling_auc": .49}, controls)
+        {**real, "mv_transition_auc": .49}, controls)
     assert not failed
 
     assert task.control_evidence(real, None) == real
