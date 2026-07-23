@@ -356,7 +356,8 @@ def _base_cfg(**kw):
              momentum_threshold=0.5, expansion_threshold=1.1,
              candle_weight=0.25, momentum_weight=1.0,
              volatility_weight=0.5, coupling_weight=0.5,
-             transition_contrastive_weight=1.0,
+             transition_contrastive_weight=0.1,
+             parent_retention_weight=0.5,
              contrastive_temperature=0.1,
              # std_guard: IN-LOOP drift halt — training stops (without saving that epoch)
              # the moment emb_std exceeds it; 0 = off. Guards the anchored-discrimination

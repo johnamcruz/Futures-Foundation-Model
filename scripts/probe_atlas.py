@@ -55,6 +55,10 @@ WINDOW = 128
 FORWARD = 20
 VOL_FORWARD = 50
 ATR_PERIOD = 20
+MV_HORIZON = 20
+MV_SCALE_LOOKBACK = 64
+MV_MOMENTUM_THRESHOLD = 0.5
+MV_EXPANSION_THRESHOLD = 1.1
 
 
 def _even_sample(rows: np.ndarray, limit: int) -> np.ndarray:
@@ -70,6 +74,53 @@ def _rolling_percentile(values: np.ndarray, width: int) -> np.ndarray:
     return series.rolling(width, min_periods=width // 4).apply(
         lambda window: ((window[:-1] < window[-1]).mean()
                         if len(window) > 1 else np.nan), raw=True).to_numpy()
+
+
+def _future_rolling(values: np.ndarray, width: int, reducer: str) -> np.ndarray:
+    """Aggregate exactly ``values[i + 1:i + width + 1]`` at decision row ``i``."""
+    shifted = pd.Series(np.asarray(values, float)).shift(-1)
+    rolling = shifted.rolling(width, min_periods=width)
+    aggregated = getattr(rolling, reducer)()
+    return aggregated.shift(-(width - 1)).to_numpy()
+
+
+def _momentum_volatility_fields(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exact headless MV-v3 targets for frozen-encoder transfer probes.
+
+    The current and prior 63 completed candle ranges define the causal scale.
+    Targets use only the next 20 completed bars and therefore remain disjoint
+    from every input window ending at the decision row.
+    """
+    candle_range = np.asarray(high, float) - np.asarray(low, float)
+    causal_scale = (
+        pd.Series(candle_range)
+        .rolling(MV_SCALE_LOOKBACK, min_periods=MV_SCALE_LOOKBACK)
+        .median()
+        .to_numpy()
+    )
+    future_range = _future_rolling(candle_range, MV_HORIZON, "median")
+    close = np.asarray(close, float)
+    step = np.r_[np.nan, np.abs(np.diff(close))]
+    path_length = _future_rolling(step, MV_HORIZON, "sum")
+    displacement = np.full(len(close), np.nan)
+    displacement[:-MV_HORIZON] = np.abs(
+        close[MV_HORIZON:] - close[:-MV_HORIZON])
+    strength = displacement / np.where(path_length > 0, path_length, np.nan)
+    expansion = future_range / np.where(causal_scale > 0, causal_scale, np.nan)
+
+    state = np.full(len(close), -1, np.int8)
+    valid = np.isfinite(strength) & np.isfinite(expansion) & (expansion > 0)
+    directional = strength >= MV_MOMENTUM_THRESHOLD
+    expanding = expansion >= MV_EXPANSION_THRESHOLD
+    state[valid & directional & expanding] = 0
+    state[valid & directional & ~expanding] = 1
+    state[valid & ~directional & expanding] = 2
+    state[valid & ~directional & ~expanding] = 3
+    return strength, expansion, state
 
 
 def _load_bars(ticker: str, timeframe: str) -> dict:
@@ -105,6 +156,8 @@ def _stream_fields(bars: dict) -> dict[str, np.ndarray]:
     atr_forward = np.full(len(close), np.nan)
     atr_forward[:-VOL_FORWARD] = (
         atr[VOL_FORWARD:] / np.where(atr[:-VOL_FORWARD] > 0, atr[:-VOL_FORWARD], np.nan))
+    mv_strength, mv_expansion, mv_state = _momentum_volatility_fields(
+        high, low, close)
     return {
         "atr_pct": _rolling_percentile(atr, 2000),
         "squeeze": atr / np.where(atr100 > 0, atr100, np.nan),
@@ -115,6 +168,9 @@ def _stream_fields(bars: dict) -> dict[str, np.ndarray]:
         "hour": bars["ts"].hour.to_numpy().astype(float),
         "forward_return": forward_return,
         "atr_forward": atr_forward,
+        "mv_strength": mv_strength,
+        "mv_expansion": mv_expansion,
+        "mv_state": mv_state,
     }
 
 
@@ -132,7 +188,8 @@ def _load_pool() -> tuple[dict[tuple[str, str], dict], list[tuple], dict[str, np
     rows_by_field: dict[str, list] = {
         "timestamp": [], "trend_dir": [], "is_start": [], "ended": [],
         "atr_pct": [], "squeeze": [], "vol_z": [], "day_pos": [], "hour": [],
-        "forward_return": [], "atr_forward": [], "stream": [],
+        "forward_return": [], "atr_forward": [], "mv_strength": [],
+        "mv_expansion": [], "mv_state": [], "stream": [],
     }
     bars_by_stream = {}
     corpus_ticker = corpus["ticker"].astype(str)
@@ -174,7 +231,8 @@ def _load_pool() -> tuple[dict[tuple[str, str], dict], list[tuple], dict[str, np
                 rows_by_field["ended"].append(bool(corpus["ended"][corpus_row]))
                 rows_by_field["stream"].append(stream_id)
                 for name in ("atr_pct", "squeeze", "vol_z", "day_pos", "hour",
-                             "forward_return", "atr_forward"):
+                             "forward_return", "atr_forward", "mv_strength",
+                             "mv_expansion", "mv_state"):
                     rows_by_field[name].append(fields[name][confirm])
             print(f"[pool] {stream_id}: fit={len(train_rows):,} eval={len(eval_rows):,}",
                   flush=True)
@@ -291,6 +349,7 @@ def main() -> dict:
     train = np.asarray(timestamps < FIT_END)
     evaluate = np.asarray((timestamps >= EVAL_START) & (timestamps < EVAL_END))
     common = np.isfinite(fields["atr_pct"])
+    mv_valid = common & (fields["mv_state"] >= 0)
     magnitude_cut = np.nanmedian(np.abs(fields["forward_return"][train & common]))
     probes = {
         "ret_vol_regime": ("retention", fields["atr_pct"]
@@ -312,6 +371,14 @@ def main() -> dict:
                             common & np.isfinite(fields["atr_forward"])),
         "pred_persistent_trend_start": (
             "prediction", fields["is_start"] & ~fields["ended"], common & fields["is_start"]),
+        "pred_mv_trend_expansion": (
+            "prediction", fields["mv_state"] == 0, mv_valid),
+        "pred_mv_trend_weakening": (
+            "prediction", fields["mv_state"] == 1, mv_valid),
+        "pred_mv_noisy_expansion": (
+            "prediction", fields["mv_state"] == 2, mv_valid),
+        "pred_mv_compression": (
+            "prediction", fields["mv_state"] == 3, mv_valid),
     }
     results = {}
     for name, (family, labels, valid) in probes.items():

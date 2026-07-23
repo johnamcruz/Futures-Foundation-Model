@@ -1,6 +1,6 @@
 """Causal, strategy-agnostic momentum-volatility transition objective.
 
-Inputs end on the decision bar and contain raw OHLCV only.  Targets describe signed future
+Inputs end on the decision bar and contain raw OHLCV only. Targets describe directionless future
 path efficiency, future completed-candle range expansion, and the full 2x2 momentum/volatility
 transition matrix. The objective never consumes ATR, entries, stops, costs, R multiples, or
 strategy labels.
@@ -14,7 +14,8 @@ import numpy as np
 from .forecast import ForecastTask
 
 
-MOMENTUM_VOLATILITY_SCHEMA = "causal_momentum_volatility_v2"
+MOMENTUM_VOLATILITY_SCHEMA = "causal_momentum_volatility_v3"
+PARENT_RETENTION_TOLERANCE = 0.005
 MV_TREND_EXPANSION = 0
 MV_TREND_WEAKENING = 1
 MV_NOISY_EXPANSION = 2
@@ -31,7 +32,7 @@ COUPLING_CLASSES = (
 class MomentumVolatilityTargets:
     """One decision bar's multi-horizon, scale-normalized SSL targets."""
 
-    momentum: np.ndarray
+    momentum_strength: np.ndarray
     volatility: np.ndarray
     coupling: np.ndarray
     valid: np.ndarray
@@ -77,10 +78,11 @@ def momentum_volatility_targets(
 ) -> MomentumVolatilityTargets:
     """Build future-only targets normalized by completed bars available at ``decision``.
 
-    Momentum is signed path efficiency: net future displacement divided by total absolute
-    close-to-close travel. Unlike endpoint return, it distinguishes a persistent move from a
-    round trip. Volatility is the log ratio between the median future candle range and the causal
-    completed-candle range. Rows without complete finite history/future fail closed.
+    Momentum strength is absolute path efficiency: absolute future displacement divided by total
+    close-to-close travel. It is direction-agnostic by design because every MV state depends on
+    strong versus weak persistence, not on guessing long versus short. Volatility is the log
+    ratio between the median future candle range and the causal completed-candle range. Rows
+    without complete finite history/future fail closed.
     """
     high = np.asarray(high, np.float64)
     low = np.asarray(low, np.float64)
@@ -97,7 +99,7 @@ def momentum_volatility_targets(
         raise ValueError("scale_lookback >= 2 and momentum_lookback >= 1 are required")
 
     count = len(horizons)
-    momentum = np.full(count, np.nan, np.float32)
+    momentum_strength = np.full(count, np.nan, np.float32)
     volatility = np.full(count, np.nan, np.float32)
     coupling = np.full(count, -1, np.int8)
     valid = np.zeros(count, bool)
@@ -106,14 +108,14 @@ def momentum_volatility_targets(
     if (history_start < 0 or momentum_start < 0 or decision >= len(close)
             or decision < 0):
         return MomentumVolatilityTargets(
-            momentum, volatility, coupling, valid, float("nan"), float("nan"))
+            momentum_strength, volatility, coupling, valid, float("nan"), float("nan"))
     past_ranges = high[history_start:decision + 1] - low[history_start:decision + 1]
     causal_scale = float(np.median(past_ranges))
     if (not np.isfinite(past_ranges).all() or not np.isfinite(causal_scale)
             or causal_scale <= np.finfo(np.float32).eps
             or not np.isfinite(close[[momentum_start, decision]]).all()):
         return MomentumVolatilityTargets(
-            momentum, volatility, coupling, valid, float("nan"), float("nan"))
+            momentum_strength, volatility, coupling, valid, float("nan"), float("nan"))
     past_momentum = float(
         (close[decision] - close[momentum_start]) / causal_scale)
 
@@ -129,22 +131,23 @@ def momentum_volatility_targets(
         path = np.concatenate(([close[decision]], close[decision + 1:end + 1]))
         steps = np.diff(path)
         path_length = float(np.abs(steps).sum())
-        future_momentum = float(
-            (close[end] - close[decision]) / max(path_length, np.finfo(np.float32).eps))
+        future_strength = float(
+            abs(close[end] - close[decision])
+            / max(path_length, np.finfo(np.float32).eps))
         range_ratio = float(np.median(future_ranges) / causal_scale)
         if not np.isfinite(range_ratio) or range_ratio <= 0:
             continue
-        momentum[index] = future_momentum
+        momentum_strength[index] = future_strength
         volatility[index] = float(np.log(range_ratio))
         coupling[index] = transition_class(
-            abs(future_momentum),
+            future_strength,
             range_ratio,
             momentum_threshold=momentum_threshold,
             expansion_threshold=expansion_threshold,
         )
         valid[index] = coupling[index] >= 0
     return MomentumVolatilityTargets(
-        momentum, volatility, coupling, valid, causal_scale, past_momentum)
+        momentum_strength, volatility, coupling, valid, causal_scale, past_momentum)
 
 
 class MomentumVolatilityTask(ForecastTask):
@@ -157,13 +160,13 @@ class MomentumVolatilityTask(ForecastTask):
 
     @property
     def control_contract(self):
-        return "momentum_volatility_transition_v2"
+        return "momentum_volatility_transition_v3"
 
     def control_evidence(self, history_row, probe_res):
         return {
             metric: self._history_metric(history_row, metric)
             for metric in (
-                "mv_momentum_corr",
+                "mv_momentum_strength_corr",
                 "mv_volatility_corr",
                 "mv_transition_auc",
                 "mv_transition_worst_auc",
@@ -172,7 +175,7 @@ class MomentumVolatilityTask(ForecastTask):
 
     def compare_control_evidence(self, real, controls):
         metrics = (
-            "mv_momentum_corr",
+            "mv_momentum_strength_corr",
             "mv_volatility_corr",
             "mv_transition_auc",
             "mv_transition_worst_auc",
@@ -189,8 +192,8 @@ class MomentumVolatilityTask(ForecastTask):
             for name, row in controls.items()
         }
         positive = (
-            real.get("mv_momentum_corr") is not None
-            and float(real["mv_momentum_corr"]) > 0
+            real.get("mv_momentum_strength_corr") is not None
+            and float(real["mv_momentum_strength_corr"]) > 0
             and real.get("mv_volatility_corr") is not None
             and float(real["mv_volatility_corr"]) > 0
             and real.get("mv_transition_auc") is not None
@@ -209,11 +212,41 @@ class MomentumVolatilityTask(ForecastTask):
         )
         return passed, margins, (margins.get("shuffle") or {}).get("mv_transition_auc")
 
+    def gate(self, probe_res, std, margin, dir_margin, forecast_skill=None):
+        """Keep Race-v2 capabilities here; require MV lift in the dedicated Probe Atlas gate.
+
+        The shared generic core average mixes descriptive and forward targets that are not all
+        specific to momentum/volatility transitions. Incremental MV refinement therefore permits
+        only a small parent-relative regression here. The canonical entrypoint subsequently
+        requires positive headless transfer on MV-relevant Probe Atlas targets, including NQ 3m.
+        """
+        _, detail = super().gate(
+            probe_res, std, margin, dir_margin, forecast_skill)
+        tolerance = PARENT_RETENTION_TOLERANCE
+        if probe_res is None:
+            detail["mv_parent_retention_ok"] = False
+            return False, detail
+        skill_ok = bool(forecast_skill is not None and float(forecast_skill) > 0.0)
+        retained = all(float(probe_res.get(name, 0.0)) >= -tolerance for name in (
+            "mean_core_delta",
+            "descriptive_delta",
+            "fwd_absmove_delta",
+            "fwd_dir_delta",
+        ))
+        detail.update({
+            "forecast_skill": None if forecast_skill is None else float(forecast_skill),
+            "forecast_skill_ok": skill_ok,
+            "core_context_ok": retained,
+            "mv_parent_retention_ok": retained,
+            "mv_parent_retention_tolerance": tolerance,
+        })
+        return bool(detail["no_collapse"] and skill_ok and retained), detail
+
     def finalize_verdict(self, verdict, fc_skill, probe_res):
         verdict = super().finalize_verdict(verdict, fc_skill, probe_res)
         verdict["momentum_volatility_schema"] = MOMENTUM_VOLATILITY_SCHEMA
         verdict["pretext_note"] = (
-            "Raw-OHLCV causal momentum/volatility transition encoding; the exported encoder must "
+            "Raw-OHLCV causal momentum-strength/volatility transition encoding; the exported encoder must "
             "beat its immediate parent after every disposable task head is removed, while "
             "retaining parent capabilities and passing downstream temporal validation."
         )
@@ -227,6 +260,7 @@ __all__ = [
     "MV_TREND_EXPANSION",
     "MV_TREND_WEAKENING",
     "MOMENTUM_VOLATILITY_SCHEMA",
+    "PARENT_RETENTION_TOLERANCE",
     "MomentumVolatilityTargets",
     "MomentumVolatilityTask",
     "momentum_volatility_targets",

@@ -43,6 +43,28 @@ def test_atlas_sampling_is_deterministic_and_preserves_time_coverage():
     assert selected[0] == 0 and selected[-1] == 99
 
 
+def test_atlas_mv_targets_use_the_exact_future_window_and_causal_scale():
+    atlas = _load("public_probe_atlas_mv", ROOT / "scripts" / "probe_atlas.py")
+    rows = 100
+    close = np.arange(rows, dtype=float)
+    width = np.full(rows, 2.0)
+    high, low = close + width / 2, close - width / 2
+
+    strength, expansion, state = atlas._momentum_volatility_fields(
+        high, low, close)
+    assert strength[63] == 1.0
+    assert expansion[63] == 1.0
+    assert state[63] == 1
+
+    changed_high, changed_low = high.copy(), low.copy()
+    changed_high[84:] += 1000
+    changed_low[84:] -= 1000
+    changed = atlas._momentum_volatility_fields(
+        changed_high, changed_low, close)
+    assert changed[1][63] == expansion[63]
+    assert changed[2][63] == state[63]
+
+
 def test_public_lifecycle_marks_breaks_without_strategy_imports():
     lifecycle = _load("public_trend_lifecycle", ROOT / "scripts" / "trend_lifecycle.py")
     high = np.array([10.0, 0.0, 12.0, 0.0, 11.0])
