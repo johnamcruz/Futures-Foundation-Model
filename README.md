@@ -232,6 +232,7 @@ The production lineage writes four independent encoder artifacts:
 | Seq2seq | `mantis_ssl_ctr_seq2seq.pt` |
 | NextLeg | `mantis_ssl_nextleg.pt` |
 | Structural NextLeg (experimental) | `mantis_ssl_structural_nextleg.pt` |
+| Momentum-Volatility (promoted base) | `mantis_ssl_mv.pt` |
 
 Each production-lineage `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Opt-in related-series experiments use the explicitly versioned composite format described above. Each checkpoint is accompanied by:
 
@@ -252,7 +253,7 @@ from futures_foundation.finetune.classifier import get_classifier
 
 clf = get_classifier(
     "mantis",
-    backbone_ckpt="checkpoints/mantis_ssl_nextleg.pt",
+    backbone_ckpt="checkpoints/mantis_ssl_mv.pt",
     ft_mode="partial",
 )
 ```
@@ -320,14 +321,14 @@ verdict = wf.loop_streamed(
     make_task,
     streams,
     classifier="mantis_frozen",
-    clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_nextleg.pt"},
+    clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_mv.pt"},
 )
 if verdict['generalizes']:
     produce.train_final_streamed(
         make_task,
         streams,
         classifier="mantis_frozen",
-        clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_nextleg.pt"},
+        clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_mv.pt"},
         export_onnx=True,
     )
 ```
