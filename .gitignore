@@ -217,7 +217,7 @@ checkpoints/*.pt
 !checkpoints/mantis_ssl_regime.pt
 !checkpoints/mantis_ssl_ctr_seq2seq.pt
 !checkpoints/mantis_ssl_nextleg_race_v2.pt
-!checkpoints/mantis_ssl_mv.pt
+!checkpoints/mantis_ssl_mv_v3.pt
 *.joblib
 
 # Claude Code memory
