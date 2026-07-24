@@ -243,6 +243,60 @@ Do not overwrite a parent checkpoint with its child. Promote validated artifacts
 
 ---
 
+## Standard Market-Context Decoder
+
+`mantis_ssl_mv_v3.pt` remains an encoder-only checkpoint. FFM separately
+provides a small, versioned decoder that turns its frozen 1,280-dimensional
+embedding into the exact four momentum/volatility states MV-v3 was trained to
+represent:
+
+- `p_trend_expansion`
+- `p_trend_weakening`
+- `p_noisy_expansion`
+- `p_compression`
+
+The probabilities share one multinomial-softmax contract and sum to one. The
+decoder is strategy-agnostic: it uses no entries, stops, R targets, position
+rules, or private strategy labels. Its artifact records the target horizon,
+training/calibration/evaluation boundaries, field order, and exact encoder
+SHA-256. Loading it against another checkpoint fails closed.
+
+Fit and validate the decoder on the same balanced 9-ticker × 4-timeframe
+corpus used by Probe Atlas:
+
+```bash
+./.venv/bin/python scripts/fit_market_context.py \
+  --checkpoint checkpoints/mantis_ssl_mv_v3.pt \
+  --device cuda \
+  --output checkpoints/mantis_ssl_mv_v3_context.npz
+```
+
+The fitting contract is chronological: `<2023` fits the shared decoder, 2023
+fits one common temperature, and 2025 remains evaluation-only. Promotion
+requires every state to exceed its AUC gate and its matched shuffled-embedding
+control. Training is uniform-stream weighted so a large 1-minute stream cannot
+dominate the common readout.
+
+Downstream code that already has frozen embeddings stays torch-free:
+
+```python
+from futures_foundation import load_market_context_decoder
+
+decoder = load_market_context_decoder(
+    "checkpoints/mantis_ssl_mv_v3_context.npz",
+    encoder_checkpoint="checkpoints/mantis_ssl_mv_v3.pt",
+)
+context = decoder.transform(embeddings)
+columns = context.as_dict()
+```
+
+For a dedicated encoder worker, `extract_market_context(...)` accepts raw
+causal OHLCV windows shaped `[N, 5, sequence]`, runs the bound encoder, and
+returns the same named fields. Input windows end on the decision candle;
+future bars are used only to train and evaluate the decoder.
+
+---
+
 ## Classifier Seam
 
 `futures_foundation.finetune.classifier` is the swap point: a `Classifier` ABC + a `get_classifier(name, **cfg)` registry. Downstream code references a classifier **by name**, so the backbone can change without changing the walk-forward harness.
