@@ -43,6 +43,13 @@ from .labels import (
 )
 from . import primitives
 from .prepare import prepare_data
+from .market_context import (
+    MARKET_CONTEXT_FIELDS,
+    MarketContextBatch,
+    MarketContextDecoder,
+    extract_market_context,
+    load_market_context_decoder,
+)
 
 # finetune is torch-free (labeling / reporting / realized-R economics) —
 # imported eagerly.
@@ -63,6 +70,9 @@ __all__ = [
     "generate_structure_labels", "generate_range_labels", "print_label_distribution",
     "REGIME_LABELS", "VOLATILITY_LABELS", "STRUCTURE_LABELS", "RANGE_LABELS",
     "LABEL_CONFIDENCE_SENTINEL", "primitives", "prepare_data",
+    # standardized Mantis MV3 context decoder (torch-free until raw extraction)
+    "MARKET_CONTEXT_FIELDS", "MarketContextBatch", "MarketContextDecoder",
+    "extract_market_context", "load_market_context_decoder",
     # finetune (labeling / reporting / economics — torch-free)
     "StrategyLabeler", "TrainingConfig", "FoldHealthMonitor",
     "run_labeling", "print_eval_summary", "print_fold_progression",
