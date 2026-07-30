@@ -9,12 +9,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'scripts' / 'mantis_ssl_clean_pipeline.py'
+SCRIPT = ROOT / 'scripts' / 'mantis' / 'mantis_ssl_clean_pipeline.py'
 SPEC = importlib.util.spec_from_file_location('mantis_ssl_clean_pipeline', SCRIPT)
 pipeline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pipeline
 SPEC.loader.exec_module(pipeline)
-PRETRAIN_SCRIPT = ROOT / 'scripts' / 'mantis_ssl_pretrain.py'
+PRETRAIN_SCRIPT = ROOT / 'scripts' / 'mantis' / 'mantis_ssl_pretrain.py'
 PRETRAIN_SPEC = importlib.util.spec_from_file_location('mantis_ssl_pretrain', PRETRAIN_SCRIPT)
 pretrain = importlib.util.module_from_spec(PRETRAIN_SPEC)
 sys.modules[PRETRAIN_SPEC.name] = pretrain

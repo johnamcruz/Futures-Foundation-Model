@@ -27,7 +27,7 @@ Mask → Temporal Contrastive → Multi-horizon Seq2seq → NextLeg
 Before a long run, validate the complete 9×4 data contract and immutable holdout:
 
 ```bash
-./.venv/bin/python scripts/mantis_ssl_clean_pipeline.py --preflight-only --device mps
+./.venv/bin/python scripts/mantis/mantis_ssl_clean_pipeline.py --preflight-only --device mps
 ```
 
 The core API can also run any registered objective independently:
@@ -92,7 +92,7 @@ continuous-contract OHLCV (9 tickers × 4 timeframes)
 
 ## Self-Supervised Pretraining
 
-`futures_foundation/finetune/ssl.py` provides the task-independent SSL loop. Registered objectives live under `futures_foundation/finetune/pretext/`; each task owns its window reserve, trainer, diagnostics, and verdict additions. `scripts/mantis_ssl_clean_pipeline.py` composes the production lineage while keeping every checkpoint distinct.
+`futures_foundation/finetune/ssl.py` provides the task-independent SSL loop. Registered objectives live under `futures_foundation/finetune/pretext/`; each task owns its window reserve, trainer, diagnostics, and verdict additions. `scripts/mantis/mantis_ssl_clean_pipeline.py` composes the production lineage while keeping every checkpoint distinct.
 
 The clean runner also executes the public, strategy-agnostic
 `scripts/probe_atlas.py` after each stage. Its balanced 9-ticker × 4-timeframe
@@ -151,7 +151,7 @@ against a drift ceiling of 1.6. Its task diagnostics were:
 The report returned `all_pass=true`, `representation_pass=true`, and `beats_controls=true`.
 
 ```bash
-./.venv/bin/python scripts/mantis_ssl_structural_nextleg.py \
+./.venv/bin/python scripts/mantis/mantis_ssl_structural_nextleg.py \
   --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
   --out temp/structural_nextleg/mantis_ssl_structural_nextleg.pt \
   --epochs 60 --controls shuffle,random --device mps
@@ -175,7 +175,7 @@ zero—before training, its output is byte-for-byte the primary-only embedding.
 Run it separately from the production lineage and warm-start it from a validated NextLeg encoder:
 
 ```bash
-./.venv/bin/python scripts/mantis_ssl_related_nextleg.py \
+./.venv/bin/python scripts/mantis/mantis_ssl_related_nextleg.py \
   --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
   --tickers NQ,ES \
   --tfs 1min,3min,5min,15min \
@@ -208,7 +208,7 @@ To test equal training exposure across the 9x4 corpus without changing the
 chronological validation distribution, use a separate output directory:
 
 ```bash
-./.venv/bin/python scripts/mantis_ssl_clean_pipeline.py \
+./.venv/bin/python scripts/mantis/mantis_ssl_clean_pipeline.py \
   --sampling-mode uniform_stream \
   --out-dir temp/clean_ssl_pre2026_lora_uniform
 ```

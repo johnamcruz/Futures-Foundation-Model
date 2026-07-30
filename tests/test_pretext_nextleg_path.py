@@ -209,7 +209,7 @@ def test_default_config_keeps_all_antiforgetting_guards_on():
     sig = inspect.signature(train_ssl_nextleg_path).parameters
     assert 'backbone_ckpt' in sig                          # warm-start surface exists
     assert sig['mse_weight'].default == 1.0                # candle ANCHOR on by default
-    src = open('scripts/mantis_ssl_nextleg_path.py').read()
+    src = open('scripts/mantis/mantis_ssl_nextleg_path.py').read()
     assert "FREEZE_ENCODER_LAYERS', '2'" in src            # freeze ON by default in the launcher
     assert 'mantis_ssl_nextleg.pt' in src and 'mantis_ssl_nextleg_path.pt' in src
     assert 'ssl/stage-2.7-adverse-path' in src             # runs from the MERGED branch

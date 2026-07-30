@@ -6,7 +6,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "mantis_ssl_nextleg_race.py"
+SCRIPT = ROOT / "scripts" / "mantis" / "mantis_ssl_nextleg_race.py"
 SPEC = importlib.util.spec_from_file_location("mantis_ssl_nextleg_race", SCRIPT)
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)

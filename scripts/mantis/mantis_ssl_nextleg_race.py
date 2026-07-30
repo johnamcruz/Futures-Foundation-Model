@@ -24,7 +24,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SOURCE_PATH = (Path(__file__).resolve() if "__file__" in globals() else None)
-ROOT = SOURCE_PATH.parents[1] if SOURCE_PATH is not None else Path.cwd()
+ROOT = SOURCE_PATH.parents[2] if SOURCE_PATH is not None else Path.cwd()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

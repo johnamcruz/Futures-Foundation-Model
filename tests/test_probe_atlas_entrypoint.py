@@ -29,7 +29,7 @@ def test_probe_atlas_is_a_standalone_public_implementation():
 
 
 def test_clean_pipeline_has_no_colabs_runtime_dependency():
-    source = (ROOT / "scripts" / "mantis_ssl_clean_pipeline.py").read_text()
+    source = (ROOT / "scripts" / "mantis" / "mantis_ssl_clean_pipeline.py").read_text()
     assert 'ROOT / "colabs"' not in source
     assert 'ROOT / "scripts" / "generate_trend_labels.py"' in source
 

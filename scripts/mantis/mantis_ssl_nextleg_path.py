@@ -136,7 +136,7 @@ for _protected in ('/content/drive/MyDrive/AI_Models/mantis_ssl_nextleg.pt',
                    '/content/drive/MyDrive/AI_Models/mantis_ssl_ctr_seq2seq.pt'):
     assert os.path.abspath(OUT_PATH) != os.path.abspath(_protected), \
         f'OUT_PATH must never overwrite a promoted checkpoint: {_protected}'
-assert RETRACE_W > 0, 'RETRACE_W=0 is stage 2.6 — run scripts/mantis_ssl_nextleg.py instead'
+assert RETRACE_W > 0, 'RETRACE_W=0 is stage 2.6 — run scripts/mantis/mantis_ssl_nextleg.py instead'
 print(f'✅ PRE-FLIGHT: {len(found)}/{len(TICKERS)*len(TFS)} CSVs | warm <- {WARM_CKPT}')
 print(f'   NEXT-LEG (bars, NO ATR): k={LEG_K} cap={LEG_CAP} leg_w={LEG_W} | anchor horizons={HORIZONS}')
 print(f'   *** 2.7 PATH TARGET: retrace_w={RETRACE_W} cap={RETRACE_CAP} '

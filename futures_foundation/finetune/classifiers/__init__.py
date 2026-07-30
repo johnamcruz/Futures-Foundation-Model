@@ -13,6 +13,8 @@ _PKG = __name__
 LAZY_BACKBONES = {
     'mantis':        _PKG + '.mantis',
     'mantis_frozen': _PKG + '.mantis',
+    'chronos2':      _PKG + '.chronos2',
+    'chronos2_frozen': _PKG + '.chronos2',
     'moment_frozen': _PKG + '.moment',
     'logistic':      _PKG + '.logistic',
 }

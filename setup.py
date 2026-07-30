@@ -19,7 +19,13 @@ setup(
         "scikit-learn>=1.3",
     ],
     extras_require={
-        "foundation": ["torch>=2.0", "chronos-forecasting"],
+        "foundation": [
+            "torch>=2.0",
+            "chronos-forecasting>=2.2",
+            "transformers>=4.41,<5",
+            "peft>=0.10",
+            "safetensors>=0.4,<0.5",
+        ],
         "heads": ["xgboost>=2.0", "joblib>=1.3"],
         "regime": ["hmmlearn>=0.3"],   # futures_foundation.regime market-state HMM
         "onnx": ["onnxmltools", "skl2onnx"],

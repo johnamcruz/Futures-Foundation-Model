@@ -125,7 +125,7 @@ if not os.path.isdir(DATA_DIR):
     raise FileNotFoundError(f'DATA_DIR does not exist:\n  {DATA_DIR}')
 if not os.path.exists(WARM_CKPT):
     raise FileNotFoundError(f'WARM_CKPT (stage-2 seq2seq encoder) not found:\n  {WARM_CKPT}\n'
-                            f'Point at the promoted base (or run scripts/mantis_ssl_seq2seq.py).')
+                            f'Point at the promoted base (or run scripts/mantis/mantis_ssl_seq2seq.py).')
 found = [f'{tk}_{tf}' for tk in TICKERS for tf in TFS
          if os.path.exists(os.path.join(DATA_DIR, f'{tk}_{tf}.csv'))]
 if not found:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
