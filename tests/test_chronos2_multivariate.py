@@ -5,6 +5,8 @@ import ast
 import hashlib
 import json
 from pathlib import Path
+import sys
+import types
 
 import numpy as np
 import pandas as pd
@@ -294,3 +296,49 @@ def test_chronos2_volatility_entrypoint_is_optional_kaufman_retaining_ssl():
     assert '"--lower-quantile", type=float, default=0.25' in source
     assert '"--upper-quantile", type=float, default=0.75' in source
     assert '"--kaufman-retention-weight", type=float, default=1.0' in source
+
+
+def test_chronos2_streaming_embedder_loads_pipeline_once(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from futures_foundation.finetune.classifiers.chronos2._embed_worker import (
+        embed_window_chunks,
+    )
+
+    calls = {"load": 0, "embed": 0}
+
+    class FakePipeline:
+        @classmethod
+        def from_pretrained(cls, source, **kwargs):
+            calls["load"] += 1
+            assert source == "fake/model"
+            return cls()
+
+        def embed(self, windows, *, batch_size, context_length):
+            calls["embed"] += 1
+            assert windows.shape[1:] == (5, 8)
+            assert batch_size == 5
+            assert context_length == 8
+            return [
+                torch.full((5, 4, 3), float(index + 1))
+                for index in range(len(windows))
+            ], None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "chronos",
+        types.SimpleNamespace(Chronos2Pipeline=FakePipeline),
+    )
+    chunks = (
+        np.ones((2, 5, 8), np.float32),
+        np.ones((1, 5, 8), np.float32),
+    )
+    output = list(embed_window_chunks(
+        chunks,
+        checkpoint="fake/model",
+        device="cpu",
+        batch=5,
+        context_length=8,
+    ))
+
+    assert calls == {"load": 1, "embed": 3}
+    assert [item.shape for item in output] == [(2, 15), (1, 15)]

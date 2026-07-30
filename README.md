@@ -101,6 +101,21 @@ direction/magnitude/volatility and HH/HL–LH/LL lifecycle information, includin
 per-stream and worst-stream results. It contains no entry rules, stop logic,
 position sizing, R targets, or dependency on private strategy repositories.
 
+The Chronos-2 adapter entrypoint reuses that exact public corpus and probe
+implementation while streaming PEFT-directory embeddings through the
+Chronos-2 pooling contract:
+
+```bash
+./.venv/bin/python scripts/chronos/chronos2_probe_atlas.py \
+  --checkpoint temp/chronos2_small_36stream/contrastive_kaufman_full/checkpoint \
+  --control real --window 256 --horizons 5,10,20,50
+```
+
+Run the same command with `--control shuffle` and `--control random` for the
+input-corruption controls. Cache and report identities seal the backbone,
+checkpoint tree hash, source data, lifecycle corpus, window, horizons, and
+control arm.
+
 ### 1. Masked reconstruction
 
 A fraction of each standardized OHLCV window is corrupted. The network reconstructs only the masked positions, forcing the encoder to use surrounding temporal context rather than memorize the visible value.

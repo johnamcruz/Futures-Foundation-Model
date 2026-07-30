@@ -167,7 +167,7 @@ def test_partial_lineage_reuses_only_hash_and_provenance_matched_atlas(tmp_path)
         'data_provenance_sha256': pipeline._provenance_sha256(provenance),
     }))
     (atlas / 'seq2seq.json').write_text(json.dumps({
-        'schema': 'ffm_probe_atlas_v2',
+        'schema': 'ffm_probe_atlas_v3',
         'scope': '9x4_strategy_agnostic',
         'fit': '<2024', 'eval': '2025',
         'checkpoint_sha256': pipeline.sha256(parent),
@@ -207,7 +207,7 @@ def test_partial_lineage_can_alias_existing_nextleg_as_refinement_parent(tmp_pat
         'data_provenance_sha256': pipeline._provenance_sha256(provenance),
     }))
     (atlas / 'nextleg.json').write_text(json.dumps({
-        'schema': 'ffm_probe_atlas_v2', 'scope': '9x4_strategy_agnostic',
+        'schema': 'ffm_probe_atlas_v3', 'scope': '9x4_strategy_agnostic',
         'fit': '<2024', 'eval': '2025',
         'checkpoint_sha256': pipeline.sha256(parent),
     }))
@@ -229,8 +229,14 @@ def test_atlas_parent_child_pool_identity_must_match(tmp_path):
     atlas.mkdir()
     parent = atlas / 'seq2seq_emb.npy.pool.json'
     child = atlas / 'nextleg_emb.npy.pool.json'
-    parent.write_text(json.dumps({'pool_sha256': 'same', 'rows': 12}))
-    child.write_text(parent.read_text())
+    parent.write_text(json.dumps({
+        'pool_sha256': 'same', 'rows': 12,
+        'checkpoint_sha256': 'parent', 'backbone': 'mantis', 'device': 'cpu',
+    }))
+    child.write_text(json.dumps({
+        'pool_sha256': 'same', 'rows': 12,
+        'checkpoint_sha256': 'child', 'backbone': 'chronos2', 'device': 'mps',
+    }))
     pipeline._assert_atlas_pool_match(tmp_path, 'seq2seq', 'nextleg')
     child.write_text(json.dumps({'pool_sha256': 'different', 'rows': 12}))
     with pytest.raises(RuntimeError, match='pool mismatch'):

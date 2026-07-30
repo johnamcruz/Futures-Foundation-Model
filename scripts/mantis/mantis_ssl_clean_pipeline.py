@@ -542,7 +542,7 @@ def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
     if saved_result.get("checkpoint_sha256") != sha256(checkpoint):
         raise RuntimeError(
             f"reusable {source_stage.name} Atlas result belongs to a different checkpoint")
-    if (saved_result.get("schema") != "ffm_probe_atlas_v2"
+    if (saved_result.get("schema") != "ffm_probe_atlas_v3"
             or saved_result.get("scope") != "9x4_strategy_agnostic"
             or saved_result.get("fit") != "<2024"
             or saved_result.get("eval") != "2025"):
@@ -567,7 +567,22 @@ def _assert_atlas_pool_match(out_dir: Path, parent: str, child: str) -> None:
     if not parent_path.is_file() or not child_path.is_file():
         raise RuntimeError(
             f"missing Probe Atlas pool identity for {parent}->{child}")
-    if json.loads(parent_path.read_text()) != json.loads(child_path.read_text()):
+    ignored = {
+        "backbone",
+        "checkpoint_sha256",
+        "device",
+    }
+    parent_identity = {
+        key: value
+        for key, value in json.loads(parent_path.read_text()).items()
+        if key not in ignored
+    }
+    child_identity = {
+        key: value
+        for key, value in json.loads(child_path.read_text()).items()
+        if key not in ignored
+    }
+    if parent_identity != child_identity:
         raise RuntimeError(f"Probe Atlas pool mismatch for {parent}->{child}")
 
 
@@ -582,7 +597,12 @@ def _run_probe_atlas(stage: Stage, checkpoint: Path, *, out_dir: Path, device: s
     checkpoint_hash = sha256(checkpoint)
     if result_path.is_file():
         existing = json.loads(result_path.read_text())
-        if existing.get("checkpoint_sha256") == checkpoint_hash:
+        if (
+            existing.get("checkpoint_sha256") == checkpoint_hash
+            and existing.get("schema") == "ffm_probe_atlas_v3"
+            and existing.get("backbone", "mantis") == "mantis"
+            and existing.get("control", "real") == "real"
+        ):
             _event(out_dir, "probe_atlas_skipped", stage=stage.name,
                    reason="matching_checkpoint", result=str(result_path))
             return _refresh_atlas_progress(out_dir)
