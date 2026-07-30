@@ -542,7 +542,7 @@ def _reuse_atlas_parent(*, source_dir: Path, out_dir: Path, stage: Stage,
     if saved_result.get("checkpoint_sha256") != sha256(checkpoint):
         raise RuntimeError(
             f"reusable {source_stage.name} Atlas result belongs to a different checkpoint")
-    if (saved_result.get("schema") != "ffm_probe_atlas_v4"
+    if (saved_result.get("schema") != "ffm_probe_atlas_v5"
             or saved_result.get("scope") != "9x4_strategy_agnostic"
             or saved_result.get("fit") != "<2024"
             or saved_result.get("eval") != "2025"):
@@ -599,7 +599,7 @@ def _run_probe_atlas(stage: Stage, checkpoint: Path, *, out_dir: Path, device: s
         existing = json.loads(result_path.read_text())
         if (
             existing.get("checkpoint_sha256") == checkpoint_hash
-            and existing.get("schema") == "ffm_probe_atlas_v4"
+            and existing.get("schema") == "ffm_probe_atlas_v5"
             and existing.get("backbone", "mantis") == "mantis"
             and existing.get("control", "real") == "real"
         ):

@@ -20,7 +20,7 @@ from typing import Any
 EXPECTED_PROBES = {
     "ret_vol_regime", "ret_squeeze", "ret_vol_surge", "ret_day_position",
     "ret_ny_session", "pred_fwd_direction", "pred_fwd_large_move",
-    "pred_vol_expand", "pred_persistent_trend_start",
+    "pred_vol_expand", "pred_trend_h20",
 }
 
 
@@ -113,9 +113,10 @@ def _artifacts(directory: Path) -> dict[str, Any]:
     if stage.get("sha256") != digest:
         raise RuntimeError(f"pipeline manifest checkpoint hash mismatch in {directory}")
     probes = atlas.get("probes") or {}
-    if set(probes) != EXPECTED_PROBES:
+    if not EXPECTED_PROBES.issubset(probes):
         raise RuntimeError(
-            f"Probe Atlas contract mismatch in {directory}: {sorted(set(probes) ^ EXPECTED_PROBES)}")
+            f"Probe Atlas contract mismatch in {directory}: "
+            f"{sorted(EXPECTED_PROBES - set(probes))}")
     task_history, task_history_source = _task_history(directory, report)
     return {"directory": directory, "checkpoint": checkpoint, "sha256": digest,
             "report": report, "manifest": manifest, "atlas": atlas, "pool": pool,
@@ -203,9 +204,9 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
             "baseline": _family_mean(bp, "prediction"),
             "candidate": _family_mean(cp, "prediction"),
         },
-        "persistent_trend_start_auc": {
-            "baseline": float(bp["pred_persistent_trend_start"]["auc"]),
-            "candidate": float(cp["pred_persistent_trend_start"]["auc"]),
+        "bounded_trend_h20_auc": {
+            "baseline": float(bp["pred_trend_h20"]["auc"]),
+            "candidate": float(cp["pred_trend_h20"]["auc"]),
         },
         "worst_stream_mean_auc": {
             "baseline": _worst_stream_mean(bp),
@@ -231,14 +232,14 @@ def select(baseline_dir: Path, candidate_dir: Path) -> dict[str, Any]:
         failures.append("retention mean regressed by more than 0.005 AUC")
     if metrics["prediction_mean_auc"]["delta"] < -0.005:
         failures.append("prediction mean regressed by more than 0.005 AUC")
-    if metrics["persistent_trend_start_auc"]["delta"] < -0.005:
-        failures.append("persistent trend-start AUC regressed by more than 0.005")
+    if metrics["bounded_trend_h20_auc"]["delta"] < -0.005:
+        failures.append("bounded h20 trend AUC regressed by more than 0.005")
     if metrics["worst_stream_mean_auc"]["delta"] < -0.010:
         failures.append("worst-stream mean regressed by more than 0.010 AUC")
 
     atlas_improves = bool(
         metrics["prediction_mean_auc"]["delta"] >= 0.001
-        or metrics["persistent_trend_start_auc"]["delta"] >= 0.005
+        or metrics["bounded_trend_h20_auc"]["delta"] >= 0.005
         or metrics["worst_stream_mean_auc"]["delta"] >= 0.005
     )
     refinement_improves = bool(

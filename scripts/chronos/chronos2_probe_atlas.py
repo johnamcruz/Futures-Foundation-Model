@@ -3,21 +3,33 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
 ATLAS_SCRIPT = ROOT / "scripts" / "probe_atlas.py"
 DEFAULT_RUN = ROOT / "temp" / "chronos2_small_36stream"
-DEFAULT_CHECKPOINT = DEFAULT_RUN / "contrastive_kaufman_full" / "checkpoint"
+DEFAULT_CHECKPOINT = DEFAULT_RUN / "contrastive_kaufman_40" / "checkpoint"
 DEFAULT_ATLAS_DIR = DEFAULT_RUN / "probe_atlas"
 DEFAULT_LABELS = DEFAULT_ATLAS_DIR / "trend_lifecycle_labels_pre2026.npz"
+MPS_SAFE_MAX_BATCH_SERIES = 320
+MPS_SAFE_MAX_CHUNK_WINDOWS = 1024
+CHRONOS2_STAGE_SCHEMAS = {
+    "ffm_chronos2_mask_v1": "mask",
+    "ffm_chronos2_contrastive_v2": "contrastive",
+}
+CHRONOS2_MODEL_ID = "autogluon/chronos-2-small"
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def _tree_sha256(path: Path) -> str:
@@ -43,6 +55,146 @@ def _checkpoint_identity(value: str) -> str:
     if path.is_absolute() or value.startswith((".", "~")) or value.count("/") != 1:
         raise SystemExit(f"Chronos-2 checkpoint does not exist: {path}")
     return f"remote:{value}"
+
+
+def _stage_identity(
+    checkpoint: str,
+    checkpoint_sha256: str,
+    stage_report: Path | None,
+    *,
+    context_length: int,
+) -> dict:
+    checkpoint_path = Path(checkpoint).expanduser()
+    if not checkpoint_path.exists():
+        if stage_report is not None:
+            raise SystemExit(
+                "--stage-report cannot authenticate a remote checkpoint")
+        return {
+            "stage_report_path": None,
+            "stage_report_sha256": None,
+            "parent_checkpoint_sha256": None,
+            "data_identity_sha256": None,
+        }
+    report_path = (
+        Path(stage_report).expanduser()
+        if stage_report is not None
+        else checkpoint_path.parent / "report.json"
+    ).resolve()
+    if not report_path.is_file():
+        raise SystemExit(
+            f"Chronos-2 stage report does not exist: {report_path}")
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"Chronos-2 stage report is unreadable: {report_path}") from exc
+    if not isinstance(report, dict):
+        raise SystemExit(
+            f"Chronos-2 stage report must be an object: {report_path}")
+    parent = report.get("parent")
+    saved_checkpoint = report.get("checkpoint")
+    config = report.get("config")
+    expected_stage = CHRONOS2_STAGE_SCHEMAS.get(report.get("schema"))
+    parent_sha256 = parent.get("sha256") if isinstance(parent, dict) else None
+    data_sha256 = report.get("data_identity_sha256")
+    if (
+        expected_stage is None
+        or report.get("status") != "complete"
+        or report.get("stage") != expected_stage
+        or not isinstance(saved_checkpoint, dict)
+        or saved_checkpoint.get("sha256") != checkpoint_sha256
+        or not isinstance(config, dict)
+        or config.get("context_length") != context_length
+        or set(config.get("timeframes", ()))
+        != {"1min", "3min", "5min", "15min"}
+        or not isinstance(parent_sha256, str)
+        or len(parent_sha256) != 64
+        or not isinstance(data_sha256, str)
+        or len(data_sha256) != 64
+    ):
+        raise SystemExit(
+            f"Chronos-2 stage report contract is invalid: {report_path}")
+    return {
+        "stage_report_path": str(report_path),
+        "stage_report_sha256": _file_sha256(report_path),
+        "parent_checkpoint_sha256": parent_sha256,
+        "data_identity_sha256": data_sha256,
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _base_identity(
+    checkpoint: str,
+    base_snapshot: Path,
+) -> dict:
+    checkpoint_path = Path(checkpoint).expanduser().resolve()
+    base_snapshot = Path(base_snapshot).expanduser().resolve()
+    adapter_path = checkpoint_path / "adapter_config.json"
+    weights_path = base_snapshot / "model.safetensors"
+    config_path = base_snapshot / "config.json"
+    if (
+        not checkpoint_path.is_dir()
+        or not adapter_path.is_file()
+        or not base_snapshot.is_dir()
+        or _HEX40.fullmatch(base_snapshot.name) is None
+        or not weights_path.is_file()
+        or not config_path.is_file()
+    ):
+        raise SystemExit(
+            "local Chronos-2 Atlas runs require a complete pinned base "
+            "snapshot named by its 40-character revision"
+        )
+    try:
+        adapter = json.loads(adapter_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("Chronos-2 adapter config is unreadable") from exc
+    if (
+        not isinstance(adapter, dict)
+        or adapter.get("base_model_name_or_path") != CHRONOS2_MODEL_ID
+        or adapter.get("peft_type") != "LORA"
+        or adapter.get("inference_mode") is not True
+        or adapter.get("revision") not in {None, base_snapshot.name}
+    ):
+        raise SystemExit(
+            "Chronos-2 adapter does not match the pinned base snapshot")
+    return {
+        "base_snapshot_path": str(base_snapshot),
+        "base_revision": base_snapshot.name,
+        "base_weights_sha256": _file_sha256(weights_path),
+        "base_config_sha256": _file_sha256(config_path),
+    }
+
+
+@contextmanager
+def _runtime_checkpoint(
+    checkpoint: str,
+    *,
+    base_revision: str,
+):
+    """Pin revision-null PEFT adapters without changing their stage hash."""
+    checkpoint_path = Path(checkpoint).expanduser().resolve()
+    adapter = json.loads(
+        (checkpoint_path / "adapter_config.json").read_text())
+    if adapter.get("revision") == base_revision:
+        yield checkpoint_path
+        return
+    adapter["revision"] = base_revision
+    with tempfile.TemporaryDirectory(
+        prefix="ffm-chronos2-atlas-adapter-",
+    ) as temporary:
+        runtime = Path(temporary)
+        (runtime / "adapter_config.json").write_text(
+            json.dumps(adapter, indent=2, sort_keys=True) + "\n")
+        (runtime / "adapter_model.safetensors").symlink_to(
+            checkpoint_path / "adapter_model.safetensors")
+        yield runtime
 
 
 def _generate_labels(labels: Path, data_dir: Path) -> None:
@@ -72,6 +224,20 @@ def _generate_labels(labels: Path, data_dir: Path) -> None:
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
+    value.add_argument(
+        "--base-snapshot",
+        type=Path,
+        required=True,
+        help="pinned Chronos2-small Hugging Face snapshot directory",
+    )
+    value.add_argument(
+        "--stage-report",
+        type=Path,
+        help=(
+            "completed public stage report; inferred beside a local "
+            "checkpoint when omitted"
+        ),
+    )
     value.add_argument("--name", default="chronos2_kaufman")
     value.add_argument("--data-dir", type=Path, default=ROOT / "data")
     value.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
@@ -109,6 +275,8 @@ def main() -> dict:
     labels = args.labels.expanduser().resolve()
     out_dir = args.out_dir.expanduser().resolve()
     checkpoint_hash = _checkpoint_identity(args.checkpoint)
+    base_identity = _base_identity(
+        args.checkpoint, args.base_snapshot)
     horizons = tuple(
         int(item) for item in args.horizons.split(",") if item.strip())
     if (
@@ -123,6 +291,27 @@ def main() -> dict:
         raise SystemExit("--batch-series must be >=5 for one OHLCV group")
     if args.chunk_windows < 1:
         raise SystemExit("--chunk-windows must be positive")
+    if args.device == "mps" and args.batch_series > MPS_SAFE_MAX_BATCH_SERIES:
+        raise SystemExit(
+            f"--batch-series exceeds the verified M1-safe limit "
+            f"({MPS_SAFE_MAX_BATCH_SERIES}); use 320 for 64 OHLCV windows"
+        )
+    if args.device == "mps" and args.chunk_windows > MPS_SAFE_MAX_CHUNK_WINDOWS:
+        raise SystemExit(
+            f"--chunk-windows exceeds the verified M1-safe limit "
+            f"({MPS_SAFE_MAX_CHUNK_WINDOWS})"
+        )
+    if args.batch_series % 5:
+        raise SystemExit(
+            "--batch-series must be divisible by 5 because every window has "
+            "five OHLCV variates"
+        )
+    stage_identity = _stage_identity(
+        args.checkpoint,
+        checkpoint_hash,
+        args.stage_report,
+        context_length=args.window,
+    )
     if not labels.is_file():
         _generate_labels(labels, data_dir)
 
@@ -133,7 +322,7 @@ def main() -> dict:
     stem = f"{safe_name}_{args.control}"
     result_path = out_dir / f"{stem}.json"
     cache_path = out_dir / f"{stem}_emb.npy"
-    os.environ.update({
+    environment = {
         "FFM_ROOT": str(ROOT),
         "DATA_DIR": str(data_dir),
         "TREND_LABELS": str(labels),
@@ -153,28 +342,60 @@ def main() -> dict:
         "ATLAS_EVAL_PER_STREAM": str(args.eval_per_stream),
         "DEVICE": args.device,
         "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-    })
-    atlas = _load_atlas()
-    if args.preflight_only:
-        bars, keys, fields = atlas._load_pool()
-        payload = {
-            "schema": "ffm_chronos2_probe_atlas_preflight_v1",
-            "checkpoint_sha256": checkpoint_hash,
-            "pool_rows": len(keys),
-            "pool_sha256": atlas._pool_sha256(keys),
-            "source_sha256": atlas._source_sha256(bars),
-            "window": args.window,
-            "horizons": list(horizons),
-            "streams": sorted(set(fields["stream"])),
-        }
-        destination = out_dir / f"{stem}_preflight.json"
-        destination.write_text(json.dumps(payload, indent=2) + "\n")
-        print(
-            f"[chronos2-atlas] PREFLIGHT PASS rows={len(keys):,} -> {destination}",
-            flush=True,
-        )
-        return payload
-    return atlas.main()
+    }
+    for field in (
+        "stage_report_sha256",
+        "parent_checkpoint_sha256",
+        "data_identity_sha256",
+    ):
+        value = stage_identity[field]
+        if value is not None:
+            environment[f"ATLAS_{field.upper()}"] = value
+    for field in (
+        "base_revision",
+        "base_weights_sha256",
+        "base_config_sha256",
+    ):
+        environment[f"ATLAS_{field.upper()}"] = base_identity[field]
+    os.environ.update(environment)
+    with _runtime_checkpoint(
+        args.checkpoint,
+        base_revision=base_identity["base_revision"],
+    ) as runtime_checkpoint:
+        os.environ["ATLAS_LOAD_CHECKPOINT_PATH"] = str(
+            runtime_checkpoint)
+        atlas = _load_atlas()
+        if (
+            "pred_persistent_trend_start"
+            not in atlas.FORBIDDEN_NONCAUSAL_PROBES
+        ):
+            raise RuntimeError(
+                "shared Probe Atlas is missing the noncausal-target guard"
+            )
+        if args.preflight_only:
+            bars, keys, fields = atlas._load_pool()
+            payload = {
+                "schema": "ffm_chronos2_probe_atlas_preflight_v1",
+                "checkpoint_sha256": checkpoint_hash,
+                **stage_identity,
+                **base_identity,
+                "pool_rows": len(keys),
+                "pool_sha256": atlas._pool_sha256(keys),
+                "source_sha256": atlas._source_sha256(bars),
+                "window": args.window,
+                "horizons": list(horizons),
+                "streams": sorted(set(fields["stream"])),
+            }
+            destination = out_dir / f"{stem}_preflight.json"
+            destination.write_text(
+                json.dumps(payload, indent=2) + "\n")
+            print(
+                f"[chronos2-atlas] PREFLIGHT PASS "
+                f"rows={len(keys):,} -> {destination}",
+                flush=True,
+            )
+            return payload
+        return atlas.main()
 
 
 if __name__ == "__main__":

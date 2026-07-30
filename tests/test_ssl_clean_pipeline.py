@@ -167,7 +167,7 @@ def test_partial_lineage_reuses_only_hash_and_provenance_matched_atlas(tmp_path)
         'data_provenance_sha256': pipeline._provenance_sha256(provenance),
     }))
     (atlas / 'seq2seq.json').write_text(json.dumps({
-        'schema': 'ffm_probe_atlas_v4',
+        'schema': 'ffm_probe_atlas_v5',
         'scope': '9x4_strategy_agnostic',
         'fit': '<2024', 'eval': '2025',
         'checkpoint_sha256': pipeline.sha256(parent),
@@ -207,7 +207,7 @@ def test_partial_lineage_can_alias_existing_nextleg_as_refinement_parent(tmp_pat
         'data_provenance_sha256': pipeline._provenance_sha256(provenance),
     }))
     (atlas / 'nextleg.json').write_text(json.dumps({
-        'schema': 'ffm_probe_atlas_v4', 'scope': '9x4_strategy_agnostic',
+        'schema': 'ffm_probe_atlas_v5', 'scope': '9x4_strategy_agnostic',
         'fit': '<2024', 'eval': '2025',
         'checkpoint_sha256': pipeline.sha256(parent),
     }))

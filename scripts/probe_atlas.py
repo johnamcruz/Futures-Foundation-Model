@@ -36,6 +36,8 @@ CKPT_PATH = os.environ.get("CKPT_PATH") or next(
         ROOT / "models" / CKPT_NAME,
         ROOT / "AI_Models" / CKPT_NAME,
     ) if path.exists()), None)
+LOAD_CKPT_PATH = os.environ.get(
+    "ATLAS_LOAD_CHECKPOINT_PATH", CKPT_PATH)
 EMB_CACHE = Path(os.environ.get(
     "EMB_CACHE", ROOT / "temp" / f"probe_atlas_{Path(CKPT_NAME).stem}.npy"))
 CORPUS = Path(os.environ.get(
@@ -48,6 +50,17 @@ EVAL_PER_STREAM = int(os.environ.get("ATLAS_EVAL_PER_STREAM", "3000"))
 DEVICE = os.environ.get("DEVICE")
 BACKBONE = os.environ.get("ATLAS_BACKBONE", "mantis").strip().lower()
 CONTROL = os.environ.get("ATLAS_CONTROL", "real").strip().lower()
+POOL = os.environ.get(
+    "ATLAS_POOL",
+    "reg" if BACKBONE == "chronos2" else "encoder_default",
+).strip().lower()
+STAGE_REPORT_SHA256 = os.environ.get("ATLAS_STAGE_REPORT_SHA256")
+PARENT_CHECKPOINT_SHA256 = os.environ.get(
+    "ATLAS_PARENT_CHECKPOINT_SHA256")
+DATA_IDENTITY_SHA256 = os.environ.get("ATLAS_DATA_IDENTITY_SHA256")
+BASE_REVISION = os.environ.get("ATLAS_BASE_REVISION")
+BASE_WEIGHTS_SHA256 = os.environ.get("ATLAS_BASE_WEIGHTS_SHA256")
+BASE_CONFIG_SHA256 = os.environ.get("ATLAS_BASE_CONFIG_SHA256")
 
 TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
 TIMEFRAMES = ("1min", "3min", "5min", "15min")
@@ -65,8 +78,11 @@ MV_HORIZON = 20
 MV_SCALE_LOOKBACK = 64
 MV_MOMENTUM_THRESHOLD = 0.5
 MV_EXPANSION_THRESHOLD = 1.1
-ATLAS_SCHEMA = "ffm_probe_atlas_v4"
+ATLAS_SCHEMA = "ffm_probe_atlas_v5"
 TARGET_SCHEMA = "ffm_probe_atlas_targets_v2_multihorizon_direction"
+FORBIDDEN_NONCAUSAL_PROBES = frozenset({
+    "pred_persistent_trend_start",
+})
 MAX_FORWARD = max((FORWARD, VOL_FORWARD, MV_HORIZON, *PROBE_HORIZONS))
 MULTI_HORIZON_FIELDS = tuple(
     name
@@ -82,6 +98,11 @@ if BACKBONE not in {"mantis", "chronos2"}:
     raise ValueError("ATLAS_BACKBONE must be 'mantis' or 'chronos2'")
 if CONTROL not in {"real", "shuffle", "random"}:
     raise ValueError("ATLAS_CONTROL must be 'real', 'shuffle', or 'random'")
+if (
+    (BACKBONE == "chronos2" and POOL not in {"reg", "mean_context"})
+    or (BACKBONE == "mantis" and POOL != "encoder_default")
+):
+    raise ValueError("ATLAS_POOL is incompatible with ATLAS_BACKBONE")
 if WINDOW < 2:
     raise ValueError("ATLAS_WINDOW must be >=2")
 if (
@@ -342,6 +363,20 @@ def _source_sha256(bars_by_stream: dict) -> str:
         json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _embedder_sha256() -> str:
+    if BACKBONE == "chronos2":
+        from futures_foundation.finetune.classifiers.chronos2 import (
+            _embed_worker,
+        )
+        module_path = Path(str(_embed_worker.__file__)).resolve()
+    else:
+        from futures_foundation.finetune.pretext._torch import common
+        module_path = Path(str(common.__file__)).resolve()
+    if not module_path.is_file():
+        raise RuntimeError("Probe Atlas embedder source is unavailable")
+    return _file_sha256(module_path)
+
+
 def _controlled_window(window: np.ndarray, key: tuple) -> np.ndarray:
     """Deterministic input-only REAL/SHUFFLE/RANDOM Atlas controls."""
     if CONTROL == "real":
@@ -379,12 +414,21 @@ def _embeddings(bars_by_stream: dict, keys: list[tuple]) -> np.ndarray:
         "label_corpus_sha256": _file_sha256(CORPUS),
         "backbone": BACKBONE,
         "checkpoint_sha256": os.environ.get("CKPT_SHA256"),
+        "stage_report_sha256": STAGE_REPORT_SHA256,
+        "parent_checkpoint_sha256": PARENT_CHECKPOINT_SHA256,
+        "data_identity_sha256": DATA_IDENTITY_SHA256,
+        "base_revision": BASE_REVISION,
+        "base_weights_sha256": BASE_WEIGHTS_SHA256,
+        "base_config_sha256": BASE_CONFIG_SHA256,
         "window": WINDOW,
         "horizons": list(PROBE_HORIZONS),
+        "pool": POOL,
         "control": CONTROL,
         "device": DEVICE,
         "train_per_stream": TRAIN_PER_STREAM,
         "eval_per_stream": EVAL_PER_STREAM,
+        "atlas_code_sha256": _file_sha256(Path(__file__).resolve()),
+        "embedder_code_sha256": _embedder_sha256(),
     }
     if EMB_CACHE.exists():
         if not identity_path.is_file() or json.loads(identity_path.read_text()) != identity:
@@ -408,7 +452,7 @@ def _embeddings(bars_by_stream: dict, keys: list[tuple]) -> np.ndarray:
             batch=ATLAS_BATCH,
         )
     else:
-        checkpoint = CKPT_PATH or "autogluon/chronos-2-small"
+        checkpoint = LOAD_CKPT_PATH or "autogluon/chronos-2-small"
         checkpoint_path = Path(checkpoint)
         if checkpoint_path.exists() and not checkpoint_path.is_dir():
             raise RuntimeError(
@@ -421,7 +465,7 @@ def _embeddings(bars_by_stream: dict, keys: list[tuple]) -> np.ndarray:
             checkpoint=checkpoint,
             device=DEVICE or "cpu",
             batch=ATLAS_BATCH,
-            pool=os.environ.get("ATLAS_POOL", "reg"),
+            pool=POOL,
             context_length=WINDOW,
         )
 
@@ -446,9 +490,18 @@ def _embeddings(bars_by_stream: dict, keys: list[tuple]) -> np.ndarray:
     return np.load(EMB_CACHE, mmap_mode="r")
 
 
+def _assert_probe_is_causal(name: str) -> None:
+    if name in FORBIDDEN_NONCAUSAL_PROBES:
+        raise RuntimeError(
+            f"Probe {name!r} is forbidden because its target is not bounded "
+            "to the configured forward reserve"
+        )
+
+
 def _fit_probe(name: str, family: str, labels: np.ndarray, valid: np.ndarray,
                train: np.ndarray, evaluate: np.ndarray, embeddings: np.ndarray,
                streams: np.ndarray) -> dict | None:
+    _assert_probe_is_causal(name)
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score
     from sklearn.preprocessing import StandardScaler
@@ -523,8 +576,6 @@ def main() -> dict:
                                 common & np.isfinite(fields["forward_return"])),
         "pred_vol_expand": ("prediction", fields["atr_forward"] > 1.2,
                             common & np.isfinite(fields["atr_forward"])),
-        "pred_persistent_trend_start": (
-            "prediction", fields["is_start"] & ~fields["ended"], common & fields["is_start"]),
         "pred_mv_trend_expansion": (
             "prediction", fields["mv_state"] == 0, mv_valid),
         "pred_mv_trend_weakening": (
@@ -582,10 +633,22 @@ def main() -> dict:
             "backbone": BACKBONE, "control": CONTROL,
             "checkpoint": CKPT_NAME, "checkpoint_path": CKPT_PATH,
             "checkpoint_sha256": os.environ.get("CKPT_SHA256"),
+            "stage_report_sha256": STAGE_REPORT_SHA256,
+            "parent_checkpoint_sha256": PARENT_CHECKPOINT_SHA256,
+            "data_identity_sha256": DATA_IDENTITY_SHA256,
+            "base_revision": BASE_REVISION,
+            "base_weights_sha256": BASE_WEIGHTS_SHA256,
+            "base_config_sha256": BASE_CONFIG_SHA256,
             "embedding_cache": str(EMB_CACHE), "fit": "<2024", "eval": "2025",
-            "window": WINDOW, "horizons": list(PROBE_HORIZONS),
+            "window": WINDOW, "horizons": list(PROBE_HORIZONS), "pool": POOL,
             "target_reserve_bars": MAX_FORWARD,
             "pool_rows": len(keys), "probes": results,
+            "embedding_cache_identity": json.loads(
+                Path(str(EMB_CACHE) + ".pool.json").read_text()
+            ),
+            "embedding_cache_identity_sha256": _file_sha256(
+                Path(str(EMB_CACHE) + ".pool.json")
+            ),
             "weakest_retention": weak, "biggest_prediction_gaps": gaps,
         }
         destination = Path(ATLAS_OUT)

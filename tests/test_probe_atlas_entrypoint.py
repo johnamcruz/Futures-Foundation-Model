@@ -1,9 +1,11 @@
 """Public Probe Atlas and lifecycle infrastructure must stay strategy-independent."""
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,22 @@ def test_probe_atlas_is_a_standalone_public_implementation():
     assert "FIXED_TARGETS" not in source
     assert "STOP_BUFFER" not in source
     assert "pred_reach_" not in source
+    assert 'ATLAS_SCHEMA = "ffm_probe_atlas_v5"' in source
+    assert source.count('"pred_persistent_trend_start"') == 1
+    assert "FORBIDDEN_NONCAUSAL_PROBES" in source
+    assert 'probes[f"pred_trend_h{horizon}"]' in source
+
+
+def test_probe_atlas_rejects_removed_noncausal_probe_before_fit():
+    atlas = _load(
+        "public_probe_atlas_forbidden_probe",
+        ROOT / "scripts" / "probe_atlas.py",
+    )
+
+    with pytest.raises(RuntimeError, match="not bounded"):
+        atlas._assert_probe_is_causal("pred_persistent_trend_start")
+
+    atlas._assert_probe_is_causal("pred_trend_h20")
 
 
 def test_clean_pipeline_has_no_colabs_runtime_dependency():
@@ -128,15 +146,50 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     )
     adapter = tmp_path / "checkpoint"
     adapter.mkdir()
-    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_config.json").write_text(json.dumps({
+        "base_model_name_or_path": "autogluon/chronos-2-small",
+        "peft_type": "LORA",
+        "inference_mode": True,
+        "revision": None,
+    }))
     (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    base = tmp_path / ("a" * 40)
+    base.mkdir()
+    (base / "config.json").write_text("{}")
+    (base / "model.safetensors").write_bytes(b"base")
 
     assert launcher._checkpoint_identity(str(adapter)) == launcher._tree_sha256(adapter)
-    defaults = launcher.parser().parse_args([])
+    defaults = launcher.parser().parse_args([
+        "--base-snapshot", str(base),
+    ])
     assert defaults.window == 256
     assert defaults.horizons == "5,10,20,50"
     assert defaults.batch_series == 320
     assert defaults.control == "real"
+    assert (
+        defaults.checkpoint
+        == str(
+            ROOT
+            / "temp"
+            / "chronos2_small_36stream"
+            / "contrastive_kaufman_40"
+            / "checkpoint"
+        )
+    )
+    assert launcher.MPS_SAFE_MAX_BATCH_SERIES == 320
+    assert launcher.MPS_SAFE_MAX_CHUNK_WINDOWS == 1024
+    base_identity = launcher._base_identity(str(adapter), base)
+    assert base_identity["base_revision"] == "a" * 40
+    assert len(base_identity["base_weights_sha256"]) == 64
+    with launcher._runtime_checkpoint(
+        str(adapter),
+        base_revision=base_identity["base_revision"],
+    ) as runtime:
+        runtime_adapter = json.loads(
+            (runtime / "adapter_config.json").read_text())
+        assert runtime_adapter["revision"] == "a" * 40
+        assert launcher._tree_sha256(adapter) == (
+            launcher._checkpoint_identity(str(adapter)))
     source = Path(launcher.__file__).read_text()
     assert 'ATLAS_BACKBONE": "chronos2"' in source
     assert 'ROOT / "scripts" / "probe_atlas.py"' in source
@@ -144,6 +197,46 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     assert 'pred_direction_h{horizon}' in atlas_source
     assert 'pred_trend_direction_h{horizon}' in atlas_source
     assert '"ret_structural_direction"' in atlas_source
+
+
+def test_chronos2_atlas_authenticates_completed_stage_lineage(tmp_path):
+    launcher = _load(
+        "chronos2_probe_atlas_stage",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    run = tmp_path / "mask"
+    adapter = run / "checkpoint"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    checkpoint_sha256 = launcher._tree_sha256(adapter)
+    report = run / "report.json"
+    report.write_text(json.dumps({
+        "schema": "ffm_chronos2_mask_v1",
+        "stage": "mask",
+        "status": "complete",
+        "checkpoint": {"sha256": checkpoint_sha256},
+        "parent": {"sha256": "a" * 64},
+        "data_identity_sha256": "b" * 64,
+        "config": {
+            "context_length": 256,
+            "timeframes": ["1min", "3min", "5min", "15min"],
+        },
+    }))
+
+    identity = launcher._stage_identity(
+        str(adapter),
+        checkpoint_sha256,
+        None,
+        context_length=256,
+    )
+
+    assert identity == {
+        "stage_report_path": str(report.resolve()),
+        "stage_report_sha256": launcher._file_sha256(report),
+        "parent_checkpoint_sha256": "a" * 64,
+        "data_identity_sha256": "b" * 64,
+    }
 
 
 def test_atlas_pool_identity_seals_model_data_targets_and_control(tmp_path, monkeypatch):
@@ -161,6 +254,7 @@ def test_atlas_pool_identity_seals_model_data_targets_and_control(tmp_path, monk
     assert atlas.BACKBONE == "chronos2"
     assert atlas.CONTROL == "random"
     assert atlas.WINDOW == 256
+    assert atlas.POOL == "reg"
     assert len(atlas._source_sha256(bars)) == 64
     assert len(atlas._file_sha256(corpus)) == 64
 
