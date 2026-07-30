@@ -135,7 +135,7 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     defaults = launcher.parser().parse_args([])
     assert defaults.window == 256
     assert defaults.horizons == "5,10,20,50"
-    assert defaults.batch_series == 5
+    assert defaults.batch_series == 320
     assert defaults.control == "real"
     source = Path(launcher.__file__).read_text()
     assert 'ATLAS_BACKBONE": "chronos2"' in source

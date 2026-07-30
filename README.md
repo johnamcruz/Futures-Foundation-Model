@@ -111,6 +111,10 @@ Chronos-2 pooling contract:
   --control real --window 256 --horizons 5,10,20,50
 ```
 
+The Chronos Atlas launcher defaults to `--batch-series 320`, which embeds 64
+five-channel OHLCV windows per call on the verified 16 GB M1 configuration.
+This setting affects frozen evaluation throughput only, not live inference.
+
 Run the same command with `--control shuffle` and `--control random` for the
 input-corruption controls. Cache and report identities seal the backbone,
 checkpoint tree hash, source data, lifecycle corpus, window, horizons, and

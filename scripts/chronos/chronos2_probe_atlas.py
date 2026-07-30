@@ -83,8 +83,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--pool", choices=("reg", "mean_context"), default="reg")
     value.add_argument(
-        "--batch-series", type=int, default=5,
-        help="Chronos batch size counts variates; five is one OHLCV window")
+        "--batch-series", type=int, default=320,
+        help=(
+            "Chronos batch size counts variates; 320 equals 64 five-channel "
+            "OHLCV windows and is the verified M1 Atlas default"))
     value.add_argument("--chunk-windows", type=int, default=1024)
     value.add_argument("--train-per-stream", type=int, default=6000)
     value.add_argument("--eval-per-stream", type=int, default=3000)
