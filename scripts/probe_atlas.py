@@ -65,12 +65,17 @@ MV_HORIZON = 20
 MV_SCALE_LOOKBACK = 64
 MV_MOMENTUM_THRESHOLD = 0.5
 MV_EXPANSION_THRESHOLD = 1.1
-ATLAS_SCHEMA = "ffm_probe_atlas_v3"
+ATLAS_SCHEMA = "ffm_probe_atlas_v4"
+TARGET_SCHEMA = "ffm_probe_atlas_targets_v2_multihorizon_direction"
 MAX_FORWARD = max((FORWARD, VOL_FORWARD, MV_HORIZON, *PROBE_HORIZONS))
 MULTI_HORIZON_FIELDS = tuple(
     name
     for horizon in PROBE_HORIZONS
-    for name in (f"trend_strength_{horizon}", f"range_expansion_{horizon}")
+    for name in (
+        f"trend_strength_{horizon}",
+        f"range_expansion_{horizon}",
+        f"future_direction_{horizon}",
+    )
 )
 
 if BACKBONE not in {"mantis", "chronos2"}:
@@ -108,6 +113,19 @@ def _future_rolling(values: np.ndarray, width: int, reducer: str) -> np.ndarray:
     rolling = shifted.rolling(width, min_periods=width)
     aggregated = getattr(rolling, reducer)()
     return aggregated.shift(-(width - 1)).to_numpy()
+
+
+def _future_direction(close: np.ndarray, horizon: int) -> np.ndarray:
+    """Signed close displacement at exactly t+h; future target only."""
+    close = np.asarray(close, float)
+    horizon = int(horizon)
+    if horizon <= 0:
+        raise ValueError("direction horizon must be positive")
+    direction = np.full(len(close), np.nan, dtype=np.float32)
+    if horizon < len(close):
+        direction[:-horizon] = (
+            close[horizon:] > close[:-horizon]).astype(np.float32)
+    return direction
 
 
 def _momentum_volatility_fields(
@@ -218,6 +236,8 @@ def _stream_fields(bars: dict) -> dict[str, np.ndarray]:
             high, low, close, horizon=horizon)
         result[f"trend_strength_{horizon}"] = strength
         result[f"range_expansion_{horizon}"] = expansion
+        result[f"future_direction_{horizon}"] = _future_direction(
+            close, horizon)
     return result
 
 
@@ -352,6 +372,7 @@ def _embeddings(bars_by_stream: dict, keys: list[tuple]) -> np.ndarray:
     identity_path = Path(str(EMB_CACHE) + ".pool.json")
     identity = {
         "schema": "ffm_probe_atlas_pool_v2",
+        "target_schema": TARGET_SCHEMA,
         "rows": len(keys),
         "pool_sha256": _pool_sha256(keys),
         "source_sha256": _source_sha256(bars_by_stream),
@@ -491,6 +512,11 @@ def main() -> dict:
                              common & np.isfinite(fields["day_pos"])),
         "ret_ny_session": ("retention", (fields["hour"] >= 13) & (fields["hour"] < 20),
                            common),
+        "ret_structural_direction": (
+            "retention",
+            fields["trend_dir"] > 0,
+            common & (fields["trend_dir"] != 0),
+        ),
         "pred_fwd_direction": ("prediction", fields["forward_return"] > 0,
                                common & np.isfinite(fields["forward_return"])),
         "pred_fwd_large_move": ("prediction", np.abs(fields["forward_return"]) > magnitude_cut,
@@ -511,6 +537,7 @@ def main() -> dict:
     for horizon in PROBE_HORIZONS:
         trend = fields[f"trend_strength_{horizon}"]
         expansion = fields[f"range_expansion_{horizon}"]
+        direction = fields[f"future_direction_{horizon}"]
         probes[f"pred_trend_h{horizon}"] = (
             "prediction",
             trend >= MV_MOMENTUM_THRESHOLD,
@@ -520,6 +547,19 @@ def main() -> dict:
             "prediction",
             expansion >= MV_EXPANSION_THRESHOLD,
             common & np.isfinite(expansion),
+        )
+        probes[f"pred_direction_h{horizon}"] = (
+            "prediction",
+            direction > 0,
+            common & np.isfinite(direction),
+        )
+        probes[f"pred_trend_direction_h{horizon}"] = (
+            "prediction",
+            direction > 0,
+            common
+            & np.isfinite(direction)
+            & np.isfinite(trend)
+            & (trend >= MV_MOMENTUM_THRESHOLD),
         )
     results = {}
     for name, (family, labels, valid) in probes.items():
@@ -537,6 +577,7 @@ def main() -> dict:
     if ATLAS_OUT:
         payload = {
             "schema": ATLAS_SCHEMA, "scope": "9x4_strategy_agnostic",
+            "target_schema": TARGET_SCHEMA,
             "ts": pd.Timestamp.now("UTC").isoformat(),
             "backbone": BACKBONE, "control": CONTROL,
             "checkpoint": CKPT_NAME, "checkpoint_path": CKPT_PATH,

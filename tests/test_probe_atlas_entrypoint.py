@@ -86,6 +86,24 @@ def test_atlas_multihorizon_targets_use_requested_completed_future_bars():
     assert changed[1][63] == expansion[63]
 
 
+def test_atlas_direction_target_is_exact_horizon_and_target_side_only():
+    atlas = _load("public_probe_atlas_direction", ROOT / "scripts" / "probe_atlas.py")
+    close = np.asarray([10, 11, 9, 12, 8, 13, 7, 14], dtype=float)
+    direction = atlas._future_direction(close, horizon=3)
+
+    np.testing.assert_array_equal(
+        direction[:5],
+        np.asarray([1, 0, 1, 0, 1], dtype=np.float32),
+    )
+    assert np.isnan(direction[-3:]).all()
+
+    changed = close.copy()
+    changed[4:] = -1_000
+    changed_direction = atlas._future_direction(changed, horizon=3)
+    # Row 0 uses exactly close[3], so bars after its target cannot change it.
+    assert changed_direction[0] == direction[0]
+
+
 def test_atlas_input_controls_are_deterministic_and_input_only(monkeypatch):
     monkeypatch.setenv("ATLAS_CONTROL", "shuffle")
     atlas = _load("public_probe_atlas_control", ROOT / "scripts" / "probe_atlas.py")
@@ -122,6 +140,10 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     source = Path(launcher.__file__).read_text()
     assert 'ATLAS_BACKBONE": "chronos2"' in source
     assert 'ROOT / "scripts" / "probe_atlas.py"' in source
+    atlas_source = (ROOT / "scripts" / "probe_atlas.py").read_text()
+    assert 'pred_direction_h{horizon}' in atlas_source
+    assert 'pred_trend_direction_h{horizon}' in atlas_source
+    assert '"ret_structural_direction"' in atlas_source
 
 
 def test_atlas_pool_identity_seals_model_data_targets_and_control(tmp_path, monkeypatch):

@@ -114,7 +114,10 @@ Chronos-2 pooling contract:
 Run the same command with `--control shuffle` and `--control random` for the
 input-corruption controls. Cache and report identities seal the backbone,
 checkpoint tree hash, source data, lifecycle corpus, window, horizons, and
-control arm.
+control arm. At each requested horizon the Atlas separately reports trend
+strength, range expansion, unconditional up/down direction, and up/down
+direction conditional on a strong future trend. Current structural direction
+is reported as a descriptive retention probe, not as future prediction.
 
 ### 1. Masked reconstruction
 
