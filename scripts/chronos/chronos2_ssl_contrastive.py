@@ -51,7 +51,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--steps", type=int, default=4)
     value.add_argument("--batch-windows", type=int, default=16)
     value.add_argument("--gradient-accumulation", type=int, default=2)
-    value.add_argument("--lr", type=float, default=2e-5)
+    value.add_argument("--lr", type=float, default=1e-5)
     value.add_argument("--patience", type=int, default=3)
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--single-ticker-probability", type=float, default=0.25)

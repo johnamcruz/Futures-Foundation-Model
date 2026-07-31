@@ -57,7 +57,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--steps", type=int, default=100)
     value.add_argument("--batch-windows", type=int, default=64)
     value.add_argument("--gradient-accumulation", type=int, default=1)
-    value.add_argument("--lr", type=float, default=2e-5)
+    value.add_argument("--lr", type=float, default=1e-5)
     value.add_argument("--patience", type=int, default=5)
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--resume", action="store_true")
