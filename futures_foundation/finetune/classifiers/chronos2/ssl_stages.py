@@ -1250,9 +1250,383 @@ def train_volatility_contrastive(prepared, **kwargs) -> dict:
     )
 
 
+def train_volume_structure_ssl(
+        prepared,
+        *,
+        parent: str | Path,
+        out_dir: str | Path,
+        device: str = "mps",
+        context_length: int = 256,
+        epochs: int = 20,
+        steps_per_epoch: int = 100,
+        batch_windows: int = 32,
+        gradient_accumulation: int = 1,
+        learning_rate: float = 2e-5,
+        weight_decay: float = 0.05,
+        patience: int = 5,
+        projection_dim: int = 128,
+        temperature: float = 0.10,
+        noise: float = 0.02,
+        scale: float = 0.10,
+        mask_ratio: float = 0.25,
+        seed: int = 0,
+        resume: bool = False,
+) -> dict:
+    """Train a causal, OHLCV-only Volume-Structure SSL adapter.
+
+    The temporary heads learn five unlabeled capabilities from completed bars:
+    masked volume/price patch reconstruction, participation contrast, profile
+    concentration versus dispersion, displacement-volume alignment, and
+    temporal order (original versus reversed windows).  Only the LoRA adapter
+    is written to the final checkpoint; the objective heads are discarded.
+    Thresholds are fitted on each training stream only and are recorded in the
+    report so validation cannot influence pseudo-target construction.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    if context_length < 32:
+        raise ValueError("context_length must be >= 32")
+    if batch_windows < 4:
+        raise ValueError("batch_windows must be >= 4")
+    if not 0.0 < mask_ratio < 1.0:
+        raise ValueError("mask_ratio must be between 0 and 1")
+    if gradient_accumulation < 1:
+        raise ValueError("gradient_accumulation must be >= 1")
+
+    corpus = _as_corpus(prepared)
+    timeframes = tuple(corpus)
+    out_dir, parent = Path(out_dir), Path(parent)
+    checkpoint = out_dir / "checkpoint"
+    state_path = out_dir / "trainer.pt"
+    if checkpoint.exists() and not resume:
+        raise RuntimeError(
+            f"completed volume-structure checkpoint already exists: {checkpoint}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    model, base = _load_trainable_adapter(parent, device)
+    embedding_dim = int(base.model_dim)
+    projection = nn.Sequential(
+        nn.LayerNorm(embedding_dim),
+        nn.Linear(embedding_dim, projection_dim),
+        nn.GELU(),
+        nn.Linear(projection_dim, projection_dim),
+    ).to(device)
+    decoder = nn.Sequential(
+        nn.LayerNorm(embedding_dim),
+        nn.Linear(embedding_dim, 64),
+        nn.GELU(),
+        nn.Linear(64, 11),
+    ).to(device)
+    order_head = nn.Sequential(
+        nn.LayerNorm(2 * embedding_dim),
+        nn.Linear(2 * embedding_dim, 64),
+        nn.GELU(),
+        nn.Linear(64, 2),
+    ).to(device)
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    parameters += list(projection.parameters())
+    parameters += list(decoder.parameters())
+    parameters += list(order_head.parameters())
+    optimizer = torch.optim.AdamW(
+        parameters, lr=learning_rate, weight_decay=weight_decay)
+
+    ticker_indices = {
+        timeframe: _ticker_indices(item)
+        for timeframe, item in corpus.items()
+    }
+
+    def starts_for(matrix):
+        return _observable_starts(
+            matrix, context_length, min_observations=context_length)
+
+    def summary(window: np.ndarray) -> np.ndarray:
+        """Return deterministic profile-style summaries for one 5xL window."""
+        finite = np.isfinite(window).all(axis=0)
+        if finite.sum() < context_length:
+            return np.full(11, np.nan, dtype=np.float32)
+        values = window[:, finite].astype(np.float64, copy=False)
+        high, low, close, volume = values[1], values[2], values[3], values[4]
+        volume = np.maximum(volume, 0.0)
+        q = max(1, len(close) // 4)
+        volume_quarters = []
+        close_quarters = []
+        for index in range(4):
+            left = index * q
+            right = len(close) if index == 3 else (index + 1) * q
+            weights = volume[left:right] + 1e-9
+            volume_quarters.append(float(np.log1p(weights).mean()))
+            close_quarters.append(float(np.average(close[left:right], weights=weights)))
+        lo, hi = float(np.min(low)), float(np.max(high))
+        width = max(hi - lo, 1e-9)
+        normalized_close = np.clip((close - lo) / width, 0.0, 1.0)
+        weights = volume + 1e-9
+        concentration = 1.0 - float(np.average(
+            (normalized_close - np.average(normalized_close, weights=weights)) ** 2,
+            weights=weights))
+        prior = max(float(np.mean(volume[:-q])), 1e-9)
+        participation = float(np.log1p(np.mean(volume[-q:]) / prior))
+        ranges = np.maximum(high - low, 1e-9)
+        prior_range = max(float(np.median(ranges[:-1])), 1e-9)
+        prior_volume = max(float(np.median(volume[:-1])), 1e-9)
+        displacement = float(
+            np.log1p((ranges[-1] / prior_range) * (volume[-1] / prior_volume)))
+        # Four volume patches, four weighted price locations, and three
+        # profile/dynamics summaries.  These are reconstruction targets, not
+        # strategy labels.
+        return np.asarray(
+            volume_quarters
+            + [float((value - lo) / width) for value in close_quarters]
+            + [concentration, participation, displacement],
+            dtype=np.float32,
+        )
+
+    train_starts = {}
+    thresholds = {}
+    for timeframe, indices_by_ticker in ticker_indices.items():
+        train_starts[timeframe] = {}
+        thresholds[timeframe] = {}
+        for ticker, indices in indices_by_ticker.items():
+            matrix = corpus[timeframe].train[indices]
+            starts = starts_for(matrix)
+            train_starts[timeframe][ticker] = starts
+            sample = starts[: min(len(starts), 4096)]
+            summaries = np.stack([
+                summary(matrix[:, start:start + context_length])
+                for start in sample
+            ])
+            valid = np.isfinite(summaries).all(axis=1)
+            summaries = summaries[valid]
+            if len(summaries) < 8:
+                raise RuntimeError(
+                    f"insufficient finite volume summaries for {timeframe}/{ticker}")
+            thresholds[timeframe][ticker] = {
+                "participation_low": float(np.quantile(summaries[:, 9], 0.33)),
+                "participation_high": float(np.quantile(summaries[:, 9], 0.67)),
+                "concentration_mid": float(np.quantile(summaries[:, 8], 0.50)),
+                "displacement_high": float(np.quantile(summaries[:, 10], 0.75)),
+            }
+
+    def sample_batch(matrices, starts_map):
+        windows, labels = [], []
+        for _ in range(batch_windows):
+            timeframe = timeframes[int(rng.integers(len(timeframes)))]
+            ticker_names = tuple(starts_map[timeframe])
+            ticker = ticker_names[int(rng.integers(len(ticker_names)))]
+            starts = starts_map[timeframe][ticker]
+            start = int(starts[int(rng.integers(len(starts)))])
+            indices = ticker_indices[timeframe][ticker]
+            raw = matrices[timeframe][ticker][:, start:start + context_length]
+            item = thresholds[timeframe][ticker]
+            target = summary(raw)
+            participation = (
+                0 if target[9] <= item["participation_low"]
+                else 2 if target[9] >= item["participation_high"] else -1)
+            concentration = int(target[8] >= item["concentration_mid"])
+            displacement = int(target[10] >= item["displacement_high"])
+            windows.append(raw)
+            labels.append((target, participation, concentration, displacement))
+        return np.stack(windows).astype(np.float32), labels
+
+    train_matrices = {
+        timeframe: {
+            ticker: corpus[timeframe].train[indices]
+            for ticker, indices in ticker_indices[timeframe].items()
+        }
+        for timeframe in timeframes
+    }
+    validation_starts = {
+        timeframe: {
+            ticker: starts_for(corpus[timeframe].validation_matrix[indices])
+            for ticker, indices in ticker_indices[timeframe].items()
+        }
+        for timeframe in timeframes
+    }
+    validation_matrices = {
+        timeframe: {
+            ticker: corpus[timeframe].validation_matrix[indices]
+            for ticker, indices in ticker_indices[timeframe].items()
+        }
+        for timeframe in timeframes
+    }
+
+    def loss_for(matrices, starts_map, *, train):
+        raw_np, labels = sample_batch(matrices, starts_map)
+        raw = torch.from_numpy(raw_np).to(device)
+        standardized, finite = _standardize(raw)
+        target = torch.from_numpy(np.stack([row[0] for row in labels])).to(device)
+        participation = torch.as_tensor([row[1] for row in labels], device=device)
+        concentration = torch.as_tensor([row[2] for row in labels], device=device)
+        displacement = torch.as_tensor([row[3] for row in labels], device=device)
+        time_mask = torch.rand(
+            (batch_windows, context_length), generator=generator, device=device) < mask_ratio
+        time_mask[:, -1] = True
+        masked_finite = finite & ~time_mask[:, None, :]
+        masked = torch.where(masked_finite, standardized, torch.zeros_like(standardized))
+        masked_embedding = _reg_embeddings(base, masked, masked_finite)
+        reconstruction = decoder(masked_embedding)
+        reconstruction_loss = F.smooth_l1_loss(reconstruction, target)
+
+        view1, mask1 = _augment(standardized, finite, generator, noise=noise, scale=scale)
+        view2, mask2 = _augment(standardized, finite, generator, noise=noise, scale=scale)
+        views = torch.cat([view1, view2], dim=0)
+        masks = torch.cat([mask1, mask2], dim=0)
+        embeddings = _reg_embeddings(base, views, masks)
+        projected = F.normalize(projection(embeddings), dim=1)
+        instance = torch.arange(batch_windows, device=device).repeat(2)
+        contrastive_losses = []
+        for label in (participation, concentration, displacement):
+            doubled = label.repeat(2)
+            valid = doubled >= 0
+            if int(valid.sum()) >= 4 and int(torch.unique(doubled[valid]).numel()) >= 2:
+                contrastive_losses.append(_regime_supcon(
+                    projected[valid], instance[valid], doubled[valid], temperature))
+        contrastive_loss = (
+            torch.stack(contrastive_losses).mean()
+            if contrastive_losses else reconstruction_loss * 0.0)
+
+        reversed_values = torch.flip(standardized, dims=[-1])
+        reversed_mask = torch.flip(finite, dims=[-1])
+        ordered_embedding = _reg_embeddings(base, standardized, finite)
+        reversed_embedding = _reg_embeddings(base, reversed_values, reversed_mask)
+        order_input = torch.cat([
+            torch.cat([ordered_embedding, reversed_embedding], dim=1),
+            torch.cat([reversed_embedding, ordered_embedding], dim=1),
+        ], dim=0)
+        order_logits = order_head(order_input)
+        order_labels = torch.cat([
+            torch.zeros(batch_windows, dtype=torch.long, device=device),
+            torch.ones(batch_windows, dtype=torch.long, device=device),
+        ])
+        order_loss = F.cross_entropy(order_logits, order_labels)
+        total = reconstruction_loss + contrastive_loss + 0.5 * order_loss
+        return total, {
+            "reconstruction": float(reconstruction_loss.detach()),
+            "participation_contrast": float(contrastive_loss.detach()),
+            "temporal_order": float(order_loss.detach()),
+        }
+
+    best_loss, best_adapter = math.inf, None
+    history, start_epoch, bad = [], 0, 0
+    if resume and state_path.is_file():
+        saved = torch.load(state_path, map_location="cpu")
+        _restore_adapter(model, saved["adapter"])
+        projection.load_state_dict(saved["projection"])
+        decoder.load_state_dict(saved["decoder"])
+        order_head.load_state_dict(saved["order_head"])
+        optimizer.load_state_dict(saved["optimizer"])
+        best_loss, best_adapter = float(saved["best_loss"]), saved["best_adapter"]
+        history, start_epoch, bad = list(saved["history"]), int(saved["epoch"]) + 1, int(saved["bad"])
+        rng.bit_generator.state = saved["numpy_rng"]
+        generator.set_state(saved["torch_generator"])
+
+    started = time.monotonic()
+    for epoch in range(start_epoch, epochs):
+        model.train(); projection.train(); decoder.train(); order_head.train()
+        optimizer.zero_grad(set_to_none=True)
+        totals = {"loss": 0.0, "reconstruction": 0.0, "participation_contrast": 0.0, "temporal_order": 0.0}
+        for step in range(steps_per_epoch):
+            loss, components = loss_for(train_matrices, train_starts, train=True)
+            if not torch.isfinite(loss):
+                raise RuntimeError("non-finite volume-structure SSL loss")
+            (loss / gradient_accumulation).backward()
+            totals["loss"] += float(loss.detach())
+            for name, value in components.items():
+                totals[name] += value
+            if (step + 1) % gradient_accumulation == 0 or step + 1 == steps_per_epoch:
+                torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+                optimizer.step(); optimizer.zero_grad(set_to_none=True)
+        model.eval(); projection.eval(); decoder.eval(); order_head.eval()
+        with torch.no_grad():
+            validation_losses = []
+            for _ in range(max(1, min(8, steps_per_epoch // 4))):
+                value, _ = loss_for(validation_matrices, validation_starts, train=False)
+                validation_losses.append(float(value))
+            val_loss = float(np.mean(validation_losses))
+        improved = val_loss < best_loss - 1e-6
+        if improved:
+            best_loss, bad = val_loss, 0
+            best_adapter = _adapter_state(model)
+        else:
+            bad += 1
+        row = {
+            "epoch": epoch,
+            "train_loss": totals["loss"] / steps_per_epoch,
+            "train_reconstruction": totals["reconstruction"] / steps_per_epoch,
+            "train_participation_contrast": totals["participation_contrast"] / steps_per_epoch,
+            "train_temporal_order": totals["temporal_order"] / steps_per_epoch,
+            "val_loss": val_loss,
+            "improved": improved,
+        }
+        history.append(row)
+        print(
+            f"[chronos2-volume-structure] ep={epoch} "
+            f"train={row['train_loss']:.5f} val={val_loss:.5f}"
+            f"{' *' if improved else ''}", flush=True)
+        _atomic_torch(state_path, {
+            "epoch": epoch,
+            "adapter": _adapter_state(model),
+            "projection": projection.state_dict(),
+            "decoder": decoder.state_dict(),
+            "order_head": order_head.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_loss": best_loss,
+            "best_adapter": best_adapter,
+            "history": history,
+            "bad": bad,
+            "numpy_rng": rng.bit_generator.state,
+            "torch_generator": generator.get_state(),
+        })
+        if bad >= patience:
+            break
+    if best_adapter is None:
+        raise RuntimeError("volume-structure SSL never produced a finite validation checkpoint")
+    _restore_adapter(model, best_adapter)
+    _save_final(model, checkpoint)
+    report = {
+        "schema": "ffm_chronos2_volume_structure_ssl_v1",
+        "stage": "volume_structure_ssl",
+        "status": "complete",
+        "parent": {"path": str(parent), "sha256": tree_sha256(parent)},
+        "checkpoint": {"path": str(checkpoint), "sha256": tree_sha256(checkpoint)},
+        "data_identity_sha256": _corpus_identity(corpus),
+        "config": {
+            "timeframes": list(timeframes),
+            "context_length": context_length,
+            "epochs": epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "batch_windows": batch_windows,
+            "gradient_accumulation": gradient_accumulation,
+            "learning_rate": learning_rate,
+            "mask_ratio": mask_ratio,
+            "projection_dim": projection_dim,
+            "temperature": temperature,
+            "seed": seed,
+            "objectives": [
+                "masked_volume_price_patch_reconstruction",
+                "participation_contrastive_learning",
+                "concentration_dispersion_contrastive_learning",
+                "displacement_volume_alignment",
+                "temporal_order_acceptance_displacement_retracement_expansion",
+            ],
+        },
+        "thresholds": thresholds,
+        "best_val_loss": best_loss,
+        "history": history,
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    _atomic_json(out_dir / "report.json", report)
+    return report
+
+
 __all__ = [
     "train_mask",
     "train_contrastive",
     "train_volatility_contrastive",
+    "train_volume_structure_ssl",
     "tree_sha256",
 ]
