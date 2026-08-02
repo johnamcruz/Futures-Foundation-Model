@@ -6,18 +6,26 @@ can be loaded by the ordinary Chronos-2 pipeline and classifier seam.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from copy import deepcopy
+import gc
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
+import shutil
+import tempfile
 import time
 
 import numpy as np
 
 
 IMPORT_ALLOWLIST = ["chronos.chronos2.model"]
+CHRONOS2_MODEL_ID = "autogluon/chronos-2-small"
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def tree_sha256(path: str | Path) -> str:
@@ -47,14 +55,91 @@ def _atomic_torch(path: Path, payload) -> None:
     temporary.replace(path)
 
 
-def _load_trainable_adapter(parent: str | Path, device: str):
+@contextmanager
+def _runtime_pinned_adapter(
+        parent: str | Path,
+        base_revision: str | None,
+        base_snapshot: str | Path | None = None,
+):
+    """Load an adapter against the exact authenticated local base bytes."""
+    parent = Path(parent).expanduser().resolve()
+    base_snapshot = (
+        None if base_snapshot is None
+        else Path(base_snapshot).expanduser().resolve()
+    )
+    if base_snapshot is not None and (
+        base_revision is None
+        or base_snapshot.name != base_revision
+        or not (base_snapshot / "config.json").is_file()
+        or not (base_snapshot / "model.safetensors").is_file()
+    ):
+        raise RuntimeError(
+            "pinned adapter base snapshot is incomplete or revision-mismatched")
+    if base_revision is None:
+        if base_snapshot is not None:
+            raise RuntimeError("base snapshot requires an exact base revision")
+        yield parent
+        return
+    config_path = parent / "adapter_config.json"
+    config = _read_json_object(config_path)
+    if config.get("revision") == base_revision and base_snapshot is None:
+        yield parent
+        return
+    if config.get("revision") not in {None, base_revision}:
+        raise RuntimeError("adapter base revision conflicts with pinned snapshot")
+    if base_snapshot is None:
+        config["revision"] = base_revision
+    else:
+        if config.get("base_model_name_or_path") != CHRONOS2_MODEL_ID:
+            raise RuntimeError(
+                "adapter base model does not match the authenticated snapshot")
+        # PEFT consumes this temporary config when it instantiates the base.
+        # A local path binds the loaded tensors to the exact files hashed by
+        # _chronos_base_identity instead of merely trusting a Hub revision.
+        config["base_model_name_or_path"] = str(base_snapshot)
+        config["revision"] = None
+    with tempfile.TemporaryDirectory(
+        prefix="ffm-chronos2-pinned-adapter-",
+    ) as temporary:
+        runtime = Path(temporary)
+        (runtime / "adapter_config.json").write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n")
+        weights = [
+            path for name in ("adapter_model.safetensors", "adapter_model.bin")
+            if (path := parent / name).is_file()
+        ]
+        if len(weights) != 1:
+            raise RuntimeError("PEFT adapter must contain exactly one weight file")
+        (runtime / weights[0].name).symlink_to(weights[0].resolve())
+        yield runtime
+
+
+def _load_trainable_adapter(
+        parent: str | Path,
+        device: str,
+        *,
+        base_revision: str | None = None,
+        base_snapshot: str | Path | None = None,
+):
     from peft import AutoPeftModel
 
-    model = AutoPeftModel.from_pretrained(
+    with _runtime_pinned_adapter(
         parent,
-        is_trainable=True,
-        import_allowlist=IMPORT_ALLOWLIST,
-    ).to(device)
+        base_revision,
+        base_snapshot,
+    ) as runtime_parent:
+        model = AutoPeftModel.from_pretrained(
+            runtime_parent,
+            is_trainable=True,
+            import_allowlist=IMPORT_ALLOWLIST,
+        ).to(device)
+    if base_snapshot is not None:
+        peft_configs = getattr(model, "peft_config", None)
+        if not isinstance(peft_configs, Mapping) or not peft_configs:
+            raise RuntimeError("loaded adapter exposes no PEFT configuration")
+        for adapter_config in peft_configs.values():
+            adapter_config.base_model_name_or_path = CHRONOS2_MODEL_ID
+            adapter_config.revision = base_revision
     model.train()
     base = model.base_model.model
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -1252,7 +1337,312 @@ def train_volatility_contrastive(prepared, **kwargs) -> dict:
 
 VOLUME_STRUCTURE_SUMMARY_SIZE = 15
 VOLUME_STRUCTURE_TEMPORAL_SIZE = 12
-VOLUME_STRUCTURE_TRAINER_SCHEMA = "ffm_chronos2_volume_structure_trainer_v3"
+VOLUME_STRUCTURE_TRAINER_SCHEMA = "ffm_chronos2_volume_structure_trainer_v4"
+VOLUME_STRUCTURE_REPORT_SCHEMA = "ffm_chronos2_volume_structure_ssl_v3"
+VOLUME_STRUCTURE_STAGED_CHECKPOINT = ".checkpoint.pending"
+VOLUME_STRUCTURE_STAGED_REPORT = ".report.complete.pending.json"
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"unreadable JSON artifact: {path}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"JSON artifact must contain an object: {path}")
+    return value
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _chronos_base_identity(
+        parent: Path,
+        base_snapshot: Path,
+) -> dict[str, str]:
+    """Authenticate the exact Chronos base used beneath a local PEFT adapter."""
+    parent = Path(parent).expanduser().resolve()
+    base_snapshot = Path(base_snapshot).expanduser().resolve()
+    adapter_path = parent / "adapter_config.json"
+    weights_path = base_snapshot / "model.safetensors"
+    config_path = base_snapshot / "config.json"
+    if (
+        not parent.is_dir()
+        or not adapter_path.is_file()
+        or not base_snapshot.is_dir()
+        or _HEX40.fullmatch(base_snapshot.name) is None
+        or not weights_path.is_file()
+        or not config_path.is_file()
+    ):
+        raise RuntimeError(
+            "Volume-Structure SSL requires a complete pinned Chronos-2-small "
+            "snapshot named by its 40-character revision")
+    adapter = _read_json_object(adapter_path)
+    if (
+        adapter.get("base_model_name_or_path") != CHRONOS2_MODEL_ID
+        or adapter.get("peft_type") != "LORA"
+        or adapter.get("revision") not in {None, base_snapshot.name}
+    ):
+        raise RuntimeError(
+            "Volume-Structure parent adapter does not match the pinned base")
+    return {
+        "model_id": CHRONOS2_MODEL_ID,
+        "snapshot_path": str(base_snapshot),
+        "revision": base_snapshot.name,
+        "weights_sha256": _file_sha256(weights_path),
+        "config_sha256": _file_sha256(config_path),
+    }
+
+
+def _authenticate_volume_structure_completion(
+        report: Mapping,
+        *,
+        checkpoint: Path,
+        run_identity_sha256: str,
+        artifact_path: Path | None = None,
+) -> None:
+    """Fail closed unless a complete report proves native, head-free learning."""
+    artifact_path = Path(checkpoint if artifact_path is None else artifact_path)
+    saved_checkpoint = report.get("checkpoint")
+    native = report.get("checkpoint_only_validation")
+    artifact = report.get("final_artifact_contract")
+    config = report.get("config")
+    saved_path = (
+        saved_checkpoint.get("path")
+        if isinstance(saved_checkpoint, Mapping) else None
+    )
+    if (
+        report.get("schema") != VOLUME_STRUCTURE_REPORT_SCHEMA
+        or report.get("stage") != "volume_structure_ssl"
+        or report.get("status") != "complete"
+        or report.get("run_identity_sha256") != run_identity_sha256
+        or not isinstance(saved_checkpoint, Mapping)
+        or not isinstance(saved_path, str)
+        or Path(saved_path).resolve() != Path(checkpoint).resolve()
+        or saved_checkpoint.get("sha256") != tree_sha256(artifact_path)
+        or not isinstance(native, Mapping)
+        or native.get("status") != "pass"
+        or native.get("contract")
+        != "freshly_reloaded_lora_native_reg_without_temporary_heads"
+        or not isinstance(artifact, Mapping)
+        or not isinstance(config, Mapping)
+    ):
+        raise RuntimeError(
+            "Volume-Structure complete report lacks authenticated native evidence")
+    parent = native.get("parent")
+    child = native.get("checkpoint")
+    saved_lift = native.get("loss_lift_parent_minus_checkpoint")
+    margin = native.get("required_margin")
+    if (
+        not isinstance(parent, Mapping)
+        or not isinstance(parent.get("aggregate"), Mapping)
+        or not isinstance(child, Mapping)
+        or not isinstance(child.get("aggregate"), Mapping)
+        or not isinstance(saved_lift, Mapping)
+        or not isinstance(margin, (int, float))
+        or not np.isfinite(float(margin))
+        or float(margin) < 0.0
+    ):
+        raise RuntimeError(
+            "Volume-Structure complete report has malformed native evidence")
+    measured = _validate_native_volume_lift(
+        parent["aggregate"], child["aggregate"], margin=float(margin))
+    for objective, value in measured.items():
+        saved = saved_lift.get(objective)
+        if (
+            not isinstance(saved, (int, float))
+            or not np.isfinite(float(saved))
+            or not math.isclose(value, float(saved), abs_tol=1e-9)
+        ):
+            raise RuntimeError(
+                "Volume-Structure complete report native lift drifted")
+    selection = config.get("checkpoint_selection")
+    base = config.get("base_model")
+    saved_files = artifact.get("checkpoint_files")
+    checkpoint_files = sorted(
+        str(path.relative_to(artifact_path))
+        for path in artifact_path.rglob("*")
+        if path.is_file()
+    )
+    if not (
+        isinstance(selection, Mapping)
+        and selection.get("contract")
+        == "gate_feasible_weighted_native_reg_participation_concentration_v1"
+        and selection.get("temporary_head_metrics_used") is False
+        and isinstance(base, Mapping)
+        and base.get("model_id") == CHRONOS2_MODEL_ID
+        and isinstance(base.get("revision"), str)
+        and _HEX40.fullmatch(base["revision"]) is not None
+        and isinstance(base.get("weights_sha256"), str)
+        and _HEX64.fullmatch(base["weights_sha256"]) is not None
+        and isinstance(base.get("config_sha256"), str)
+        and _HEX64.fullmatch(base["config_sha256"]) is not None
+        and artifact.get("temporary_heads_in_checkpoint") is False
+        and artifact.get("ssl_heads_required_for_inference") is False
+        and artifact.get("trainer_state")
+        == "discarded_after_successful_checkpoint"
+        and artifact.get("inference_requires")
+        == ["chronos_base_model", "lora_checkpoint"]
+        and isinstance(saved_files, list)
+        and sorted(saved_files) == checkpoint_files
+        and checkpoint_files
+        and not any(
+            token in Path(name).name.lower()
+            for name in checkpoint_files
+            for token in ("head", "decoder", "projection", "trainer")
+        )
+    ):
+        raise RuntimeError(
+            "Volume-Structure complete report violates head-free artifact contract")
+
+
+def _recover_volume_structure_finalization(
+        out_dir: Path,
+        *,
+        run_identity_sha256: str,
+        trainer_payload: Mapping | None = None,
+) -> dict | None:
+    """Complete a previously validated two-phase publish after a crash.
+
+    The pending complete report is written while ``trainer.pt`` still exists.
+    Therefore its presence authenticates that checkpoint-only validation passed
+    before finalization began. Recovery publishes the exact staged checkpoint,
+    removes only the run's resumable trainer state, and exposes that report.
+    """
+    out_dir = Path(out_dir)
+    checkpoint = out_dir / "checkpoint"
+    staged_checkpoint = out_dir / VOLUME_STRUCTURE_STAGED_CHECKPOINT
+    state_path = out_dir / "trainer.pt"
+    state_temporary = state_path.with_name(f".{state_path.name}.tmp")
+    report_path = out_dir / "report.json"
+    staged_report = out_dir / VOLUME_STRUCTURE_STAGED_REPORT
+    if _HEX64.fullmatch(run_identity_sha256) is None:
+        raise ValueError("expected Volume-Structure run identity must be SHA-256")
+    if not staged_report.is_file():
+        if checkpoint.exists() and staged_checkpoint.exists():
+            raise RuntimeError(
+                "published Volume-Structure run has an extra staged checkpoint")
+        if (
+            report_path.is_file()
+            and checkpoint.is_dir()
+            and not state_path.exists()
+            and not staged_checkpoint.exists()
+        ):
+            published = _read_json_object(report_path)
+            saved_checkpoint = published.get("checkpoint")
+            if (
+                published.get("schema") == VOLUME_STRUCTURE_REPORT_SCHEMA
+                and published.get("status") == "complete"
+                and published.get("run_identity_sha256")
+                == run_identity_sha256
+                and isinstance(saved_checkpoint, dict)
+                and saved_checkpoint.get("sha256") == tree_sha256(checkpoint)
+            ):
+                _authenticate_volume_structure_completion(
+                    published,
+                    checkpoint=checkpoint,
+                    run_identity_sha256=run_identity_sha256,
+                )
+                if state_temporary.exists():
+                    if not state_temporary.is_file():
+                        raise RuntimeError(
+                            "Volume-Structure temporary trainer state is not a file")
+                    state_temporary.unlink()
+                return published
+        return None
+    if not report_path.is_file():
+        raise RuntimeError(
+            "Volume-Structure finalization marker exists without report.json")
+    finalizing = _read_json_object(report_path)
+    complete = _read_json_object(staged_report)
+    expected_checkpoint = complete.get("checkpoint")
+    expected_path = (
+        expected_checkpoint.get("path")
+        if isinstance(expected_checkpoint, dict) else None
+    )
+    expected_complete = deepcopy(finalizing)
+    expected_complete["status"] = "complete"
+    if (
+        finalizing.get("schema") != VOLUME_STRUCTURE_REPORT_SCHEMA
+        or complete.get("schema") != VOLUME_STRUCTURE_REPORT_SCHEMA
+        or finalizing.get("status") != "finalizing"
+        or complete.get("status") != "complete"
+        or complete != expected_complete
+        or complete.get("run_identity_sha256") != run_identity_sha256
+        or not isinstance(expected_checkpoint, dict)
+        or not isinstance(expected_path, str)
+        or Path(expected_path).resolve() != checkpoint.resolve()
+    ):
+        raise RuntimeError(
+            "Volume-Structure finalization artifacts do not share one identity")
+    expected_sha256 = expected_checkpoint.get("sha256")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise RuntimeError(
+            "Volume-Structure pending report has no checkpoint identity")
+    if checkpoint.exists() and staged_checkpoint.exists():
+        raise RuntimeError(
+            "both published and staged Volume-Structure checkpoints exist")
+    candidate = checkpoint if checkpoint.is_dir() else staged_checkpoint
+    if not candidate.is_dir() or tree_sha256(candidate) != expected_sha256:
+        raise RuntimeError(
+            "Volume-Structure pending checkpoint identity is invalid")
+    if candidate == staged_checkpoint and not state_path.is_file():
+        raise RuntimeError(
+            "staged Volume-Structure checkpoint cannot finalize without trainer state")
+    _authenticate_volume_structure_completion(
+        complete,
+        checkpoint=checkpoint,
+        artifact_path=candidate,
+        run_identity_sha256=run_identity_sha256,
+    )
+    if state_path.exists():
+        if not state_path.is_file():
+            raise RuntimeError("Volume-Structure trainer state is not a file")
+        trainer = trainer_payload
+        if trainer is None:
+            import torch
+
+            try:
+                trainer = torch.load(
+                    state_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Volume-Structure trainer state is unreadable") from exc
+        _validate_volume_structure_resume(
+            trainer, run_identity_sha256=run_identity_sha256)
+    if state_temporary.exists() and not state_temporary.is_file():
+        raise RuntimeError(
+            "Volume-Structure temporary trainer state is not a file")
+    if candidate == staged_checkpoint:
+        staged_checkpoint.replace(checkpoint)
+    if state_path.exists():
+        state_path.unlink()
+    if state_temporary.exists():
+        state_temporary.unlink()
+    if state_path.exists() or state_temporary.exists():
+        raise RuntimeError("Volume-Structure trainer state was not discarded")
+    staged_report.replace(report_path)
+    published = _read_json_object(report_path)
+    if published.get("status") != "complete":
+        raise RuntimeError("Volume-Structure completion report was not published")
+    return published
+
+
+def _release_accelerator_cache(device: str) -> None:
+    import torch
+
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif str(device) == "mps" and hasattr(torch, "mps"):
+        empty_cache = getattr(torch.mps, "empty_cache", None)
+        if empty_cache is not None:
+            empty_cache()
 
 
 def _evenly_spaced_starts(
@@ -1487,6 +1877,73 @@ def _volume_structure_states(summary: np.ndarray, thresholds: Mapping) -> np.nda
             else 2 if value >= float(thresholds[f"{name}_high"])
             else -1)
     return np.asarray(states, dtype=np.int64)
+
+
+def _native_reg_volume_structure_losses(
+        embeddings,
+        instance,
+        states,
+        *,
+        temperature: float,
+        require_all: bool,
+):
+    """Parameter-free state losses applied directly to native Chronos REG."""
+    import torch
+    import torch.nn.functional as F
+
+    if states.ndim != 2 or states.shape[1] != 3:
+        raise ValueError("volume-structure states must have shape [B,3]")
+    if embeddings.ndim != 2 or len(embeddings) != 2 * len(states):
+        raise ValueError("native REG embeddings must contain two views per state row")
+    if instance.shape != (len(embeddings),):
+        raise ValueError("native REG instance IDs have the wrong shape")
+    losses, eligible = {}, {}
+    normalized = F.normalize(embeddings, dim=1)
+    for column, objective in enumerate(
+            ("participation", "concentration", "displacement")):
+        labels = states[:, column].repeat(2)
+        valid = labels >= 0
+        eligible[objective] = int(valid.sum().item() // 2)
+        active = (
+            int(valid.sum()) >= 4
+            and int(torch.unique(labels[valid]).numel()) >= 2
+        )
+        if require_all and not active:
+            raise RuntimeError(
+                f"native REG batch lost the {objective} objective")
+        losses[objective] = (
+            _regime_supcon(
+                normalized[valid],
+                instance[valid],
+                labels[valid],
+                temperature,
+            )
+            if active else None
+        )
+    return losses, eligible
+
+
+def _validate_native_volume_lift(
+        parent: Mapping[str, float],
+        child: Mapping[str, float],
+        *,
+        margin: float,
+) -> dict[str, float]:
+    """Fail closed unless native participation and concentration both improve."""
+    if margin < 0.0:
+        raise ValueError("native promotion margin must be nonnegative")
+    lift = {}
+    for objective in ("participation", "concentration"):
+        before = float(parent[objective])
+        after = float(child[objective])
+        if not np.isfinite(before) or not np.isfinite(after):
+            raise RuntimeError(
+                f"non-finite native {objective} checkpoint evidence")
+        lift[objective] = before - after
+        if lift[objective] <= margin:
+            raise RuntimeError(
+                f"native {objective} did not improve beyond the parent checkpoint")
+    return lift
 
 
 def _volume_structure_run_identity(
@@ -1782,6 +2239,7 @@ def train_volume_structure_ssl(
         prepared,
         *,
         parent: str | Path,
+        base_snapshot: str | Path,
         out_dir: str | Path,
         device: str = "mps",
         context_length: int = 256,
@@ -1793,6 +2251,7 @@ def train_volume_structure_ssl(
         weight_decay: float = 0.05,
         patience: int = 8,
         projection_dim: int = 128,
+        head_auxiliary_weight: float = 0.25,
         temperature: float = 0.10,
         noise: float = 0.02,
         scale: float = 0.10,
@@ -1806,6 +2265,7 @@ def train_volume_structure_ssl(
         displacement_weight: float = 1.0,
         temporal_weight: float = 0.5,
         adapter_retention_weight: float = 0.1,
+        native_promotion_margin: float = 1e-4,
         log_every_steps: int = 10,
         seed: int = 0,
         resume: bool = False,
@@ -1813,11 +2273,14 @@ def train_volume_structure_ssl(
     """Train an isolated causal OHLCV Volume-Structure LoRA adapter.
 
     Participation and price-volume concentration are distinct self-supervised
-    tasks with separate heads, losses, and validation metrics. Reconstruction
-    predicts genuinely hidden Chronos patches using normalization fitted only
-    from visible values. The temporal task reconstructs ordered quarter-level
-    volume, price-location, and range descriptors; it does not claim to label a
-    proprietary trading sequence or a literal intrabar exchange profile.
+    tasks trained directly on the native Chronos REG representation. Temporary
+    projection heads and decoders are auxiliary optimization scaffolding only;
+    best-checkpoint selection and the final parent/child lift gate never use
+    them. Reconstruction predicts genuinely hidden Chronos patches using
+    normalization fitted only from visible values. The temporal task
+    reconstructs ordered quarter-level volume, price-location, and range
+    descriptors; it does not claim to label a proprietary trading sequence or
+    a literal intrabar exchange profile.
     """
     import torch
     import torch.nn as nn
@@ -1841,10 +2304,14 @@ def train_volume_structure_ssl(
         raise ValueError("validation_windows_per_stream must be >= 4")
     if projection_dim < 2 or temperature <= 0.0:
         raise ValueError("projection_dim must be >= 2 and temperature must be > 0")
+    if head_auxiliary_weight < 0.0:
+        raise ValueError("head_auxiliary_weight must be nonnegative")
     if noise < 0.0 or scale < 0.0 or scale >= 1.0:
         raise ValueError("noise must be >= 0 and scale must be in [0,1)")
     if weight_decay < 0.0:
         raise ValueError("weight_decay must be nonnegative")
+    if native_promotion_margin < 0.0:
+        raise ValueError("native_promotion_margin must be nonnegative")
     objective_weights = {
         "reconstruction": float(reconstruction_weight),
         "participation": float(participation_weight),
@@ -1853,32 +2320,34 @@ def train_volume_structure_ssl(
         "temporal_structure": float(temporal_weight),
         "adapter_retention": float(adapter_retention_weight),
     }
+    native_selection_weights = {
+        "participation_native": float(participation_weight),
+        "concentration_native": float(concentration_weight),
+    }
     if any(value < 0.0 for value in objective_weights.values()):
         raise ValueError("volume-structure objective weights must be nonnegative")
     if not any(value > 0.0 for value in objective_weights.values()):
         raise ValueError("at least one volume-structure objective weight must be positive")
+    if (
+        objective_weights["participation"] <= 0.0
+        or objective_weights["concentration"] <= 0.0
+    ):
+        raise ValueError(
+            "native participation and concentration objectives must stay active")
     if log_every_steps < 1:
         raise ValueError("log_every_steps must be >= 1")
 
     out_dir, parent = Path(out_dir), Path(parent)
+    base_snapshot = Path(base_snapshot)
     checkpoint = out_dir / "checkpoint"
+    staged_checkpoint = out_dir / VOLUME_STRUCTURE_STAGED_CHECKPOINT
     state_path = out_dir / "trainer.pt"
+    state_temporary = state_path.with_name(f".{state_path.name}.tmp")
     report_path = out_dir / "report.json"
+    staged_report = out_dir / VOLUME_STRUCTURE_STAGED_REPORT
     preflight_path = out_dir / "preflight.json"
     if not parent.is_dir():
         raise RuntimeError(f"volume-structure parent adapter is missing: {parent}")
-    if checkpoint.exists():
-        raise RuntimeError(
-            f"completed volume-structure checkpoint already exists: {checkpoint}")
-    if report_path.exists():
-        raise RuntimeError(
-            f"completed volume-structure report already exists: {report_path}")
-    if resume and not state_path.is_file():
-        raise RuntimeError(
-            f"--resume requested but trainer state is missing: {state_path}")
-    if state_path.exists() and not resume:
-        raise RuntimeError(
-            f"incomplete trainer state exists; pass --resume or use a new out-dir: {state_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     data = _prepare_volume_structure_data(
@@ -1892,6 +2361,7 @@ def train_volume_structure_ssl(
     timeframes = tuple(corpus)
     parent_sha256 = tree_sha256(parent)
     data_identity_sha256 = data["data_identity_sha256"]
+    base_identity = _chronos_base_identity(parent, base_snapshot)
 
     def package_version(distribution: str) -> str:
         try:
@@ -1906,6 +2376,7 @@ def train_volume_structure_ssl(
         "torch_version": str(torch.__version__),
         "chronos_version": package_version("chronos-forecasting"),
         "peft_version": package_version("peft"),
+        "base_model": base_identity,
         "timeframes": list(timeframes),
         "stream_sampler": "uniform_stream_balanced_extreme_states",
         "context_length": context_length,
@@ -1918,6 +2389,7 @@ def train_volume_structure_ssl(
         "temporary_head_weight_decay": weight_decay,
         "patience": patience,
         "projection_dim": projection_dim,
+        "head_auxiliary_weight": head_auxiliary_weight,
         "temperature": temperature,
         "noise": noise,
         "scale": scale,
@@ -1928,14 +2400,25 @@ def train_volume_structure_ssl(
         "validation_sampling": "fixed_evenly_spaced_per_stream",
         "price_bins": price_bins,
         "objective_weights": objective_weights,
+        "checkpoint_selection": {
+            "contract": (
+                "gate_feasible_weighted_native_reg_"
+                "participation_concentration_v1"),
+            "weights": native_selection_weights,
+            "temporary_head_metrics_used": False,
+        },
+        "native_promotion_margin": native_promotion_margin,
         "log_every_steps": log_every_steps,
         "seed": seed,
         "objective_schema": {
             "summary": "scale_free_volume_price_range_quarters_v2",
             "reconstruction": "visible_normalized_masked_chronos_patches_v1",
-            "participation": "recent_vs_prior_relative_volume_extremes_v1",
-            "concentration": "volume_weighted_typical_price_entropy_hhi_v1",
-            "displacement": "range_volume_cooccurrence_extremes_v1",
+            "participation": (
+                "native_reg_plus_projection_recent_vs_prior_volume_v2"),
+            "concentration": (
+                "native_reg_plus_projection_typical_price_entropy_hhi_v2"),
+            "displacement": (
+                "native_reg_plus_projection_range_volume_cooccurrence_v2"),
             "temporal_structure": "ordered_quarter_descriptor_reconstruction_v1",
             "retention": "l2_sp_parent_adapter_anchor_v1",
         },
@@ -1946,11 +2429,64 @@ def train_volume_structure_ssl(
         config=run_config,
     )
     resume_payload = None
-    if resume:
-        resume_payload = torch.load(
-            state_path, map_location="cpu", weights_only=False)
+    if resume and state_path.is_file():
+        try:
+            resume_payload = torch.load(
+                state_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(
+                "volume-structure trainer state is unreadable") from exc
         _validate_volume_structure_resume(
             resume_payload, run_identity_sha256=run_identity_sha256)
+    if resume:
+        recovered = _recover_volume_structure_finalization(
+            out_dir,
+            run_identity_sha256=run_identity_sha256,
+            trainer_payload=resume_payload,
+        )
+        if recovered is not None:
+            return recovered
+    if checkpoint.exists():
+        raise RuntimeError(
+            f"completed volume-structure checkpoint already exists: {checkpoint}")
+    if report_path.exists():
+        pending = _read_json_object(report_path)
+        can_rebuild_finalization = (
+            resume_payload is not None
+            and staged_checkpoint.is_dir()
+            and not staged_report.exists()
+            and pending.get("schema") == VOLUME_STRUCTURE_REPORT_SCHEMA
+            and pending.get("status") == "finalizing"
+            and pending.get("run_identity_sha256") == run_identity_sha256
+        )
+        if not can_rebuild_finalization:
+            raise RuntimeError(
+                f"completed volume-structure report already exists: {report_path}")
+        # The complete marker was never serialized, so no success decision was
+        # published. The authenticated trainer can deterministically rebuild it.
+        report_path.unlink()
+    if resume and resume_payload is None:
+        raise RuntimeError(
+            f"--resume requested but trainer state is missing: {state_path}")
+    if state_path.exists() and not resume:
+        raise RuntimeError(
+            f"incomplete trainer state exists; pass --resume or use a new out-dir: {state_path}")
+    if resume_payload is not None and state_temporary.exists():
+        if not state_temporary.is_file():
+            raise RuntimeError(
+                "volume-structure temporary trainer state is not a file")
+        state_temporary.unlink()
+    if staged_report.exists():
+        raise RuntimeError(
+            f"unrecoverable Volume-Structure finalization report exists: {staged_report}")
+    if staged_checkpoint.exists():
+        if resume_payload is None or not staged_checkpoint.is_dir():
+            raise RuntimeError(
+                f"unrecoverable staged Volume-Structure checkpoint exists: {staged_checkpoint}")
+        # A crash before the two-phase publish marker leaves a reconstructible
+        # directory. Delete only this exact staging path after trainer identity
+        # authentication, then rebuild it from the retained best adapter.
+        shutil.rmtree(staged_checkpoint)
     _atomic_json(preflight_path, {
         "schema": "ffm_chronos2_volume_structure_preflight_v1",
         "status": "pass",
@@ -1969,7 +2505,12 @@ def train_volume_structure_ssl(
     rng = np.random.default_rng(seed)
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
-    model, base = _load_trainable_adapter(parent, device)
+    model, base = _load_trainable_adapter(
+        parent,
+        device,
+        base_revision=base_identity["revision"],
+        base_snapshot=base_snapshot,
+    )
     patch_size = int(base.chronos_config.input_patch_size)
     patch_stride = int(base.chronos_config.input_patch_stride)
     if patch_stride != patch_size:
@@ -2105,6 +2646,85 @@ def train_volume_structure_ssl(
         ]).astype(np.float32)
         return raw, stream["validation_states"], stream["validation_temporal"]
 
+    def native_checkpoint_validation(validation_base):
+        """Measure raw REG state geometry without any temporary SSL module."""
+        validation_generator = torch.Generator(device=device)
+        validation_generator.manual_seed(seed + 20_260_802)
+        per_stream = {}
+        with torch.no_grad():
+            for timeframe, ticker in stream_keys:
+                raw_np, states_np, _ = validation_batch((timeframe, ticker))
+                raw = torch.from_numpy(raw_np).to(device)
+                states = torch.from_numpy(
+                    np.asarray(states_np, dtype=np.int64)).to(device)
+                standardized, finite, _ = _volume_structure_standardize(raw)
+                first, first_mask = _volume_structure_augment(
+                    standardized,
+                    finite,
+                    validation_generator,
+                    noise=noise,
+                    scale=scale,
+                )
+                second, second_mask = _volume_structure_augment(
+                    standardized,
+                    finite,
+                    validation_generator,
+                    noise=noise,
+                    scale=scale,
+                )
+                embeddings = _reg_embeddings(
+                    validation_base,
+                    torch.cat([first, second], dim=0),
+                    torch.cat([first_mask, second_mask], dim=0),
+                )
+                instance = torch.arange(
+                    len(raw), device=device).repeat(2)
+                losses, eligible = _native_reg_volume_structure_losses(
+                    embeddings,
+                    instance,
+                    states,
+                    temperature=temperature,
+                    require_all=False,
+                )
+                per_stream[f"{ticker}@{timeframe}"] = {
+                    **{
+                        name: (
+                            None if value is None
+                            else float(value.detach().cpu()))
+                        for name, value in losses.items()
+                    },
+                    "eligible": eligible,
+                }
+        aggregate, worst_streams = {}, {}
+        for objective in objective_names:
+            eligible_losses = {
+                name: metrics[objective]
+                for name, metrics in per_stream.items()
+                if metrics[objective] is not None
+            }
+            if not eligible_losses:
+                raise RuntimeError(
+                    f"native checkpoint validation cannot measure {objective}")
+            aggregate[objective] = float(np.mean(list(eligible_losses.values())))
+            worst = max(eligible_losses, key=eligible_losses.get)
+            worst_streams[objective] = {
+                "stream": worst,
+                "loss": float(eligible_losses[worst]),
+                "eligible_streams": int(len(eligible_losses)),
+            }
+        return {
+            "contract": (
+                "fixed_augmented_native_chronos_reg_without_ssl_heads"),
+            "seed": seed + 20_260_802,
+            "aggregate": aggregate,
+            "worst_streams": worst_streams,
+            "per_stream": per_stream,
+        }
+
+    model.eval()
+    parent_native_validation = native_checkpoint_validation(base)
+    model.train()
+
     def adapter_drift():
         values = [
             (parameter - initial_adapter[name]).square().mean()
@@ -2118,6 +2738,7 @@ def train_volume_structure_ssl(
             temporal_np,
             *,
             loss_generator,
+            native_generator=None,
             require_all_contrastive,
     ):
         raw = torch.from_numpy(raw_np).to(device)
@@ -2172,10 +2793,22 @@ def train_volume_structure_ssl(
             reconstruction[selected], normalized_target[selected])
 
         standardized, full_finite, _ = _volume_structure_standardize(raw)
+        augmentation_generator = (
+            loss_generator if native_generator is None else native_generator)
         view1, mask1 = _volume_structure_augment(
-            standardized, full_finite, loss_generator, noise=noise, scale=scale)
+            standardized,
+            full_finite,
+            augmentation_generator,
+            noise=noise,
+            scale=scale,
+        )
         view2, mask2 = _volume_structure_augment(
-            standardized, full_finite, loss_generator, noise=noise, scale=scale)
+            standardized,
+            full_finite,
+            augmentation_generator,
+            noise=noise,
+            scale=scale,
+        )
         embeddings = _reg_embeddings(
             base,
             torch.cat([view1, view2], dim=0),
@@ -2183,29 +2816,36 @@ def train_volume_structure_ssl(
         )
         instance = torch.arange(batch, device=device).repeat(2)
         component_tensors = {"reconstruction": reconstruction_loss}
-        eligible = {}
+        native_losses, eligible = _native_reg_volume_structure_losses(
+            embeddings,
+            instance,
+            states,
+            temperature=temperature,
+            require_all=require_all_contrastive,
+        )
         for column, objective in enumerate(objective_names):
             labels = states[:, column].repeat(2)
             valid = labels >= 0
-            eligible[objective] = int(valid.sum().item() // 2)
-            active = (
-                int(valid.sum()) >= 4
-                and int(torch.unique(labels[valid]).numel()) >= 2
-            )
-            if require_all_contrastive and not active:
-                raise RuntimeError(
-                    f"balanced training batch lost the {objective} objective")
-            if active:
+            native_loss = native_losses[objective]
+            if native_loss is not None:
                 projected = F.normalize(
                     projection_heads[objective](embeddings[valid]), dim=1)
-                component_tensors[objective] = _regime_supcon(
+                projected_loss = _regime_supcon(
                     projected,
                     instance[valid],
                     labels[valid],
                     temperature,
                 )
+                component_tensors[f"{objective}_native"] = native_loss
+                component_tensors[f"{objective}_head"] = projected_loss
+                # Native REG geometry is primary. The head can stabilize
+                # gradients, but it cannot carry most of the optimized loss.
+                component_tensors[objective] = (
+                    native_loss + head_auxiliary_weight * projected_loss)
             else:
                 component_tensors[objective] = None
+                component_tensors[f"{objective}_native"] = None
+                component_tensors[f"{objective}_head"] = None
 
         temporal_prediction = temporal_decoder(embeddings[:batch])
         component_tensors["temporal_structure"] = F.smooth_l1_loss(
@@ -2269,28 +2909,38 @@ def train_volume_structure_ssl(
         optimizer.load_state_dict(saved["optimizer"])
         best_loss = float(saved["best_loss"])
         best_adapter = saved["best_adapter"]
-        best_epoch = int(saved["best_epoch"])
+        best_epoch = (
+            None if saved["best_epoch"] is None
+            else int(saved["best_epoch"])
+        )
         history = list(saved["history"])
         start_epoch = int(saved["epoch"]) + 1
         bad = int(saved["bad"])
         rng.bit_generator.state = saved["numpy_rng"]
         generator.set_state(saved["torch_generator"])
         restore_global_rng(saved["global_torch_rng"])
-        if start_epoch >= epochs:
-            raise RuntimeError(
-                "resume state already reached the configured epoch budget")
+        resume_payload = None
+        del saved
+        gc.collect()
 
     started = time.monotonic()
     component_keys = (
         "reconstruction",
         "participation",
+        "participation_native",
+        "participation_head",
         "concentration",
+        "concentration_native",
+        "concentration_head",
         "displacement",
+        "displacement_native",
+        "displacement_head",
         "temporal_structure",
         "adapter_retention",
         "embedding_std",
     )
-    for epoch in range(start_epoch, epochs):
+    epoch_stop = start_epoch if bad >= patience else epochs
+    for epoch in range(start_epoch, epoch_stop):
         model.train()
         projection_heads.train()
         patch_decoder.train()
@@ -2338,6 +2988,8 @@ def train_volume_structure_ssl(
         temporal_decoder.eval()
         validation_generator = torch.Generator(device=device)
         validation_generator.manual_seed(seed + 20_260_801)
+        native_validation_generator = torch.Generator(device=device)
+        native_validation_generator.manual_seed(seed + 20_260_802)
         with torch.no_grad():
             val_per_stream = {}
             for timeframe, ticker in stream_keys:
@@ -2348,6 +3000,7 @@ def train_volume_structure_ssl(
                     states_np,
                     temporal_np,
                     loss_generator=validation_generator,
+                    native_generator=native_validation_generator,
                     require_all_contrastive=False,
                 )
                 val_per_stream[f"{ticker}@{timeframe}"] = {
@@ -2366,17 +3019,18 @@ def train_volume_structure_ssl(
                 raise RuntimeError(
                     f"fixed validation bank cannot measure {name}")
             val_components[name] = float(np.mean(values))
+        # Checkpoint selection uses only native REG geometry. Temporary heads,
+        # reconstruction decoders, and retention penalties remain diagnostics
+        # and training auxiliaries; they cannot make an adapter look learned.
         val_loss = sum(
-            objective_weights[name] * val_components[name]
-            for name in objective_weights
+            weight * val_components[name]
+            for name, weight in native_selection_weights.items()
         )
         worst_streams = {}
         for name in (
-            "reconstruction",
-            "participation",
-            "concentration",
-            "displacement",
-            "temporal_structure",
+            "participation_native",
+            "concentration_native",
+            "displacement_native",
         ):
             eligible_values = {
                 key: value[name]
@@ -2390,12 +3044,25 @@ def train_volume_structure_ssl(
                 "eligible_streams": int(len(eligible_values)),
             }
 
-        improved = val_loss < best_loss - 1e-6
+        try:
+            _validate_native_volume_lift(
+                parent_native_validation["aggregate"],
+                {
+                    objective: val_components[f"{objective}_native"]
+                    for objective in ("participation", "concentration")
+                },
+                margin=native_promotion_margin,
+            )
+            native_gate_feasible = True
+        except RuntimeError:
+            native_gate_feasible = False
+        improved = (
+            native_gate_feasible and val_loss < best_loss - 1e-6)
         if improved:
             best_loss, bad = val_loss, 0
             best_adapter = _adapter_state(model)
             best_epoch = epoch
-        else:
+        elif best_adapter is not None:
             bad += 1
         row = {
             "epoch": epoch,
@@ -2408,6 +3075,7 @@ def train_volume_structure_ssl(
             "val_components": val_components,
             "val_worst_streams": worst_streams,
             "val_per_stream": val_per_stream,
+            "native_gate_feasible": native_gate_feasible,
             "improved": improved,
             "bad_epochs": bad,
             "elapsed_seconds": time.monotonic() - started,
@@ -2416,8 +3084,9 @@ def train_volume_structure_ssl(
         print(
             f"[chronos2-volume-structure] ep={epoch} "
             f"train={row['train_loss']:.5f} val={val_loss:.5f} "
-            f"part={val_components['participation']:.5f} "
-            f"conc={val_components['concentration']:.5f}"
+            f"part_native={val_components['participation_native']:.5f} "
+            f"conc_native={val_components['concentration_native']:.5f}"
+            f" feasible={int(native_gate_feasible)}"
             f"{' *' if improved else ''}",
             flush=True,
         )
@@ -2448,17 +3117,81 @@ def train_volume_structure_ssl(
     if tree_sha256(parent) != parent_sha256:
         raise RuntimeError(
             "volume-structure parent adapter changed during training")
+    if _chronos_base_identity(parent, base_snapshot) != base_identity:
+        raise RuntimeError(
+            "pinned Chronos base snapshot changed during training")
+    if not state_path.is_file():
+        raise RuntimeError(
+            "volume-structure trainer state disappeared before finalization")
     _restore_adapter(model, best_adapter)
-    _save_final(model, checkpoint)
+    _save_final(model, staged_checkpoint)
+    forbidden_artifact_tokens = ("head", "decoder", "projection", "trainer")
+    checkpoint_files = sorted(
+        str(item.relative_to(staged_checkpoint))
+        for item in staged_checkpoint.rglob("*")
+        if item.is_file()
+    )
+    if not checkpoint_files or any(
+        token in Path(name).name.lower()
+        for name in checkpoint_files
+        for token in forbidden_artifact_tokens
+    ):
+        raise RuntimeError(
+            "final Volume-Structure checkpoint contains temporary training artifacts")
+    adapter_config_path = staged_checkpoint / "adapter_config.json"
+    if not adapter_config_path.is_file():
+        raise RuntimeError("final Volume-Structure LoRA config is missing")
+    adapter_config = _read_json_object(adapter_config_path)
+    base_model_name = adapter_config.get("base_model_name_or_path")
+    if (
+        base_model_name != CHRONOS2_MODEL_ID
+        or adapter_config.get("revision") != base_identity["revision"]
+    ):
+        raise RuntimeError(
+            "final Volume-Structure LoRA does not declare its pinned Chronos base")
+
+    # Drop every temporary training module before reloading the staged LoRA.
+    # The following validation therefore cannot accidentally consult a head or
+    # decoder that will not exist in downstream inference.
+    del loss_for
+    del adapter_drift
+    del optimizer
+    del projection_heads
+    del patch_decoder
+    del temporal_decoder
+    del parameters
+    del head_parameters
+    del adapter_parameters
+    del base
+    del model
+    _release_accelerator_cache(device)
+
+    checkpoint_model, checkpoint_base = _load_trainable_adapter(
+        staged_checkpoint,
+        device,
+        base_revision=base_identity["revision"],
+        base_snapshot=base_snapshot,
+    )
+    checkpoint_model.eval()
+    child_native_validation = native_checkpoint_validation(checkpoint_base)
+    del checkpoint_base
+    del checkpoint_model
+    _release_accelerator_cache(device)
+    native_lift = _validate_native_volume_lift(
+        parent_native_validation["aggregate"],
+        child_native_validation["aggregate"],
+        margin=native_promotion_margin,
+    )
+    staged_checkpoint_sha256 = tree_sha256(staged_checkpoint)
     report = {
-        "schema": "ffm_chronos2_volume_structure_ssl_v2",
+        "schema": VOLUME_STRUCTURE_REPORT_SCHEMA,
         "stage": "volume_structure_ssl",
-        "status": "complete",
+        "status": "finalizing",
         "run_identity_sha256": run_identity_sha256,
         "parent": {"path": str(parent), "sha256": parent_sha256},
         "checkpoint": {
             "path": str(checkpoint),
-            "sha256": tree_sha256(checkpoint),
+            "sha256": staged_checkpoint_sha256,
         },
         "data_identity_sha256": data_identity_sha256,
         "data_contracts": {
@@ -2469,6 +3202,29 @@ def train_volume_structure_ssl(
         "preflight_streams": data["preflight_streams"],
         "best_val_loss": best_loss,
         "best_epoch": best_epoch,
+        "checkpoint_only_validation": {
+            "status": "pass",
+            "contract": (
+                "freshly_reloaded_lora_native_reg_without_temporary_heads"),
+            "parent": parent_native_validation,
+            "checkpoint": child_native_validation,
+            "loss_lift_parent_minus_checkpoint": native_lift,
+            "required_margin": native_promotion_margin,
+        },
+        "final_artifact_contract": {
+            "checkpoint_files": checkpoint_files,
+            "temporary_heads_in_checkpoint": False,
+            "temporary_training_modules": [
+                "projection_heads",
+                "patch_decoder",
+                "temporal_decoder",
+                "optimizer",
+            ],
+            "ssl_heads_required_for_inference": False,
+            "trainer_state": "discarded_after_successful_checkpoint",
+            "base_model_name_or_path": base_model_name,
+            "inference_requires": ["chronos_base_model", "lora_checkpoint"],
+        },
         "history": history,
         "retention_gate": {
             "status": "required_before_promotion",
@@ -2483,14 +3239,41 @@ def train_volume_structure_ssl(
                 "not literal intrabar exchange volume profile"
             ),
             (
-                "temporary SSL heads are discarded; capability must be "
-                "confirmed with frozen-embedding probes"
+                "temporary SSL heads are discarded; the native REG gate "
+                "confirms direct learning, while Probe Atlas remains the "
+                "required transfer and retention test"
             ),
         ],
         "elapsed_seconds": time.monotonic() - started,
     }
+    complete_report = deepcopy(report)
+    complete_report["status"] = "complete"
+
+    # Two-phase publication keeps trainer.pt on every pre-success failure. The
+    # completed report is fully serialized first, then the staged adapter is
+    # published, exactly trainer.pt is removed, and only then is status=complete
+    # exposed. _recover_volume_structure_finalization handles crashes between
+    # those final atomic operations.
     _atomic_json(report_path, report)
-    return report
+    _atomic_json(staged_report, complete_report)
+    staged_checkpoint.replace(checkpoint)
+    if tree_sha256(checkpoint) != staged_checkpoint_sha256:
+        raise RuntimeError(
+            "published Volume-Structure checkpoint identity drifted")
+    state_path.unlink()
+    if state_temporary.exists():
+        if not state_temporary.is_file():
+            raise RuntimeError(
+                "volume-structure temporary trainer state is not a file")
+        state_temporary.unlink()
+    if state_path.exists() or state_temporary.exists():
+        raise RuntimeError(
+            "volume-structure trainer state was not discarded")
+    staged_report.replace(report_path)
+    if staged_checkpoint.exists() or staged_report.exists():
+        raise RuntimeError(
+            "Volume-Structure finalization left a staged artifact behind")
+    return complete_report
 
 
 __all__ = [

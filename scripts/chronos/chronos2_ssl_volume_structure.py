@@ -39,6 +39,12 @@ def parser() -> argparse.ArgumentParser:
         "--parent", type=Path,
         default=ROOT / "temp/chronos2_small_36stream/mask_full/checkpoint")
     value.add_argument(
+        "--base-snapshot",
+        type=Path,
+        required=True,
+        help="pinned Chronos2-small Hugging Face snapshot directory",
+    )
+    value.add_argument(
         "--out-dir", type=Path,
         default=ROOT / "temp/chronos2_small_36stream/volume_structure_ssl")
     value.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
@@ -46,6 +52,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--timeframes", default=",".join(TIMEFRAMES))
     value.add_argument("--mask-ratio", type=float, default=0.25)
     value.add_argument("--projection-dim", type=int, default=128)
+    value.add_argument("--head-auxiliary-weight", type=float, default=0.25)
     value.add_argument("--temperature", type=float, default=0.10)
     value.add_argument("--noise", type=float, default=0.02)
     value.add_argument("--scale", type=float, default=0.10)
@@ -65,6 +72,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--displacement-weight", type=float, default=1.0)
     value.add_argument("--temporal-weight", type=float, default=0.5)
     value.add_argument("--adapter-retention-weight", type=float, default=0.1)
+    value.add_argument("--native-promotion-margin", type=float, default=1e-4)
     value.add_argument("--log-every-steps", type=int, default=10)
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--resume", action="store_true")
@@ -76,6 +84,9 @@ def main() -> None:
     args = parser().parse_args()
     if not args.parent.is_dir():
         raise SystemExit(f"parent adapter is missing: {args.parent}")
+    if not args.base_snapshot.is_dir():
+        raise SystemExit(
+            f"pinned Chronos base snapshot is missing: {args.base_snapshot}")
     timeframes = tuple(
         item.strip() for item in args.timeframes.split(",") if item.strip())
     if not timeframes or len(set(timeframes)) != len(timeframes):
@@ -123,6 +134,7 @@ def main() -> None:
     report = train_volume_structure_ssl(
         prepared,
         parent=args.parent,
+        base_snapshot=args.base_snapshot,
         out_dir=args.out_dir,
         device=args.device,
         context_length=args.context_length,
@@ -134,6 +146,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         patience=args.patience,
         projection_dim=args.projection_dim,
+        head_auxiliary_weight=args.head_auxiliary_weight,
         temperature=args.temperature,
         noise=args.noise,
         scale=args.scale,
@@ -147,6 +160,7 @@ def main() -> None:
         displacement_weight=args.displacement_weight,
         temporal_weight=args.temporal_weight,
         adapter_retention_weight=args.adapter_retention_weight,
+        native_promotion_margin=args.native_promotion_margin,
         log_every_steps=args.log_every_steps,
         seed=args.seed,
         resume=args.resume,

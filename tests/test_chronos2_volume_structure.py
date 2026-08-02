@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,9 +12,16 @@ import pytest
 
 from futures_foundation.finetune.classifiers.chronos2 import ssl_stages
 from futures_foundation.finetune.classifiers.chronos2.ssl_stages import (
+    VOLUME_STRUCTURE_REPORT_SCHEMA,
+    VOLUME_STRUCTURE_STAGED_CHECKPOINT,
+    VOLUME_STRUCTURE_STAGED_REPORT,
     VOLUME_STRUCTURE_TRAINER_SCHEMA,
     _evenly_spaced_starts,
     _fit_volume_structure_thresholds,
+    _native_reg_volume_structure_losses,
+    _recover_volume_structure_finalization,
+    _runtime_pinned_adapter,
+    _validate_native_volume_lift,
     _validate_volume_structure_resume,
     _volume_structure_encoder_input,
     _volume_structure_patch_mask,
@@ -236,6 +245,158 @@ def test_volume_structure_resume_requires_exact_run_identity():
         _validate_volume_structure_resume({}, run_identity_sha256=identity)
 
 
+def test_runtime_pinned_adapter_does_not_mutate_parent(tmp_path):
+    parent = tmp_path / "adapter"
+    parent.mkdir()
+    original = {
+        "base_model_name_or_path": "autogluon/chronos-2-small",
+        "peft_type": "LORA",
+        "revision": None,
+    }
+    (parent / "adapter_config.json").write_text(json.dumps(original))
+    weights = parent / "adapter_model.safetensors"
+    weights.write_bytes(b"adapter")
+    base_snapshot = tmp_path / ("b" * 40)
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text("{}\n")
+    (base_snapshot / "model.safetensors").write_bytes(b"base")
+
+    with _runtime_pinned_adapter(
+        parent,
+        "b" * 40,
+        base_snapshot,
+    ) as runtime:
+        assert runtime != parent
+        runtime_config = json.loads(
+            (runtime / "adapter_config.json").read_text())
+        assert runtime_config["base_model_name_or_path"] == str(
+            base_snapshot.resolve())
+        assert runtime_config["revision"] is None
+        assert (runtime / "adapter_model.safetensors").read_bytes() == b"adapter"
+
+    assert json.loads((parent / "adapter_config.json").read_text()) == original
+    assert weights.read_bytes() == b"adapter"
+
+
+def test_trainable_loader_receives_exact_snapshot_and_restores_canonical_metadata(
+        tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    parent = tmp_path / "adapter"
+    parent.mkdir()
+    original = {
+        "base_model_name_or_path": "autogluon/chronos-2-small",
+        "peft_type": "LORA",
+        "revision": None,
+    }
+    (parent / "adapter_config.json").write_text(json.dumps(original))
+    (parent / "adapter_model.safetensors").write_bytes(b"adapter")
+    revision = "b" * 40
+    base_snapshot = tmp_path / revision
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text("{}\n")
+    (base_snapshot / "model.safetensors").write_bytes(b"base")
+    captured = {}
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, adapter_config):
+            super().__init__()
+            self.lora_weight = torch.nn.Parameter(torch.ones(1))
+            self.base_model = SimpleNamespace(model=object())
+            self.peft_config = {
+                "default": SimpleNamespace(**adapter_config),
+            }
+
+    class FakeAutoPeftModel:
+        @staticmethod
+        def from_pretrained(runtime, **kwargs):
+            captured["config"] = json.loads(
+                (Path(runtime) / "adapter_config.json").read_text())
+            captured["kwargs"] = kwargs
+            return FakeModel(captured["config"])
+
+    fake_peft = ModuleType("peft")
+    fake_peft.AutoPeftModel = FakeAutoPeftModel
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+
+    model, _ = ssl_stages._load_trainable_adapter(
+        parent,
+        "cpu",
+        base_revision=revision,
+        base_snapshot=base_snapshot,
+    )
+
+    assert captured["config"]["base_model_name_or_path"] == str(
+        base_snapshot.resolve())
+    assert captured["config"]["revision"] is None
+    assert captured["kwargs"]["is_trainable"] is True
+    assert model.peft_config["default"].base_model_name_or_path == (
+        "autogluon/chronos-2-small")
+    assert model.peft_config["default"].revision == revision
+    assert json.loads((parent / "adapter_config.json").read_text()) == original
+
+
+def test_native_reg_volume_losses_train_embeddings_without_temporary_heads():
+    torch = pytest.importorskip("torch")
+    generator = torch.Generator().manual_seed(91)
+    embeddings = torch.randn(
+        (12, 8), generator=generator, requires_grad=True)
+    instance = torch.arange(6).repeat(2)
+    states = torch.tensor([
+        [0, 0, 0],
+        [0, 2, 2],
+        [0, 0, 2],
+        [2, 2, 0],
+        [2, 0, 0],
+        [2, 2, 2],
+    ])
+
+    losses, eligible = _native_reg_volume_structure_losses(
+        embeddings,
+        instance,
+        states,
+        temperature=0.1,
+        require_all=True,
+    )
+    assert eligible == {
+        "participation": 6,
+        "concentration": 6,
+        "displacement": 6,
+    }
+    assert all(torch.isfinite(value) for value in losses.values())
+
+    changed_participation = states.clone()
+    changed_participation[:, 0] = torch.tensor([0, 0, 2, 0, 2, 2])
+    changed, _ = _native_reg_volume_structure_losses(
+        embeddings,
+        instance,
+        changed_participation,
+        temperature=0.1,
+        require_all=True,
+    )
+    torch.testing.assert_close(
+        losses["concentration"], changed["concentration"])
+
+    sum(losses.values()).backward()
+    assert embeddings.grad is not None
+    assert torch.isfinite(embeddings.grad).all()
+    assert float(embeddings.grad.abs().sum()) > 0.0
+
+
+def test_native_volume_lift_requires_both_checkpoint_capabilities():
+    assert _validate_native_volume_lift(
+        {"participation": 1.5, "concentration": 1.2},
+        {"participation": 1.4, "concentration": 1.0},
+        margin=0.01,
+    ) == {"participation": pytest.approx(0.1), "concentration": pytest.approx(0.2)}
+
+    with pytest.raises(RuntimeError, match="concentration"):
+        _validate_native_volume_lift(
+            {"participation": 1.5, "concentration": 1.2},
+            {"participation": 1.4, "concentration": 1.2},
+            margin=0.0,
+        )
+
+
 def test_volume_structure_entrypoint_freezes_full_corpus_and_safe_defaults():
     source = (
         Path(__file__).resolve().parents[1]
@@ -243,12 +404,16 @@ def test_volume_structure_entrypoint_freezes_full_corpus_and_safe_defaults():
     ).read_text()
 
     assert 'value.add_argument("--timeframes", default=",".join(TIMEFRAMES))' in source
+    assert '"--base-snapshot"' in source
     assert 'value.add_argument("--epochs", type=int, default=60)' in source
     assert 'value.add_argument("--lr", type=float, default=1e-5)' in source
     assert 'value.add_argument("--patience", type=int, default=8)' in source
     assert "preflight_volume_structure_ssl" in source
     assert "participation_weight=args.participation_weight" in source
     assert "concentration_weight=args.concentration_weight" in source
+    assert "head_auxiliary_weight=args.head_auxiliary_weight" in source
+    assert "native_promotion_margin=args.native_promotion_margin" in source
+    assert "base_snapshot=args.base_snapshot" in source
 
 
 def test_visible_normalization_is_independent_of_hidden_patch_values():
@@ -446,8 +611,9 @@ def test_volume_structure_mocked_cpu_trainer_smoke(tmp_path, monkeypatch):
             )
 
     class FakeModel(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, base_revision):
             super().__init__()
+            self.base_revision = base_revision
             self.lora_weight = torch.nn.Parameter(
                 torch.linspace(0.1, 0.8, 8, dtype=torch.float32))
             self.base = FakeBase(self)
@@ -455,16 +621,46 @@ def test_volume_structure_mocked_cpu_trainer_smoke(tmp_path, monkeypatch):
         def save_pretrained(self, destination):
             destination = Path(destination)
             destination.mkdir(parents=True)
-            (destination / "adapter_config.json").write_text("{}\n")
+            (destination / "adapter_config.json").write_text(json.dumps({
+                "base_model_name_or_path": "autogluon/chronos-2-small",
+                "peft_type": "LORA",
+                "revision": self.base_revision,
+            }) + "\n")
             (destination / "adapter_model.safetensors").write_bytes(
                 self.lora_weight.detach().cpu().numpy().tobytes())
 
-    model = FakeModel()
+    base_revision = "b" * 40
+    model = FakeModel(base_revision)
+    initial_lora = model.lora_weight.detach().clone()
+    loaded_models = []
+
+    def load_adapter(
+            parent,
+            device,
+            *,
+            base_revision=None,
+            base_snapshot=None,
+    ):
+        del device
+        assert base_revision == "b" * 40
+        assert Path(base_snapshot).name == base_revision
+        if Path(parent).name == VOLUME_STRUCTURE_STAGED_CHECKPOINT:
+            loaded = FakeModel(base_revision)
+            values = np.frombuffer(
+                (Path(parent) / "adapter_model.safetensors").read_bytes(),
+                dtype=np.float32,
+            ).copy()
+            with torch.no_grad():
+                loaded.lora_weight.copy_(torch.from_numpy(values))
+            loaded_models.append(loaded)
+            return loaded, loaded.base
+        loaded_models.append(model)
+        return model, model.base
 
     monkeypatch.setattr(
         ssl_stages,
         "_load_trainable_adapter",
-        lambda parent, device: (model, model.base),
+        load_adapter,
     )
     monkeypatch.setattr(
         ssl_stages,
@@ -479,15 +675,35 @@ def test_volume_structure_mocked_cpu_trainer_smoke(tmp_path, monkeypatch):
             value.lora_weight.copy_(state["lora_weight"])
 
     monkeypatch.setattr(ssl_stages, "_restore_adapter", restore)
+    # The deliberately tiny fake encoder has nearly scale-only REG geometry,
+    # so its one-step contrastive loss is not a meaningful promotion signal.
+    # The pure gate is tested separately above; this smoke covers publication.
+    monkeypatch.setattr(
+        ssl_stages,
+        "_validate_native_volume_lift",
+        lambda parent, child, *, margin: {
+            name: float(parent[name] - child[name])
+            for name in ("participation", "concentration")
+        },
+    )
 
     parent = tmp_path / "parent"
     parent.mkdir()
-    (parent / "adapter_config.json").write_text("{}\n")
+    (parent / "adapter_config.json").write_text(json.dumps({
+        "base_model_name_or_path": "autogluon/chronos-2-small",
+        "peft_type": "LORA",
+        "revision": None,
+    }) + "\n")
+    base_snapshot = tmp_path / base_revision
+    base_snapshot.mkdir()
+    (base_snapshot / "config.json").write_text("{}\n")
+    (base_snapshot / "model.safetensors").write_bytes(b"pinned base")
     parent_sha256 = ssl_stages.tree_sha256(parent)
     output = tmp_path / "volume"
     report = ssl_stages.train_volume_structure_ssl(
         {"3min": _prepared_volume_structure_fixture()},
         parent=parent,
+        base_snapshot=base_snapshot,
         out_dir=output,
         device="cpu",
         context_length=32,
@@ -509,7 +725,7 @@ def test_volume_structure_mocked_cpu_trainer_smoke(tmp_path, monkeypatch):
     )
 
     saved = json.loads((output / "report.json").read_text())
-    assert report["schema"] == "ffm_chronos2_volume_structure_ssl_v2"
+    assert report["schema"] == VOLUME_STRUCTURE_REPORT_SCHEMA
     assert report["stage"] == "volume_structure_ssl"
     assert report["status"] == "complete"
     assert report["checkpoint"]["sha256"] == ssl_stages.tree_sha256(
@@ -522,13 +738,254 @@ def test_volume_structure_mocked_cpu_trainer_smoke(tmp_path, monkeypatch):
     assert len(report["history"][0]["val_per_stream"]) == 9
     assert {
         "participation",
+        "participation_native",
+        "participation_head",
         "concentration",
+        "concentration_native",
+        "concentration_head",
         "displacement",
+        "displacement_native",
+        "displacement_head",
     } <= report["history"][0]["train_components"].keys()
     assert {
         "participation",
+        "participation_native",
+        "participation_head",
         "concentration",
+        "concentration_native",
+        "concentration_head",
         "displacement",
+        "displacement_native",
+        "displacement_head",
     } <= report["history"][0]["val_components"].keys()
-    assert (output / "trainer.pt").is_file()
+    native = report["checkpoint_only_validation"]
+    assert native["status"] == "pass"
+    assert native["contract"] == (
+        "freshly_reloaded_lora_native_reg_without_temporary_heads")
+    assert set(native["parent"]["aggregate"]) == {
+        "participation", "concentration", "displacement"}
+    assert set(native["checkpoint"]["aggregate"]) == {
+        "participation", "concentration", "displacement"}
+    assert set(native["loss_lift_parent_minus_checkpoint"]) == {
+        "participation", "concentration"}
+    assert len(loaded_models) == 2
+    assert loaded_models[0] is model
+    assert loaded_models[1] is not model
+    assert not torch.equal(model.lora_weight.detach(), initial_lora)
+    assert not (output / "trainer.pt").exists()
+    assert not (output / VOLUME_STRUCTURE_STAGED_CHECKPOINT).exists()
+    assert not (output / VOLUME_STRUCTURE_STAGED_REPORT).exists()
     assert (output / "checkpoint" / "adapter_config.json").is_file()
+    checkpoint_files = [
+        path.name.lower()
+        for path in (output / "checkpoint").rglob("*")
+        if path.is_file()
+    ]
+    assert checkpoint_files
+    assert not any(
+        token in name
+        for name in checkpoint_files
+        for token in ("head", "decoder", "projection", "trainer")
+    )
+    artifact = report["final_artifact_contract"]
+    assert artifact["ssl_heads_required_for_inference"] is False
+    assert artifact["temporary_heads_in_checkpoint"] is False
+    assert artifact["trainer_state"] == (
+        "discarded_after_successful_checkpoint")
+    assert artifact["inference_requires"] == [
+        "chronos_base_model", "lora_checkpoint"]
+
+
+def _completion_reports(output, checkpoint_sha256, run_identity):
+    finalizing = {
+        "schema": VOLUME_STRUCTURE_REPORT_SCHEMA,
+        "stage": "volume_structure_ssl",
+        "status": "finalizing",
+        "run_identity_sha256": run_identity,
+        "checkpoint": {
+            "path": str(output / "checkpoint"),
+            "sha256": checkpoint_sha256,
+        },
+        "config": {
+            "checkpoint_selection": {
+                "contract": (
+                    "gate_feasible_weighted_native_reg_"
+                    "participation_concentration_v1"),
+                "temporary_head_metrics_used": False,
+            },
+            "base_model": {
+                "model_id": "autogluon/chronos-2-small",
+                "revision": "b" * 40,
+                "weights_sha256": "c" * 64,
+                "config_sha256": "d" * 64,
+            },
+        },
+        "checkpoint_only_validation": {
+            "status": "pass",
+            "contract": (
+                "freshly_reloaded_lora_native_reg_without_temporary_heads"),
+            "parent": {
+                "aggregate": {"participation": 1.2, "concentration": 1.1},
+            },
+            "checkpoint": {
+                "aggregate": {"participation": 1.0, "concentration": 0.8},
+            },
+            "loss_lift_parent_minus_checkpoint": {
+                "participation": 0.2,
+                "concentration": 0.3,
+            },
+            "required_margin": 1e-4,
+        },
+        "final_artifact_contract": {
+            "checkpoint_files": [
+                "adapter_config.json", "adapter_model.safetensors"],
+            "temporary_heads_in_checkpoint": False,
+            "ssl_heads_required_for_inference": False,
+            "trainer_state": "discarded_after_successful_checkpoint",
+            "inference_requires": ["chronos_base_model", "lora_checkpoint"],
+        },
+    }
+    return finalizing, {**finalizing, "status": "complete"}
+
+
+def test_volume_structure_finalization_recovery_discards_only_trainer(tmp_path):
+    torch = pytest.importorskip("torch")
+    output = tmp_path / "volume"
+    staged_checkpoint = output / VOLUME_STRUCTURE_STAGED_CHECKPOINT
+    staged_checkpoint.mkdir(parents=True)
+    (staged_checkpoint / "adapter_config.json").write_text(json.dumps({
+        "base_model_name_or_path": "autogluon/chronos-2-small",
+    }))
+    (staged_checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    checkpoint_sha256 = ssl_stages.tree_sha256(staged_checkpoint)
+    run_identity = "a" * 64
+    finalizing, complete = _completion_reports(
+        output, checkpoint_sha256, run_identity)
+    (output / "report.json").write_text(json.dumps(finalizing))
+    (output / VOLUME_STRUCTURE_STAGED_REPORT).write_text(json.dumps(complete))
+    torch.save({
+        "schema": VOLUME_STRUCTURE_TRAINER_SCHEMA,
+        "run_identity_sha256": run_identity,
+    }, output / "trainer.pt")
+    preserved = output / "preflight.json"
+    preserved.write_text("{}")
+
+    recovered = _recover_volume_structure_finalization(
+        output, run_identity_sha256=run_identity)
+
+    assert recovered == complete
+    assert (output / "checkpoint").is_dir()
+    assert not staged_checkpoint.exists()
+    assert not (output / "trainer.pt").exists()
+    assert not (output / VOLUME_STRUCTURE_STAGED_REPORT).exists()
+    assert json.loads((output / "report.json").read_text())["status"] == "complete"
+    assert preserved.is_file()
+
+
+def test_volume_structure_recovery_rejects_mismatched_run_without_mutation(
+        tmp_path):
+    torch = pytest.importorskip("torch")
+    output = tmp_path / "volume"
+    staged_checkpoint = output / VOLUME_STRUCTURE_STAGED_CHECKPOINT
+    staged_checkpoint.mkdir(parents=True)
+    (staged_checkpoint / "adapter_config.json").write_text("{}")
+    (staged_checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    checkpoint_sha256 = ssl_stages.tree_sha256(staged_checkpoint)
+    old_identity = "a" * 64
+    current_identity = "b" * 64
+    finalizing, complete = _completion_reports(
+        output, checkpoint_sha256, old_identity)
+    (output / "report.json").write_text(json.dumps(finalizing))
+    (output / VOLUME_STRUCTURE_STAGED_REPORT).write_text(json.dumps(complete))
+    torch.save({
+        "schema": VOLUME_STRUCTURE_TRAINER_SCHEMA,
+        "run_identity_sha256": old_identity,
+    }, output / "trainer.pt")
+
+    with pytest.raises(RuntimeError, match="identity"):
+        _recover_volume_structure_finalization(
+            output, run_identity_sha256=current_identity)
+
+    assert staged_checkpoint.is_dir()
+    assert (output / "trainer.pt").is_file()
+    assert (output / VOLUME_STRUCTURE_STAGED_REPORT).is_file()
+    assert json.loads((output / "report.json").read_text()) == finalizing
+
+    (output / "trainer.pt").write_bytes(b"corrupt trainer")
+    with pytest.raises(RuntimeError, match="trainer state is unreadable"):
+        _recover_volume_structure_finalization(
+            output, run_identity_sha256=old_identity)
+    assert staged_checkpoint.is_dir()
+    assert (output / "trainer.pt").read_bytes() == b"corrupt trainer"
+    assert (output / VOLUME_STRUCTURE_STAGED_REPORT).is_file()
+
+
+def test_volume_structure_train_never_recovers_before_parent_authentication(
+        tmp_path):
+    output = tmp_path / "volume"
+    output.mkdir()
+    trainer = output / "trainer.pt"
+    trainer.write_bytes(b"must not be deleted")
+
+    with pytest.raises(RuntimeError, match="parent adapter is missing"):
+        ssl_stages.train_volume_structure_ssl(
+            {},
+            parent=tmp_path / "missing-parent",
+            base_snapshot=tmp_path / ("b" * 40),
+            out_dir=output,
+            device="cpu",
+            context_length=32,
+            epochs=1,
+            steps_per_epoch=1,
+            batch_windows=6,
+            threshold_samples=16,
+            validation_windows_per_stream=4,
+            resume=True,
+        )
+
+    assert trainer.read_bytes() == b"must not be deleted"
+
+
+def test_volume_structure_recovery_rejects_staged_checkpoint_without_trainer(
+        tmp_path):
+    output = tmp_path / "volume"
+    staged = output / VOLUME_STRUCTURE_STAGED_CHECKPOINT
+    staged.mkdir(parents=True)
+    (staged / "adapter_config.json").write_text("{}")
+    (staged / "adapter_model.safetensors").write_bytes(b"adapter")
+    identity = "a" * 64
+    finalizing, complete = _completion_reports(
+        output, ssl_stages.tree_sha256(staged), identity)
+    (output / "report.json").write_text(json.dumps(finalizing))
+    (output / VOLUME_STRUCTURE_STAGED_REPORT).write_text(json.dumps(complete))
+
+    with pytest.raises(RuntimeError, match="without trainer state"):
+        _recover_volume_structure_finalization(
+            output, run_identity_sha256=identity)
+
+    assert staged.is_dir()
+    assert (output / VOLUME_STRUCTURE_STAGED_REPORT).is_file()
+    assert json.loads((output / "report.json").read_text()) == finalizing
+
+
+def test_volume_structure_recovery_rejects_committed_run_with_extra_staging(
+        tmp_path):
+    output = tmp_path / "volume"
+    checkpoint = output / "checkpoint"
+    staged = output / VOLUME_STRUCTURE_STAGED_CHECKPOINT
+    for directory in (checkpoint, staged):
+        directory.mkdir(parents=True)
+        (directory / "adapter_config.json").write_text("{}")
+        (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+    identity = "a" * 64
+    _, complete = _completion_reports(
+        output, ssl_stages.tree_sha256(checkpoint), identity)
+    (output / "report.json").write_text(json.dumps(complete))
+
+    with pytest.raises(RuntimeError, match="extra staged checkpoint"):
+        _recover_volume_structure_finalization(
+            output, run_identity_sha256=identity)
+
+    assert checkpoint.is_dir()
+    assert staged.is_dir()
+    assert json.loads((output / "report.json").read_text()) == complete

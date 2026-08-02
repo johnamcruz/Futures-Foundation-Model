@@ -184,10 +184,12 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     with launcher._runtime_checkpoint(
         str(adapter),
         base_revision=base_identity["base_revision"],
+        base_snapshot=base,
     ) as runtime:
         runtime_adapter = json.loads(
             (runtime / "adapter_config.json").read_text())
-        assert runtime_adapter["revision"] == "a" * 40
+        assert runtime_adapter["base_model_name_or_path"] == str(base.resolve())
+        assert runtime_adapter["revision"] is None
         assert launcher._tree_sha256(adapter) == (
             launcher._checkpoint_identity(str(adapter)))
     source = Path(launcher.__file__).read_text()
@@ -199,9 +201,67 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     assert '"ret_structural_direction"' in atlas_source
 
 
+def _valid_volume_stage_payload(launcher, checkpoint_sha256):
+    config = {
+        "context_length": 256,
+        "timeframes": ["1min", "3min", "5min", "15min"],
+        "checkpoint_selection": {
+            "contract": (
+                "gate_feasible_weighted_native_reg_"
+                "participation_concentration_v1"),
+            "temporary_head_metrics_used": False,
+        },
+        "base_model": {
+            "model_id": "autogluon/chronos-2-small",
+            "revision": "d" * 40,
+            "weights_sha256": "e" * 64,
+            "config_sha256": "f" * 64,
+        },
+    }
+    payload = {
+        "schema": "ffm_chronos2_volume_structure_ssl_v3",
+        "stage": "volume_structure_ssl",
+        "status": "complete",
+        "checkpoint": {"sha256": checkpoint_sha256},
+        "parent": {"sha256": "a" * 64},
+        "data_identity_sha256": "b" * 64,
+        "config": config,
+        "checkpoint_only_validation": {
+            "status": "pass",
+            "contract": (
+                "freshly_reloaded_lora_native_reg_without_temporary_heads"),
+            "parent": {
+                "aggregate": {"participation": 1.2, "concentration": 1.1},
+            },
+            "checkpoint": {
+                "aggregate": {"participation": 1.0, "concentration": 0.8},
+            },
+            "loss_lift_parent_minus_checkpoint": {
+                "participation": 0.2,
+                "concentration": 0.3,
+            },
+            "required_margin": 1e-4,
+        },
+        "final_artifact_contract": {
+            "checkpoint_files": [
+                "adapter_config.json", "adapter_model.safetensors"],
+            "temporary_heads_in_checkpoint": False,
+            "ssl_heads_required_for_inference": False,
+            "trainer_state": "discarded_after_successful_checkpoint",
+            "inference_requires": ["chronos_base_model", "lora_checkpoint"],
+        },
+    }
+    payload["run_identity_sha256"] = launcher._volume_structure_run_identity(
+        parent_sha256="a" * 64,
+        data_identity_sha256="b" * 64,
+        config=config,
+    )
+    return payload
+
+
 @pytest.mark.parametrize(("schema", "stage"), [
     ("ffm_chronos2_mask_v1", "mask"),
-    ("ffm_chronos2_volume_structure_ssl_v2", "volume_structure_ssl"),
+    ("ffm_chronos2_volume_structure_ssl_v3", "volume_structure_ssl"),
 ])
 def test_chronos2_atlas_authenticates_completed_stage_lineage(
         tmp_path, schema, stage):
@@ -216,18 +276,22 @@ def test_chronos2_atlas_authenticates_completed_stage_lineage(
     (adapter / "adapter_model.safetensors").write_bytes(b"weights")
     checkpoint_sha256 = launcher._tree_sha256(adapter)
     report = run / "report.json"
-    report.write_text(json.dumps({
-        "schema": schema,
-        "stage": stage,
-        "status": "complete",
-        "checkpoint": {"sha256": checkpoint_sha256},
-        "parent": {"sha256": "a" * 64},
-        "data_identity_sha256": "b" * 64,
-        "config": {
-            "context_length": 256,
-            "timeframes": ["1min", "3min", "5min", "15min"],
-        },
-    }))
+    if stage == "volume_structure_ssl":
+        payload = _valid_volume_stage_payload(launcher, checkpoint_sha256)
+    else:
+        payload = {
+            "schema": schema,
+            "stage": stage,
+            "status": "complete",
+            "checkpoint": {"sha256": checkpoint_sha256},
+            "parent": {"sha256": "a" * 64},
+            "data_identity_sha256": "b" * 64,
+            "config": {
+                "context_length": 256,
+                "timeframes": ["1min", "3min", "5min", "15min"],
+            },
+        }
+    report.write_text(json.dumps(payload))
 
     identity = launcher._stage_identity(
         str(adapter),
@@ -241,7 +305,95 @@ def test_chronos2_atlas_authenticates_completed_stage_lineage(
         "stage_report_sha256": launcher._file_sha256(report),
         "parent_checkpoint_sha256": "a" * 64,
         "data_identity_sha256": "b" * 64,
+        "base_revision": "d" * 40 if stage == "volume_structure_ssl" else None,
+        "base_weights_sha256": (
+            "e" * 64 if stage == "volume_structure_ssl" else None
+        ),
+        "base_config_sha256": (
+            "f" * 64 if stage == "volume_structure_ssl" else None
+        ),
     }
+
+
+def test_chronos2_atlas_rejects_stage_base_snapshot_identity_drift():
+    launcher = _load(
+        "chronos2_probe_atlas_base_drift",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    stage_identity = {
+        "base_revision": "a" * 40,
+        "base_weights_sha256": "b" * 64,
+        "base_config_sha256": "c" * 64,
+    }
+    supplied_base = {
+        "base_revision": "a" * 40,
+        "base_weights_sha256": "d" * 64,
+        "base_config_sha256": "c" * 64,
+    }
+
+    with pytest.raises(SystemExit, match="does not match --base-snapshot"):
+        launcher._validate_stage_base_identity(stage_identity, supplied_base)
+
+
+def test_chronos2_atlas_rejects_volume_stage_run_identity_drift(tmp_path):
+    launcher = _load(
+        "chronos2_probe_atlas_run_identity_drift",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    run = tmp_path / "volume_structure_ssl"
+    adapter = run / "checkpoint"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    report = run / "report.json"
+    checkpoint_sha256 = launcher._tree_sha256(adapter)
+    payload = _valid_volume_stage_payload(launcher, checkpoint_sha256)
+    correct_identity = payload["run_identity_sha256"]
+    payload["run_identity_sha256"] = "0" * 64
+    assert payload["run_identity_sha256"] != correct_identity
+    report.write_text(json.dumps(payload))
+
+    with pytest.raises(SystemExit, match="contract is invalid"):
+        launcher._stage_identity(
+            str(adapter),
+            checkpoint_sha256,
+            None,
+            context_length=256,
+        )
+
+
+def test_chronos2_atlas_rejects_volume_stage_without_native_checkpoint_gate(
+        tmp_path):
+    launcher = _load(
+        "chronos2_probe_atlas_unsafe_volume",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    run = tmp_path / "volume_structure_ssl"
+    adapter = run / "checkpoint"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    checkpoint_sha256 = launcher._tree_sha256(adapter)
+    (run / "report.json").write_text(json.dumps({
+        "schema": "ffm_chronos2_volume_structure_ssl_v3",
+        "stage": "volume_structure_ssl",
+        "status": "complete",
+        "checkpoint": {"sha256": checkpoint_sha256},
+        "parent": {"sha256": "a" * 64},
+        "data_identity_sha256": "b" * 64,
+        "config": {
+            "context_length": 256,
+            "timeframes": ["1min", "3min", "5min", "15min"],
+        },
+    }))
+
+    with pytest.raises(SystemExit, match="contract is invalid"):
+        launcher._stage_identity(
+            str(adapter),
+            checkpoint_sha256,
+            None,
+            context_length=256,
+        )
 
 
 def test_atlas_pool_identity_seals_model_data_targets_and_control(tmp_path, monkeypatch):
