@@ -5,11 +5,13 @@ This stage is deliberately self-supervised and uses completed OHLCV only.  It
 combines masked volume/price patch reconstruction with participation,
 concentration/dispersion, displacement-volume, and temporal-order objectives.
 The temporary objective heads are discarded; the output is a LoRA adapter
-whose frozen embeddings can be probed for Volume Profile context.
+whose frozen embeddings can be probed for causal OHLCV volume structure. Bars
+cannot reconstruct a literal intrabar exchange volume profile.
 """
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -21,6 +23,7 @@ from futures_foundation.finetune.classifiers.chronos2.multivariate import (
     prepare_multivariate,
 )
 from futures_foundation.finetune.classifiers.chronos2.ssl_stages import (
+    preflight_volume_structure_ssl,
     train_volume_structure_ssl,
 )
 
@@ -40,7 +43,7 @@ def parser() -> argparse.ArgumentParser:
         default=ROOT / "temp/chronos2_small_36stream/volume_structure_ssl")
     value.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
     value.add_argument("--context-length", type=int, default=256)
-    value.add_argument("--timeframes", default="3min")
+    value.add_argument("--timeframes", default=",".join(TIMEFRAMES))
     value.add_argument("--mask-ratio", type=float, default=0.25)
     value.add_argument("--projection-dim", type=int, default=128)
     value.add_argument("--temperature", type=float, default=0.10)
@@ -51,7 +54,18 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--batch-windows", type=int, default=32)
     value.add_argument("--gradient-accumulation", type=int, default=1)
     value.add_argument("--lr", type=float, default=1e-5)
-    value.add_argument("--patience", type=int, default=5)
+    value.add_argument("--weight-decay", type=float, default=0.05)
+    value.add_argument("--patience", type=int, default=8)
+    value.add_argument("--threshold-samples", type=int, default=4096)
+    value.add_argument("--validation-windows-per-stream", type=int, default=16)
+    value.add_argument("--price-bins", type=int, default=16)
+    value.add_argument("--reconstruction-weight", type=float, default=1.0)
+    value.add_argument("--participation-weight", type=float, default=1.0)
+    value.add_argument("--concentration-weight", type=float, default=1.0)
+    value.add_argument("--displacement-weight", type=float, default=1.0)
+    value.add_argument("--temporal-weight", type=float, default=0.5)
+    value.add_argument("--adapter-retention-weight", type=float, default=0.1)
+    value.add_argument("--log-every-steps", type=int, default=10)
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--resume", action="store_true")
     value.add_argument("--preflight-only", action="store_true")
@@ -89,6 +103,22 @@ def main() -> None:
             flush=True,
         )
     if args.preflight_only:
+        report = preflight_volume_structure_ssl(
+            prepared,
+            context_length=args.context_length,
+            threshold_samples=args.threshold_samples,
+            validation_windows_per_stream=args.validation_windows_per_stream,
+            price_bins=args.price_bins,
+        )
+        path = args.out_dir / "volume_structure_preflight_only.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        temporary.replace(path)
+        print(
+            f"[chronos2-volume-structure] PREFLIGHT PASS report={path}",
+            flush=True,
+        )
         return
     report = train_volume_structure_ssl(
         prepared,
@@ -101,12 +131,23 @@ def main() -> None:
         batch_windows=args.batch_windows,
         gradient_accumulation=args.gradient_accumulation,
         learning_rate=args.lr,
+        weight_decay=args.weight_decay,
         patience=args.patience,
         projection_dim=args.projection_dim,
         temperature=args.temperature,
         noise=args.noise,
         scale=args.scale,
         mask_ratio=args.mask_ratio,
+        threshold_samples=args.threshold_samples,
+        validation_windows_per_stream=args.validation_windows_per_stream,
+        price_bins=args.price_bins,
+        reconstruction_weight=args.reconstruction_weight,
+        participation_weight=args.participation_weight,
+        concentration_weight=args.concentration_weight,
+        displacement_weight=args.displacement_weight,
+        temporal_weight=args.temporal_weight,
+        adapter_retention_weight=args.adapter_retention_weight,
+        log_every_steps=args.log_every_steps,
         seed=args.seed,
         resume=args.resume,
     )

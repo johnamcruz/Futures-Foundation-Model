@@ -26,6 +26,7 @@ MPS_SAFE_MAX_CHUNK_WINDOWS = 1024
 CHRONOS2_STAGE_SCHEMAS = {
     "ffm_chronos2_mask_v1": "mask",
     "ffm_chronos2_contrastive_v2": "contrastive",
+    "ffm_chronos2_volume_structure_ssl_v2": "volume_structure_ssl",
 }
 CHRONOS2_MODEL_ID = "autogluon/chronos-2-small"
 _HEX40 = re.compile(r"[0-9a-f]{40}")

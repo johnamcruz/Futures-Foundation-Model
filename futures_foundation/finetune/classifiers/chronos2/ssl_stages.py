@@ -1250,6 +1250,534 @@ def train_volatility_contrastive(prepared, **kwargs) -> dict:
     )
 
 
+VOLUME_STRUCTURE_SUMMARY_SIZE = 15
+VOLUME_STRUCTURE_TEMPORAL_SIZE = 12
+VOLUME_STRUCTURE_TRAINER_SCHEMA = "ffm_chronos2_volume_structure_trainer_v3"
+
+
+def _evenly_spaced_starts(
+        starts: np.ndarray,
+        max_samples: int,
+) -> np.ndarray:
+    """Select deterministic starts spanning the full supplied chronology."""
+    starts = np.asarray(starts, dtype=np.int64)
+    if starts.ndim != 1 or not len(starts):
+        raise ValueError("starts must be a non-empty one-dimensional array")
+    if max_samples < 1:
+        raise ValueError("max_samples must be >= 1")
+    if len(starts) <= max_samples:
+        return starts.copy()
+    indices = np.linspace(
+        0, len(starts) - 1, num=max_samples, dtype=np.int64)
+    selected = starts[indices]
+    if len(np.unique(selected)) != len(selected):
+        raise RuntimeError("evenly spaced start selection produced duplicates")
+    return selected
+
+
+def _volume_structure_summary(
+        window: np.ndarray,
+        *,
+        price_bins: int = 16,
+) -> np.ndarray:
+    """Return a scale-free causal OHLCV volume-structure description.
+
+    This is an OHLCV proxy for volume-at-price structure, not an exchange
+    volume-profile reconstruction: bars do not reveal where their volume
+    traded intrabar.  The layout is four relative-volume quarters, four
+    volume-weighted typical-price locations, four relative-range quarters,
+    concentration, recent participation, and displacement-volume alignment.
+    """
+    values = np.asarray(window, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != 5 or values.shape[1] < 8:
+        raise ValueError("volume-structure windows must have shape [5,L], L>=8")
+    if price_bins < 4:
+        raise ValueError("price_bins must be >= 4")
+    if not np.isfinite(values).all():
+        return np.full(VOLUME_STRUCTURE_SUMMARY_SIZE, np.nan, dtype=np.float32)
+    _, high, low, close, volume = values
+    if (
+        np.any(high < low)
+        or np.any(volume < 0.0)
+        or not np.isfinite(high - low).all()
+    ):
+        return np.full(VOLUME_STRUCTURE_SUMMARY_SIZE, np.nan, dtype=np.float32)
+
+    quarters = np.array_split(np.arange(values.shape[1]), 4)
+    mean_volume = float(np.mean(volume))
+    volume_scale = mean_volume if mean_volume > 0.0 else 1.0
+    volume_epsilon = volume_scale * 1e-12
+    relative_volume = [
+        float(np.log((float(np.mean(volume[index])) + volume_epsilon)
+                     / (mean_volume + volume_epsilon)))
+        for index in quarters
+    ]
+
+    price_low = float(np.min(low))
+    price_high = float(np.max(high))
+    price_width = price_high - price_low
+    if not price_width > 0.0:
+        price_width = max(abs(price_high), 1.0) * 1e-12
+    typical = (high + low + close) / 3.0
+    price_locations = []
+    for index in quarters:
+        weights = volume[index]
+        if float(weights.sum()) > 0.0:
+            location = float(np.average(typical[index], weights=weights))
+        else:
+            location = float(np.mean(typical[index]))
+        price_locations.append((location - price_low) / price_width)
+
+    ranges = high - low
+    mean_range = float(np.mean(ranges))
+    range_scale = mean_range if mean_range > 0.0 else 1.0
+    range_epsilon = range_scale * 1e-12
+    relative_range = [
+        float(np.log((float(np.mean(ranges[index])) + range_epsilon)
+                     / (mean_range + range_epsilon)))
+        for index in quarters
+    ]
+
+    normalized_typical = np.clip(
+        (typical - price_low) / price_width, 0.0, 1.0)
+    histogram, _ = np.histogram(
+        normalized_typical,
+        bins=price_bins,
+        range=(0.0, 1.0),
+        weights=volume,
+    )
+    if float(histogram.sum()) <= 0.0:
+        histogram, _ = np.histogram(
+            normalized_typical, bins=price_bins, range=(0.0, 1.0))
+    probabilities = histogram.astype(np.float64)
+    probabilities /= probabilities.sum()
+    positive = probabilities > 0.0
+    entropy_concentration = 1.0 + float(
+        np.sum(probabilities[positive] * np.log(probabilities[positive]))
+        / np.log(price_bins))
+    hhi = float(np.square(probabilities).sum())
+    hhi_concentration = (hhi - 1.0 / price_bins) / (1.0 - 1.0 / price_bins)
+    concentration = float(np.clip(
+        0.5 * (entropy_concentration + hhi_concentration), 0.0, 1.0))
+
+    recent = quarters[-1]
+    prior = np.concatenate(quarters[:-1])
+    prior_volume = float(np.mean(volume[prior]))
+    recent_volume = float(np.mean(volume[recent]))
+    participation_scale = (
+        prior_volume if prior_volume > 0.0
+        else mean_volume if mean_volume > 0.0
+        else 1.0)
+    participation_epsilon = participation_scale * 1e-12
+    participation = float(np.log(
+        (recent_volume + participation_epsilon)
+        / (prior_volume + participation_epsilon)))
+
+    prior_range = float(np.median(ranges[prior]))
+    recent_range = float(np.quantile(ranges[recent], 0.75))
+    prior_volume_median = float(np.median(volume[prior]))
+    recent_volume_quantile = float(np.quantile(volume[recent], 0.75))
+    safe_prior_range = prior_range if prior_range > 0.0 else range_scale
+    safe_prior_volume = (
+        prior_volume_median if prior_volume_median > 0.0 else volume_scale)
+    displacement = float(np.log1p(
+        (recent_range / max(safe_prior_range, 1e-12))
+        * (recent_volume_quantile / max(safe_prior_volume, 1e-12))))
+
+    result = np.asarray(
+        relative_volume
+        + price_locations
+        + relative_range
+        + [concentration, participation, displacement],
+        dtype=np.float32,
+    )
+    if result.shape != (VOLUME_STRUCTURE_SUMMARY_SIZE,):
+        raise RuntimeError("volume-structure summary shape drifted")
+    return result
+
+
+def _volume_structure_fit_arrays(
+        matrix: np.ndarray,
+        starts: np.ndarray,
+        *,
+        context_length: int,
+        max_samples: int,
+        price_bins: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    selected = _evenly_spaced_starts(starts, max_samples=max_samples)
+    summaries = np.stack([
+        _volume_structure_summary(
+            matrix[:, int(start):int(start) + context_length],
+            price_bins=price_bins,
+        )
+        for start in selected
+    ])
+    finite = np.isfinite(summaries).all(axis=1)
+    if int(finite.sum()) < 16:
+        raise RuntimeError("insufficient finite volume-structure fit samples")
+    return selected[finite], summaries[finite]
+
+
+def _fit_volume_structure_thresholds(
+        matrix: np.ndarray,
+        starts: np.ndarray,
+        *,
+        context_length: int,
+        max_samples: int = 4096,
+        price_bins: int = 16,
+) -> dict:
+    """Fit pseudo-state cutoffs from representative training windows only."""
+    selected, summaries = _volume_structure_fit_arrays(
+        matrix,
+        starts,
+        context_length=context_length,
+        max_samples=max_samples,
+        price_bins=price_bins,
+    )
+    return _volume_structure_thresholds_from_arrays(selected, summaries)
+
+
+def _volume_structure_thresholds_from_arrays(
+        selected: np.ndarray,
+        summaries: np.ndarray,
+) -> dict:
+    temporal = summaries[:, :VOLUME_STRUCTURE_TEMPORAL_SIZE].astype(np.float64)
+    temporal_feature_mean = temporal.mean(axis=0)
+    temporal_feature_std = temporal.std(axis=0)
+    temporal_feature_std = np.maximum(temporal_feature_std, 1e-6)
+    result = {
+        "fit_samples": int(len(summaries)),
+        "fit_start_min": int(selected.min()),
+        "fit_start_max": int(selected.max()),
+        "participation_low": float(np.quantile(summaries[:, 13], 0.33)),
+        "participation_high": float(np.quantile(summaries[:, 13], 0.67)),
+        "concentration_low": float(np.quantile(summaries[:, 12], 0.33)),
+        "concentration_high": float(np.quantile(summaries[:, 12], 0.67)),
+        "displacement_low": float(np.quantile(summaries[:, 14], 0.50)),
+        "displacement_high": float(np.quantile(summaries[:, 14], 0.75)),
+        "temporal_mean": float(temporal.mean()),
+        "temporal_std": float(max(temporal.std(), 1e-6)),
+        "temporal_feature_mean": temporal_feature_mean.tolist(),
+        "temporal_feature_std": temporal_feature_std.tolist(),
+    }
+    for prefix in ("participation", "concentration", "displacement"):
+        if not result[f"{prefix}_low"] < result[f"{prefix}_high"]:
+            raise RuntimeError(
+                f"degenerate {prefix} pseudo-state thresholds in training data")
+    if not result["participation_low"] < 0.0 < result["participation_high"]:
+        raise RuntimeError(
+            "participation training states must span falling and rising volume")
+    return result
+
+
+def _volume_structure_states(summary: np.ndarray, thresholds: Mapping) -> np.ndarray:
+    """Map one summary to low/high states, leaving the middle ambiguous."""
+    summary = np.asarray(summary)
+    if summary.shape != (VOLUME_STRUCTURE_SUMMARY_SIZE,):
+        raise ValueError("volume-structure summary shape mismatch")
+    states = []
+    for name, index in (
+        ("participation", 13),
+        ("concentration", 12),
+        ("displacement", 14),
+    ):
+        value = float(summary[index])
+        states.append(
+            0 if value <= float(thresholds[f"{name}_low"])
+            else 2 if value >= float(thresholds[f"{name}_high"])
+            else -1)
+    return np.asarray(states, dtype=np.int64)
+
+
+def _volume_structure_run_identity(
+        *,
+        parent_sha256: str,
+        data_identity_sha256: str,
+        config: Mapping,
+) -> str:
+    """Bind resumable state to the exact parent, corpus, and objective."""
+    payload = {
+        "schema": VOLUME_STRUCTURE_TRAINER_SCHEMA,
+        "parent_sha256": str(parent_sha256),
+        "data_identity_sha256": str(data_identity_sha256),
+        "config": dict(config),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_volume_structure_resume(
+        saved: Mapping,
+        *,
+        run_identity_sha256: str,
+) -> None:
+    if (
+        saved.get("schema") != VOLUME_STRUCTURE_TRAINER_SCHEMA
+        or saved.get("run_identity_sha256") != run_identity_sha256
+    ):
+        raise RuntimeError(
+            "volume-structure trainer identity does not match this run")
+
+
+def _volume_structure_standardize(raw, visible_time=None):
+    """Normalize OHLC together and volume separately using visible values only."""
+    import torch
+
+    if raw.ndim != 3 or raw.shape[1] != 5:
+        raise ValueError("raw OHLCV batch must have shape [B,5,L]")
+    finite = torch.isfinite(raw)
+    if visible_time is None:
+        visible_time = torch.ones(
+            (raw.shape[0], raw.shape[-1]), dtype=torch.bool, device=raw.device)
+    visible = finite & visible_time[:, None, :]
+    if (visible.sum(dim=-1) == 0).any():
+        raise RuntimeError("volume-structure corruption hid an entire variate")
+
+    price_visible = visible[:, :4]
+    price_count = price_visible.sum(dim=(1, 2), keepdim=True).clamp_min(1)
+    price_clean = torch.where(
+        price_visible, raw[:, :4], torch.zeros_like(raw[:, :4]))
+    price_mean = price_clean.sum(dim=(1, 2), keepdim=True) / price_count
+    price_centered = torch.where(
+        price_visible, raw[:, :4] - price_mean, torch.zeros_like(raw[:, :4]))
+    price_variance = (
+        price_centered.square().sum(dim=(1, 2), keepdim=True) / price_count)
+    price_scaled = (raw[:, :4] - price_mean) / price_variance.sqrt().clamp_min(1e-5)
+
+    volume = raw[:, 4:5].clamp_min(0.0)
+    volume_visible = visible[:, 4:5]
+    volume_count = volume_visible.sum(dim=-1, keepdim=True).clamp_min(1)
+    visible_volume = torch.where(
+        volume_visible, volume, torch.zeros_like(volume))
+    volume_scale = (
+        visible_volume.sum(dim=-1, keepdim=True) / volume_count).clamp_min(1e-6)
+    # Preserve the signed relative-volume path before Chronos performs its own
+    # instance normalization. The objective distinguishes falling versus
+    # rising participation; it does not claim to retain absolute volume units.
+    volume_epsilon = volume_scale * 1e-6
+    volume_scaled = torch.log(
+        (volume + volume_epsilon) / (volume_scale + volume_epsilon))
+    standardized = torch.cat([price_scaled, volume_scaled], dim=1).clamp(-10.0, 10.0)
+    standardized = torch.where(finite, standardized, torch.zeros_like(standardized))
+    return standardized, finite, visible
+
+
+def _volume_structure_patch_mask(
+        batch: int,
+        n_patches: int,
+        mask_ratio: float,
+        generator,
+        device: str,
+):
+    """Return exact-count patch masks with at least one hidden and visible patch."""
+    import torch
+
+    if n_patches < 2:
+        raise ValueError("volume-structure reconstruction needs at least two patches")
+    masked = min(n_patches - 1, max(1, int(round(n_patches * mask_ratio))))
+    scores = torch.rand(
+        (batch, n_patches), device=device, generator=generator)
+    indices = scores.topk(masked, dim=1).indices
+    result = torch.zeros(
+        (batch, n_patches), dtype=torch.bool, device=device)
+    result.scatter_(1, indices, True)
+    return result
+
+
+def _volume_structure_encoder_input(standardized, visible):
+    """Hide artificial targets from Chronos InstanceNorm with actual NaNs."""
+    import torch
+
+    if standardized.shape != visible.shape or standardized.ndim != 3:
+        raise ValueError("standardized values and visible mask must share [B,C,L]")
+    flat = standardized.reshape(-1, standardized.shape[-1])
+    visible_flat = visible.reshape(-1, visible.shape[-1])
+    context = torch.where(
+        visible_flat, flat, torch.full_like(flat, float("nan")))
+    return context, visible_flat
+
+
+def _volume_structure_augment(values, finite, generator, *, noise, scale):
+    """Apply OHLC-safe common price perturbations and separate volume noise."""
+    import torch
+
+    output = values.clone()
+    if scale:
+        factor = 1.0 + scale * (
+            2.0 * torch.rand(
+                (values.shape[0], 1, 1), device=values.device,
+                generator=generator) - 1.0)
+        output = output * factor
+    if noise:
+        price_noise = noise * torch.randn(
+            (values.shape[0], 1, values.shape[-1]),
+            device=values.device,
+            generator=generator,
+        )
+        volume_noise = noise * torch.randn(
+            (values.shape[0], 1, values.shape[-1]),
+            device=values.device,
+            generator=generator,
+        )
+        output[:, :4] = output[:, :4] + price_noise
+        output[:, 4:5] = output[:, 4:5] + volume_noise
+    return output, finite
+
+
+def _prepare_volume_structure_data(
+        prepared,
+        *,
+        context_length: int,
+        threshold_samples: int,
+        validation_windows_per_stream: int,
+        price_bins: int,
+) -> dict:
+    """Build train-only pseudo-state pools and fixed chronological validation."""
+    corpus = _as_corpus(prepared)
+    ticker_indices = {
+        timeframe: _ticker_indices(item)
+        for timeframe, item in corpus.items()
+    }
+    streams = {}
+    thresholds = {}
+    preflight_streams = {}
+    for timeframe, indices_by_ticker in ticker_indices.items():
+        thresholds[timeframe] = {}
+        preflight_streams[timeframe] = {}
+        for ticker, indices in indices_by_ticker.items():
+            key = (timeframe, ticker)
+            train_matrix = corpus[timeframe].train[indices]
+            train_starts = _observable_starts(
+                train_matrix,
+                context_length,
+                min_observations=context_length,
+            )
+            fit_starts, fit_summaries = _volume_structure_fit_arrays(
+                train_matrix,
+                train_starts,
+                context_length=context_length,
+                max_samples=threshold_samples,
+                price_bins=price_bins,
+            )
+            fitted = _volume_structure_thresholds_from_arrays(
+                fit_starts, fit_summaries)
+            fit_states = np.stack([
+                _volume_structure_states(summary, fitted)
+                for summary in fit_summaries
+            ])
+            state_counts = {}
+            for column, objective in enumerate(
+                    ("participation", "concentration", "displacement")):
+                counts = {
+                    str(state): int((fit_states[:, column] == state).sum())
+                    for state in (0, -1, 2)
+                }
+                if counts["0"] == 0 or counts["2"] == 0:
+                    raise RuntimeError(
+                        f"{timeframe}/{ticker} has a degenerate {objective} "
+                        "training pool")
+                state_counts[objective] = counts
+
+            validation_matrix = corpus[timeframe].validation_matrix[indices]
+            validation_starts = _observable_starts(
+                validation_matrix,
+                context_length,
+                min_observations=context_length,
+            )
+            validation_starts = _evenly_spaced_starts(
+                validation_starts,
+                max_samples=validation_windows_per_stream,
+            )
+            validation_summaries = np.stack([
+                _volume_structure_summary(
+                    validation_matrix[:, int(start):int(start) + context_length],
+                    price_bins=price_bins,
+                )
+                for start in validation_starts
+            ])
+            if not np.isfinite(validation_summaries).all():
+                raise RuntimeError(
+                    f"non-finite validation summaries for {timeframe}/{ticker}")
+            validation_states = np.stack([
+                _volume_structure_states(summary, fitted)
+                for summary in validation_summaries
+            ])
+            temporal_mean = np.asarray(
+                fitted["temporal_feature_mean"], dtype=np.float32)
+            temporal_std = np.asarray(
+                fitted["temporal_feature_std"], dtype=np.float32)
+            train_temporal = (
+                fit_summaries[:, :VOLUME_STRUCTURE_TEMPORAL_SIZE]
+                - temporal_mean) / temporal_std
+            validation_temporal = (
+                validation_summaries[:, :VOLUME_STRUCTURE_TEMPORAL_SIZE]
+                - temporal_mean) / temporal_std
+            train_temporal = np.clip(train_temporal, -10.0, 10.0)
+            validation_temporal = np.clip(validation_temporal, -10.0, 10.0)
+            streams[key] = {
+                "train_matrix": train_matrix,
+                "train_starts": train_starts,
+                "fit_starts": fit_starts,
+                "fit_states": fit_states,
+                "fit_temporal": train_temporal.astype(np.float32),
+                "validation_matrix": validation_matrix,
+                "validation_starts": validation_starts,
+                "validation_states": validation_states,
+                "validation_temporal": validation_temporal.astype(np.float32),
+            }
+            thresholds[timeframe][ticker] = fitted
+            preflight_streams[timeframe][ticker] = {
+                "train_available_windows": int(len(train_starts)),
+                "train_fit_windows": int(len(fit_starts)),
+                "train_fit_start_min": int(fit_starts.min()),
+                "train_fit_start_max": int(fit_starts.max()),
+                "validation_windows": int(len(validation_starts)),
+                "validation_start_min": int(validation_starts.min()),
+                "validation_start_max": int(validation_starts.max()),
+                "train_state_counts": state_counts,
+            }
+    return {
+        "corpus": corpus,
+        "data_identity_sha256": _corpus_identity(corpus),
+        "streams": streams,
+        "thresholds": thresholds,
+        "preflight_streams": preflight_streams,
+    }
+
+
+def preflight_volume_structure_ssl(
+        prepared,
+        *,
+        context_length: int = 256,
+        threshold_samples: int = 4096,
+        validation_windows_per_stream: int = 16,
+        price_bins: int = 16,
+) -> dict:
+    """Exercise all Volume-Structure data/target contracts without loading a model."""
+    data = _prepare_volume_structure_data(
+        prepared,
+        context_length=context_length,
+        threshold_samples=threshold_samples,
+        validation_windows_per_stream=validation_windows_per_stream,
+        price_bins=price_bins,
+    )
+    return {
+        "schema": "ffm_chronos2_volume_structure_preflight_v1",
+        "status": "pass",
+        "data_identity_sha256": data["data_identity_sha256"],
+        "data_contracts": {
+            timeframe: item.report
+            for timeframe, item in data["corpus"].items()
+        },
+        "context_length": context_length,
+        "threshold_samples": threshold_samples,
+        "validation_windows_per_stream": validation_windows_per_stream,
+        "price_bins": price_bins,
+        "streams": data["preflight_streams"],
+        "thresholds": data["thresholds"],
+    }
+
+
 def train_volume_structure_ssl(
         prepared,
         *,
@@ -1257,369 +1785,711 @@ def train_volume_structure_ssl(
         out_dir: str | Path,
         device: str = "mps",
         context_length: int = 256,
-        epochs: int = 20,
+        epochs: int = 60,
         steps_per_epoch: int = 100,
         batch_windows: int = 32,
         gradient_accumulation: int = 1,
         learning_rate: float = 1e-5,
         weight_decay: float = 0.05,
-        patience: int = 5,
+        patience: int = 8,
         projection_dim: int = 128,
         temperature: float = 0.10,
         noise: float = 0.02,
         scale: float = 0.10,
         mask_ratio: float = 0.25,
+        threshold_samples: int = 4096,
+        validation_windows_per_stream: int = 16,
+        price_bins: int = 16,
+        reconstruction_weight: float = 1.0,
+        participation_weight: float = 1.0,
+        concentration_weight: float = 1.0,
+        displacement_weight: float = 1.0,
+        temporal_weight: float = 0.5,
+        adapter_retention_weight: float = 0.1,
+        log_every_steps: int = 10,
         seed: int = 0,
         resume: bool = False,
 ) -> dict:
-    """Train a causal, OHLCV-only Volume-Structure SSL adapter.
+    """Train an isolated causal OHLCV Volume-Structure LoRA adapter.
 
-    The temporary heads learn five unlabeled capabilities from completed bars:
-    masked volume/price patch reconstruction, participation contrast, profile
-    concentration versus dispersion, displacement-volume alignment, and
-    temporal order (original versus reversed windows).  Only the LoRA adapter
-    is written to the final checkpoint; the objective heads are discarded.
-    Thresholds are fitted on each training stream only and are recorded in the
-    report so validation cannot influence pseudo-target construction.
+    Participation and price-volume concentration are distinct self-supervised
+    tasks with separate heads, losses, and validation metrics. Reconstruction
+    predicts genuinely hidden Chronos patches using normalization fitted only
+    from visible values. The temporal task reconstructs ordered quarter-level
+    volume, price-location, and range descriptors; it does not claim to label a
+    proprietary trading sequence or a literal intrabar exchange profile.
     """
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    from importlib.metadata import PackageNotFoundError, version
 
     if context_length < 32:
         raise ValueError("context_length must be >= 32")
-    if batch_windows < 4:
-        raise ValueError("batch_windows must be >= 4")
-    if not 0.0 < mask_ratio < 1.0:
-        raise ValueError("mask_ratio must be between 0 and 1")
+    if batch_windows < 6:
+        raise ValueError(
+            "batch_windows must be >= 6 to balance three contrastive objectives")
+    if epochs < 1 or steps_per_epoch < 1 or patience < 1:
+        raise ValueError("epochs, steps_per_epoch, and patience must be >= 1")
     if gradient_accumulation < 1:
         raise ValueError("gradient_accumulation must be >= 1")
+    if not 0.0 < mask_ratio < 1.0:
+        raise ValueError("mask_ratio must be between 0 and 1")
+    if threshold_samples < 16:
+        raise ValueError("threshold_samples must be >= 16")
+    if validation_windows_per_stream < 4:
+        raise ValueError("validation_windows_per_stream must be >= 4")
+    if projection_dim < 2 or temperature <= 0.0:
+        raise ValueError("projection_dim must be >= 2 and temperature must be > 0")
+    if noise < 0.0 or scale < 0.0 or scale >= 1.0:
+        raise ValueError("noise must be >= 0 and scale must be in [0,1)")
+    if weight_decay < 0.0:
+        raise ValueError("weight_decay must be nonnegative")
+    objective_weights = {
+        "reconstruction": float(reconstruction_weight),
+        "participation": float(participation_weight),
+        "concentration": float(concentration_weight),
+        "displacement": float(displacement_weight),
+        "temporal_structure": float(temporal_weight),
+        "adapter_retention": float(adapter_retention_weight),
+    }
+    if any(value < 0.0 for value in objective_weights.values()):
+        raise ValueError("volume-structure objective weights must be nonnegative")
+    if not any(value > 0.0 for value in objective_weights.values()):
+        raise ValueError("at least one volume-structure objective weight must be positive")
+    if log_every_steps < 1:
+        raise ValueError("log_every_steps must be >= 1")
 
-    corpus = _as_corpus(prepared)
-    timeframes = tuple(corpus)
     out_dir, parent = Path(out_dir), Path(parent)
     checkpoint = out_dir / "checkpoint"
     state_path = out_dir / "trainer.pt"
-    if checkpoint.exists() and not resume:
+    report_path = out_dir / "report.json"
+    preflight_path = out_dir / "preflight.json"
+    if not parent.is_dir():
+        raise RuntimeError(f"volume-structure parent adapter is missing: {parent}")
+    if checkpoint.exists():
         raise RuntimeError(
             f"completed volume-structure checkpoint already exists: {checkpoint}")
+    if report_path.exists():
+        raise RuntimeError(
+            f"completed volume-structure report already exists: {report_path}")
+    if resume and not state_path.is_file():
+        raise RuntimeError(
+            f"--resume requested but trainer state is missing: {state_path}")
+    if state_path.exists() and not resume:
+        raise RuntimeError(
+            f"incomplete trainer state exists; pass --resume or use a new out-dir: {state_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    data = _prepare_volume_structure_data(
+        prepared,
+        context_length=context_length,
+        threshold_samples=threshold_samples,
+        validation_windows_per_stream=validation_windows_per_stream,
+        price_bins=price_bins,
+    )
+    corpus = data["corpus"]
+    timeframes = tuple(corpus)
+    parent_sha256 = tree_sha256(parent)
+    data_identity_sha256 = data["data_identity_sha256"]
+
+    def package_version(distribution: str) -> str:
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            return "not-installed"
+
+    run_config = {
+        "objective_code_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()).hexdigest(),
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+        "chronos_version": package_version("chronos-forecasting"),
+        "peft_version": package_version("peft"),
+        "timeframes": list(timeframes),
+        "stream_sampler": "uniform_stream_balanced_extreme_states",
+        "context_length": context_length,
+        "epochs": epochs,
+        "steps_per_epoch": steps_per_epoch,
+        "batch_windows": batch_windows,
+        "gradient_accumulation": gradient_accumulation,
+        "learning_rate": learning_rate,
+        "adapter_weight_decay": 0.0,
+        "temporary_head_weight_decay": weight_decay,
+        "patience": patience,
+        "projection_dim": projection_dim,
+        "temperature": temperature,
+        "noise": noise,
+        "scale": scale,
+        "mask_ratio": mask_ratio,
+        "threshold_samples": threshold_samples,
+        "threshold_sampling": "evenly_spaced_full_training_chronology",
+        "validation_windows_per_stream": validation_windows_per_stream,
+        "validation_sampling": "fixed_evenly_spaced_per_stream",
+        "price_bins": price_bins,
+        "objective_weights": objective_weights,
+        "log_every_steps": log_every_steps,
+        "seed": seed,
+        "objective_schema": {
+            "summary": "scale_free_volume_price_range_quarters_v2",
+            "reconstruction": "visible_normalized_masked_chronos_patches_v1",
+            "participation": "recent_vs_prior_relative_volume_extremes_v1",
+            "concentration": "volume_weighted_typical_price_entropy_hhi_v1",
+            "displacement": "range_volume_cooccurrence_extremes_v1",
+            "temporal_structure": "ordered_quarter_descriptor_reconstruction_v1",
+            "retention": "l2_sp_parent_adapter_anchor_v1",
+        },
+    }
+    run_identity_sha256 = _volume_structure_run_identity(
+        parent_sha256=parent_sha256,
+        data_identity_sha256=data_identity_sha256,
+        config=run_config,
+    )
+    resume_payload = None
+    if resume:
+        resume_payload = torch.load(
+            state_path, map_location="cpu", weights_only=False)
+        _validate_volume_structure_resume(
+            resume_payload, run_identity_sha256=run_identity_sha256)
+    _atomic_json(preflight_path, {
+        "schema": "ffm_chronos2_volume_structure_preflight_v1",
+        "status": "pass",
+        "run_identity_sha256": run_identity_sha256,
+        "parent": {"path": str(parent), "sha256": parent_sha256},
+        "data_identity_sha256": data_identity_sha256,
+        "data_contracts": {
+            timeframe: item.report for timeframe, item in corpus.items()
+        },
+        "config": run_config,
+        "streams": data["preflight_streams"],
+        "thresholds": data["thresholds"],
+    })
+
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     model, base = _load_trainable_adapter(parent, device)
+    patch_size = int(base.chronos_config.input_patch_size)
+    patch_stride = int(base.chronos_config.input_patch_stride)
+    if patch_stride != patch_size:
+        raise RuntimeError(
+            "Volume-Structure reconstruction requires non-overlapping Chronos patches")
+    if not bool(base.chronos_config.use_reg_token):
+        raise RuntimeError("Volume-Structure SSL requires the Chronos REG token")
+    if context_length % patch_size:
+        raise ValueError("context_length must be divisible by Chronos-2 patch size")
+    n_patches = context_length // patch_size
+    if n_patches < 2:
+        raise ValueError("context_length must contain at least two Chronos-2 patches")
     embedding_dim = int(base.model_dim)
-    projection = nn.Sequential(
-        nn.LayerNorm(embedding_dim),
-        nn.Linear(embedding_dim, projection_dim),
-        nn.GELU(),
-        nn.Linear(projection_dim, projection_dim),
-    ).to(device)
-    decoder = nn.Sequential(
-        nn.LayerNorm(embedding_dim),
-        nn.Linear(embedding_dim, 64),
-        nn.GELU(),
-        nn.Linear(64, 11),
-    ).to(device)
-    order_head = nn.Sequential(
-        nn.LayerNorm(2 * embedding_dim),
-        nn.Linear(2 * embedding_dim, 64),
-        nn.GELU(),
-        nn.Linear(64, 2),
-    ).to(device)
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    parameters += list(projection.parameters())
-    parameters += list(decoder.parameters())
-    parameters += list(order_head.parameters())
-    optimizer = torch.optim.AdamW(
-        parameters, lr=learning_rate, weight_decay=weight_decay)
 
-    ticker_indices = {
-        timeframe: _ticker_indices(item)
-        for timeframe, item in corpus.items()
-    }
-
-    def starts_for(matrix):
-        return _observable_starts(
-            matrix, context_length, min_observations=context_length)
-
-    def summary(window: np.ndarray) -> np.ndarray:
-        """Return deterministic profile-style summaries for one 5xL window."""
-        finite = np.isfinite(window).all(axis=0)
-        if finite.sum() < context_length:
-            return np.full(11, np.nan, dtype=np.float32)
-        values = window[:, finite].astype(np.float64, copy=False)
-        high, low, close, volume = values[1], values[2], values[3], values[4]
-        volume = np.maximum(volume, 0.0)
-        q = max(1, len(close) // 4)
-        volume_quarters = []
-        close_quarters = []
-        for index in range(4):
-            left = index * q
-            right = len(close) if index == 3 else (index + 1) * q
-            weights = volume[left:right] + 1e-9
-            volume_quarters.append(float(np.log1p(weights).mean()))
-            close_quarters.append(float(np.average(close[left:right], weights=weights)))
-        lo, hi = float(np.min(low)), float(np.max(high))
-        width = max(hi - lo, 1e-9)
-        normalized_close = np.clip((close - lo) / width, 0.0, 1.0)
-        weights = volume + 1e-9
-        concentration = 1.0 - float(np.average(
-            (normalized_close - np.average(normalized_close, weights=weights)) ** 2,
-            weights=weights))
-        prior = max(float(np.mean(volume[:-q])), 1e-9)
-        participation = float(np.log1p(np.mean(volume[-q:]) / prior))
-        ranges = np.maximum(high - low, 1e-9)
-        prior_range = max(float(np.median(ranges[:-1])), 1e-9)
-        prior_volume = max(float(np.median(volume[:-1])), 1e-9)
-        displacement = float(
-            np.log1p((ranges[-1] / prior_range) * (volume[-1] / prior_volume)))
-        # Four volume patches, four weighted price locations, and three
-        # profile/dynamics summaries.  These are reconstruction targets, not
-        # strategy labels.
-        return np.asarray(
-            volume_quarters
-            + [float((value - lo) / width) for value in close_quarters]
-            + [concentration, participation, displacement],
-            dtype=np.float32,
+    def projection_head():
+        return nn.Sequential(
+            nn.LayerNorm(embedding_dim),
+            nn.Linear(embedding_dim, projection_dim),
+            nn.GELU(),
+            nn.Linear(projection_dim, projection_dim),
         )
 
-    train_starts = {}
-    thresholds = {}
-    for timeframe, indices_by_ticker in ticker_indices.items():
-        train_starts[timeframe] = {}
-        thresholds[timeframe] = {}
-        for ticker, indices in indices_by_ticker.items():
-            matrix = corpus[timeframe].train[indices]
-            starts = starts_for(matrix)
-            train_starts[timeframe][ticker] = starts
-            sample = starts[: min(len(starts), 4096)]
-            summaries = np.stack([
-                summary(matrix[:, start:start + context_length])
-                for start in sample
-            ])
-            valid = np.isfinite(summaries).all(axis=1)
-            summaries = summaries[valid]
-            if len(summaries) < 8:
-                raise RuntimeError(
-                    f"insufficient finite volume summaries for {timeframe}/{ticker}")
-            thresholds[timeframe][ticker] = {
-                "participation_low": float(np.quantile(summaries[:, 9], 0.33)),
-                "participation_high": float(np.quantile(summaries[:, 9], 0.67)),
-                "concentration_mid": float(np.quantile(summaries[:, 8], 0.50)),
-                "displacement_high": float(np.quantile(summaries[:, 10], 0.75)),
-            }
+    projection_heads = nn.ModuleDict({
+        name: projection_head()
+        for name in ("participation", "concentration", "displacement")
+    }).to(device)
+    patch_decoder = nn.Linear(embedding_dim, patch_size).to(device)
+    temporal_decoder = nn.Sequential(
+        nn.LayerNorm(embedding_dim),
+        nn.Linear(embedding_dim, max(32, projection_dim)),
+        nn.GELU(),
+        nn.Linear(max(32, projection_dim), VOLUME_STRUCTURE_TEMPORAL_SIZE),
+    ).to(device)
 
-    def sample_batch(matrices, starts_map):
-        windows, labels = [], []
-        for _ in range(batch_windows):
-            timeframe = timeframes[int(rng.integers(len(timeframes)))]
-            ticker_names = tuple(starts_map[timeframe])
-            ticker = ticker_names[int(rng.integers(len(ticker_names)))]
-            starts = starts_map[timeframe][ticker]
-            start = int(starts[int(rng.integers(len(starts)))])
-            indices = ticker_indices[timeframe][ticker]
-            raw = matrices[timeframe][ticker][:, start:start + context_length]
-            item = thresholds[timeframe][ticker]
-            target = summary(raw)
-            participation = (
-                0 if target[9] <= item["participation_low"]
-                else 2 if target[9] >= item["participation_high"] else -1)
-            concentration = int(target[8] >= item["concentration_mid"])
-            displacement = int(target[10] >= item["displacement_high"])
-            windows.append(raw)
-            labels.append((target, participation, concentration, displacement))
-        return np.stack(windows).astype(np.float32), labels
+    adapter_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    if not adapter_parameters:
+        raise RuntimeError("volume-structure stage found no trainable LoRA parameters")
+    initial_adapter = {
+        name: parameter.detach().clone()
+        for name, parameter in adapter_parameters
+    }
+    parameters = [parameter for _, parameter in adapter_parameters]
+    head_parameters = list(projection_heads.parameters())
+    head_parameters += list(patch_decoder.parameters())
+    head_parameters += list(temporal_decoder.parameters())
+    parameters += head_parameters
+    optimizer = torch.optim.AdamW([
+        {
+            "params": [parameter for _, parameter in adapter_parameters],
+            "weight_decay": 0.0,
+        },
+        {"params": head_parameters, "weight_decay": weight_decay},
+    ], lr=learning_rate)
 
-    train_matrices = {
-        timeframe: {
-            ticker: corpus[timeframe].train[indices]
-            for ticker, indices in ticker_indices[timeframe].items()
+    streams = data["streams"]
+    stream_keys = tuple(streams)
+    objective_names = ("participation", "concentration", "displacement")
+    class_pools = {
+        objective: {
+            state: tuple(
+                key for key in stream_keys
+                if np.any(streams[key]["fit_states"][:, column] == state)
+            )
+            for state in (0, 2)
         }
-        for timeframe in timeframes
+        for column, objective in enumerate(objective_names)
     }
-    validation_starts = {
-        timeframe: {
-            ticker: starts_for(corpus[timeframe].validation_matrix[indices])
-            for ticker, indices in ticker_indices[timeframe].items()
-        }
-        for timeframe in timeframes
-    }
-    validation_matrices = {
-        timeframe: {
-            ticker: corpus[timeframe].validation_matrix[indices]
-            for ticker, indices in ticker_indices[timeframe].items()
-        }
-        for timeframe in timeframes
-    }
+    if any(
+        not keys
+        for objective in class_pools.values()
+        for keys in objective.values()
+    ):
+        raise RuntimeError("a balanced volume-structure state pool is empty")
 
-    def loss_for(matrices, starts_map, *, train):
-        raw_np, labels = sample_batch(matrices, starts_map)
+    def balanced_record(key, row):
+        stream = streams[key]
+        start = int(stream["fit_starts"][row])
+        raw = stream["train_matrix"][:, start:start + context_length]
+        return (
+            raw,
+            stream["fit_states"][row],
+            stream["fit_temporal"][row],
+        )
+
+    def uniform_record(key, row):
+        stream = streams[key]
+        start = int(stream["train_starts"][row])
+        raw = stream["train_matrix"][:, start:start + context_length]
+        target = _volume_structure_summary(raw, price_bins=price_bins)
+        fitted = data["thresholds"][key[0]][key[1]]
+        temporal_mean = np.asarray(
+            fitted["temporal_feature_mean"], dtype=np.float32)
+        temporal_std = np.asarray(
+            fitted["temporal_feature_std"], dtype=np.float32)
+        temporal = (
+            target[:VOLUME_STRUCTURE_TEMPORAL_SIZE] - temporal_mean
+        ) / temporal_std
+        temporal = np.clip(temporal, -10.0, 10.0)
+        return raw, _volume_structure_states(target, fitted), temporal
+
+    def sample_training_batch():
+        chosen = []
+        for column, objective in enumerate(objective_names):
+            for state in (0, 2):
+                eligible = class_pools[objective][state]
+                key = eligible[int(rng.integers(len(eligible)))]
+                candidates = np.flatnonzero(
+                    streams[key]["fit_states"][:, column] == state)
+                row = int(candidates[int(rng.integers(len(candidates)))])
+                chosen.append(balanced_record(key, row))
+        while len(chosen) < batch_windows:
+            key = stream_keys[int(rng.integers(len(stream_keys)))]
+            row = int(rng.integers(len(streams[key]["train_starts"])))
+            chosen.append(uniform_record(key, row))
+        order = rng.permutation(len(chosen))
+        chosen = [chosen[int(index)] for index in order]
+        return (
+            np.stack([item[0] for item in chosen]).astype(np.float32),
+            np.stack([item[1] for item in chosen]).astype(np.int64),
+            np.stack([item[2] for item in chosen]).astype(np.float32),
+        )
+
+    def validation_batch(key):
+        stream = streams[key]
+        raw = np.stack([
+            stream["validation_matrix"][
+                :, int(start):int(start) + context_length]
+            for start in stream["validation_starts"]
+        ]).astype(np.float32)
+        return raw, stream["validation_states"], stream["validation_temporal"]
+
+    def adapter_drift():
+        values = [
+            (parameter - initial_adapter[name]).square().mean()
+            for name, parameter in adapter_parameters
+        ]
+        return torch.stack(values).mean()
+
+    def loss_for(
+            raw_np,
+            states_np,
+            temporal_np,
+            *,
+            loss_generator,
+            require_all_contrastive,
+    ):
         raw = torch.from_numpy(raw_np).to(device)
-        standardized, finite = _standardize(raw)
-        target = torch.from_numpy(np.stack([row[0] for row in labels])).to(device)
-        participation = torch.as_tensor([row[1] for row in labels], device=device)
-        concentration = torch.as_tensor([row[2] for row in labels], device=device)
-        displacement = torch.as_tensor([row[3] for row in labels], device=device)
-        time_mask = torch.rand(
-            (batch_windows, context_length), generator=generator, device=device) < mask_ratio
-        time_mask[:, -1] = True
-        masked_finite = finite & ~time_mask[:, None, :]
-        masked = torch.where(masked_finite, standardized, torch.zeros_like(standardized))
-        masked_embedding = _reg_embeddings(base, masked, masked_finite)
-        reconstruction = decoder(masked_embedding)
-        reconstruction_loss = F.smooth_l1_loss(reconstruction, target)
+        states = torch.from_numpy(np.asarray(states_np, dtype=np.int64)).to(device)
+        temporal_target = torch.from_numpy(
+            np.asarray(temporal_np, dtype=np.float32)).to(device)
+        batch = raw.shape[0]
 
-        view1, mask1 = _augment(standardized, finite, generator, noise=noise, scale=scale)
-        view2, mask2 = _augment(standardized, finite, generator, noise=noise, scale=scale)
-        views = torch.cat([view1, view2], dim=0)
-        masks = torch.cat([mask1, mask2], dim=0)
-        embeddings = _reg_embeddings(base, views, masks)
-        projected = F.normalize(projection(embeddings), dim=1)
-        instance = torch.arange(batch_windows, device=device).repeat(2)
-        contrastive_losses = []
-        for label in (participation, concentration, displacement):
-            doubled = label.repeat(2)
-            valid = doubled >= 0
-            if int(valid.sum()) >= 4 and int(torch.unique(doubled[valid]).numel()) >= 2:
-                contrastive_losses.append(_regime_supcon(
-                    projected[valid], instance[valid], doubled[valid], temperature))
-        contrastive_loss = (
-            torch.stack(contrastive_losses).mean()
-            if contrastive_losses else reconstruction_loss * 0.0)
+        patch_mask = _volume_structure_patch_mask(
+            batch,
+            n_patches,
+            mask_ratio,
+            loss_generator,
+            device,
+        )
+        time_mask = patch_mask.repeat_interleave(patch_size, dim=1)
+        standardized_masked, finite, visible = _volume_structure_standardize(
+            raw, visible_time=~time_mask)
+        encoder_context, visible_flat = _volume_structure_encoder_input(
+            standardized_masked, visible)
+        # Chronos-2 InstanceNorm runs before its context_mask is applied. Hide
+        # artificial targets from that normalization with NaN; passing finite
+        # values plus a False mask would leak target statistics into visible
+        # patch tokens.
+        groups = torch.arange(batch, device=device).repeat_interleave(5)
+        outputs, loc_scale, _, context_patches = base.encode(
+            context=encoder_context,
+            context_mask=visible_flat,
+            group_ids=groups,
+            num_output_patches=1,
+        )
+        if context_patches != n_patches:
+            raise RuntimeError(
+                "Chronos-2 returned an unexpected context patch count")
+        if not isinstance(loc_scale, tuple) or len(loc_scale) != 2:
+            raise RuntimeError("Chronos-2 encode did not return visible loc/scale")
+        loc, normalization_scale = loc_scale
+        normalized_target = (
+            standardized_masked.reshape(batch * 5, context_length) - loc
+        ) / normalization_scale.clamp_min(1e-5)
+        if bool(getattr(base.chronos_config, "use_arcsinh", False)):
+            normalized_target = torch.arcsinh(normalized_target)
+        normalized_target = normalized_target.reshape(
+            batch, 5, context_length).clamp(-10.0, 10.0)
+        reconstruction = patch_decoder(
+            outputs[0][:, :context_patches, :]).reshape(
+                batch, 5, context_patches * patch_size)[..., :context_length]
+        selected = finite & time_mask[:, None, :]
+        if not selected.any():
+            raise RuntimeError("masked reconstruction selected no finite targets")
+        reconstruction_loss = F.smooth_l1_loss(
+            reconstruction[selected], normalized_target[selected])
 
-        reversed_values = torch.flip(standardized, dims=[-1])
-        reversed_mask = torch.flip(finite, dims=[-1])
-        ordered_embedding = _reg_embeddings(base, standardized, finite)
-        reversed_embedding = _reg_embeddings(base, reversed_values, reversed_mask)
-        order_input = torch.cat([
-            torch.cat([ordered_embedding, reversed_embedding], dim=1),
-            torch.cat([reversed_embedding, ordered_embedding], dim=1),
-        ], dim=0)
-        order_logits = order_head(order_input)
-        order_labels = torch.cat([
-            torch.zeros(batch_windows, dtype=torch.long, device=device),
-            torch.ones(batch_windows, dtype=torch.long, device=device),
-        ])
-        order_loss = F.cross_entropy(order_logits, order_labels)
-        total = reconstruction_loss + contrastive_loss + 0.5 * order_loss
-        return total, {
-            "reconstruction": float(reconstruction_loss.detach()),
-            "participation_contrast": float(contrastive_loss.detach()),
-            "temporal_order": float(order_loss.detach()),
+        standardized, full_finite, _ = _volume_structure_standardize(raw)
+        view1, mask1 = _volume_structure_augment(
+            standardized, full_finite, loss_generator, noise=noise, scale=scale)
+        view2, mask2 = _volume_structure_augment(
+            standardized, full_finite, loss_generator, noise=noise, scale=scale)
+        embeddings = _reg_embeddings(
+            base,
+            torch.cat([view1, view2], dim=0),
+            torch.cat([mask1, mask2], dim=0),
+        )
+        instance = torch.arange(batch, device=device).repeat(2)
+        component_tensors = {"reconstruction": reconstruction_loss}
+        eligible = {}
+        for column, objective in enumerate(objective_names):
+            labels = states[:, column].repeat(2)
+            valid = labels >= 0
+            eligible[objective] = int(valid.sum().item() // 2)
+            active = (
+                int(valid.sum()) >= 4
+                and int(torch.unique(labels[valid]).numel()) >= 2
+            )
+            if require_all_contrastive and not active:
+                raise RuntimeError(
+                    f"balanced training batch lost the {objective} objective")
+            if active:
+                projected = F.normalize(
+                    projection_heads[objective](embeddings[valid]), dim=1)
+                component_tensors[objective] = _regime_supcon(
+                    projected,
+                    instance[valid],
+                    labels[valid],
+                    temperature,
+                )
+            else:
+                component_tensors[objective] = None
+
+        temporal_prediction = temporal_decoder(embeddings[:batch])
+        component_tensors["temporal_structure"] = F.smooth_l1_loss(
+            temporal_prediction, temporal_target)
+        component_tensors["adapter_retention"] = adapter_drift()
+
+        total = component_tensors["reconstruction"] * reconstruction_weight
+        for objective, weight in (
+            ("participation", participation_weight),
+            ("concentration", concentration_weight),
+            ("displacement", displacement_weight),
+            ("temporal_structure", temporal_weight),
+            ("adapter_retention", adapter_retention_weight),
+        ):
+            value = component_tensors[objective]
+            if value is not None:
+                total = total + value * weight
+        components = {
+            name: (None if value is None else float(value.detach()))
+            for name, value in component_tensors.items()
         }
+        components["embedding_std"] = float(
+            embeddings[:batch].detach().std(dim=0, unbiased=False).mean())
+        return total, components, eligible
 
-    best_loss, best_adapter = math.inf, None
+    def capture_global_rng():
+        state = {"cpu": torch.get_rng_state()}
+        if str(device).startswith("cuda"):
+            state["device"] = torch.cuda.get_rng_state(torch.device(device))
+        elif (
+            str(device) == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "get_rng_state")
+        ):
+            state["device"] = torch.mps.get_rng_state()
+        return state
+
+    def restore_global_rng(state):
+        torch.set_rng_state(state["cpu"])
+        if "device" not in state:
+            return
+        if str(device).startswith("cuda"):
+            torch.cuda.set_rng_state(state["device"], torch.device(device))
+        elif (
+            str(device) == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "set_rng_state")
+        ):
+            torch.mps.set_rng_state(state["device"])
+
+    best_loss, best_adapter, best_epoch = math.inf, None, None
     history, start_epoch, bad = [], 0, 0
-    if resume and state_path.is_file():
-        saved = torch.load(state_path, map_location="cpu")
+    if resume:
+        saved = resume_payload
+        if saved is None:
+            raise RuntimeError("validated volume-structure resume state is missing")
         _restore_adapter(model, saved["adapter"])
-        projection.load_state_dict(saved["projection"])
-        decoder.load_state_dict(saved["decoder"])
-        order_head.load_state_dict(saved["order_head"])
+        projection_heads.load_state_dict(saved["projection_heads"])
+        patch_decoder.load_state_dict(saved["patch_decoder"])
+        temporal_decoder.load_state_dict(saved["temporal_decoder"])
         optimizer.load_state_dict(saved["optimizer"])
-        best_loss, best_adapter = float(saved["best_loss"]), saved["best_adapter"]
-        history, start_epoch, bad = list(saved["history"]), int(saved["epoch"]) + 1, int(saved["bad"])
+        best_loss = float(saved["best_loss"])
+        best_adapter = saved["best_adapter"]
+        best_epoch = int(saved["best_epoch"])
+        history = list(saved["history"])
+        start_epoch = int(saved["epoch"]) + 1
+        bad = int(saved["bad"])
         rng.bit_generator.state = saved["numpy_rng"]
         generator.set_state(saved["torch_generator"])
+        restore_global_rng(saved["global_torch_rng"])
+        if start_epoch >= epochs:
+            raise RuntimeError(
+                "resume state already reached the configured epoch budget")
 
     started = time.monotonic()
+    component_keys = (
+        "reconstruction",
+        "participation",
+        "concentration",
+        "displacement",
+        "temporal_structure",
+        "adapter_retention",
+        "embedding_std",
+    )
     for epoch in range(start_epoch, epochs):
-        model.train(); projection.train(); decoder.train(); order_head.train()
+        model.train()
+        projection_heads.train()
+        patch_decoder.train()
+        temporal_decoder.train()
         optimizer.zero_grad(set_to_none=True)
-        totals = {"loss": 0.0, "reconstruction": 0.0, "participation_contrast": 0.0, "temporal_order": 0.0}
+        totals = {"loss": 0.0, **{name: 0.0 for name in component_keys}}
         for step in range(steps_per_epoch):
-            loss, components = loss_for(train_matrices, train_starts, train=True)
+            raw_np, states_np, temporal_np = sample_training_batch()
+            loss, components, _ = loss_for(
+                raw_np,
+                states_np,
+                temporal_np,
+                loss_generator=generator,
+                require_all_contrastive=True,
+            )
             if not torch.isfinite(loss):
-                raise RuntimeError("non-finite volume-structure SSL loss")
+                raise RuntimeError(
+                    "non-finite volume-structure loss; refusing adapter update")
             (loss / gradient_accumulation).backward()
             totals["loss"] += float(loss.detach())
-            for name, value in components.items():
+            for name in component_keys:
+                value = components[name]
+                if value is None:
+                    raise RuntimeError(
+                        f"training objective {name} became inactive")
                 totals[name] += value
-            if (step + 1) % gradient_accumulation == 0 or step + 1 == steps_per_epoch:
+            if (
+                (step + 1) % gradient_accumulation == 0
+                or step + 1 == steps_per_epoch
+            ):
                 torch.nn.utils.clip_grad_norm_(parameters, 1.0)
-                optimizer.step(); optimizer.zero_grad(set_to_none=True)
-        model.eval(); projection.eval(); decoder.eval(); order_head.eval()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            if (step + 1) % log_every_steps == 0 or step + 1 == steps_per_epoch:
+                print(
+                    f"[chronos2-volume-structure] ep={epoch} "
+                    f"step={step + 1}/{steps_per_epoch} "
+                    f"loss={totals['loss'] / (step + 1):.5f}",
+                    flush=True,
+                )
+
+        model.eval()
+        projection_heads.eval()
+        patch_decoder.eval()
+        temporal_decoder.eval()
+        validation_generator = torch.Generator(device=device)
+        validation_generator.manual_seed(seed + 20_260_801)
         with torch.no_grad():
-            validation_losses = []
-            for _ in range(max(1, min(8, steps_per_epoch // 4))):
-                value, _ = loss_for(validation_matrices, validation_starts, train=False)
-                validation_losses.append(float(value))
-            val_loss = float(np.mean(validation_losses))
+            val_per_stream = {}
+            for timeframe, ticker in stream_keys:
+                raw_np, states_np, temporal_np = validation_batch(
+                    (timeframe, ticker))
+                _, components, eligible = loss_for(
+                    raw_np,
+                    states_np,
+                    temporal_np,
+                    loss_generator=validation_generator,
+                    require_all_contrastive=False,
+                )
+                val_per_stream[f"{ticker}@{timeframe}"] = {
+                    **components,
+                    "eligible": eligible,
+                }
+
+        val_components = {}
+        for name in component_keys:
+            values = [
+                stream[name]
+                for stream in val_per_stream.values()
+                if stream[name] is not None
+            ]
+            if not values:
+                raise RuntimeError(
+                    f"fixed validation bank cannot measure {name}")
+            val_components[name] = float(np.mean(values))
+        val_loss = sum(
+            objective_weights[name] * val_components[name]
+            for name in objective_weights
+        )
+        worst_streams = {}
+        for name in (
+            "reconstruction",
+            "participation",
+            "concentration",
+            "displacement",
+            "temporal_structure",
+        ):
+            eligible_values = {
+                key: value[name]
+                for key, value in val_per_stream.items()
+                if value[name] is not None
+            }
+            worst_key = max(eligible_values, key=eligible_values.get)
+            worst_streams[name] = {
+                "stream": worst_key,
+                "loss": float(eligible_values[worst_key]),
+                "eligible_streams": int(len(eligible_values)),
+            }
+
         improved = val_loss < best_loss - 1e-6
         if improved:
             best_loss, bad = val_loss, 0
             best_adapter = _adapter_state(model)
+            best_epoch = epoch
         else:
             bad += 1
         row = {
             "epoch": epoch,
             "train_loss": totals["loss"] / steps_per_epoch,
-            "train_reconstruction": totals["reconstruction"] / steps_per_epoch,
-            "train_participation_contrast": totals["participation_contrast"] / steps_per_epoch,
-            "train_temporal_order": totals["temporal_order"] / steps_per_epoch,
+            "train_components": {
+                name: totals[name] / steps_per_epoch
+                for name in component_keys
+            },
             "val_loss": val_loss,
+            "val_components": val_components,
+            "val_worst_streams": worst_streams,
+            "val_per_stream": val_per_stream,
             "improved": improved,
+            "bad_epochs": bad,
+            "elapsed_seconds": time.monotonic() - started,
         }
         history.append(row)
         print(
             f"[chronos2-volume-structure] ep={epoch} "
-            f"train={row['train_loss']:.5f} val={val_loss:.5f}"
-            f"{' *' if improved else ''}", flush=True)
+            f"train={row['train_loss']:.5f} val={val_loss:.5f} "
+            f"part={val_components['participation']:.5f} "
+            f"conc={val_components['concentration']:.5f}"
+            f"{' *' if improved else ''}",
+            flush=True,
+        )
         _atomic_torch(state_path, {
+            "schema": VOLUME_STRUCTURE_TRAINER_SCHEMA,
+            "run_identity_sha256": run_identity_sha256,
             "epoch": epoch,
             "adapter": _adapter_state(model),
-            "projection": projection.state_dict(),
-            "decoder": decoder.state_dict(),
-            "order_head": order_head.state_dict(),
+            "projection_heads": projection_heads.state_dict(),
+            "patch_decoder": patch_decoder.state_dict(),
+            "temporal_decoder": temporal_decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
             "best_loss": best_loss,
             "best_adapter": best_adapter,
+            "best_epoch": best_epoch,
             "history": history,
             "bad": bad,
             "numpy_rng": rng.bit_generator.state,
             "torch_generator": generator.get_state(),
+            "global_torch_rng": capture_global_rng(),
         })
         if bad >= patience:
             break
-    if best_adapter is None:
-        raise RuntimeError("volume-structure SSL never produced a finite validation checkpoint")
+
+    if best_adapter is None or best_epoch is None:
+        raise RuntimeError(
+            "volume-structure SSL never produced a finite validation checkpoint")
+    if tree_sha256(parent) != parent_sha256:
+        raise RuntimeError(
+            "volume-structure parent adapter changed during training")
     _restore_adapter(model, best_adapter)
     _save_final(model, checkpoint)
     report = {
-        "schema": "ffm_chronos2_volume_structure_ssl_v1",
+        "schema": "ffm_chronos2_volume_structure_ssl_v2",
         "stage": "volume_structure_ssl",
         "status": "complete",
-        "parent": {"path": str(parent), "sha256": tree_sha256(parent)},
-        "checkpoint": {"path": str(checkpoint), "sha256": tree_sha256(checkpoint)},
-        "data_identity_sha256": _corpus_identity(corpus),
-        "config": {
-            "timeframes": list(timeframes),
-            "context_length": context_length,
-            "epochs": epochs,
-            "steps_per_epoch": steps_per_epoch,
-            "batch_windows": batch_windows,
-            "gradient_accumulation": gradient_accumulation,
-            "learning_rate": learning_rate,
-            "mask_ratio": mask_ratio,
-            "projection_dim": projection_dim,
-            "temperature": temperature,
-            "seed": seed,
-            "objectives": [
-                "masked_volume_price_patch_reconstruction",
-                "participation_contrastive_learning",
-                "concentration_dispersion_contrastive_learning",
-                "displacement_volume_alignment",
-                "temporal_order_acceptance_displacement_retracement_expansion",
-            ],
+        "run_identity_sha256": run_identity_sha256,
+        "parent": {"path": str(parent), "sha256": parent_sha256},
+        "checkpoint": {
+            "path": str(checkpoint),
+            "sha256": tree_sha256(checkpoint),
         },
-        "thresholds": thresholds,
+        "data_identity_sha256": data_identity_sha256,
+        "data_contracts": {
+            timeframe: item.report for timeframe, item in corpus.items()
+        },
+        "config": run_config,
+        "thresholds": data["thresholds"],
+        "preflight_streams": data["preflight_streams"],
         "best_val_loss": best_loss,
+        "best_epoch": best_epoch,
         "history": history,
+        "retention_gate": {
+            "status": "required_before_promotion",
+            "contract": (
+                "matched parent-versus-child Probe Atlas on identical pools, "
+                "per-stream metrics, and controls"
+            ),
+        },
+        "limitations": [
+            (
+                "OHLCV bars support a causal volume-at-typical-price proxy, "
+                "not literal intrabar exchange volume profile"
+            ),
+            (
+                "temporary SSL heads are discarded; capability must be "
+                "confirmed with frozen-embedding probes"
+            ),
+        ],
         "elapsed_seconds": time.monotonic() - started,
     }
-    _atomic_json(out_dir / "report.json", report)
+    _atomic_json(report_path, report)
     return report
 
 
@@ -1627,6 +2497,7 @@ __all__ = [
     "train_mask",
     "train_contrastive",
     "train_volatility_contrastive",
+    "preflight_volume_structure_ssl",
     "train_volume_structure_ssl",
     "tree_sha256",
 ]

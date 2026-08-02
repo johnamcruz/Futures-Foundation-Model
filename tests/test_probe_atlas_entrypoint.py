@@ -199,12 +199,17 @@ def test_chronos2_probe_atlas_entrypoint_ports_public_atlas_contract(tmp_path):
     assert '"ret_structural_direction"' in atlas_source
 
 
-def test_chronos2_atlas_authenticates_completed_stage_lineage(tmp_path):
+@pytest.mark.parametrize(("schema", "stage"), [
+    ("ffm_chronos2_mask_v1", "mask"),
+    ("ffm_chronos2_volume_structure_ssl_v2", "volume_structure_ssl"),
+])
+def test_chronos2_atlas_authenticates_completed_stage_lineage(
+        tmp_path, schema, stage):
     launcher = _load(
         "chronos2_probe_atlas_stage",
         ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
     )
-    run = tmp_path / "mask"
+    run = tmp_path / stage
     adapter = run / "checkpoint"
     adapter.mkdir(parents=True)
     (adapter / "adapter_config.json").write_text("{}")
@@ -212,8 +217,8 @@ def test_chronos2_atlas_authenticates_completed_stage_lineage(tmp_path):
     checkpoint_sha256 = launcher._tree_sha256(adapter)
     report = run / "report.json"
     report.write_text(json.dumps({
-        "schema": "ffm_chronos2_mask_v1",
-        "stage": "mask",
+        "schema": schema,
+        "stage": stage,
         "status": "complete",
         "checkpoint": {"sha256": checkpoint_sha256},
         "parent": {"sha256": "a" * 64},
