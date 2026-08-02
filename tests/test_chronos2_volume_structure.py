@@ -28,6 +28,7 @@ from futures_foundation.finetune.classifiers.chronos2.ssl_stages import (
     _volume_structure_run_identity,
     _volume_structure_standardize,
     _volume_structure_summary,
+    _volume_structure_thresholds_from_arrays,
 )
 
 
@@ -159,6 +160,30 @@ def test_volume_structure_thresholds_are_deterministic_and_representative():
     assert first["displacement_low"] < first["displacement_high"]
     assert np.isfinite(first["temporal_mean"])
     assert np.isfinite(first["temporal_std"])
+
+
+def test_participation_thresholds_preserve_falling_rising_semantics_when_skewed():
+    rows = 100
+    summaries = np.zeros((rows, 15), dtype=np.float32)
+    summaries[:, 12] = np.linspace(0.1, 0.9, rows)
+    summaries[:, 13] = np.concatenate((
+        np.linspace(-1.0, -0.05, 80),
+        np.linspace(0.05, 0.5, 20),
+    ))
+    summaries[:, 14] = np.linspace(0.1, 2.0, rows)
+
+    thresholds = _volume_structure_thresholds_from_arrays(
+        np.arange(rows, dtype=np.int64), summaries)
+
+    assert thresholds["participation_low"] < 0.0
+    assert thresholds["participation_high"] > 0.0
+    assert thresholds["participation_high"] == pytest.approx(1e-6)
+    states = np.stack([
+        ssl_stages._volume_structure_states(summary, thresholds)
+        for summary in summaries
+    ])
+    assert np.any(states[:, 0] == 0)
+    assert np.any(states[:, 0] == 2)
 
 
 def test_volume_structure_identity_is_stable_and_binds_parent_data_and_config():

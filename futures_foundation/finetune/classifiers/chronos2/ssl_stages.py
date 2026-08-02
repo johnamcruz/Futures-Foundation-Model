@@ -1835,12 +1835,25 @@ def _volume_structure_thresholds_from_arrays(
     temporal_feature_mean = temporal.mean(axis=0)
     temporal_feature_std = temporal.std(axis=0)
     temporal_feature_std = np.maximum(temporal_feature_std, 1e-6)
+    participation_low, participation_high = np.quantile(
+        summaries[:, 13], (0.33, 0.67))
+    # Participation is the signed log ratio of recent to prior volume. Keep
+    # the quantile-derived extremes, but require their class boundary to retain
+    # its absolute falling (<0) versus rising (>0) meaning when a stream is
+    # skewed toward one side. The downstream state-count gate still fails
+    # closed when the training data contains no examples on either side.
+    participation_zero_margin = 1e-6
+    participation_low = min(
+        float(participation_low), -participation_zero_margin)
+    participation_high = max(
+        float(participation_high), participation_zero_margin)
     result = {
         "fit_samples": int(len(summaries)),
         "fit_start_min": int(selected.min()),
         "fit_start_max": int(selected.max()),
-        "participation_low": float(np.quantile(summaries[:, 13], 0.33)),
-        "participation_high": float(np.quantile(summaries[:, 13], 0.67)),
+        "participation_low": participation_low,
+        "participation_high": participation_high,
+        "participation_zero_margin": participation_zero_margin,
         "concentration_low": float(np.quantile(summaries[:, 12], 0.33)),
         "concentration_high": float(np.quantile(summaries[:, 12], 0.67)),
         "displacement_low": float(np.quantile(summaries[:, 14], 0.50)),
