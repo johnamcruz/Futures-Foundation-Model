@@ -3289,11 +3289,1603 @@ def train_volume_structure_ssl(
     return complete_report
 
 
+BALANCED_KAUFMAN_TRAINER_SCHEMA = (
+    "ffm_chronos2_balanced_kaufman_trainer_v1")
+BALANCED_KAUFMAN_REPORT_SCHEMA = "ffm_chronos2_balanced_kaufman_ssl_v1"
+BALANCED_KAUFMAN_PREFLIGHT_SCHEMA = (
+    "ffm_chronos2_balanced_kaufman_preflight_v1")
+BALANCED_KAUFMAN_STAGED_CHECKPOINT = ".checkpoint.pending"
+BALANCED_KAUFMAN_STAGED_REPORT = ".report.complete.pending.json"
+
+
+def _kaufman_efficiency_scores(
+        matrix: np.ndarray,
+        starts: np.ndarray,
+        *,
+        context_length: int,
+        kaufman_length: int,
+        close_channel: int = 3,
+) -> np.ndarray:
+    """Vectorized causal ER from the final completed bars of each context."""
+    matrix = np.asarray(matrix)
+    starts = np.asarray(starts, dtype=np.int64)
+    if matrix.ndim != 2 or not 0 <= close_channel < matrix.shape[0]:
+        raise ValueError("Kaufman matrix or close channel is invalid")
+    if starts.ndim != 1 or not len(starts):
+        raise ValueError("Kaufman starts must be a non-empty vector")
+    if not 2 <= kaufman_length <= context_length:
+        raise ValueError("kaufman_length must be in [2, context_length]")
+    if int(starts.min()) < 0 or int(starts.max()) + context_length > matrix.shape[1]:
+        raise ValueError("Kaufman starts exceed the supplied matrix")
+    close = np.asarray(matrix[close_channel], dtype=np.float64)
+    first = starts + context_length - kaufman_length
+    last = starts + context_length - 1
+    if not (
+        np.isfinite(close[first]).all()
+        and np.isfinite(close[last]).all()
+    ):
+        raise RuntimeError("Kaufman endpoints contain non-finite values")
+    differences = np.abs(np.diff(close))
+    invalid_prefix = np.empty(len(close), dtype=np.int64)
+    invalid_prefix[0] = 0
+    np.cumsum(~np.isfinite(differences), dtype=np.int64,
+              out=invalid_prefix[1:])
+    if np.any((invalid_prefix[last] - invalid_prefix[first]) != 0):
+        raise RuntimeError("Kaufman paths contain non-finite values")
+    prefix = np.empty(len(close), dtype=np.float64)
+    prefix[0] = 0.0
+    np.cumsum(
+        np.where(np.isfinite(differences), differences, 0.0),
+        dtype=np.float64,
+        out=prefix[1:],
+    )
+    path = prefix[last] - prefix[first]
+    displacement = np.abs(close[last] - close[first])
+    efficiency = np.divide(
+        displacement,
+        np.maximum(path, 1e-12),
+        out=np.zeros_like(displacement),
+    )
+    efficiency = np.clip(efficiency, 0.0, 1.0).astype(np.float32)
+    if not np.isfinite(efficiency).all():
+        raise RuntimeError("Kaufman efficiency produced non-finite values")
+    return efficiency
+
+
+def _kaufman_binary_states(
+        efficiency: np.ndarray,
+        *,
+        chop: float,
+        trend: float,
+) -> np.ndarray:
+    """Direction-agnostic chop=0/trend=2 with an ambiguous middle state."""
+    if not 0.0 <= chop < trend <= 1.0:
+        raise ValueError("Kaufman thresholds must satisfy 0 <= chop < trend <= 1")
+    efficiency = np.asarray(efficiency, dtype=np.float32)
+    if not np.isfinite(efficiency).all():
+        raise ValueError("Kaufman efficiency must be finite")
+    states = np.full(efficiency.shape, -1, dtype=np.int64)
+    states[efficiency <= chop] = 0
+    states[efficiency >= trend] = 2
+    return states
+
+
+def _reg_embeddings_concat(base, windows, finite):
+    """Return the exact ordered five-variate native REG concatenation [B,5D]."""
+    import torch
+
+    if windows.ndim != 3 or windows.shape[1] != 5 or finite.shape != windows.shape:
+        raise ValueError("balanced Kaufman input must have shape [B,5,L]")
+    batch, channels, _ = windows.shape
+    flat = windows.reshape(batch * channels, -1)
+    mask = finite.reshape(batch * channels, -1)
+    groups = torch.arange(batch, device=windows.device).repeat_interleave(channels)
+    outputs, _, _, context_patches = base.encode(
+        context=flat,
+        context_mask=mask,
+        group_ids=groups,
+        num_output_patches=1,
+    )
+    reg = outputs[0][:, context_patches, :]
+    if reg.ndim != 2 or reg.shape[0] != batch * 5:
+        raise RuntimeError("Chronos REG output shape drifted")
+    return reg.reshape(batch, 5 * reg.shape[-1])
+
+
+def _native_balanced_kaufman_metrics(
+        embeddings,
+        instance,
+        states,
+        *,
+        temperature: float,
+        require_both: bool,
+):
+    """Native direction-agnostic regime loss and projection-free geometry."""
+    import torch
+    import torch.nn.functional as F
+
+    if embeddings.ndim != 2 or len(embeddings) % 2:
+        raise ValueError("native embeddings must contain two views per instance")
+    batch = len(embeddings) // 2
+    if states.shape != (batch,) or instance.shape != (2 * batch,):
+        raise ValueError("balanced Kaufman state or instance shape mismatch")
+    labels = states.repeat(2)
+    valid = labels >= 0
+    classes = torch.unique(labels[valid])
+    class_counts = {
+        str(state): int((states == state).sum().item()) for state in (0, 2)
+    }
+    active = (
+        int(valid.sum()) >= 8
+        and int(classes.numel()) == 2
+        and all(value >= 2 for value in class_counts.values())
+    )
+    if require_both and not active:
+        raise RuntimeError("balanced Kaufman batch lost chop or trend support")
+    if not active:
+        return None
+    normalized = F.normalize(embeddings[valid], dim=1)
+    valid_instance = instance[valid]
+    valid_labels = labels[valid]
+    loss = _regime_supcon(
+        normalized, valid_instance, valid_labels, temperature)
+    similarity = normalized @ normalized.T
+    eye = torch.eye(
+        len(normalized), dtype=torch.bool, device=normalized.device)
+    distinct_instance = valid_instance[:, None] != valid_instance[None, :]
+    same = (
+        (valid_labels[:, None] == valid_labels[None, :])
+        & distinct_instance & ~eye)
+    different = valid_labels[:, None] != valid_labels[None, :]
+    if not same.any() or not different.any():
+        if require_both:
+            raise RuntimeError("balanced Kaufman geometry has no valid pairs")
+        return None
+    margin = similarity[same].mean() - similarity[different].mean()
+    embedding_std = normalized[:batch].std(
+        dim=0, unbiased=False).mean()
+    return {
+        "loss": loss,
+        "margin": margin,
+        "embedding_std": embedding_std,
+        "class_counts": class_counts,
+    }
+
+
+def _validate_native_balanced_kaufman_lift(
+        parent: Mapping[str, float],
+        child: Mapping[str, float],
+        *,
+        margin: float,
+) -> dict[str, float]:
+    """Require lower native loss and a larger native regime margin."""
+    if not np.isfinite(float(margin)) or margin < 0.0:
+        raise ValueError("native promotion margin must be finite and nonnegative")
+    values = {
+        "loss": float(parent["loss"]) - float(child["loss"]),
+        "margin": float(child["margin"]) - float(parent["margin"]),
+    }
+    for name, value in values.items():
+        if not np.isfinite(value) or value <= margin:
+            raise RuntimeError(
+                f"native balanced Kaufman {name} did not improve beyond parent")
+    for side, metrics in (("parent", parent), ("checkpoint", child)):
+        std = float(metrics["embedding_std"])
+        if not np.isfinite(std) or std <= 0.0:
+            raise RuntimeError(f"{side} native balanced Kaufman embedding collapsed")
+    return values
+
+
+def _prepare_balanced_kaufman_data(
+        prepared,
+        *,
+        context_length: int,
+        kaufman_length: int,
+        kaufman_chop: float,
+        kaufman_trend: float,
+        validation_windows_per_state: int,
+) -> dict:
+    """Build exact fixed-threshold, balanced train and validation state pools."""
+    if validation_windows_per_state < 2:
+        raise ValueError("validation_windows_per_state must be >= 2")
+    if not 2 <= kaufman_length <= context_length:
+        raise ValueError("kaufman_length must be in [2, context_length]")
+    if not 0.0 <= kaufman_chop < kaufman_trend <= 1.0:
+        raise ValueError("Kaufman thresholds must satisfy 0 <= chop < trend <= 1")
+    corpus = _as_corpus(prepared)
+    ticker_indices = {
+        timeframe: _ticker_indices(item)
+        for timeframe, item in corpus.items()
+    }
+    streams, preflight_streams = {}, {}
+    for timeframe, indices_by_ticker in ticker_indices.items():
+        preflight_streams[timeframe] = {}
+        for ticker, indices in indices_by_ticker.items():
+            key = (timeframe, ticker)
+            train_matrix = corpus[timeframe].train[indices]
+            train_starts = _observable_starts(
+                train_matrix,
+                context_length,
+                min_observations=context_length,
+            )
+            train_efficiency = _kaufman_efficiency_scores(
+                train_matrix,
+                train_starts,
+                context_length=context_length,
+                kaufman_length=kaufman_length,
+            )
+            train_states = _kaufman_binary_states(
+                train_efficiency,
+                chop=kaufman_chop,
+                trend=kaufman_trend,
+            )
+            train_state_starts = {
+                state: train_starts[train_states == state] for state in (0, 2)
+            }
+            if any(len(values) < 2 for values in train_state_starts.values()):
+                raise RuntimeError(
+                    f"{timeframe}/{ticker} lacks fixed-threshold Kaufman train support")
+
+            validation_matrix = corpus[timeframe].validation_matrix[indices]
+            validation_starts = _observable_starts(
+                validation_matrix,
+                context_length,
+                min_observations=context_length,
+            )
+            validation_efficiency = _kaufman_efficiency_scores(
+                validation_matrix,
+                validation_starts,
+                context_length=context_length,
+                kaufman_length=kaufman_length,
+            )
+            validation_states_all = _kaufman_binary_states(
+                validation_efficiency,
+                chop=kaufman_chop,
+                trend=kaufman_trend,
+            )
+            validation_state_starts = {}
+            for state in (0, 2):
+                candidates = validation_starts[validation_states_all == state]
+                if len(candidates) < validation_windows_per_state:
+                    raise RuntimeError(
+                        f"{timeframe}/{ticker} lacks fixed-threshold Kaufman "
+                        "validation support")
+                validation_state_starts[state] = _evenly_spaced_starts(
+                    candidates,
+                    max_samples=validation_windows_per_state,
+                )
+                if len(validation_state_starts[state]) != validation_windows_per_state:
+                    raise RuntimeError(
+                        "balanced Kaufman validation bank size drifted")
+            selected_validation = np.concatenate([
+                validation_state_starts[0], validation_state_starts[2]])
+            order = np.argsort(selected_validation, kind="stable")
+            selected_validation = selected_validation[order]
+            selected_states = np.concatenate([
+                np.zeros(len(validation_state_starts[0]), dtype=np.int64),
+                np.full(len(validation_state_starts[2]), 2, dtype=np.int64),
+            ])[order]
+            streams[key] = {
+                "train_matrix": train_matrix,
+                "train_state_starts": train_state_starts,
+                "validation_matrix": validation_matrix,
+                "validation_starts": selected_validation,
+                "validation_states": selected_states,
+            }
+            preflight_streams[timeframe][ticker] = {
+                "train_available_windows": int(len(train_starts)),
+                "train_state_counts": {
+                    "chop": int(len(train_state_starts[0])),
+                    "trend": int(len(train_state_starts[2])),
+                    "transition": int((train_states == -1).sum()),
+                },
+                "validation_available_windows": int(len(validation_starts)),
+                "validation_state_counts": {
+                    "chop": int((validation_states_all == 0).sum()),
+                    "trend": int((validation_states_all == 2).sum()),
+                    "transition": int((validation_states_all == -1).sum()),
+                },
+                "validation_selected": {
+                    "chop": int(len(validation_state_starts[0])),
+                    "trend": int(len(validation_state_starts[2])),
+                },
+            }
+    aggregate_state_counts = {
+        "chop": int(sum(
+            len(stream["train_state_starts"][0]) for stream in streams.values())),
+        "trend": int(sum(
+            len(stream["train_state_starts"][2]) for stream in streams.values())),
+    }
+    return {
+        "corpus": corpus,
+        "data_identity_sha256": _corpus_identity(corpus),
+        "streams": streams,
+        "preflight_streams": preflight_streams,
+        "aggregate_state_counts": aggregate_state_counts,
+    }
+
+
+def _authenticate_balanced_kaufman_parent(
+        *,
+        parent: Path,
+        parent_report: Path,
+        base_snapshot: Path,
+        data_identity_sha256: str,
+) -> tuple[dict, dict, dict]:
+    """Authenticate the completed Volume checkpoint, report, base, and corpus."""
+    parent = Path(parent).expanduser().resolve()
+    parent_report = Path(parent_report).expanduser().resolve()
+    if not parent_report.is_file():
+        raise RuntimeError("balanced Kaufman Volume parent report is missing")
+    report = _read_json_object(parent_report)
+    run_identity = report.get("run_identity_sha256")
+    volume_source_parent = report.get("parent")
+    volume_data_identity = report.get("data_identity_sha256")
+    volume_config = report.get("config")
+    if not isinstance(run_identity, str) or _HEX64.fullmatch(run_identity) is None:
+        raise RuntimeError("Volume parent report has no valid run identity")
+    if not (
+        isinstance(volume_source_parent, Mapping)
+        and isinstance(volume_source_parent.get("sha256"), str)
+        and _HEX64.fullmatch(volume_source_parent["sha256"]) is not None
+        and isinstance(volume_data_identity, str)
+        and _HEX64.fullmatch(volume_data_identity) is not None
+        and isinstance(volume_config, Mapping)
+        and _volume_structure_run_identity(
+            parent_sha256=volume_source_parent["sha256"],
+            data_identity_sha256=volume_data_identity,
+            config=volume_config,
+        ) == run_identity
+    ):
+        raise RuntimeError("Volume parent report run identity is not reproducible")
+    _authenticate_volume_structure_completion(
+        report,
+        checkpoint=parent,
+        run_identity_sha256=run_identity,
+    )
+    base_identity = _chronos_base_identity(parent, Path(base_snapshot))
+    config = report.get("config")
+    if not isinstance(config, Mapping) or config.get("base_model") != base_identity:
+        raise RuntimeError("Volume parent report base identity drifted")
+    parent_identity = {"path": str(parent), "sha256": tree_sha256(parent)}
+    report_identity = {
+        "path": str(parent_report),
+        "sha256": _file_sha256(parent_report),
+        "schema": report["schema"],
+        "stage": report["stage"],
+        "run_identity_sha256": run_identity,
+        "data_identity_sha256": volume_data_identity,
+    }
+    return parent_identity, report_identity, base_identity
+
+
+def preflight_balanced_kaufman_ssl(
+        prepared,
+        *,
+        parent: str | Path,
+        parent_report: str | Path,
+        base_snapshot: str | Path,
+        context_length: int = 256,
+        kaufman_length: int = 64,
+        kaufman_chop: float = 0.25,
+        kaufman_trend: float = 0.50,
+        validation_windows_per_state: int = 16,
+) -> dict:
+    """Validate fixed-threshold class support and authenticated Volume lineage."""
+    if (
+        context_length != 256
+        or kaufman_length != 64
+        or not math.isclose(kaufman_chop, 0.25, abs_tol=1e-12)
+        or not math.isclose(kaufman_trend, 0.50, abs_tol=1e-12)
+    ):
+        raise ValueError(
+            "balanced Kaufman v1 fixes context=256, ER64, chop=.25, trend=.50")
+    corpus = _as_corpus(prepared)
+    data_identity_sha256 = _corpus_identity(corpus)
+    parent_identity, report_identity, base_identity = (
+        _authenticate_balanced_kaufman_parent(
+            parent=Path(parent),
+            parent_report=Path(parent_report),
+            base_snapshot=Path(base_snapshot),
+            data_identity_sha256=data_identity_sha256,
+        )
+    )
+    data = _prepare_balanced_kaufman_data(
+        corpus,
+        context_length=context_length,
+        kaufman_length=kaufman_length,
+        kaufman_chop=kaufman_chop,
+        kaufman_trend=kaufman_trend,
+        validation_windows_per_state=validation_windows_per_state,
+    )
+    if data["data_identity_sha256"] != data_identity_sha256:
+        raise RuntimeError("balanced Kaufman corpus identity drifted during preflight")
+    if min(data["aggregate_state_counts"].values()) < 16:
+        raise RuntimeError(
+            "balanced Kaufman preflight lacks 16 distinct records per state")
+    return {
+        "schema": BALANCED_KAUFMAN_PREFLIGHT_SCHEMA,
+        "status": "pass",
+        "parent": parent_identity,
+        "parent_report": report_identity,
+        "base_model": base_identity,
+        "data_identity_sha256": data["data_identity_sha256"],
+        "data_contracts": {
+            timeframe: item.report for timeframe, item in data["corpus"].items()
+        },
+        "config": {
+            "context_length": context_length,
+            "kaufman_length": kaufman_length,
+            "kaufman_chop": kaufman_chop,
+            "kaufman_trend": kaufman_trend,
+            "direction_contract": "direction_agnostic",
+            "validation_windows_per_state": validation_windows_per_state,
+        },
+        "streams": data["preflight_streams"],
+        "aggregate_state_counts": data["aggregate_state_counts"],
+    }
+
+
+def _balanced_kaufman_run_identity(
+        *,
+        parent_sha256: str,
+        parent_report_sha256: str,
+        parent_report_run_identity_sha256: str,
+        data_identity_sha256: str,
+        config: Mapping,
+) -> str:
+    payload = {
+        "schema": BALANCED_KAUFMAN_TRAINER_SCHEMA,
+        "parent_sha256": parent_sha256,
+        "parent_report_sha256": parent_report_sha256,
+        "parent_report_run_identity_sha256": (
+            parent_report_run_identity_sha256),
+        "data_identity_sha256": data_identity_sha256,
+        "config": dict(config),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_balanced_kaufman_resume(
+        saved: Mapping,
+        *,
+        run_identity_sha256: str,
+) -> None:
+    if (
+        saved.get("schema") != BALANCED_KAUFMAN_TRAINER_SCHEMA
+        or saved.get("run_identity_sha256") != run_identity_sha256
+    ):
+        raise RuntimeError("balanced Kaufman trainer identity does not match this run")
+
+
+def _sample_balanced_kaufman_batch(
+        streams: Mapping,
+        *,
+        batch_windows: int,
+        context_length: int,
+        rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Uniform-stream batch with equal unique chop and trend records."""
+    if batch_windows < 4 or batch_windows % 2:
+        raise ValueError("balanced Kaufman batch_windows must be even and >= 4")
+    stream_keys = tuple(streams)
+    if not stream_keys:
+        raise ValueError("balanced Kaufman streams cannot be empty")
+    chosen, states, seen = [], [], set()
+    per_state = batch_windows // 2
+    for state in (0, 2):
+        attempts = 0
+        while len(states) < (per_state if state == 0 else batch_windows):
+            attempts += 1
+            if attempts > batch_windows * 100:
+                raise RuntimeError("unable to sample distinct balanced Kaufman records")
+            key = stream_keys[int(rng.integers(len(stream_keys)))]
+            pool = streams[key]["train_state_starts"][state]
+            start = int(pool[int(rng.integers(len(pool)))])
+            identity = (key, start)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            chosen.append(
+                streams[key]["train_matrix"][:, start:start + context_length])
+            states.append(state)
+    order = rng.permutation(batch_windows)
+    return (
+        np.stack([chosen[int(index)] for index in order]).astype(np.float32),
+        np.asarray([states[int(index)] for index in order], dtype=np.int64),
+    )
+
+
+def _balanced_kaufman_validation_batch(
+        stream: Mapping,
+        *,
+        context_length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw = np.stack([
+        stream["validation_matrix"][:, int(start):int(start) + context_length]
+        for start in stream["validation_starts"]
+    ]).astype(np.float32)
+    states = np.asarray(stream["validation_states"], dtype=np.int64)
+    return raw, states
+
+
+def _balanced_kaufman_native_validation(
+        base,
+        data: Mapping,
+        *,
+        device: str,
+        context_length: int,
+        temperature: float,
+        noise: float,
+        scale: float,
+        seed: int,
+) -> dict:
+    """Fixed projection-free validation on balanced per-stream banks."""
+    import torch
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    per_stream = {}
+    with torch.no_grad():
+        for timeframe, ticker in data["streams"]:
+            raw_np, states_np = _balanced_kaufman_validation_batch(
+                data["streams"][(timeframe, ticker)],
+                context_length=context_length,
+            )
+            raw = torch.from_numpy(raw_np).to(device)
+            states = torch.from_numpy(states_np).to(device)
+            standardized, finite, _ = _volume_structure_standardize(raw)
+            first, first_mask = _volume_structure_augment(
+                standardized, finite, generator, noise=noise, scale=scale)
+            second, second_mask = _volume_structure_augment(
+                standardized, finite, generator, noise=noise, scale=scale)
+            embeddings = _reg_embeddings_concat(
+                base,
+                torch.cat([first, second], dim=0),
+                torch.cat([first_mask, second_mask], dim=0),
+            )
+            instance = torch.arange(len(raw), device=device).repeat(2)
+            metrics = _native_balanced_kaufman_metrics(
+                embeddings,
+                instance,
+                states,
+                temperature=temperature,
+                require_both=True,
+            )
+            if metrics is None:
+                raise RuntimeError("balanced Kaufman native validation became inactive")
+            per_stream[f"{ticker}@{timeframe}"] = {
+                name: float(value.detach().cpu())
+                for name, value in metrics.items()
+                if name != "class_counts"
+            }
+            per_stream[f"{ticker}@{timeframe}"]["class_counts"] = (
+                metrics["class_counts"])
+    aggregate = {
+        name: float(np.mean([row[name] for row in per_stream.values()]))
+        for name in ("loss", "margin", "embedding_std")
+    }
+    worst_streams = {}
+    for name, choose in (
+        ("loss", max),
+        ("margin", min),
+        ("embedding_std", min),
+    ):
+        key = choose(per_stream, key=lambda value: per_stream[value][name])
+        worst_streams[name] = {
+            "stream": key,
+            "value": float(per_stream[key][name]),
+            "eligible_streams": int(len(per_stream)),
+        }
+    return {
+        "contract": "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads",
+        "seed": seed,
+        "aggregate": aggregate,
+        "worst_streams": worst_streams,
+        "per_stream": per_stream,
+    }
+
+
+def _validate_balanced_kaufman_native_receipt(
+        receipt: Mapping,
+        *,
+        validation_windows_per_state: int,
+) -> tuple[frozenset[str], int]:
+    """Validate that a native receipt is internally self-consistent."""
+    aggregate = receipt.get("aggregate")
+    per_stream = receipt.get("per_stream")
+    seed = receipt.get("seed")
+    metric_names = ("loss", "margin", "embedding_std")
+    if (
+        receipt.get("contract")
+        != "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads"
+        or not isinstance(aggregate, Mapping)
+        or not isinstance(per_stream, Mapping)
+        or not per_stream
+        or type(seed) is not int
+        or type(validation_windows_per_state) is not int
+        or validation_windows_per_state < 2
+    ):
+        raise RuntimeError("balanced Kaufman native receipt is malformed")
+    stream_names = frozenset(per_stream)
+    if not all(isinstance(name, str) and name for name in stream_names):
+        raise RuntimeError("balanced Kaufman native receipt has invalid streams")
+    for stream, row in per_stream.items():
+        if not isinstance(row, Mapping):
+            raise RuntimeError(
+                f"balanced Kaufman native receipt row is malformed for {stream}")
+        for name in metric_names:
+            value = row.get(name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not np.isfinite(float(value))
+            ):
+                raise RuntimeError(
+                    f"balanced Kaufman native metric is invalid for {stream}")
+        counts = row.get("class_counts")
+        if (
+            not isinstance(counts, Mapping)
+            or set(counts) != {"0", "2"}
+            or any(
+                type(counts[state]) is not int
+                or counts[state] != validation_windows_per_state
+                for state in ("0", "2")
+            )
+        ):
+            raise RuntimeError(
+                f"balanced Kaufman native class counts drifted for {stream}")
+    for name in metric_names:
+        saved = aggregate.get(name)
+        measured = float(np.mean([
+            float(per_stream[stream][name]) for stream in sorted(stream_names)
+        ]))
+        if (
+            not isinstance(saved, (int, float))
+            or isinstance(saved, bool)
+            or not np.isfinite(float(saved))
+            or not math.isclose(
+                float(saved), measured, rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            raise RuntimeError(
+                f"balanced Kaufman native aggregate drifted for {name}")
+    return stream_names, seed
+
+
+def _authenticate_balanced_kaufman_completion(
+        report: Mapping,
+        *,
+        checkpoint: Path,
+        run_identity_sha256: str,
+        artifact_path: Path | None = None,
+) -> None:
+    """Authenticate a complete head-free balanced Kaufman artifact."""
+    artifact_path = Path(checkpoint if artifact_path is None else artifact_path)
+    saved_checkpoint = report.get("checkpoint")
+    native = report.get("checkpoint_only_validation")
+    artifact = report.get("final_artifact_contract")
+    config = report.get("config")
+    parent = report.get("parent")
+    parent_report = report.get("parent_report")
+    saved_path = (
+        saved_checkpoint.get("path")
+        if isinstance(saved_checkpoint, Mapping) else None)
+    if (
+        report.get("schema") != BALANCED_KAUFMAN_REPORT_SCHEMA
+        or report.get("stage") != "balanced_kaufman_ssl"
+        or report.get("status") != "complete"
+        or report.get("run_identity_sha256") != run_identity_sha256
+        or not isinstance(saved_checkpoint, Mapping)
+        or not isinstance(saved_path, str)
+        or Path(saved_path).resolve() != Path(checkpoint).resolve()
+        or saved_checkpoint.get("sha256") != tree_sha256(artifact_path)
+        or not isinstance(native, Mapping)
+        or native.get("status") != "pass"
+        or native.get("contract")
+        != "freshly_reloaded_lora_native_reg_without_temporary_heads"
+        or not isinstance(artifact, Mapping)
+        or not isinstance(config, Mapping)
+        or not isinstance(parent, Mapping)
+        or not isinstance(parent_report, Mapping)
+    ):
+        raise RuntimeError("balanced Kaufman completion lacks authenticated evidence")
+    parent_path = parent.get("path")
+    report_path = parent_report.get("path")
+    if (
+        not isinstance(parent_path, str)
+        or not Path(parent_path).is_dir()
+        or parent.get("sha256") != tree_sha256(Path(parent_path))
+        or not isinstance(report_path, str)
+        or not Path(report_path).is_file()
+        or parent_report.get("sha256") != _file_sha256(Path(report_path))
+    ):
+        raise RuntimeError("balanced Kaufman parent lineage drifted")
+    volume_report = _read_json_object(Path(report_path))
+    if (
+        volume_report.get("schema") != parent_report.get("schema")
+        or volume_report.get("stage") != parent_report.get("stage")
+        or volume_report.get("run_identity_sha256")
+        != parent_report.get("run_identity_sha256")
+        or volume_report.get("data_identity_sha256")
+        != parent_report.get("data_identity_sha256")
+    ):
+        raise RuntimeError("balanced Kaufman Volume report identity drifted")
+    _authenticate_volume_structure_completion(
+        volume_report,
+        checkpoint=Path(parent_path),
+        run_identity_sha256=parent_report["run_identity_sha256"],
+    )
+    parent_native = native.get("parent")
+    child_native = native.get("checkpoint")
+    saved_lift = native.get("loss_lift_parent_minus_checkpoint")
+    required_margin = native.get("required_margin")
+    if not (
+        isinstance(parent_native, Mapping)
+        and isinstance(parent_native.get("aggregate"), Mapping)
+        and parent_native.get("contract")
+        == "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads"
+        and isinstance(child_native, Mapping)
+        and isinstance(child_native.get("aggregate"), Mapping)
+        and child_native.get("contract")
+        == "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads"
+        and isinstance(saved_lift, Mapping)
+        and isinstance(required_margin, (int, float))
+    ):
+        raise RuntimeError("balanced Kaufman native evidence is malformed")
+    validation_windows_per_state = config.get("validation_windows_per_state")
+    parent_streams, parent_seed = _validate_balanced_kaufman_native_receipt(
+        parent_native,
+        validation_windows_per_state=validation_windows_per_state,
+    )
+    child_streams, child_seed = _validate_balanced_kaufman_native_receipt(
+        child_native,
+        validation_windows_per_state=validation_windows_per_state,
+    )
+    if parent_streams != child_streams or parent_seed != child_seed:
+        raise RuntimeError(
+            "balanced Kaufman parent/checkpoint validation contracts drifted")
+    measured = _validate_native_balanced_kaufman_lift(
+        parent_native["aggregate"],
+        child_native["aggregate"],
+        margin=float(required_margin),
+    )
+    for name, value in measured.items():
+        saved = saved_lift.get(name)
+        if (
+            not isinstance(saved, (int, float))
+            or not math.isclose(value, float(saved), abs_tol=1e-9)
+        ):
+            raise RuntimeError("balanced Kaufman native lift drifted")
+    selection = config.get("checkpoint_selection")
+    base = config.get("base_model")
+    volume_base = volume_report.get("config", {}).get("base_model")
+    saved_files = artifact.get("checkpoint_files")
+    checkpoint_files = sorted(
+        str(path.relative_to(artifact_path))
+        for path in artifact_path.rglob("*") if path.is_file())
+    if not (
+        isinstance(selection, Mapping)
+        and selection.get("contract")
+        == "gate_feasible_native_reg_balanced_kaufman_v1"
+        and selection.get("temporary_head_metrics_used") is False
+        and isinstance(base, Mapping)
+        and base == volume_base
+        and base.get("model_id") == CHRONOS2_MODEL_ID
+        and isinstance(base.get("revision"), str)
+        and _HEX40.fullmatch(base["revision"]) is not None
+        and isinstance(base.get("weights_sha256"), str)
+        and _HEX64.fullmatch(base["weights_sha256"]) is not None
+        and isinstance(base.get("config_sha256"), str)
+        and _HEX64.fullmatch(base["config_sha256"]) is not None
+        and config.get("context_length") == 256
+        and config.get("kaufman_length") == 64
+        and config.get("kaufman_chop") == 0.25
+        and config.get("kaufman_trend") == 0.50
+        and config.get("threshold_contract")
+        == "fixed_causal_completed_context_er64_v1"
+        and config.get("direction_contract")
+        == "direction_agnostic_chop_vs_trend"
+        and config.get("native_embedding_contract")
+        == "ordered_ohlcv_reg_concat_5d"
+        and config.get("stream_sampler")
+        == "uniform_stream_equal_chop_trend_50_50"
+        and config.get("validation_sampling")
+        == "fixed_equal_state_per_stream"
+        and isinstance(config.get("validation_windows_per_state"), int)
+        and config["validation_windows_per_state"] >= 2
+        and isinstance(config.get("native_promotion_margin"), (int, float))
+        and np.isfinite(float(config["native_promotion_margin"]))
+        and math.isclose(
+            float(required_margin),
+            float(config["native_promotion_margin"]),
+            abs_tol=1e-12,
+        )
+        and artifact.get("temporary_heads_in_checkpoint") is False
+        and artifact.get("ssl_heads_required_for_inference") is False
+        and artifact.get("trainer_state")
+        == "discarded_after_successful_checkpoint"
+        and artifact.get("inference_requires")
+        == ["chronos_base_model", "lora_checkpoint"]
+        and isinstance(saved_files, list)
+        and sorted(saved_files) == checkpoint_files
+        and checkpoint_files
+        and not any(
+            token in Path(name).name.lower()
+            for name in checkpoint_files
+            for token in ("head", "decoder", "projection", "trainer"))
+    ):
+        raise RuntimeError("balanced Kaufman head-free artifact contract failed")
+
+
+def _recover_balanced_kaufman_finalization(
+        out_dir: Path,
+        *,
+        run_identity_sha256: str,
+        trainer_payload: Mapping | None = None,
+) -> dict | None:
+    """Recover an authenticated balanced Kaufman two-phase publication."""
+    out_dir = Path(out_dir)
+    checkpoint = out_dir / "checkpoint"
+    staged_checkpoint = out_dir / BALANCED_KAUFMAN_STAGED_CHECKPOINT
+    state_path = out_dir / "trainer.pt"
+    state_temporary = state_path.with_name(f".{state_path.name}.tmp")
+    report_path = out_dir / "report.json"
+    staged_report = out_dir / BALANCED_KAUFMAN_STAGED_REPORT
+    if _HEX64.fullmatch(run_identity_sha256) is None:
+        raise ValueError("balanced Kaufman run identity must be SHA-256")
+    if not staged_report.is_file():
+        if checkpoint.exists() and staged_checkpoint.exists():
+            raise RuntimeError("published balanced Kaufman has a staged checkpoint")
+        if (
+            report_path.is_file() and checkpoint.is_dir()
+            and not state_path.exists() and not staged_checkpoint.exists()
+        ):
+            published = _read_json_object(report_path)
+            if (
+                published.get("status") == "complete"
+                and published.get("run_identity_sha256") == run_identity_sha256
+            ):
+                _authenticate_balanced_kaufman_completion(
+                    published,
+                    checkpoint=checkpoint,
+                    run_identity_sha256=run_identity_sha256,
+                )
+                if state_temporary.exists():
+                    if not state_temporary.is_file():
+                        raise RuntimeError("temporary trainer state is not a file")
+                    state_temporary.unlink()
+                return published
+        return None
+    if not report_path.is_file():
+        raise RuntimeError("balanced Kaufman finalization marker lacks report")
+    finalizing = _read_json_object(report_path)
+    complete = _read_json_object(staged_report)
+    expected = deepcopy(finalizing)
+    expected["status"] = "complete"
+    expected_checkpoint = complete.get("checkpoint")
+    expected_path = (
+        expected_checkpoint.get("path")
+        if isinstance(expected_checkpoint, Mapping) else None)
+    if (
+        finalizing.get("status") != "finalizing"
+        or complete != expected
+        or complete.get("schema") != BALANCED_KAUFMAN_REPORT_SCHEMA
+        or complete.get("run_identity_sha256") != run_identity_sha256
+        or not isinstance(expected_path, str)
+        or Path(expected_path).resolve() != checkpoint.resolve()
+    ):
+        raise RuntimeError("balanced Kaufman finalization identities differ")
+    expected_sha = expected_checkpoint.get("sha256")
+    if checkpoint.exists() and staged_checkpoint.exists():
+        raise RuntimeError("both published and staged Kaufman checkpoints exist")
+    candidate = checkpoint if checkpoint.is_dir() else staged_checkpoint
+    if (
+        not candidate.is_dir()
+        or not isinstance(expected_sha, str)
+        or tree_sha256(candidate) != expected_sha
+    ):
+        raise RuntimeError("balanced Kaufman pending checkpoint is invalid")
+    if candidate == staged_checkpoint and not state_path.is_file():
+        raise RuntimeError("staged Kaufman checkpoint lacks trainer state")
+    _authenticate_balanced_kaufman_completion(
+        complete,
+        checkpoint=checkpoint,
+        artifact_path=candidate,
+        run_identity_sha256=run_identity_sha256,
+    )
+    if state_path.exists():
+        trainer = trainer_payload
+        if trainer is None:
+            import torch
+            try:
+                trainer = torch.load(
+                    state_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                raise RuntimeError("balanced Kaufman trainer is unreadable") from exc
+        _validate_balanced_kaufman_resume(
+            trainer, run_identity_sha256=run_identity_sha256)
+    if candidate == staged_checkpoint:
+        staged_checkpoint.replace(checkpoint)
+    if state_path.exists():
+        state_path.unlink()
+    if state_temporary.exists():
+        if not state_temporary.is_file():
+            raise RuntimeError("temporary trainer state is not a file")
+        state_temporary.unlink()
+    staged_report.replace(report_path)
+    return _read_json_object(report_path)
+
+
+def train_balanced_kaufman_ssl(
+        prepared,
+        *,
+        parent: str | Path,
+        parent_report: str | Path,
+        base_snapshot: str | Path,
+        out_dir: str | Path,
+        device: str = "mps",
+        context_length: int = 256,
+        kaufman_length: int = 64,
+        kaufman_chop: float = 0.25,
+        kaufman_trend: float = 0.50,
+        epochs: int = 60,
+        steps_per_epoch: int = 100,
+        batch_windows: int = 32,
+        gradient_accumulation: int = 1,
+        learning_rate: float = 5e-6,
+        weight_decay: float = 0.05,
+        patience: int = 8,
+        projection_dim: int = 128,
+        head_auxiliary_weight: float = 0.25,
+        temperature: float = 0.10,
+        noise: float = 0.02,
+        scale: float = 0.10,
+        validation_windows_per_state: int = 16,
+        adapter_retention_weight: float = 0.1,
+        native_promotion_margin: float = 1e-4,
+        log_every_steps: int = 10,
+        seed: int = 0,
+        resume: bool = False,
+) -> dict:
+    """Direction-agnostic, class-balanced Kaufman refinement of Volume LoRA."""
+    import torch
+    import torch.nn as nn
+    from importlib.metadata import PackageNotFoundError, version
+
+    if (
+        context_length != 256
+        or kaufman_length != 64
+        or not math.isclose(kaufman_chop, 0.25, abs_tol=1e-12)
+        or not math.isclose(kaufman_trend, 0.50, abs_tol=1e-12)
+    ):
+        raise ValueError(
+            "balanced Kaufman v1 fixes context=256, ER64, chop=.25, trend=.50")
+    if batch_windows < 4 or batch_windows % 2:
+        raise ValueError("balanced Kaufman batch_windows must be even and >= 4")
+    if epochs < 1 or steps_per_epoch < 1 or patience < 1:
+        raise ValueError("epochs, steps_per_epoch, and patience must be >= 1")
+    if gradient_accumulation < 1:
+        raise ValueError("gradient_accumulation must be >= 1")
+    numeric = (
+        float(learning_rate), float(weight_decay), float(head_auxiliary_weight),
+        float(temperature), float(noise), float(scale),
+        float(adapter_retention_weight), float(native_promotion_margin),
+    )
+    if not all(np.isfinite(value) for value in numeric):
+        raise ValueError("balanced Kaufman floating configuration must be finite")
+    if learning_rate <= 0.0:
+        raise ValueError("balanced Kaufman learning_rate must be positive")
+    if projection_dim < 2 or temperature <= 0.0:
+        raise ValueError("projection_dim must be >= 2 and temperature must be > 0")
+    if validation_windows_per_state < 2:
+        raise ValueError("validation_windows_per_state must be >= 2")
+    if any(value < 0.0 for value in (
+            weight_decay, head_auxiliary_weight, adapter_retention_weight,
+            native_promotion_margin, noise, scale)):
+        raise ValueError("balanced Kaufman weights and augmentations must be nonnegative")
+    if scale >= 1.0:
+        raise ValueError("balanced Kaufman scale must be below 1")
+    if log_every_steps < 1:
+        raise ValueError("log_every_steps must be >= 1")
+
+    parent = Path(parent).expanduser().resolve()
+    parent_report = Path(parent_report).expanduser().resolve()
+    base_snapshot = Path(base_snapshot).expanduser().resolve()
+    out_dir = Path(out_dir)
+
+    # Authenticate cheap immutable lineage before the full ER scan or any output
+    # mutation. The child corpus is independently bound to its own run identity;
+    # a bounded 3-minute smoke may validly inherit the full 36-stream parent.
+    corpus = _as_corpus(prepared)
+    data_identity_sha256 = _corpus_identity(corpus)
+    parent_identity, parent_report_identity, base_identity = (
+        _authenticate_balanced_kaufman_parent(
+            parent=parent,
+            parent_report=parent_report,
+            base_snapshot=base_snapshot,
+            data_identity_sha256=data_identity_sha256,
+        )
+    )
+    data = _prepare_balanced_kaufman_data(
+        corpus,
+        context_length=context_length,
+        kaufman_length=kaufman_length,
+        kaufman_chop=kaufman_chop,
+        kaufman_trend=kaufman_trend,
+        validation_windows_per_state=validation_windows_per_state,
+    )
+    if data["data_identity_sha256"] != data_identity_sha256:
+        raise RuntimeError("balanced Kaufman corpus identity drifted during preparation")
+    if min(data["aggregate_state_counts"].values()) < batch_windows // 2:
+        raise RuntimeError(
+            "balanced Kaufman corpus cannot supply one distinct balanced batch")
+    timeframes = tuple(data["corpus"])
+
+    def package_version(distribution: str) -> str:
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            return "not-installed"
+
+    run_config = {
+        "objective_code_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()).hexdigest(),
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+        "chronos_version": package_version("chronos-forecasting"),
+        "peft_version": package_version("peft"),
+        "base_model": base_identity,
+        "timeframes": list(timeframes),
+        "context_length": context_length,
+        "kaufman_length": kaufman_length,
+        "kaufman_chop": kaufman_chop,
+        "kaufman_trend": kaufman_trend,
+        "threshold_contract": "fixed_causal_completed_context_er64_v1",
+        "direction_contract": "direction_agnostic_chop_vs_trend",
+        "native_embedding_contract": "ordered_ohlcv_reg_concat_5d",
+        "stream_sampler": "uniform_stream_equal_chop_trend_50_50",
+        "validation_sampling": "fixed_equal_state_per_stream",
+        "validation_windows_per_state": validation_windows_per_state,
+        "epochs": epochs,
+        "steps_per_epoch": steps_per_epoch,
+        "batch_windows": batch_windows,
+        "gradient_accumulation": gradient_accumulation,
+        "learning_rate": learning_rate,
+        "adapter_weight_decay": 0.0,
+        "temporary_head_weight_decay": weight_decay,
+        "patience": patience,
+        "projection_dim": projection_dim,
+        "head_auxiliary_weight": head_auxiliary_weight,
+        "temperature": temperature,
+        "noise": noise,
+        "scale": scale,
+        "adapter_retention_weight": adapter_retention_weight,
+        "native_promotion_margin": native_promotion_margin,
+        "log_every_steps": log_every_steps,
+        "seed": seed,
+        "checkpoint_selection": {
+            "contract": "gate_feasible_native_reg_balanced_kaufman_v1",
+            "temporary_head_metrics_used": False,
+            "metric": "macro_stream_native_loss",
+        },
+        "objective_schema": {
+            "regime": "native_reg_direction_agnostic_fixed_kaufman_er64_v1",
+            "projection": "temporary_auxiliary_only_v1",
+            "retention": "l2_sp_volume_parent_adapter_anchor_v1",
+        },
+    }
+    run_identity_sha256 = _balanced_kaufman_run_identity(
+        parent_sha256=parent_identity["sha256"],
+        parent_report_sha256=parent_report_identity["sha256"],
+        parent_report_run_identity_sha256=(
+            parent_report_identity["run_identity_sha256"]),
+        data_identity_sha256=data_identity_sha256,
+        config=run_config,
+    )
+
+    checkpoint = out_dir / "checkpoint"
+    staged_checkpoint = out_dir / BALANCED_KAUFMAN_STAGED_CHECKPOINT
+    state_path = out_dir / "trainer.pt"
+    state_temporary = state_path.with_name(f".{state_path.name}.tmp")
+    report_path = out_dir / "report.json"
+    staged_report = out_dir / BALANCED_KAUFMAN_STAGED_REPORT
+    preflight_path = out_dir / "preflight.json"
+    resume_payload = None
+    if resume and state_path.is_file():
+        try:
+            resume_payload = torch.load(
+                state_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            raise RuntimeError("balanced Kaufman trainer state is unreadable") from exc
+        _validate_balanced_kaufman_resume(
+            resume_payload, run_identity_sha256=run_identity_sha256)
+    if resume:
+        recovered = _recover_balanced_kaufman_finalization(
+            out_dir,
+            run_identity_sha256=run_identity_sha256,
+            trainer_payload=resume_payload,
+        )
+        if recovered is not None:
+            return recovered
+    if checkpoint.exists():
+        raise RuntimeError(f"completed balanced Kaufman checkpoint exists: {checkpoint}")
+    if resume and resume_payload is None:
+        raise RuntimeError(f"--resume requested but trainer state is missing: {state_path}")
+    if state_path.exists() and not resume:
+        raise RuntimeError(
+            f"incomplete trainer state exists; pass --resume or use a new out-dir: {state_path}")
+    if staged_report.exists():
+        raise RuntimeError("unrecoverable balanced Kaufman staged report exists")
+    if report_path.exists():
+        pending = _read_json_object(report_path)
+        rebuild = (
+            resume_payload is not None
+            and staged_checkpoint.is_dir()
+            and pending.get("schema") == BALANCED_KAUFMAN_REPORT_SCHEMA
+            and pending.get("status") == "finalizing"
+            and pending.get("run_identity_sha256") == run_identity_sha256
+        )
+        if not rebuild:
+            raise RuntimeError(f"balanced Kaufman report already exists: {report_path}")
+        report_path.unlink()
+    if resume_payload is not None and state_temporary.exists():
+        if not state_temporary.is_file():
+            raise RuntimeError("temporary trainer state is not a file")
+        state_temporary.unlink()
+    if staged_checkpoint.exists():
+        if resume_payload is None or not staged_checkpoint.is_dir():
+            raise RuntimeError("unrecoverable staged balanced Kaufman checkpoint exists")
+        shutil.rmtree(staged_checkpoint)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_json(preflight_path, {
+        "schema": BALANCED_KAUFMAN_PREFLIGHT_SCHEMA,
+        "status": "pass",
+        "run_identity_sha256": run_identity_sha256,
+        "parent": parent_identity,
+        "parent_report": parent_report_identity,
+        "data_identity_sha256": data_identity_sha256,
+        "data_contracts": {
+            timeframe: item.report for timeframe, item in data["corpus"].items()
+        },
+        "config": run_config,
+        "streams": data["preflight_streams"],
+        "aggregate_state_counts": data["aggregate_state_counts"],
+    })
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    model, base = _load_trainable_adapter(
+        parent,
+        device,
+        base_revision=base_identity["revision"],
+        base_snapshot=base_snapshot,
+    )
+    if not bool(base.chronos_config.use_reg_token):
+        raise RuntimeError("balanced Kaufman SSL requires the Chronos REG token")
+    embedding_dim = 5 * int(base.model_dim)
+    projection_head = nn.Sequential(
+        nn.LayerNorm(embedding_dim),
+        nn.Linear(embedding_dim, projection_dim),
+        nn.GELU(),
+        nn.Linear(projection_dim, projection_dim),
+    ).to(device)
+    adapter_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    if not adapter_parameters:
+        raise RuntimeError("balanced Kaufman stage found no trainable LoRA parameters")
+    initial_adapter = {
+        name: parameter.detach().clone()
+        for name, parameter in adapter_parameters
+    }
+    head_parameters = list(projection_head.parameters())
+    parameters = [parameter for _, parameter in adapter_parameters] + head_parameters
+    optimizer = torch.optim.AdamW([
+        {
+            "params": [parameter for _, parameter in adapter_parameters],
+            "weight_decay": 0.0,
+        },
+        {"params": head_parameters, "weight_decay": weight_decay},
+    ], lr=learning_rate)
+
+    def adapter_drift():
+        return torch.stack([
+            (parameter - initial_adapter[name]).square().mean()
+            for name, parameter in adapter_parameters
+        ]).mean()
+
+    def loss_for(raw_np, states_np, *, loss_generator, require_both):
+        raw = torch.from_numpy(raw_np).to(device)
+        states = torch.from_numpy(states_np).to(device)
+        standardized, finite, _ = _volume_structure_standardize(raw)
+        first, first_mask = _volume_structure_augment(
+            standardized, finite, loss_generator, noise=noise, scale=scale)
+        second, second_mask = _volume_structure_augment(
+            standardized, finite, loss_generator, noise=noise, scale=scale)
+        embeddings = _reg_embeddings_concat(
+            base,
+            torch.cat([first, second], dim=0),
+            torch.cat([first_mask, second_mask], dim=0),
+        )
+        instance = torch.arange(len(raw), device=device).repeat(2)
+        native = _native_balanced_kaufman_metrics(
+            embeddings,
+            instance,
+            states,
+            temperature=temperature,
+            require_both=require_both,
+        )
+        if native is None:
+            raise RuntimeError("balanced Kaufman native objective became inactive")
+        projected = torch.nn.functional.normalize(
+            projection_head(embeddings), dim=1)
+        projected_metrics = _native_balanced_kaufman_metrics(
+            projected,
+            instance,
+            states,
+            temperature=temperature,
+            require_both=require_both,
+        )
+        if projected_metrics is None:
+            raise RuntimeError("balanced Kaufman auxiliary objective became inactive")
+        retention = adapter_drift()
+        total = (
+            native["loss"]
+            + head_auxiliary_weight * projected_metrics["loss"]
+            + adapter_retention_weight * retention)
+        components = {
+            "native_loss": float(native["loss"].detach()),
+            "native_margin": float(native["margin"].detach()),
+            "native_embedding_std": float(native["embedding_std"].detach()),
+            "head_loss": float(projected_metrics["loss"].detach()),
+            "adapter_retention": float(retention.detach()),
+        }
+        return total, components
+
+    model.eval()
+    parent_native_validation = _balanced_kaufman_native_validation(
+        base,
+        data,
+        device=device,
+        context_length=context_length,
+        temperature=temperature,
+        noise=noise,
+        scale=scale,
+        seed=seed + 20_260_803,
+    )
+    model.train()
+
+    def capture_global_rng():
+        state = {"cpu": torch.get_rng_state()}
+        if str(device).startswith("cuda"):
+            state["device"] = torch.cuda.get_rng_state(torch.device(device))
+        elif (
+            str(device) == "mps" and hasattr(torch, "mps")
+            and hasattr(torch.mps, "get_rng_state")
+        ):
+            state["device"] = torch.mps.get_rng_state()
+        return state
+
+    def restore_global_rng(state):
+        torch.set_rng_state(state["cpu"])
+        if "device" not in state:
+            return
+        if str(device).startswith("cuda"):
+            torch.cuda.set_rng_state(state["device"], torch.device(device))
+        elif (
+            str(device) == "mps" and hasattr(torch, "mps")
+            and hasattr(torch.mps, "set_rng_state")
+        ):
+            torch.mps.set_rng_state(state["device"])
+
+    best_loss, best_adapter, best_epoch = math.inf, None, None
+    history, start_epoch, bad = [], 0, 0
+    if resume_payload is not None:
+        saved = resume_payload
+        _restore_adapter(model, saved["adapter"])
+        projection_head.load_state_dict(saved["projection_head"])
+        optimizer.load_state_dict(saved["optimizer"])
+        best_loss = float(saved["best_loss"])
+        best_adapter = saved["best_adapter"]
+        best_epoch = saved["best_epoch"]
+        history = list(saved["history"])
+        start_epoch = int(saved["epoch"]) + 1
+        bad = int(saved["bad"])
+        rng.bit_generator.state = saved["numpy_rng"]
+        generator.set_state(saved["torch_generator"])
+        restore_global_rng(saved["global_torch_rng"])
+        resume_payload = None
+        del saved
+        gc.collect()
+
+    started = time.monotonic()
+    component_names = (
+        "native_loss", "native_margin", "native_embedding_std",
+        "head_loss", "adapter_retention")
+    epoch_stop = start_epoch if bad >= patience else epochs
+    for epoch in range(start_epoch, epoch_stop):
+        model.train()
+        projection_head.train()
+        optimizer.zero_grad(set_to_none=True)
+        totals = {"loss": 0.0, **{name: 0.0 for name in component_names}}
+        for step in range(steps_per_epoch):
+            raw_np, states_np = _sample_balanced_kaufman_batch(
+                data["streams"],
+                batch_windows=batch_windows,
+                context_length=context_length,
+                rng=rng,
+            )
+            loss, components = loss_for(
+                raw_np,
+                states_np,
+                loss_generator=generator,
+                require_both=True,
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError("non-finite balanced Kaufman training loss")
+            accumulation_group_start = (
+                step // gradient_accumulation) * gradient_accumulation
+            accumulation_group_size = min(
+                gradient_accumulation,
+                steps_per_epoch - accumulation_group_start,
+            )
+            (loss / accumulation_group_size).backward()
+            totals["loss"] += float(loss.detach())
+            for name in component_names:
+                totals[name] += components[name]
+            if (
+                (step + 1) % gradient_accumulation == 0
+                or step + 1 == steps_per_epoch
+            ):
+                torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            if (step + 1) % log_every_steps == 0 or step + 1 == steps_per_epoch:
+                print(
+                    f"[chronos2-balanced-kaufman] ep={epoch} "
+                    f"step={step + 1}/{steps_per_epoch} "
+                    f"loss={totals['loss'] / (step + 1):.5f}",
+                    flush=True,
+                )
+
+        model.eval()
+        projection_head.eval()
+        validation = _balanced_kaufman_native_validation(
+            base,
+            data,
+            device=device,
+            context_length=context_length,
+            temperature=temperature,
+            noise=noise,
+            scale=scale,
+            seed=seed + 20_260_803,
+        )
+        val_loss = float(validation["aggregate"]["loss"])
+        try:
+            _validate_native_balanced_kaufman_lift(
+                parent_native_validation["aggregate"],
+                validation["aggregate"],
+                margin=native_promotion_margin,
+            )
+            native_gate_feasible = True
+        except RuntimeError:
+            native_gate_feasible = False
+        improved = native_gate_feasible and val_loss < best_loss - 1e-6
+        if improved:
+            best_loss, bad = val_loss, 0
+            best_adapter = _adapter_state(model)
+            best_epoch = epoch
+        elif best_adapter is not None:
+            bad += 1
+        row = {
+            "epoch": epoch,
+            "train_loss": totals["loss"] / steps_per_epoch,
+            "train_components": {
+                name: totals[name] / steps_per_epoch for name in component_names
+            },
+            "val_loss": val_loss,
+            "val_native": validation,
+            "native_gate_feasible": native_gate_feasible,
+            "improved": improved,
+            "bad_epochs": bad,
+            "elapsed_seconds": time.monotonic() - started,
+        }
+        history.append(row)
+        print(
+            f"[chronos2-balanced-kaufman] ep={epoch} "
+            f"train={row['train_loss']:.5f} val={val_loss:.5f} "
+            f"margin={validation['aggregate']['margin']:.5f} "
+            f"feasible={int(native_gate_feasible)}"
+            f"{' *' if improved else ''}",
+            flush=True,
+        )
+        _atomic_torch(state_path, {
+            "schema": BALANCED_KAUFMAN_TRAINER_SCHEMA,
+            "run_identity_sha256": run_identity_sha256,
+            "epoch": epoch,
+            "adapter": _adapter_state(model),
+            "projection_head": projection_head.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_loss": best_loss,
+            "best_adapter": best_adapter,
+            "best_epoch": best_epoch,
+            "history": history,
+            "bad": bad,
+            "numpy_rng": rng.bit_generator.state,
+            "torch_generator": generator.get_state(),
+            "global_torch_rng": capture_global_rng(),
+        })
+        if bad >= patience:
+            break
+
+    if best_adapter is None or best_epoch is None:
+        raise RuntimeError(
+            "balanced Kaufman SSL never produced native parent lift")
+    current_parent, current_report, current_base = (
+        _authenticate_balanced_kaufman_parent(
+            parent=parent,
+            parent_report=parent_report,
+            base_snapshot=base_snapshot,
+            data_identity_sha256=data_identity_sha256,
+        )
+    )
+    if (
+        current_parent != parent_identity
+        or current_report != parent_report_identity
+        or current_base != base_identity
+    ):
+        raise RuntimeError("balanced Kaufman parent lineage changed during training")
+    if not state_path.is_file():
+        raise RuntimeError("balanced Kaufman trainer disappeared before finalization")
+    _restore_adapter(model, best_adapter)
+    _save_final(model, staged_checkpoint)
+    checkpoint_files = sorted(
+        str(item.relative_to(staged_checkpoint))
+        for item in staged_checkpoint.rglob("*") if item.is_file())
+    if not checkpoint_files or any(
+        token in Path(name).name.lower()
+        for name in checkpoint_files
+        for token in ("head", "decoder", "projection", "trainer")
+    ):
+        raise RuntimeError("balanced Kaufman checkpoint contains training artifacts")
+    adapter_config_path = staged_checkpoint / "adapter_config.json"
+    if not adapter_config_path.is_file():
+        raise RuntimeError("balanced Kaufman LoRA config is missing")
+    adapter_config = _read_json_object(adapter_config_path)
+    base_model_name = adapter_config.get("base_model_name_or_path")
+    if (
+        base_model_name != CHRONOS2_MODEL_ID
+        or adapter_config.get("revision") != base_identity["revision"]
+    ):
+        raise RuntimeError("balanced Kaufman LoRA base identity drifted")
+
+    del loss_for
+    del adapter_drift
+    del optimizer
+    del projection_head
+    del parameters
+    del head_parameters
+    del adapter_parameters
+    del base
+    del model
+    _release_accelerator_cache(device)
+
+    checkpoint_model, checkpoint_base = _load_trainable_adapter(
+        staged_checkpoint,
+        device,
+        base_revision=base_identity["revision"],
+        base_snapshot=base_snapshot,
+    )
+    checkpoint_model.eval()
+    child_native_validation = _balanced_kaufman_native_validation(
+        checkpoint_base,
+        data,
+        device=device,
+        context_length=context_length,
+        temperature=temperature,
+        noise=noise,
+        scale=scale,
+        seed=seed + 20_260_803,
+    )
+    del checkpoint_base
+    del checkpoint_model
+    _release_accelerator_cache(device)
+    native_lift = _validate_native_balanced_kaufman_lift(
+        parent_native_validation["aggregate"],
+        child_native_validation["aggregate"],
+        margin=native_promotion_margin,
+    )
+    staged_checkpoint_sha256 = tree_sha256(staged_checkpoint)
+    report = {
+        "schema": BALANCED_KAUFMAN_REPORT_SCHEMA,
+        "stage": "balanced_kaufman_ssl",
+        "status": "finalizing",
+        "run_identity_sha256": run_identity_sha256,
+        "parent": parent_identity,
+        "parent_report": parent_report_identity,
+        "checkpoint": {
+            "path": str(out_dir / "checkpoint"),
+            "sha256": staged_checkpoint_sha256,
+        },
+        "data_identity_sha256": data_identity_sha256,
+        "data_contracts": {
+            timeframe: item.report for timeframe, item in data["corpus"].items()
+        },
+        "config": run_config,
+        "preflight_streams": data["preflight_streams"],
+        "best_val_loss": best_loss,
+        "best_epoch": best_epoch,
+        "checkpoint_only_validation": {
+            "status": "pass",
+            "contract": (
+                "freshly_reloaded_lora_native_reg_without_temporary_heads"),
+            "parent": parent_native_validation,
+            "checkpoint": child_native_validation,
+            "loss_lift_parent_minus_checkpoint": native_lift,
+            "required_margin": native_promotion_margin,
+        },
+        "final_artifact_contract": {
+            "checkpoint_files": checkpoint_files,
+            "temporary_heads_in_checkpoint": False,
+            "temporary_training_modules": ["projection_head", "optimizer"],
+            "ssl_heads_required_for_inference": False,
+            "trainer_state": "discarded_after_successful_checkpoint",
+            "base_model_name_or_path": base_model_name,
+            "inference_requires": ["chronos_base_model", "lora_checkpoint"],
+        },
+        "history": history,
+        "retention_gate": {
+            "status": "required_before_promotion",
+            "contract": (
+                "matched Volume-parent versus Kaufman-child Probe Atlas on "
+                "identical pools, per-stream metrics, and controls"),
+        },
+        "limitations": [
+            "Kaufman v1 separates current completed-context chop from trend; "
+            "it does not claim to predict a future trend start",
+            "trend direction is intentionally excluded from this SSL objective",
+            "temporary projection heads are discarded and never required downstream",
+        ],
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    complete_report = deepcopy(report)
+    complete_report["status"] = "complete"
+    _authenticate_balanced_kaufman_completion(
+        complete_report,
+        checkpoint=checkpoint,
+        artifact_path=staged_checkpoint,
+        run_identity_sha256=run_identity_sha256,
+    )
+    _atomic_json(report_path, report)
+    _atomic_json(staged_report, complete_report)
+    staged_checkpoint.replace(checkpoint)
+    if tree_sha256(checkpoint) != staged_checkpoint_sha256:
+        raise RuntimeError("published balanced Kaufman checkpoint identity drifted")
+    state_path.unlink()
+    if state_temporary.exists():
+        if not state_temporary.is_file():
+            raise RuntimeError("temporary trainer state is not a file")
+        state_temporary.unlink()
+    if state_path.exists() or state_temporary.exists():
+        raise RuntimeError("balanced Kaufman trainer state was not discarded")
+    staged_report.replace(report_path)
+    if staged_checkpoint.exists() or staged_report.exists():
+        raise RuntimeError("balanced Kaufman finalization left staged artifacts")
+    return complete_report
+
+
 __all__ = [
     "train_mask",
     "train_contrastive",
     "train_volatility_contrastive",
     "preflight_volume_structure_ssl",
     "train_volume_structure_ssl",
+    "preflight_balanced_kaufman_ssl",
+    "train_balanced_kaufman_ssl",
     "tree_sha256",
 ]

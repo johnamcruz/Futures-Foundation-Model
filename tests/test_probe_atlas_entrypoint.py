@@ -205,6 +205,7 @@ def _valid_volume_stage_payload(launcher, checkpoint_sha256):
     config = {
         "context_length": 256,
         "timeframes": ["1min", "3min", "5min", "15min"],
+        "native_promotion_margin": 1e-4,
         "checkpoint_selection": {
             "contract": (
                 "gate_feasible_weighted_native_reg_"
@@ -257,6 +258,143 @@ def _valid_volume_stage_payload(launcher, checkpoint_sha256):
         config=config,
     )
     return payload
+
+
+def _valid_balanced_kaufman_stage(tmp_path, launcher):
+    volume_run = tmp_path / "volume_structure_ssl"
+    volume_checkpoint = volume_run / "checkpoint"
+    volume_checkpoint.mkdir(parents=True)
+    (volume_checkpoint / "adapter_config.json").write_text("{}")
+    (volume_checkpoint / "adapter_model.safetensors").write_bytes(
+        b"volume weights")
+    volume_checkpoint_sha256 = launcher._tree_sha256(volume_checkpoint)
+    volume_payload = _valid_volume_stage_payload(
+        launcher, volume_checkpoint_sha256)
+    volume_payload["checkpoint"]["path"] = str(volume_checkpoint)
+    volume_report = volume_run / "report.json"
+    volume_report.write_text(json.dumps(volume_payload))
+
+    run = tmp_path / "balanced_kaufman_ssl"
+    checkpoint = run / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(
+        b"balanced Kaufman weights")
+    checkpoint_sha256 = launcher._tree_sha256(checkpoint)
+    config = {
+        "context_length": 256,
+        "timeframes": ["1min", "3min", "5min", "15min"],
+        "native_promotion_margin": 1e-4,
+        "checkpoint_selection": {
+            "contract": launcher.BALANCED_KAUFMAN_SELECTION_CONTRACT,
+            "temporary_head_metrics_used": False,
+        },
+        "base_model": dict(volume_payload["config"]["base_model"]),
+        "kaufman_length": 64,
+        "kaufman_chop": 0.25,
+        "kaufman_trend": 0.50,
+        "threshold_contract": "fixed_causal_completed_context_er64_v1",
+        "direction_contract": "direction_agnostic_chop_vs_trend",
+        "native_embedding_contract": "ordered_ohlcv_reg_concat_5d",
+        "stream_sampler": "uniform_stream_equal_chop_trend_50_50",
+        "validation_sampling": "fixed_equal_state_per_stream",
+        "validation_windows_per_state": 16,
+    }
+    parent_report_sha256 = launcher._file_sha256(volume_report)
+    data_identity_sha256 = "9" * 64
+    payload = {
+        "schema": launcher.BALANCED_KAUFMAN_REPORT_SCHEMA,
+        "stage": launcher.BALANCED_KAUFMAN_STAGE,
+        "status": "complete",
+        "checkpoint": {
+            "path": str(checkpoint),
+            "sha256": checkpoint_sha256,
+        },
+        "parent": {
+            "path": str(volume_checkpoint),
+            "sha256": volume_checkpoint_sha256,
+        },
+        "parent_report": {
+            "path": str(volume_report),
+            "sha256": parent_report_sha256,
+            "schema": volume_payload["schema"],
+            "stage": volume_payload["stage"],
+            "run_identity_sha256": volume_payload["run_identity_sha256"],
+            "data_identity_sha256": volume_payload["data_identity_sha256"],
+        },
+        "data_identity_sha256": data_identity_sha256,
+        "config": config,
+        "checkpoint_only_validation": {
+            "status": "pass",
+            "contract": (
+                "freshly_reloaded_lora_native_reg_without_temporary_heads"),
+            "parent": {},
+            "checkpoint": {},
+            "loss_lift_parent_minus_checkpoint": {
+                "loss": 0.3,
+                "margin": 0.2,
+            },
+            "required_margin": 1e-4,
+        },
+        "final_artifact_contract": {
+            "checkpoint_files": [
+                "adapter_config.json", "adapter_model.safetensors"],
+            "temporary_heads_in_checkpoint": False,
+            "ssl_heads_required_for_inference": False,
+            "trainer_state": "discarded_after_successful_checkpoint",
+            "temporary_training_modules": ["projection_head", "optimizer"],
+            "base_model_name_or_path": launcher.CHRONOS2_MODEL_ID,
+            "inference_requires": ["chronos_base_model", "lora_checkpoint"],
+        },
+    }
+    stream_names = [
+        f"{ticker}@{timeframe}"
+        for timeframe in config["timeframes"]
+        for ticker in ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
+    ]
+    for side, loss, margin, embedding_std in (
+        ("parent", 1.2, 0.1, 0.4),
+        ("checkpoint", 0.9, 0.3, 0.5),
+    ):
+        rows = {
+            name: {
+                "loss": loss,
+                "margin": margin,
+                "embedding_std": embedding_std,
+                "class_counts": {"0": 16, "2": 16},
+            }
+            for name in stream_names
+        }
+        payload["checkpoint_only_validation"][side] = {
+            "contract": (
+                "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads"),
+            "seed": 20_260_803,
+            "aggregate": {
+                "loss": loss,
+                "margin": margin,
+                "embedding_std": embedding_std,
+            },
+            "per_stream": rows,
+        }
+    payload["run_identity_sha256"] = launcher._balanced_kaufman_run_identity(
+        parent_sha256=volume_checkpoint_sha256,
+        parent_report_sha256=parent_report_sha256,
+        parent_report_run_identity_sha256=(
+            volume_payload["run_identity_sha256"]),
+        data_identity_sha256=data_identity_sha256,
+        config=config,
+    )
+    report = run / "report.json"
+    report.write_text(json.dumps(payload))
+    return {
+        "run": run,
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": checkpoint_sha256,
+        "report": report,
+        "payload": payload,
+        "volume_checkpoint": volume_checkpoint,
+        "volume_report": volume_report,
+    }
 
 
 @pytest.mark.parametrize(("schema", "stage"), [
@@ -391,6 +529,126 @@ def test_chronos2_atlas_rejects_volume_stage_without_native_checkpoint_gate(
         launcher._stage_identity(
             str(adapter),
             checkpoint_sha256,
+            None,
+            context_length=256,
+        )
+
+
+def test_chronos2_atlas_authenticates_balanced_kaufman_volume_lineage(
+        tmp_path):
+    launcher = _load(
+        "chronos2_probe_atlas_balanced_kaufman",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    artifacts = _valid_balanced_kaufman_stage(tmp_path, launcher)
+
+    identity = launcher._stage_identity(
+        str(artifacts["checkpoint"]),
+        artifacts["checkpoint_sha256"],
+        None,
+        context_length=256,
+    )
+
+    base = artifacts["payload"]["config"]["base_model"]
+    assert identity == {
+        "stage_report_path": str(artifacts["report"].resolve()),
+        "stage_report_sha256": launcher._file_sha256(artifacts["report"]),
+        "parent_checkpoint_sha256": launcher._tree_sha256(
+            artifacts["volume_checkpoint"]),
+        "data_identity_sha256": "9" * 64,
+        "base_revision": base["revision"],
+        "base_weights_sha256": base["weights_sha256"],
+        "base_config_sha256": base["config_sha256"],
+    }
+
+
+@pytest.mark.parametrize("drift", [
+    "run_identity",
+    "native_gate",
+    "projection_only",
+    "volume_report",
+    "base_identity",
+    "trainer_state",
+    "required_margin",
+    "teacher_contract",
+    "native_bank",
+])
+def test_chronos2_atlas_rejects_balanced_kaufman_lineage_drift(
+        tmp_path, drift):
+    launcher = _load(
+        f"chronos2_probe_atlas_balanced_kaufman_{drift}",
+        ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py",
+    )
+    artifacts = _valid_balanced_kaufman_stage(tmp_path, launcher)
+    payload = artifacts["payload"]
+    if drift == "run_identity":
+        payload["run_identity_sha256"] = "0" * 64
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "native_gate":
+        payload["checkpoint_only_validation"][
+            "loss_lift_parent_minus_checkpoint"]["loss"] = 0.2
+        payload["run_identity_sha256"] = launcher._balanced_kaufman_run_identity(
+            parent_sha256=payload["parent"]["sha256"],
+            parent_report_sha256=payload["parent_report"]["sha256"],
+            parent_report_run_identity_sha256=(
+                payload["parent_report"]["run_identity_sha256"]),
+            data_identity_sha256=payload["data_identity_sha256"],
+            config=payload["config"],
+        )
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "projection_only":
+        payload["checkpoint_only_validation"]["contract"] = (
+            "temporary_projection_head_only")
+        payload["config"]["checkpoint_selection"][
+            "temporary_head_metrics_used"] = True
+        payload["run_identity_sha256"] = launcher._balanced_kaufman_run_identity(
+            parent_sha256=payload["parent"]["sha256"],
+            parent_report_sha256=payload["parent_report"]["sha256"],
+            parent_report_run_identity_sha256=(
+                payload["parent_report"]["run_identity_sha256"]),
+            data_identity_sha256=payload["data_identity_sha256"],
+            config=payload["config"],
+        )
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "volume_report":
+        with artifacts["volume_report"].open("a") as stream:
+            stream.write("\n")
+    elif drift == "base_identity":
+        payload["config"]["base_model"]["weights_sha256"] = "8" * 64
+        payload["run_identity_sha256"] = launcher._balanced_kaufman_run_identity(
+            parent_sha256=payload["parent"]["sha256"],
+            parent_report_sha256=payload["parent_report"]["sha256"],
+            parent_report_run_identity_sha256=(
+                payload["parent_report"]["run_identity_sha256"]),
+            data_identity_sha256=payload["data_identity_sha256"],
+            config=payload["config"],
+        )
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "required_margin":
+        payload["checkpoint_only_validation"]["required_margin"] = 0.0
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "teacher_contract":
+        payload["config"]["direction_contract"] = "direction_sensitive"
+        payload["run_identity_sha256"] = launcher._balanced_kaufman_run_identity(
+            parent_sha256=payload["parent"]["sha256"],
+            parent_report_sha256=payload["parent_report"]["sha256"],
+            parent_report_run_identity_sha256=(
+                payload["parent_report"]["run_identity_sha256"]),
+            data_identity_sha256=payload["data_identity_sha256"],
+            config=payload["config"],
+        )
+        artifacts["report"].write_text(json.dumps(payload))
+    elif drift == "native_bank":
+        payload["checkpoint_only_validation"]["checkpoint"][
+            "per_stream"]["NQ@3min"]["loss"] = 0.1
+        artifacts["report"].write_text(json.dumps(payload))
+    else:
+        (artifacts["run"] / "trainer.pt").write_bytes(b"leftover trainer")
+
+    with pytest.raises(SystemExit, match="contract is invalid"):
+        launcher._stage_identity(
+            str(artifacts["checkpoint"]),
+            artifacts["checkpoint_sha256"],
             None,
             context_length=256,
         )
