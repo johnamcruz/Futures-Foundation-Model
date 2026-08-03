@@ -21,6 +21,14 @@ Copy
 - Python 3.9+, format with `black`, lint with `ruff`
 - Type hints encouraged, Google-style docstrings
 
+## Self-Supervised Checkpoint Independence
+
+- Temporary projection heads, decoders, or classifiers may be used during SSL optimization only.
+- Best-checkpoint selection and promotion must validate the saved native encoder representation with every temporary module absent.
+- A run fails when an auxiliary head improves but the native checkpoint does not.
+- Successful finalization must discard auxiliary modules, optimizer state, and resumable trainer state; downstream use must require only the saved checkpoint and its declared base model.
+- Failed or interrupted runs may retain trainer state only for exact identity-authenticated resume; trainer state is never an inference artifact.
+
 ## Adding a New Instrument
 1. Add to `INSTRUMENT_MAP` in `features.py`
 2. Verify feature derivation works

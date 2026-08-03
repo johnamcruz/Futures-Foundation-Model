@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,8 +27,23 @@ MPS_SAFE_MAX_CHUNK_WINDOWS = 1024
 CHRONOS2_STAGE_SCHEMAS = {
     "ffm_chronos2_mask_v1": "mask",
     "ffm_chronos2_contrastive_v2": "contrastive",
+    "ffm_chronos2_volume_structure_ssl_v3": "volume_structure_ssl",
+    "ffm_chronos2_balanced_kaufman_ssl_v1": "balanced_kaufman_ssl",
 }
 CHRONOS2_MODEL_ID = "autogluon/chronos-2-small"
+VOLUME_STRUCTURE_TRAINER_SCHEMA = (
+    "ffm_chronos2_volume_structure_trainer_v4"
+)
+BALANCED_KAUFMAN_TRAINER_SCHEMA = (
+    "ffm_chronos2_balanced_kaufman_trainer_v1"
+)
+BALANCED_KAUFMAN_REPORT_SCHEMA = (
+    "ffm_chronos2_balanced_kaufman_ssl_v1"
+)
+BALANCED_KAUFMAN_STAGE = "balanced_kaufman_ssl"
+BALANCED_KAUFMAN_SELECTION_CONTRACT = (
+    "gate_feasible_native_reg_balanced_kaufman_v1"
+)
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -57,6 +73,441 @@ def _checkpoint_identity(value: str) -> str:
     return f"remote:{value}"
 
 
+def _volume_structure_run_identity(
+    *,
+    parent_sha256: str,
+    data_identity_sha256: str,
+    config: dict,
+) -> str:
+    """Recompute the trainer identity from the published immutable inputs."""
+    payload = {
+        "schema": VOLUME_STRUCTURE_TRAINER_SCHEMA,
+        "parent_sha256": parent_sha256,
+        "data_identity_sha256": data_identity_sha256,
+        "config": config,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _balanced_kaufman_run_identity(
+    *,
+    parent_sha256: str,
+    parent_report_sha256: str,
+    parent_report_run_identity_sha256: str,
+    data_identity_sha256: str,
+    config: dict,
+) -> str:
+    """Recompute the balanced-Kaufman identity from immutable lineage."""
+    payload = {
+        "schema": BALANCED_KAUFMAN_TRAINER_SCHEMA,
+        "parent_sha256": parent_sha256,
+        "parent_report_sha256": parent_report_sha256,
+        "parent_report_run_identity_sha256": (
+            parent_report_run_identity_sha256),
+        "data_identity_sha256": data_identity_sha256,
+        "config": config,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _balanced_kaufman_native_bank_contract(
+    value: object,
+    config: dict,
+) -> bool:
+    """Validate the fixed 9x4 projection-free validation receipt."""
+    if not isinstance(value, dict):
+        return False
+    aggregate = value.get("aggregate")
+    per_stream = value.get("per_stream")
+    timeframes = config.get("timeframes")
+    samples = config.get("validation_windows_per_state")
+    if (
+        value.get("contract")
+        != "fixed_balanced_native_chronos_reg_5d_concat_without_ssl_heads"
+        or not isinstance(value.get("seed"), int)
+        or not isinstance(aggregate, dict)
+        or set(aggregate) != {"loss", "margin", "embedding_std"}
+        or not isinstance(per_stream, dict)
+        or not isinstance(timeframes, list)
+        or set(timeframes) != {"1min", "3min", "5min", "15min"}
+        or samples != 16
+        or len(per_stream) != 9 * len(timeframes)
+    ):
+        return False
+    tickers_by_timeframe = {timeframe: set() for timeframe in timeframes}
+    for stream, row in per_stream.items():
+        if not isinstance(stream, str) or "@" not in stream:
+            return False
+        ticker, timeframe = stream.rsplit("@", 1)
+        if not ticker or timeframe not in tickers_by_timeframe:
+            return False
+        tickers_by_timeframe[timeframe].add(ticker)
+        if not isinstance(row, dict) or set(row) != {
+            "loss", "margin", "embedding_std", "class_counts"
+        }:
+            return False
+        metrics = (row["loss"], row["margin"], row["embedding_std"])
+        if not all(
+            isinstance(item, (int, float)) and math.isfinite(float(item))
+            for item in metrics
+        ) or float(row["embedding_std"]) <= 0.0:
+            return False
+        if row["class_counts"] != {"0": samples, "2": samples}:
+            return False
+    ticker_sets = list(tickers_by_timeframe.values())
+    if (
+        not ticker_sets
+        or len(ticker_sets[0]) != 9
+        or any(tickers != ticker_sets[0] for tickers in ticker_sets[1:])
+    ):
+        return False
+    for metric in ("loss", "margin", "embedding_std"):
+        saved = aggregate.get(metric)
+        measured = sum(
+            float(row[metric]) for row in per_stream.values()) / len(per_stream)
+        if (
+            not isinstance(saved, (int, float))
+            or not math.isfinite(float(saved))
+            or not math.isclose(float(saved), measured, abs_tol=1e-9)
+        ):
+            return False
+    return True
+
+
+def _volume_structure_stage_contract(
+        report: dict,
+        report_path: Path,
+        checkpoint_path: Path,
+) -> bool:
+    """Authenticate the v3 native-checkpoint and discarded-head contract."""
+    run_identity = report.get("run_identity_sha256")
+    native = report.get("checkpoint_only_validation")
+    artifact = report.get("final_artifact_contract")
+    config = report.get("config")
+    source_parent = report.get("parent")
+    data_identity = report.get("data_identity_sha256")
+    if (
+        not isinstance(run_identity, str)
+        or _HEX64.fullmatch(run_identity) is None
+        or not isinstance(native, dict)
+        or native.get("status") != "pass"
+        or native.get("contract")
+        != "freshly_reloaded_lora_native_reg_without_temporary_heads"
+        or not isinstance(artifact, dict)
+        or not isinstance(config, dict)
+        or not isinstance(source_parent, dict)
+        or not isinstance(source_parent.get("sha256"), str)
+        or _HEX64.fullmatch(source_parent["sha256"]) is None
+        or not isinstance(data_identity, str)
+        or _HEX64.fullmatch(data_identity) is None
+        or run_identity != _volume_structure_run_identity(
+            parent_sha256=source_parent["sha256"],
+            data_identity_sha256=data_identity,
+            config=config,
+        )
+        or (report_path.parent / "trainer.pt").exists()
+        or (report_path.parent / ".trainer.pt.tmp").exists()
+    ):
+        return False
+    parent = native.get("parent")
+    checkpoint = native.get("checkpoint")
+    lift = native.get("loss_lift_parent_minus_checkpoint")
+    margin = native.get("required_margin")
+    if (
+        not isinstance(parent, dict)
+        or not isinstance(parent.get("aggregate"), dict)
+        or not isinstance(checkpoint, dict)
+        or not isinstance(checkpoint.get("aggregate"), dict)
+        or not isinstance(lift, dict)
+        or not isinstance(margin, (int, float))
+        or not math.isfinite(float(margin))
+        or float(margin) < 0.0
+        or not isinstance(
+            config.get("native_promotion_margin"), (int, float))
+        or not math.isclose(
+            float(margin),
+            float(config["native_promotion_margin"]),
+            abs_tol=1e-12,
+        )
+    ):
+        return False
+    for objective in ("participation", "concentration"):
+        before = parent["aggregate"].get(objective)
+        after = checkpoint["aggregate"].get(objective)
+        saved_lift = lift.get(objective)
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in (before, after, saved_lift)
+        ):
+            return False
+        measured = float(before) - float(after)
+        if (
+            not math.isclose(measured, float(saved_lift), abs_tol=1e-9)
+            or measured <= float(margin)
+        ):
+            return False
+    selection = config.get("checkpoint_selection")
+    base = config.get("base_model")
+    files = artifact.get("checkpoint_files")
+    actual_files = sorted(
+        str(path.relative_to(checkpoint_path))
+        for path in checkpoint_path.rglob("*")
+        if path.is_file()
+    )
+    return bool(
+        isinstance(selection, dict)
+        and selection.get("contract")
+        == "gate_feasible_weighted_native_reg_participation_concentration_v1"
+        and selection.get("temporary_head_metrics_used") is False
+        and isinstance(base, dict)
+        and base.get("model_id") == CHRONOS2_MODEL_ID
+        and isinstance(base.get("revision"), str)
+        and _HEX40.fullmatch(base["revision"]) is not None
+        and isinstance(base.get("weights_sha256"), str)
+        and _HEX64.fullmatch(base["weights_sha256"]) is not None
+        and isinstance(base.get("config_sha256"), str)
+        and _HEX64.fullmatch(base["config_sha256"]) is not None
+        and artifact.get("temporary_heads_in_checkpoint") is False
+        and artifact.get("ssl_heads_required_for_inference") is False
+        and artifact.get("trainer_state")
+        == "discarded_after_successful_checkpoint"
+        and artifact.get("inference_requires")
+        == ["chronos_base_model", "lora_checkpoint"]
+        and isinstance(files, list)
+        and files
+        and sorted(files) == actual_files
+        and not any(
+            token in Path(name).name.lower()
+            for name in files
+            for token in ("head", "decoder", "projection", "trainer")
+        )
+    )
+
+
+def _balanced_kaufman_stage_contract(
+    report: dict,
+    report_path: Path,
+    checkpoint_path: Path,
+) -> bool:
+    """Authenticate native Kaufman lift and its exact Volume-SSL parent."""
+    run_identity = report.get("run_identity_sha256")
+    saved_checkpoint = report.get("checkpoint")
+    parent = report.get("parent")
+    parent_report_identity = report.get("parent_report")
+    data_identity = report.get("data_identity_sha256")
+    config = report.get("config")
+    native = report.get("checkpoint_only_validation")
+    artifact = report.get("final_artifact_contract")
+    if (
+        report.get("schema") != BALANCED_KAUFMAN_REPORT_SCHEMA
+        or report.get("stage") != BALANCED_KAUFMAN_STAGE
+        or report.get("status") != "complete"
+        or not isinstance(run_identity, str)
+        or _HEX64.fullmatch(run_identity) is None
+        or not isinstance(saved_checkpoint, dict)
+        or not isinstance(parent, dict)
+        or not isinstance(parent_report_identity, dict)
+        or not isinstance(data_identity, str)
+        or _HEX64.fullmatch(data_identity) is None
+        or not isinstance(config, dict)
+        or not isinstance(native, dict)
+        or not isinstance(artifact, dict)
+        or (report_path.parent / "trainer.pt").exists()
+        or (report_path.parent / ".trainer.pt.tmp").exists()
+    ):
+        return False
+
+    try:
+        checkpoint_saved_path = Path(saved_checkpoint["path"]).expanduser().resolve()
+        parent_path = Path(parent["path"]).expanduser().resolve()
+        parent_report_path = Path(
+            parent_report_identity["path"]).expanduser().resolve()
+    except (KeyError, TypeError, OSError):
+        return False
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    if (
+        checkpoint_saved_path != checkpoint_path
+        or saved_checkpoint.get("sha256") != _tree_sha256(checkpoint_path)
+        or not parent_path.is_dir()
+        or not parent_report_path.is_file()
+        or parent.get("sha256") != _tree_sha256(parent_path)
+        or parent_report_identity.get("sha256")
+        != _file_sha256(parent_report_path)
+        or parent_report_identity.get("schema")
+        != "ffm_chronos2_volume_structure_ssl_v3"
+        or parent_report_identity.get("stage") != "volume_structure_ssl"
+        or not isinstance(
+            parent_report_identity.get("run_identity_sha256"), str)
+        or _HEX64.fullmatch(
+            parent_report_identity["run_identity_sha256"]) is None
+    ):
+        return False
+    try:
+        parent_report = json.loads(parent_report_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    parent_saved_checkpoint = (
+        parent_report.get("checkpoint")
+        if isinstance(parent_report, dict) else None
+    )
+    if (
+        not isinstance(parent_saved_checkpoint, dict)
+        or parent_report.get("schema") != parent_report_identity["schema"]
+        or parent_report.get("stage") != parent_report_identity["stage"]
+        or parent_report.get("run_identity_sha256")
+        != parent_report_identity["run_identity_sha256"]
+        or parent_report.get("data_identity_sha256")
+        != parent_report_identity.get("data_identity_sha256")
+        or parent_saved_checkpoint.get("sha256") != parent["sha256"]
+        or not isinstance(parent_saved_checkpoint.get("path"), str)
+        or Path(parent_saved_checkpoint["path"]).expanduser().resolve()
+        != parent_path
+        or not _volume_structure_stage_contract(
+            parent_report, parent_report_path, parent_path)
+    ):
+        return False
+
+    parent_report_sha256 = parent_report_identity["sha256"]
+    parent_run_identity = parent_report_identity["run_identity_sha256"]
+    if run_identity != _balanced_kaufman_run_identity(
+        parent_sha256=parent["sha256"],
+        parent_report_sha256=parent_report_sha256,
+        parent_report_run_identity_sha256=parent_run_identity,
+        data_identity_sha256=data_identity,
+        config=config,
+    ):
+        return False
+
+    base = config.get("base_model")
+    parent_base = parent_report.get("config", {}).get("base_model")
+    selection = config.get("checkpoint_selection")
+    if not (
+        isinstance(base, dict)
+        and base == parent_base
+        and base.get("model_id") == CHRONOS2_MODEL_ID
+        and isinstance(base.get("revision"), str)
+        and _HEX40.fullmatch(base["revision"]) is not None
+        and isinstance(base.get("weights_sha256"), str)
+        and _HEX64.fullmatch(base["weights_sha256"]) is not None
+        and isinstance(base.get("config_sha256"), str)
+        and _HEX64.fullmatch(base["config_sha256"]) is not None
+        and isinstance(selection, dict)
+        and selection.get("contract")
+        == BALANCED_KAUFMAN_SELECTION_CONTRACT
+        and selection.get("temporary_head_metrics_used") is False
+        and config.get("context_length") == 256
+        and config.get("kaufman_length") == 64
+        and config.get("kaufman_chop") == 0.25
+        and config.get("kaufman_trend") == 0.50
+        and config.get("threshold_contract")
+        == "fixed_causal_completed_context_er64_v1"
+        and config.get("direction_contract")
+        == "direction_agnostic_chop_vs_trend"
+        and config.get("native_embedding_contract")
+        == "ordered_ohlcv_reg_concat_5d"
+        and config.get("stream_sampler")
+        == "uniform_stream_equal_chop_trend_50_50"
+        and config.get("validation_sampling")
+        == "fixed_equal_state_per_stream"
+        and config.get("validation_windows_per_state") == 16
+    ):
+        return False
+
+    before = native.get("parent")
+    after = native.get("checkpoint")
+    lift = native.get("loss_lift_parent_minus_checkpoint")
+    margin = native.get("required_margin")
+    if (
+        native.get("status") != "pass"
+        or native.get("contract")
+        != "freshly_reloaded_lora_native_reg_without_temporary_heads"
+        or not isinstance(before, dict)
+        or not isinstance(before.get("aggregate"), dict)
+        or not isinstance(after, dict)
+        or not isinstance(after.get("aggregate"), dict)
+        or not _balanced_kaufman_native_bank_contract(before, config)
+        or not _balanced_kaufman_native_bank_contract(after, config)
+        or set(before["per_stream"]) != set(after["per_stream"])
+        or before.get("seed") != after.get("seed")
+        or not isinstance(lift, dict)
+        or set(before["aggregate"])
+        != {"loss", "margin", "embedding_std"}
+        or set(after["aggregate"])
+        != {"loss", "margin", "embedding_std"}
+        or set(lift) != {"loss", "margin"}
+        or not isinstance(margin, (int, float))
+        or not math.isfinite(float(margin))
+        or float(margin) < 0.0
+        or not isinstance(
+            config.get("native_promotion_margin"), (int, float))
+        or not math.isclose(
+            float(margin),
+            float(config["native_promotion_margin"]),
+            abs_tol=1e-12,
+        )
+    ):
+        return False
+    native_values = (
+        *before["aggregate"].values(),
+        *after["aggregate"].values(),
+        *lift.values(),
+    )
+    if not all(
+        isinstance(value, (int, float)) and math.isfinite(float(value))
+        for value in native_values
+    ):
+        return False
+    measured_lift = {
+        "loss": (
+            float(before["aggregate"]["loss"])
+            - float(after["aggregate"]["loss"])
+        ),
+        "margin": (
+            float(after["aggregate"]["margin"])
+            - float(before["aggregate"]["margin"])
+        ),
+    }
+    if (
+        float(before["aggregate"]["embedding_std"]) <= 0.0
+        or float(after["aggregate"]["embedding_std"]) <= 0.0
+        or any(
+            not math.isclose(
+                measured_lift[name], float(lift[name]), abs_tol=1e-9)
+            or measured_lift[name] <= float(margin)
+            for name in measured_lift
+        )
+    ):
+        return False
+
+    files = artifact.get("checkpoint_files")
+    actual_files = sorted(
+        str(path.relative_to(checkpoint_path))
+        for path in checkpoint_path.rglob("*")
+        if path.is_file()
+    )
+    return bool(
+        artifact.get("temporary_heads_in_checkpoint") is False
+        and artifact.get("ssl_heads_required_for_inference") is False
+        and artifact.get("trainer_state")
+        == "discarded_after_successful_checkpoint"
+        and artifact.get("temporary_training_modules")
+        == ["projection_head", "optimizer"]
+        and artifact.get("base_model_name_or_path") == CHRONOS2_MODEL_ID
+        and artifact.get("inference_requires")
+        == ["chronos_base_model", "lora_checkpoint"]
+        and isinstance(files, list)
+        and files
+        and sorted(files) == actual_files
+        and not any(
+            token in Path(name).name.lower()
+            for name in files
+            for token in ("head", "decoder", "projection", "trainer")
+        )
+    )
+
+
 def _stage_identity(
     checkpoint: str,
     checkpoint_sha256: str,
@@ -74,6 +525,9 @@ def _stage_identity(
             "stage_report_sha256": None,
             "parent_checkpoint_sha256": None,
             "data_identity_sha256": None,
+            "base_revision": None,
+            "base_weights_sha256": None,
+            "base_config_sha256": None,
         }
     report_path = (
         Path(stage_report).expanduser()
@@ -95,10 +549,19 @@ def _stage_identity(
     saved_checkpoint = report.get("checkpoint")
     config = report.get("config")
     expected_stage = CHRONOS2_STAGE_SCHEMAS.get(report.get("schema"))
+    if expected_stage == "volume_structure_ssl":
+        specialized_contract = _volume_structure_stage_contract(
+            report, report_path, checkpoint_path)
+    elif expected_stage == BALANCED_KAUFMAN_STAGE:
+        specialized_contract = _balanced_kaufman_stage_contract(
+            report, report_path, checkpoint_path)
+    else:
+        specialized_contract = True
     parent_sha256 = parent.get("sha256") if isinstance(parent, dict) else None
     data_sha256 = report.get("data_identity_sha256")
     if (
         expected_stage is None
+        or not specialized_contract
         or report.get("status") != "complete"
         or report.get("stage") != expected_stage
         or not isinstance(saved_checkpoint, dict)
@@ -119,6 +582,24 @@ def _stage_identity(
         "stage_report_sha256": _file_sha256(report_path),
         "parent_checkpoint_sha256": parent_sha256,
         "data_identity_sha256": data_sha256,
+        "base_revision": (
+            config["base_model"]["revision"]
+            if expected_stage in {
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+            } else None
+        ),
+        "base_weights_sha256": (
+            config["base_model"]["weights_sha256"]
+            if expected_stage in {
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+            } else None
+        ),
+        "base_config_sha256": (
+            config["base_model"]["config_sha256"]
+            if expected_stage in {
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+            } else None
+        ),
     }
 
 
@@ -172,20 +653,51 @@ def _base_identity(
     }
 
 
+def _validate_stage_base_identity(
+    stage_identity: dict,
+    base_identity: dict,
+) -> None:
+    """Bind a Volume-SSL stage report to the supplied pinned base snapshot."""
+    if stage_identity["base_revision"] is not None and (
+        stage_identity["base_revision"] != base_identity["base_revision"]
+        or stage_identity["base_weights_sha256"]
+        != base_identity["base_weights_sha256"]
+        or stage_identity["base_config_sha256"]
+        != base_identity["base_config_sha256"]
+    ):
+        raise SystemExit(
+            "Chronos-2 stage report base identity does not match "
+            "--base-snapshot"
+        )
+
+
 @contextmanager
 def _runtime_checkpoint(
     checkpoint: str,
     *,
     base_revision: str,
+    base_snapshot: Path,
 ):
-    """Pin revision-null PEFT adapters without changing their stage hash."""
+    """Load PEFT against the exact hashed base snapshot without mutation."""
     checkpoint_path = Path(checkpoint).expanduser().resolve()
+    base_snapshot = Path(base_snapshot).expanduser().resolve()
+    if (
+        base_snapshot.name != base_revision
+        or not (base_snapshot / "config.json").is_file()
+        or not (base_snapshot / "model.safetensors").is_file()
+    ):
+        raise SystemExit(
+            "Chronos-2 runtime base snapshot is incomplete or revision-mismatched")
     adapter = json.loads(
         (checkpoint_path / "adapter_config.json").read_text())
-    if adapter.get("revision") == base_revision:
-        yield checkpoint_path
-        return
-    adapter["revision"] = base_revision
+    if (
+        adapter.get("base_model_name_or_path") != CHRONOS2_MODEL_ID
+        or adapter.get("revision") not in {None, base_revision}
+    ):
+        raise SystemExit(
+            "Chronos-2 adapter does not match the authenticated base snapshot")
+    adapter["base_model_name_or_path"] = str(base_snapshot)
+    adapter["revision"] = None
     with tempfile.TemporaryDirectory(
         prefix="ffm-chronos2-atlas-adapter-",
     ) as temporary:
@@ -312,6 +824,7 @@ def main() -> dict:
         args.stage_report,
         context_length=args.window,
     )
+    _validate_stage_base_identity(stage_identity, base_identity)
     if not labels.is_file():
         _generate_labels(labels, data_dir)
 
@@ -361,6 +874,7 @@ def main() -> dict:
     with _runtime_checkpoint(
         args.checkpoint,
         base_revision=base_identity["base_revision"],
+        base_snapshot=args.base_snapshot,
     ) as runtime_checkpoint:
         os.environ["ATLAS_LOAD_CHECKPOINT_PATH"] = str(
             runtime_checkpoint)
