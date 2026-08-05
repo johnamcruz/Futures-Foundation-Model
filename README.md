@@ -94,6 +94,24 @@ continuous-contract OHLCV (9 tickers × 4 timeframes)
 
 `futures_foundation/finetune/ssl.py` provides the task-independent SSL loop. Registered objectives live under `futures_foundation/finetune/pretext/`; each task owns its window reserve, trainer, diagnostics, and verdict additions. `scripts/mantis/mantis_ssl_clean_pipeline.py` composes the production lineage while keeping every checkpoint distinct.
 
+FFM can also sequence existing SSL commands through the shared
+`ml-training-loop` state machine. A JSON workflow declares preflight, training,
+Probe Atlas, control, comparison, and packaging commands together with the
+artifacts each command must publish. FFM still owns every training and
+validation implementation; the shared loop provides bootstrap-first execution,
+durable logs and receipts, resume by run ID, and fail-closed transitions.
+
+```bash
+./.venv/bin/python scripts/chronos/chronos2_ssl_training_loop.py \
+  --config /path/to/ssl-workflow.json \
+  --run-id chronos2-volume-v3
+```
+
+The workflow schema is `ffm_ssl_training_workflow_v1`. Commands execute from
+the declared repository root, and artifact contracts can require files,
+checkpoint-directory members, JSON schema/status fields, and stable SHA-256
+identities. FFM and its orchestration dependency require Python 3.11 or newer.
+
 The clean runner also executes the public, strategy-agnostic
 `scripts/probe_atlas.py` after each stage. Its balanced 9-ticker × 4-timeframe
 corpus measures causal market-state retention and generic forward

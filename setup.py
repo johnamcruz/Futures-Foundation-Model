@@ -9,7 +9,7 @@ setup(
     license="Apache-2.0",
     url="https://github.com/johnamcruz/Futures-Foundation-Model",
     packages=find_packages(),
-    python_requires=">=3.9",
+    python_requires=">=3.11",
     # Core install is torch-free (the parent process must never load torch —
     # see futures_foundation/foundation.py). Torch/Chronos run only inside
     # the embed subprocess; install them via the [foundation] extra.
@@ -17,6 +17,7 @@ setup(
         "pandas>=2.0",
         "numpy>=1.24",
         "scikit-learn>=1.3",
+        "ml-training-loop @ git+https://github.com/johnamcruz/ML-training-loop.git@0b31183cbe28141269fb5a250913cbdccac48d27",
     ],
     extras_require={
         "foundation": [
