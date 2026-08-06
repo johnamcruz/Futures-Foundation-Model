@@ -111,6 +111,12 @@ The workflow schema is `ffm_ssl_training_workflow_v1`. Commands execute from
 the declared repository root, and artifact contracts can require files,
 checkpoint-directory members, JSON schema/status fields, and stable SHA-256
 identities. FFM and its orchestration dependency require Python 3.11 or newer.
+Failed representation-report gates can optionally invoke bounded Codex
+reasoning with `ml-diagnose-experiment`, `ml-design-experiment`, and
+`ml-train-representation`; Codex may select only a declared revision while the
+data, objective, temporal roles, checkpoint lineage, controls, sealed holdout,
+and promotion gates remain frozen. See
+[`docs/SSL_TRAINING_LOOP.md`](docs/SSL_TRAINING_LOOP.md).
 
 The clean runner also executes the public, strategy-agnostic
 `scripts/probe_atlas.py` after each stage. Its balanced 9-ticker × 4-timeframe

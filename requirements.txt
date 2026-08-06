@@ -19,4 +19,4 @@ hmmlearn>=0.3              # regime HMM (futures_foundation.regime): market-stat
 chronos-forecasting>=2.2   # Chronos-2 multivariate + LoRA and legacy Chronos-Bolt
 databento>=0.76            # DBN metadata, decoding, and symbology
 zstandard>=0.23            # compressed Databento CSV input
-ml-training-loop @ git+https://github.com/johnamcruz/ML-training-loop.git@0b31183cbe28141269fb5a250913cbdccac48d27
+ml-training-loop @ git+https://github.com/johnamcruz/ML-training-loop.git@3644eab5a753cba29d73e92991edcd85b8e2ca8f
