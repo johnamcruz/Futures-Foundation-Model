@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
+import numbers
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +19,8 @@ from typing import Any, Mapping
 from ml_training_loop import (
     Decision,
     GateResult,
+    ReasoningOutcome,
+    Revision,
     StageReceipt,
     StageSpec,
     TrainingLoop,
@@ -30,6 +34,7 @@ from ml_training_loop.interfaces import (
     SkillBootstrapper,
     StageRequest,
 )
+from ml_training_loop.integrations import CodexCliReasoningAdapter
 from ml_training_loop.skills import BundledSkillBootstrapper
 from ml_training_loop.stores import JsonRunStore
 
@@ -37,6 +42,95 @@ from ml_training_loop.stores import JsonRunStore
 _STAGE_ADAPTER = "ffm-command"
 _GATE_ADAPTER = "ffm-artifact-contract"
 _ARTIFACT_KINDS = frozenset({"file", "directory", "json"})
+_OPERATORS = frozenset({">=", ">", "<=", "<", "=="})
+
+
+@dataclass(frozen=True)
+class MetricRequirement:
+    field: str
+    operator: str
+    value: float
+
+    def __post_init__(self) -> None:
+        if not self.field or self.operator not in _OPERATORS:
+            raise ValueError("metric requirement field or operator is invalid")
+        if (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, numbers.Real)
+            or not math.isfinite(self.value)
+        ):
+            raise ValueError("metric requirement value must be finite numeric")
+
+
+@dataclass(frozen=True)
+class ReportGate:
+    report_path: Path
+    requirements: tuple[MetricRequirement, ...]
+    failure_decision: Decision = Decision.REVISE
+
+    def __post_init__(self) -> None:
+        if not self.requirements:
+            raise ValueError("report gate requires at least one metric")
+        if self.failure_decision not in {Decision.REVISE, Decision.STOP}:
+            raise ValueError("report gate failure decision must be REVISE or STOP")
+
+
+@dataclass(frozen=True)
+class StageRevision:
+    candidate_id: str
+    rationale: str
+    command: tuple[str, ...]
+    changed_settings: Mapping[str, Any]
+    environment: Mapping[str, str] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id or not self.rationale or not self.command:
+            raise ValueError("stage revision requires id, rationale, and command")
+        if not self.changed_settings:
+            raise ValueError("stage revision requires changed_settings")
+
+
+@dataclass(frozen=True)
+class SslScientificContext:
+    objective: str
+    causal_setup: tuple[str, ...]
+    frozen_constraints: tuple[str, ...]
+    experiment_ledger: tuple[Mapping[str, Any], ...]
+    required_skills: tuple[str, ...] = (
+        "ml-diagnose-experiment",
+        "ml-design-experiment",
+        "ml-train-representation",
+    )
+
+    def __post_init__(self) -> None:
+        if not self.objective.strip():
+            raise ValueError("SSL scientific objective must be non-empty")
+        for name in ("causal_setup", "frozen_constraints", "required_skills"):
+            values = getattr(self, name)
+            if not values or any(not item.strip() for item in values):
+                raise ValueError(f"SSL scientific context {name} is invalid")
+        if any(
+            not isinstance(item, Mapping) or not item for item in self.experiment_ledger
+        ):
+            raise ValueError("SSL experiment ledger entries must be objects")
+
+
+@dataclass(frozen=True)
+class SslReasoningConfig:
+    provider: str = "codex"
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: str = "medium"
+    timeout_seconds: int = 1800
+    scientific_context: SslScientificContext | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"codex", "predeclared"}:
+            raise ValueError("unsupported SSL reasoning provider")
+        if self.provider == "codex" and self.scientific_context is None:
+            raise ValueError("Codex SSL reasoning requires scientific_context")
+        if self.timeout_seconds <= 0:
+            raise ValueError("SSL reasoning timeout_seconds must be positive")
 
 
 @dataclass(frozen=True)
@@ -67,6 +161,8 @@ class CommandStage:
     environment: Mapping[str, str] = field(default_factory=dict)
     timeout_seconds: float | None = None
     required_skills: tuple[str, ...] = ()
+    gate: ReportGate | None = None
+    revisions: tuple[StageRevision, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name or not self.command:
@@ -77,6 +173,9 @@ class CommandStage:
             raise ValueError("command arguments must be non-empty strings")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        revision_ids = tuple(item.candidate_id for item in self.revisions)
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValueError("stage revision candidate ids must be unique")
 
 
 @dataclass(frozen=True)
@@ -88,6 +187,7 @@ class SslTrainingWorkflow:
     state_root: Path
     stages: tuple[CommandStage, ...]
     max_revisions_per_stage: int = 0
+    reasoning: SslReasoningConfig | None = None
 
     def __post_init__(self) -> None:
         names = tuple(stage.name for stage in self.stages)
@@ -99,6 +199,8 @@ class SslTrainingWorkflow:
             raise ValueError("repository_root must be an existing directory")
         if self.max_revisions_per_stage < 0:
             raise ValueError("max revisions must be nonnegative")
+        if self.reasoning is not None and self.max_revisions_per_stage <= 0:
+            raise ValueError("SSL reasoning requires a positive revision budget")
 
 
 def _resolve_from(base: Path, value: str) -> Path:
@@ -135,15 +237,76 @@ def load_ssl_workflow(path: Path) -> SslTrainingWorkflow:
                 environment=item.get("environment", {}),
                 timeout_seconds=item.get("timeout_seconds"),
                 required_skills=tuple(item.get("required_skills", ())),
+                gate=(
+                    None
+                    if item.get("gate") is None
+                    else ReportGate(
+                        report_path=Path(item["gate"]["report_path"]),
+                        requirements=tuple(
+                            MetricRequirement(
+                                field=requirement["field"],
+                                operator=requirement["operator"],
+                                value=requirement["value"],
+                            )
+                            for requirement in item["gate"]["requirements"]
+                        ),
+                        failure_decision=Decision(
+                            item["gate"].get("failure_decision", "REVISE")
+                        ),
+                    )
+                ),
+                revisions=tuple(
+                    StageRevision(
+                        candidate_id=revision["candidate_id"],
+                        rationale=revision["rationale"],
+                        command=tuple(revision["command"]),
+                        changed_settings=revision["changed_settings"],
+                        environment=revision.get("environment", {}),
+                        timeout_seconds=revision.get("timeout_seconds"),
+                    )
+                    for revision in item.get("revisions", ())
+                ),
             )
             for item in payload["stages"]
         )
+        raw_reasoning = payload.get("reasoning")
+        reasoning = None
+        if raw_reasoning is not None:
+            raw_context = raw_reasoning.get("scientific_context")
+            context = None
+            if raw_context is not None:
+                context = SslScientificContext(
+                    objective=raw_context["objective"],
+                    causal_setup=tuple(raw_context["causal_setup"]),
+                    frozen_constraints=tuple(raw_context["frozen_constraints"]),
+                    experiment_ledger=tuple(raw_context["experiment_ledger"]),
+                    required_skills=tuple(
+                        raw_context.get(
+                            "required_skills",
+                            (
+                                "ml-diagnose-experiment",
+                                "ml-design-experiment",
+                                "ml-train-representation",
+                            ),
+                        )
+                    ),
+                )
+            reasoning = SslReasoningConfig(
+                provider=raw_reasoning.get("provider", "codex"),
+                model=raw_reasoning.get("model", "gpt-5.6-sol"),
+                reasoning_effort=raw_reasoning.get("reasoning_effort", "medium"),
+                timeout_seconds=raw_reasoning.get("timeout_seconds", 1800),
+                scientific_context=context,
+            )
         return SslTrainingWorkflow(
             name=payload["name"],
             repository_root=_resolve_from(base, payload.get("repository_root", ".")),
-            state_root=_resolve_from(base, payload.get("state_root", ".ml-training-loop")),
+            state_root=_resolve_from(
+                base, payload.get("state_root", ".ml-training-loop")
+            ),
             stages=stages,
             max_revisions_per_stage=int(payload.get("max_revisions_per_stage", 0)),
+            reasoning=reasoning,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid SSL workflow contract: {error}") from error
@@ -151,7 +314,9 @@ def load_ssl_workflow(path: Path) -> SslTrainingWorkflow:
 
 def _tree_sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+    for item in sorted(
+        candidate for candidate in path.rglob("*") if candidate.is_file()
+    ):
         digest.update(item.relative_to(path).as_posix().encode())
         with item.open("rb") as source:
             for block in iter(lambda: source.read(1 << 20), b""):
@@ -281,13 +446,57 @@ class _ArtifactContractGate:
                     {"path": str(path), "log_path": outputs.get("log_path")},
                 )
             evidence["artifacts"][str(path)] = measured
+        gate = request.stage.config.get("report_gate")
+        if gate is not None:
+            report = json.loads(Path(gate["report_path"]).read_text())
+            failures = []
+            measured = {}
+            for requirement in gate["requirements"]:
+                actual = _nested_value(report, requirement["field"])
+                measured[requirement["field"]] = actual
+                if not _compare(
+                    actual,
+                    requirement["operator"],
+                    requirement["value"],
+                ):
+                    failures.append({**requirement, "actual": actual})
+            if failures:
+                return GateResult(
+                    Decision(gate["failure_decision"]),
+                    f"{request.stage.name} representation gate failed",
+                    {"metrics": measured, "failures": failures},
+                )
         return GateResult(
             Decision.PROCEED,
             f"{request.stage.name} command and artifact contracts passed",
             evidence,
         )
 
-def _artifact_config(contract: ArtifactContract, repository_root: Path) -> dict[str, Any]:
+
+def _nested_value(payload: Mapping[str, Any], field: str) -> float:
+    value: Any = payload
+    for part in field.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise ValueError(f"report metric is missing: {field}")
+        value = value[part]
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"report metric must be numeric: {field}")
+    return float(value)
+
+
+def _compare(actual: float, operator: str, expected: float) -> bool:
+    return {
+        ">=": actual >= expected,
+        ">": actual > expected,
+        "<=": actual <= expected,
+        "<": actual < expected,
+        "==": actual == expected,
+    }[operator]
+
+
+def _artifact_config(
+    contract: ArtifactContract, repository_root: Path
+) -> dict[str, Any]:
     path = contract.path.expanduser()
     if not path.is_absolute():
         path = repository_root / path
@@ -299,8 +508,71 @@ def _artifact_config(contract: ArtifactContract, repository_root: Path) -> dict[
     }
 
 
+def _revision_override(revision: StageRevision) -> dict[str, Any]:
+    return {
+        "command": list(revision.command),
+        "environment": dict(revision.environment),
+        "timeout_seconds": revision.timeout_seconds,
+        "changed_settings": dict(revision.changed_settings),
+    }
+
+
+def _report_gate_config(
+    gate: ReportGate | None,
+    artifacts: tuple[ArtifactContract, ...],
+    repository_root: Path,
+) -> dict[str, Any] | None:
+    if gate is None:
+        return None
+    path = gate.report_path.expanduser()
+    if not path.is_absolute():
+        path = repository_root / path
+    path = path.resolve()
+    declared_reports = {
+        (
+            item.path.expanduser()
+            if item.path.expanduser().is_absolute()
+            else repository_root / item.path.expanduser()
+        ).resolve()
+        for item in artifacts
+        if item.kind == "json"
+    }
+    if path not in declared_reports:
+        raise ValueError("report gate path must be a declared JSON artifact")
+    return {
+        "report_path": str(path),
+        "requirements": [
+            {"field": item.field, "operator": item.operator, "value": item.value}
+            for item in gate.requirements
+        ],
+        "failure_decision": gate.failure_decision.value,
+    }
+
+
 def _plan(workflow: SslTrainingWorkflow) -> TrainingPlan:
     root = workflow.repository_root.expanduser().resolve()
+    reasoning_policy = None
+    if workflow.reasoning is not None:
+        context = workflow.reasoning.scientific_context
+        reasoning_policy = {
+            "provider": workflow.reasoning.provider,
+            "model": workflow.reasoning.model,
+            "reasoning_effort": workflow.reasoning.reasoning_effort,
+            "timeout_seconds": workflow.reasoning.timeout_seconds,
+            "scientific_context": (
+                None
+                if context is None
+                else {
+                    "objective": context.objective,
+                    "causal_setup": list(context.causal_setup),
+                    "frozen_constraints": list(context.frozen_constraints),
+                    "experiment_ledger": [
+                        dict(item) for item in context.experiment_ledger
+                    ],
+                    "required_skills": list(context.required_skills),
+                }
+            ),
+        }
     stages = tuple(
         StageSpec(
             name=stage.name,
@@ -311,8 +583,21 @@ def _plan(workflow: SslTrainingWorkflow) -> TrainingPlan:
                 "environment": dict(stage.environment),
                 "timeout_seconds": stage.timeout_seconds,
                 "artifacts": [
-                    _artifact_config(contract, root)
-                    for contract in stage.artifacts
+                    _artifact_config(contract, root) for contract in stage.artifacts
+                ],
+                "report_gate": _report_gate_config(
+                    stage.gate,
+                    stage.artifacts,
+                    root,
+                ),
+                "reasoning_policy": reasoning_policy,
+                "revision_ladder": [
+                    {
+                        "candidate_id": item.candidate_id,
+                        "rationale": item.rationale,
+                        **_revision_override(item),
+                    }
+                    for item in stage.revisions
                 ],
             },
             required_skills=stage.required_skills,
@@ -327,9 +612,120 @@ def _plan(workflow: SslTrainingWorkflow) -> TrainingPlan:
             "ml-audit-data-labels",
             "ml-train-representation",
             "ml-validate-temporal",
+            *(
+                (
+                    "ml-diagnose-experiment",
+                    "ml-design-experiment",
+                )
+                if workflow.reasoning is not None
+                else ()
+            ),
         ),
         max_revisions_per_stage=workflow.max_revisions_per_stage,
     )
+
+
+def build_ssl_reasoning_adapter(
+    workflow: SslTrainingWorkflow,
+    *,
+    executor=None,
+) -> ReasoningAdapter | None:
+    """Build the bounded, skill-directed Codex adapter for an SSL workflow."""
+    config = workflow.reasoning
+    if config is None or config.provider == "predeclared":
+        return None
+    context = config.scientific_context
+    assert context is not None
+
+    def prompt_builder(request) -> str:
+        return (
+            "Use $ml-diagnose-experiment first to classify the failure and "
+            "localize the first failed representation boundary. Then use "
+            "$ml-design-experiment to select one smallest falsifying revision, "
+            "and $ml-train-representation to preserve native checkpoint utility, "
+            "retention, controls, and auxiliary-head independence. Select exactly "
+            "one unused candidate from stage.config.revision_ladder by returning "
+            '{"declared_revision_id": <candidate_id>}. Do not invent commands '
+            "or change the frozen objective, data, temporal roles, sealed holdout, "
+            "parent checkpoint, controls, evidence gates, or artifact contract. "
+            "Return STOP when no candidate tests the diagnosed boundary and "
+            "BLOCKED only for integrity, causality, lineage, or executable faults.\n\n"
+            "Authenticated SSL scientific context:\n"
+            + json.dumps(
+                {
+                    "objective": context.objective,
+                    "causal_setup": list(context.causal_setup),
+                    "frozen_constraints": list(context.frozen_constraints),
+                    "experiment_ledger": [
+                        dict(item) for item in context.experiment_ledger
+                    ],
+                    "required_skills": list(context.required_skills),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+
+    def candidates(request) -> dict[str, dict[str, Any]]:
+        used = {
+            revision.config_override.get("candidate_id")
+            for revision in request.prior_revisions
+        }
+        return {
+            item["candidate_id"]: {
+                "command": item["command"],
+                "environment": item["environment"],
+                "timeout_seconds": item["timeout_seconds"],
+                "changed_settings": item["changed_settings"],
+                "candidate_id": item["candidate_id"],
+            }
+            for item in request.stage.config.get("revision_ladder", ())
+            if item["candidate_id"] not in used
+        }
+
+    selected: dict[str, dict[str, Any]] = {}
+
+    def validate(revision: Revision) -> None:
+        if set(revision.config_override) != {"declared_revision_id"}:
+            raise ValueError("Codex must select one declared SSL revision")
+        available = candidates(_active_request[0])
+        candidate_id = revision.config_override["declared_revision_id"]
+        if candidate_id not in available:
+            raise ValueError("Codex selected an unknown or used SSL revision")
+        selected.clear()
+        selected.update(available[candidate_id])
+
+    _active_request = [None]
+    adapter = CodexCliReasoningAdapter(
+        repository_root=workflow.repository_root,
+        receipt_root=workflow.state_root / "reasoning",
+        prompt_builder=prompt_builder,
+        revision_validator=validate,
+        executor=executor,
+        model=config.model,
+        reasoning_effort=config.reasoning_effort,
+        sandbox="read-only",
+        timeout_seconds=config.timeout_seconds,
+    )
+
+    class _Adapter:
+        def revise(self, request):
+            _active_request[0] = request
+            outcome = adapter.revise(request)
+            if outcome.decision is not Decision.REVISE:
+                return outcome
+            return ReasoningOutcome(
+                decision=Decision.REVISE,
+                rationale=outcome.rationale,
+                revision=Revision(
+                    stage=request.stage.name,
+                    rationale=outcome.rationale,
+                    config_override=dict(selected),
+                ),
+                evidence=outcome.evidence,
+            )
+
+    return _Adapter()
 
 
 def run_ssl_training(
@@ -353,6 +749,10 @@ def run_ssl_training(
         ),
         store=JsonRunStore(state_root),
         skills=skills or BundledSkillBootstrapper(DEFAULT_BUNDLE),
-        reasoning=reasoning,
+        reasoning=(
+            reasoning
+            if reasoning is not None
+            else build_ssl_reasoning_adapter(workflow)
+        ),
     )
     return loop.run(_plan(workflow), run_id=run_id)
