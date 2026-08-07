@@ -12,6 +12,7 @@ authenticated module hash remain reusable.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -48,29 +49,38 @@ def _embed_reg_windows(
         drop_last=False,
     )
     batches = []
-    with torch.no_grad():
+    fast_group_attention = os.environ.get(
+        "FFM_CHRONOS2_FAST_GROUP_ATTENTION", "0") == "1"
+    with torch.inference_mode():
         for batch in loader:
             if batch["future_target"] is not None:
                 raise RuntimeError(
                     "Chronos-2 embedding dataset exposed a future target")
             ranges = tuple(batch["target_idx_ranges"])
-            encoder_outputs, _loc_scale, *_ = pipeline.model.encode(
-                context=batch["context"].to(
-                    device=pipeline.model.device,
-                    dtype=torch.float32,
-                ),
-                group_ids=batch["group_ids"].to(pipeline.model.device),
-            )
-            encoded = encoder_outputs[0]
             expected_start = 0
-            for start, end in ranges:
+            group_ids = batch["group_ids"]
+            for group_index, (start, end) in enumerate(ranges):
                 if (
                     int(start) != expected_start
                     or int(end) - int(start) != windows.shape[1]
                 ):
                     raise RuntimeError(
                         "Chronos-2 grouped target ranges are malformed")
+                if fast_group_attention and not torch.all(
+                    group_ids[int(start):int(end)]
+                    == group_ids[int(start)]
+                ):
+                    raise RuntimeError(
+                        f"Chronos-2 group {group_index} is not contiguous")
                 expected_start = int(end)
+            encoder_outputs, _loc_scale, *_ = pipeline.model.encode(
+                context=batch["context"].to(
+                    device=pipeline.model.device,
+                    dtype=torch.float32,
+                ),
+                group_ids=group_ids.to(pipeline.model.device),
+            )
+            encoded = encoder_outputs[0]
             if (
                 not ranges
                 or encoded.ndim != 3
@@ -121,6 +131,13 @@ def embed_window_chunks(
         return
 
     from chronos import Chronos2Pipeline
+
+    if os.environ.get("FFM_CHRONOS2_FAST_GROUP_ATTENTION", "0") == "1":
+        from ._fast_group_attention_prototype import (
+            enable_fast_group_attention,
+        )
+
+        enable_fast_group_attention(group_size=5)
 
     source = checkpoint or model_id
     load_kwargs = {"device_map": device}
