@@ -1,105 +1,171 @@
-# 🏛️ Futures Foundation Model (FFM)
+# Futures Foundation Model (FFM)
 
 ![Python Unit Tests](https://github.com/johnamcruz/Futures-Foundation-Model/actions/workflows/main.yml/badge.svg)
 
-**A leakage-aware foundation-model pipeline for futures bars: adapt a pretrained time-series encoder to raw OHLCV, validate it through causal controls and walk-forward tests, then export lightweight downstream heads for deployment.**
+FFM adapts **Chronos-2 Small** to causal futures OHLCV and exposes its learned
+representations through a model-agnostic classifier seam. The foundation learns
+from price and volume bars; private trading labels, entry rules, stops, targets,
+and execution policy belong in downstream projects.
 
-**Contents:** [Quick Start](#quick-start) · [Design](#design) · [Overview](#overview) · [Self-Supervised Pretraining](#self-supervised-pretraining) · [Checkpoint Contract](#checkpoint-contract) · [Classifier Seam](#classifier-seam) · [Walk-forward and Production](#walk-forward-and-production) · [Data](#data) · [Project Structure](#project-structure)
+## Current status
 
----
+| Capability | Status |
+|---|---|
+| Chronos-2 multivariate OHLCV integration | Available |
+| Masked OHLCV pretraining | Validated foundation checkpoint |
+| Frozen Chronos-2 embedding classifier | Available |
+| Public Probe Atlas representation evaluation | Available |
+| LangGraph-backed automated SSL workflow | Available |
+| Volume-Structure SSL | Experimental; promotion validation pending |
+| Trend/Chop contrastive SSL | Experimental; promotion validation pending |
+| Fast grouped attention | Optional prototype; disabled by default |
 
-## Quick Start
+“Available” means the implementation and its contracts exist. Experimental SSL
+stages are not promoted merely because they complete training: they must beat
+the validated Mask checkpoint under matched causal evaluation without losing
+important retained capabilities.
+
+## Design
+
+> Learn reusable market context first; train decisions separately.
+
+Four rules define the foundation:
+
+1. **OHLCV is the model input.** SSL consumes completed open, high, low, close,
+   and volume bars—not order-book data, indicators, or trading outcomes.
+2. **Representations and decisions are separate.** Downstream projects attach
+   lightweight task heads through the classifier interface.
+3. **Time is a hard boundary.** Windows, labels, validation periods, and sealed
+   holdouts are constructed causally.
+4. **Artifacts are authenticated.** Data, configuration, parent checkpoint,
+   controls, seed, and reports are recorded so a result can be reproduced.
+
+## Architecture
+
+```text
+continuous-contract OHLCV (9 tickers x 4 native timeframes)
+                         |
+                         v
+              Chronos-2 Small backbone
+                         |
+          +--------------+---------------+
+          |                              |
+          v                              v
+ validated Mask SSL             candidate SSL refinements
+                                 - Volume Structure
+                                 - Trend / Chop contrastive
+          |                              |
+          +--------------+---------------+
+                         |
+                         v
+           frozen causal Chronos embeddings
+                         |
+                         v
+       downstream Pivot / Trend / Expansion / Entry heads
+                         |
+                         v
+        temporal validation -> production packaging
+```
+
+The default research universe contains ES, NQ, RTY, YM, GC, SI, CL, ZB, and ZN
+at 1-, 3-, 5-, and 15-minute resolution. Each five-channel OHLCV stream is an
+individual multivariate series that shares the same Chronos backbone, allowing
+the representation to learn recurring structures across markets and scales.
+
+## Installation
+
+FFM requires Python 3.11 or newer.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
-pip install mantis-tsfm
 ```
 
-FFM separates **learning reusable market representations** from **training a downstream decision head**. The production pretraining lineage is:
+Large datasets, caches, checkpoints, and campaign state should live outside the
+Git checkout—preferably on an SSD. Repository paths may point to those assets
+without copying them back into the working tree.
 
-```text
-Mask → Temporal Contrastive → Multi-horizon Seq2seq → NextLeg
-```
+## Representation learning
 
-Before a long run, validate the complete 9×4 data contract and immutable holdout:
+### Masked OHLCV pretraining
+
+Masked pretraining is the validated base. Causal OHLCV patches are hidden and
+reconstructed so Chronos must infer local price, volatility, participation, and
+temporal structure from the visible context. Training uses LoRA and publishes a
+native Chronos adapter checkpoint; temporary training state is not required by
+downstream consumers.
+
+The pinned repository baseline is `checkpoints/chronos2_mask_full/`; its
+completion receipt is `checkpoints/chronos2_mask_full.report.json`.
 
 ```bash
-./.venv/bin/python scripts/mantis/mantis_ssl_clean_pipeline.py --preflight-only --device mps
+./.venv/bin/python scripts/chronos/chronos2_ssl_pretrain.py \
+  --parent /path/to/pinned/chronos2/adapter \
+  --data-dir /path/to/ohlcv \
+  --out-dir /path/to/ssd/mask-run \
+  --timeframes 1min,3min,5min,15min \
+  --device mps
 ```
 
-The core API can also run any registered objective independently:
+### Volume-Structure SSL
 
-```python
-from futures_foundation.finetune import ssl
+The experimental Volume-Structure stage learns from OHLCV-only objectives for
+masked volume/price reconstruction, participation, concentration versus
+dispersion, displacement with abnormal volume, and temporal ordering. Temporary
+objective heads may supervise training, but they are discarded. Promotion is
+based on the resulting Chronos checkpoint itself.
 
-mask = ssl.loop_ssl(
-    data_dir="data",
-    out_path="checkpoints/mantis_ssl_ohlcv.pt",
-    pretext="mask",
-    holdout_start="2026-01-01",
-    controls=("shuffle", "random"),
-    lora_r=8,
-    lora_alpha=16,
-)
+```bash
+./.venv/bin/python scripts/chronos/chronos2_ssl_volume_structure.py \
+  --parent /path/to/mask/checkpoint \
+  --base-snapshot /path/to/pinned/chronos2-small \
+  --data-dir /path/to/ohlcv \
+  --out-dir /path/to/ssd/volume-run \
+  --preflight-only
 ```
 
-Each later stage receives the previous checkpoint through `backbone_ckpt` and writes to a different output path. See [Self-Supervised Pretraining](#self-supervised-pretraining) and [Checkpoint Contract](#checkpoint-contract).
+Remove `--preflight-only` only after the data and lineage contracts pass.
 
-## Design
+### Trend/Chop contrastive SSL
 
-> Separate **"understanding market context"** from **"making downstream decisions."**
+The experimental balanced Kaufman stage uses causal efficiency-ratio teachers
+to organize direction-agnostic trend and chop contexts while preserving native
+Chronos geometry. Up and down trends share the same regime concept; direction
+remains a downstream decision. This stage is pending matched promotion evidence.
 
-Like masked-language pretraining, FFM first learns structure from unlabeled sequences. The backbone learns **regime, temporal geometry, volatility, and forward dynamics** from futures OHLCV before a downstream task is introduced. A lightweight classifier or forecasting head can then reuse the same encoder.
-
-Four principles shape everything below:
-
-1. **Raw bars are the source of truth.** The foundation path consumes multivariate OHLCV rather than future-derived trading labels.
-2. **Backbones and heads are separated.** Downstream code depends on a small classifier interface, not on one model implementation.
-3. **Time is a hard boundary.** Training, validation, and held-out periods are separated before windows and targets are constructed.
-4. **Artifacts are traceable.** Every stage records its data provenance, configuration, parent-checkpoint hash, and validation report.
-
----
-
-## Overview
-
-The flow is a self-supervised pretraining pipeline over one shared backbone, followed by a lightweight downstream head:
-
-```
-continuous-contract OHLCV (9 tickers × 4 timeframes)
-        │
-        ▼  SELF-SUPERVISED PRETRAINING
-   1) masked reconstruction       → local candle and volatility structure
-   2) temporal contrastive        → smooth multi-scale market-state geometry
-   3) multi-horizon seq2seq       → forward OHLCV dynamics
-   4) next-leg forecasting        → direction-agnostic leg development in bars
-        │   warm-started checkpoints; LoRA or full adaptation; crash-safe best saves
-        ▼  DOWNSTREAM VALIDATION  (finetune/wf.py)
-   task labeler + light classifier head
-        ▼  PRODUCTION  (finetune/produce.py)
-   calibrated bundle + signal contract + ONNX artifacts
+```bash
+./.venv/bin/python scripts/chronos/chronos2_ssl_contrastive.py \
+  --parent /path/to/validated/parent/checkpoint \
+  --parent-report /path/to/validated/parent/report.json \
+  --base-snapshot /path/to/pinned/chronos2-small \
+  --data-dir /path/to/ohlcv \
+  --out-dir /path/to/ssd/trend-chop-run \
+  --preflight-only
 ```
 
-- **Honest by construction.** Downstream claims pass rolling walk-forward evaluation with REAL/SHUFFLE/RANDOM controls and validation-selected operating points.
-- **2026 is reserved out of sample.** The clean SSL runner physically excludes timestamps on or after `2026-01-01` from training inputs and targets.
-- **Causal by contract.** Every feature/window is strictly causal (streaming == batch, per bar); the leak audit is mandatory.
-- **Roll-safe bars.** Continuous futures streams are assembled by session, exclude spreads, and can be back-adjusted at contract switches.
-- **Bar data only.** Tick and order-book inputs are not currently supported; aggregate source data into closed OHLCV bars first.
+Every SSL candidate must remain usable through its encoder checkpoint alone.
+Auxiliary heads, decoders, and trainer state are training tools—not serving-time
+dependencies.
 
----
+## Automated SSL development
 
-## Self-Supervised Pretraining
+FFM can execute its existing SSL commands through the shared **ML Training
+Loop**, whose internal workflow is implemented with LangGraph. FFM continues to
+own data preparation, objective implementations, Chronos/LoRA training, Probe
+Atlas, checkpoint validation, and promotion rules. LangGraph owns durable graph
+execution, routing, checkpoint/resume, interrupts, and recovery.
 
-`futures_foundation/finetune/ssl.py` provides the task-independent SSL loop. Registered objectives live under `futures_foundation/finetune/pretext/`; each task owns its window reserve, trainer, diagnostics, and verdict additions. `scripts/mantis/mantis_ssl_clean_pipeline.py` composes the production lineage while keeping every checkpoint distinct.
+A versioned JSON workflow declares:
 
-FFM can also sequence existing SSL commands through the shared
-`ml-training-loop` state machine. A JSON workflow declares preflight, training,
-Probe Atlas, control, comparison, and packaging commands together with the
-artifacts each command must publish. FFM still owns every training and
-validation implementation; the shared loop provides bootstrap-first execution,
-durable logs and receipts, resume by run ID, and fail-closed transitions.
+- immutable data, temporal, checkpoint, seed, and holdout contracts;
+- preflight, training, Probe Atlas, control, comparison, and packaging stages;
+- required artifacts and authenticated receipts;
+- bounded, skill-directed reasoning when an experiment requires revision; and
+- the exact settings a permitted revision may change.
+
+Run or resume a workflow with the same run identifier:
 
 ```bash
 ./.venv/bin/python scripts/chronos/chronos2_ssl_training_loop.py \
@@ -107,403 +173,99 @@ durable logs and receipts, resume by run ID, and fail-closed transitions.
   --run-id chronos2-volume-v3
 ```
 
-The workflow schema is `ffm_ssl_training_workflow_v1`. Commands execute from
-the declared repository root, and artifact contracts can require files,
-checkpoint-directory members, JSON schema/status fields, and stable SHA-256
-identities. FFM and its orchestration dependency require Python 3.11 or newer.
-Failed representation-report gates can optionally invoke bounded Codex
-reasoning with `ml-diagnose-experiment`, `ml-design-experiment`, and
-`ml-train-representation`; Codex may select only a declared revision while the
-data, objective, temporal roles, checkpoint lineage, controls, sealed holdout,
-and promotion gates remain frozen. See
-[`docs/SSL_TRAINING_LOOP.md`](docs/SSL_TRAINING_LOOP.md).
+The workflow resumes completed stages from durable receipts and fails closed on
+lineage drift or malformed artifacts. Reasoning may diagnose evidence and select
+an allowed scientific revision; it may not silently change the data universe,
+temporal split, holdout, parent checkpoint, controls, or promotion criteria.
 
-The clean runner also executes the public, strategy-agnostic
-`scripts/probe_atlas.py` after each stage. Its balanced 9-ticker × 4-timeframe
-corpus measures causal market-state retention and generic forward
-direction/magnitude/volatility and HH/HL–LH/LL lifecycle information, including
-per-stream and worst-stream results. It contains no entry rules, stop logic,
-position sizing, R targets, or dependency on private strategy repositories.
+## Probe Atlas
 
-The Chronos-2 adapter entrypoint reuses that exact public corpus and probe
-implementation while streaming PEFT-directory embeddings through the
-Chronos-2 pooling contract:
+Probe Atlas compares frozen representations on the same causal 9-ticker x
+4-timeframe corpus. It measures retained market-state information and generic
+forward expansion, compression, magnitude, trend, and direction probes with
+per-stream and worst-stream results.
 
 ```bash
 ./.venv/bin/python scripts/chronos/chronos2_probe_atlas.py \
-  --checkpoint temp/chronos2_small_36stream/contrastive_kaufman_full/checkpoint \
-  --control real --window 256 --horizons 5,10,20,50
+  --checkpoint /path/to/chronos2/checkpoint \
+  --control real \
+  --window 256 \
+  --horizons 5,10,20,50
 ```
 
-The Chronos Atlas launcher defaults to `--batch-series 320`, which embeds 64
-five-channel OHLCV windows per call on the verified 16 GB M1 configuration.
-This setting affects frozen evaluation throughput only, not live inference.
+Run matched `real`, `shuffle`, and `random` controls. A candidate is promoted
+only from an identical corpus, split, probe configuration, solver, seed, and
+checkpoint contract. Probe Atlas measures representation quality; it does not
+claim trading profitability.
 
-Run the same command with `--control shuffle` and `--control random` for the
-input-corruption controls. Cache and report identities seal the backbone,
-checkpoint tree hash, source data, lifecycle corpus, window, horizons, and
-control arm. At each requested horizon the Atlas separately reports trend
-strength, range expansion, unconditional up/down direction, and up/down
-direction conditional on a strong future trend. Current structural direction
-is reported as a descriptive retention probe, not as future prediction.
+## Downstream classifier seam
 
-### 1. Masked reconstruction
-
-A fraction of each standardized OHLCV window is corrupted. The network reconstructs only the masked positions, forcing the encoder to use surrounding temporal context rather than memorize the visible value.
-
-### 2. Temporal contrastive learning
-
-Augmented views and temporally nearby windows form positives; sufficiently distant windows form negatives. This stage shapes a smooth, multi-scale market-state embedding without using future trading outcomes as labels.
-
-### 3. Multi-horizon seq2seq forecasting
-
-Variable-length context predicts future OHLCV moves at several horizons. Targets are expressed relative to the final context bar, making copy-the-last-value a zero forecast rather than an accidental shortcut.
-
-### 4. Next-leg forecasting
-
-The final pretraining stage predicts the duration of the developing leg and its counter-leg in bars while retaining the candle-forecasting objective as an anchor. Bar counts keep the target comparable across instruments and timeframes.
-
-### Experimental Structural NextLeg
-
-`nextleg_structural` is an opt-in, strategy-agnostic refinement of a validated NextLeg
-encoder. Inputs end at a close-confirmed pivot and targets remain within the same temporal
-split. In addition to the ordinary candle and leg anchors, the temporary training heads learn:
-
-- current and next HH/HL/LH/LL state;
-- the first future close-confirmed structural break and its delay;
-- scale-free next-leg excursion and duration; and
-- reconstruction of a short candle span around the confirmed formation.
-
-The saved artifact remains an ordinary merged **encoder-only** checkpoint named
-`mantis_ssl_structural_nextleg.pt`; none of the temporary structural heads are required by a
-downstream consumer.
-
-The first 9-ticker × 4-timeframe, pre-2026 LoRA run used a 60-epoch ceiling and selected epoch
-53 (report index 52) at validation loss **4.7688**. Its aggregate temporal-control margin was
-**0.1456**, forecast skill was **0.0307**, and embedding standard deviation was **1.0968**
-against a drift ceiling of 1.6. Its task diagnostics were:
-
-| Validation diagnostic | REAL | time-SHUFFLE | RANDOM |
-|---|---:|---:|---:|
-| Forecast skill over persistence | 0.0307 | 0.0120 | 0.0111 |
-| First-leg correlation | 0.1890 | -0.0033 | -0.0046 |
-| Second-leg correlation | 0.1535 | 0.0216 | -0.0226 |
-| Current structure balanced accuracy | 0.4308 | 0.2836 | 0.2496 |
-| Next structure balanced accuracy | 0.4184 | 0.2727 | 0.2522 |
-| Structural-break balanced accuracy | 0.3974 | 0.2235 | 0.1985 |
-| Excursion correlation | 0.2608 | 0.0385 | 0.0053 |
-| Pivot-span reconstruction skill | 0.7763 | 0.0947 | 0.0061 |
-
-The report returned `all_pass=true`, `representation_pass=true`, and `beats_controls=true`.
-
-```bash
-./.venv/bin/python scripts/mantis/mantis_ssl_structural_nextleg.py \
-  --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
-  --out temp/structural_nextleg/mantis_ssl_structural_nextleg.pt \
-  --epochs 60 --controls shuffle,random --device mps
-```
-
-### Experimental related-series context
-
-`related_nextleg` is an isolated Mantis-native experiment inspired by the grouped-series
-attention used in universal forecasting models. It does **not** replace the compact Mantis
-encoder. Every OHLCV context is encoded with the same shared weights, then one small gated
-attention block lets the primary embedding consult:
-
-- other configured timeframes of the same ticker; and
-- a same-timeframe correlated sibling, such as NQ with ES.
-
-The primary stream owns every forecast and NextLeg target; related streams are evidence only.
-Alignment compares bar **close** times, so an unfinished higher-timeframe candle is physically
-unreachable. Missing and stale contexts are masked, and the fusion residual starts at exactly
-zero—before training, its output is byte-for-byte the primary-only embedding.
-
-Run it separately from the production lineage and warm-start it from a validated NextLeg encoder:
-
-```bash
-./.venv/bin/python scripts/mantis/mantis_ssl_related_nextleg.py \
-  --warm-ckpt checkpoints/mantis_ssl_nextleg.pt \
-  --tickers NQ,ES \
-  --tfs 1min,3min,5min,15min \
-  --out temp/related_nextleg/mantis_related_nextleg.pt
-```
-
-Promotion requires matched primary-only, multi-timeframe, and sibling ablations plus shuffled-
-context, missing-context, walk-forward, and temporal-stability controls. The related experiment
-writes a `mantis-related-v1` composite checkpoint containing ordinary Mantis weights and the small
-fusion block; it never overwrites a plain production encoder checkpoint.
-
-Use `--related-control shuffle` (or `drop`) for the incremental-context control: it preserves the
-primary window and every target while corrupting only the related members.
-
-Shared discipline across every stage:
-
-| Guardrail | What it does |
-|---|---|
-| **Warm-start chain** | every child loads the exact parent encoder; missing parents fail closed |
-| **LoRA or full adaptation** | rank/alpha/dropout are configurable; merged LoRA checkpoints are ordinary encoder state dictionaries |
-| **Anti-forgetting** | later stages can freeze the tokenizer and early encoder layers while refining higher layers |
-| **Crash-safe save + resume** | the best checkpoint is written progressively (atomic, every val improvement) with a resume path — a disconnected GPU run never loses progress |
-| **Time-split validation** | all windows and objective-specific future reserves stay inside their split; `>=2026-01-01` is excluded by the clean runner |
-| **Input controls** | REAL, time-SHUFFLE, and RANDOM inputs can be trained against unchanged targets to expose temporal shortcuts |
-| **Bounded memory** | training data stays resident per process; downstream embeddings and large diagnostics support disk-backed/chunked execution |
-| **MPS/CUDA support** | device-specific batches, fixed sample budgets, and automatic MPS OOM fallback preserve comparable training exposure |
-| **Configurable source mixture** | `bar_proportional` remains the default; opt-in `uniform_stream` chooses a ticker/timeframe stream first, then a legal window within it |
-
-To test equal training exposure across the 9x4 corpus without changing the
-chronological validation distribution, use a separate output directory:
-
-```bash
-./.venv/bin/python scripts/mantis/mantis_ssl_clean_pipeline.py \
-  --sampling-mode uniform_stream \
-  --out-dir temp/clean_ssl_pre2026_lora_uniform
-```
-
-The runner refuses to reuse a completed checkpoint produced under a different
-sampling mode.
-
-### LoRA
-
-The clean runner defaults to LoRA rank 8, alpha 16. It freezes the pretrained encoder weights and learns low-rank changes in the attention projections. At save time those changes are merged into a plain encoder state dictionary, so downstream consumers do not need LoRA-specific loading code. `--lora-r 0` restores full encoder fine-tuning.
-
-## Checkpoint Contract
-
-The production lineage writes four independent encoder artifacts:
-
-| Stage | Default filename |
-|---|---|
-| Mask | `mantis_ssl_ohlcv.pt` |
-| Temporal contrastive | `mantis_ssl_regime_from_mask.pt` |
-| Seq2seq | `mantis_ssl_ctr_seq2seq.pt` |
-| NextLeg | `mantis_ssl_nextleg.pt` |
-| Structural NextLeg (experimental) | `mantis_ssl_structural_nextleg.pt` |
-| Momentum-Volatility v3 (downstream extraction candidate) | `mantis_ssl_mv_v3.pt` |
-
-Each production-lineage `.pt` contains the best merged **encoder** state—not its temporary training decoder or projection head. That makes every stage independently reusable as `backbone_ckpt` for downstream tasks or new pretraining branches. Opt-in related-series experiments use the explicitly versioned composite format described above. Each checkpoint is accompanied by:
-
-- `<checkpoint>.report.json`: configuration, validation history, and task diagnostics;
-- `<checkpoint>.data_provenance.json`: source hashes, holdout boundary, and parent-checkpoint hash;
-- `pipeline_manifest.json`: final ordered lineage and SHA-256 for every stage.
-
-Do not overwrite a parent checkpoint with its child. Promote validated artifacts from temporary run storage into a versioned checkpoint directory as one bundle.
-
----
-
-## Standard Market-Context Decoder
-
-`mantis_ssl_mv_v3.pt` remains an encoder-only checkpoint. FFM separately
-provides a small, versioned decoder that turns its frozen 1,280-dimensional
-embedding into the exact four momentum/volatility states MV-v3 was trained to
-represent:
-
-- `p_trend_expansion`
-- `p_trend_weakening`
-- `p_noisy_expansion`
-- `p_compression`
-
-The probabilities share one multinomial-softmax contract and sum to one. The
-decoder is strategy-agnostic: it uses no entries, stops, R targets, position
-rules, or private strategy labels. Its artifact records the target horizon,
-training/calibration/evaluation boundaries, field order, and exact encoder
-SHA-256. Loading it against another checkpoint fails closed.
-
-Fit and validate the decoder on the same balanced 9-ticker × 4-timeframe
-corpus used by Probe Atlas:
-
-```bash
-./.venv/bin/python scripts/fit_market_context.py \
-  --checkpoint checkpoints/mantis_ssl_mv_v3.pt \
-  --device cuda \
-  --output checkpoints/mantis_ssl_mv_v3_context.npz
-```
-
-The fitting contract is chronological: `<2023` fits the shared decoder, 2023
-fits one common temperature, and 2025 remains evaluation-only. Promotion
-requires every state to exceed its AUC gate and its matched shuffled-embedding
-control. Training is uniform-stream weighted so a large 1-minute stream cannot
-dominate the common readout.
-
-Downstream code that already has frozen embeddings stays torch-free:
-
-```python
-from futures_foundation import load_market_context_decoder
-
-decoder = load_market_context_decoder(
-    "checkpoints/mantis_ssl_mv_v3_context.npz",
-    encoder_checkpoint="checkpoints/mantis_ssl_mv_v3.pt",
-)
-context = decoder.transform(embeddings)
-columns = context.as_dict()
-```
-
-For a dedicated encoder worker, `extract_market_context(...)` accepts raw
-causal OHLCV windows shaped `[N, 5, sequence]`, runs the bound encoder, and
-returns the same named fields. Input windows end on the decision candle;
-future bars are used only to train and evaluate the decoder.
-
----
-
-## Classifier Seam
-
-`futures_foundation.finetune.classifier` is the swap point: a `Classifier` ABC + a `get_classifier(name, **cfg)` registry. Downstream code references a classifier **by name**, so the backbone can change without changing the walk-forward harness.
+Downstream training refers to the backbone by registered name rather than model
+implementation:
 
 ```python
 from futures_foundation.finetune.classifier import get_classifier
 
-clf = get_classifier(
-    "mantis",
-    backbone_ckpt="checkpoints/mantis_ssl_mv_v3.pt",
-    ft_mode="partial",
+classifier = get_classifier(
+    "chronos2_frozen",
+    backbone_ckpt="/path/to/chronos2/checkpoint",
+    device="mps",
+    pool="reg",
+    with_features=False,
 )
 ```
 
-Two ways to attach the backbone — both initialize from the SSL checkpoint via `backbone_ckpt`, both run torch in an **isolated subprocess** (the parent stays torch-free, so torch never collides with other native libraries in one process):
+The encoder runs in an isolated worker, embeddings can be cached by authenticated
+identity, and a lightweight fold-specific head consumes the representation.
+This keeps the walk-forward harness independent of the foundation backbone.
 
-- **End-to-end fine-tune** — foundation model + downstream channel adapter + light head, all trained together. Maximum capacity; the backbone specializes to the task.
-- **Frozen head-only** — embed each window **once** through the frozen encoder, then train a cheap **logistic or MLP head** per fold on the cached embedding (optionally concatenated with hand-crafted geometry features). This is the "embed once → head per fold" pattern: fast enough to iterate on local hardware, and a clean linear/​shallow probe of what the representation actually carries.
-  - **Cross-run embedding cache** — the frozen embedding is deterministic in `(backbone_ckpt, bars, window spec)`, so it's cached to disk keyed on exactly those. The expensive embed cost is **paid once per backbone**: reruns, head swaps (logistic↔MLP), and interpretability checks reuse the cached vectors instead of re-embedding. `EMBED_CACHE=0` disables; `EMBED_CACHE_DIR` relocates it.
+## Experimental grouped-attention switch
 
-**Currently available:** Mantis end-to-end and frozen-embedding classifiers plus a torch-free logistic baseline. A frozen MOMENT adapter is registered as an explicit stub and raises `NotImplementedError` until its encoder integration is implemented. Heavy backbones are imported lazily so the parent orchestration process remains torch-free.
+An optional prototype ports the split grouped-attention approach proposed for
+Chronos-2:
 
-- **`logistic`** — a torch-free baseline / test vehicle for the whole pipeline.
-- **Add your own backbone** by implementing `featurize()` + `fit_predict()` and registering it — the walk-forward, produce, and ONNX paths are all classifier-agnostic.
-
----
-
-## Walk-forward and Production
-
-**`futures_foundation/finetune/` is a task-pluggable harness:** streamed walk-forward evaluation with controls, production training, and ONNX export. Nothing in the harness is tied to a specific backbone or downstream task.
-
-**What it does:** a task labeler supplies causal event candidates, multivariate context windows, targets, and an evaluator. Validation runs the **overfit-driven training loop** on rolling **train / validate / test** folds with **REAL / SHUFFLE / RANDOM** controls and a PASS/FAIL verdict. The production trainer fits one final head on the corpus before the holdout and can export its artifacts to ONNX.
-
-| Component | Role |
-|---|---|
-| `wf.py` | Streamed walk-forward (`run_streamed`, `loop_streamed`) — featurize once across all streams (bounded RAM), rolling folds, VAL-selected operating point + **VAL→TEST generalization gate**, REAL/SHUFFLE/RANDOM, overfit→Optuna loop, PASS/FAIL verdict. 2026 excluded as OOS. |
-| `produce.py` | Production training: one fit on the full corpus minus an N-month holdout; scores the 2026 OOS; emits the deployment bundle + signal contract + ONNX. |
-| `tune.py` | Optuna search with a generalization-robust objective + held-out guard, auto-falling back to defaults unless the tuned config beats them. |
-| `loop.py` | The overfit-driven loop: default WF → generalize check → Optuna only if it overfits → rerun → repeat → final full WF. |
-| `_memmap.py` | Featurize-to-disk + streaming so full multi-timeframe, all-ticker runs fit in bounded RAM. |
-| `classifier.py` / `classifiers/` | The model-agnostic seam (above) + backbone implementations. |
-
-### The training loop — overfit-driven
-
-`loop_streamed(...)` runs the whole process as one self-correcting loop. **Optuna fires only when overfitting is detected** — a config that already generalizes is left untouched:
-
-1. Walk-forward with the **default** classifier config.
-2. **Generalizes?** (VAL→TEST gap within tolerance, REAL beats controls fold-after-fold) → **keep defaults, done.**
-3. **Overfit?** → **Optuna** for a config that generalizes (objective rewards cross-fold stability; auto-falls back to defaults unless the tuned config beats them on a held-out guard).
-4. **Rerun**; repeat until it passes (capped — if nothing generalizes, the model is **flagged**).
-
-Two guardrails keep it honest: the **VAL→TEST gate** (operating point chosen on *validation*, reported on *test*; an edge that decays is rejected) and tuning/selection that sees train+validation only — **test is never consulted**.
-
----
-
-### Downstream task contract
-
-```python
-class MyTask:
-    n_classes = 2                               # binary selection (take / skip)
-    def calendar(self): ...                     # ticker × timestamp
-    def build(self, lo, hi, test_start):
-        # → (contexts, labels, keys)  — keys carry realized-R per target
-        ...
-    def mv_contexts(self, keys):                # → [N, C, seq] multivariate windows
-        ...
-    def evaluate(self, keys, preds):            # → per-trade realized-R array
-        ...
+```bash
+FFM_CHRONOS2_FAST_GROUP_ATTENTION=1 <embedding-command>
 ```
 
-```python
-from futures_foundation.finetune import wf, produce
+It is disabled by default. Because its floating-point output is not bit-identical
+to the legacy worker, it must start a fresh cache family and pass matched MPS
+throughput and representation validation before promotion. Never enable it
+halfway through an existing cache build.
 
-verdict = wf.loop_streamed(
-    make_task,
-    streams,
-    classifier="mantis_frozen",
-    clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_mv_v3.pt"},
-)
-if verdict['generalizes']:
-    produce.train_final_streamed(
-        make_task,
-        streams,
-        classifier="mantis_frozen",
-        clf_kwargs={"backbone_ckpt": "checkpoints/mantis_ssl_mv_v3.pt"},
-        export_onnx=True,
-    )
+## Data contract
+
+Input files contain one completed bar per row:
+
+```text
+timestamp,open,high,low,close,volume
 ```
 
-The public `StrategyLabeler` base class centralizes causal next-bar labeling and the shared output schema. `FoldHealthMonitor` flags per-fold pathologies such as validation/test gaps, sample collapse, flat confidence, and empty-signal folds. Downstream task definitions and deployment policy remain outside the foundation-model core.
+The public data layer validates timestamps, OHLC ordering, finite values,
+continuous-contract construction, temporal identity, and source manifests.
+Tick, quote, order-book, and unfinished higher-timeframe data are outside the
+current foundation contract.
 
----
+## Repository map
 
-## Data
-
-### Supported instruments
-
-9 instruments: **ES, NQ, RTY, YM** (equity indices), **GC, SI** (metals), **CL** (energy), **ZB, ZN** (rates) — each at **1 / 3 / 5 / 15min**.
-
-### Input format
-
+```text
+futures_foundation/
+  finetune/
+    classifiers/chronos2/  # Chronos integration, SSL stages, frozen embeddings
+    pretext/               # shared SSL objective infrastructure
+    classifier.py          # model-agnostic classifier registry
+  orchestration/           # FFM adapter for the ML Training Loop
+scripts/
+  chronos/                 # SSL, Probe Atlas, and benchmark entrypoints
+  probe_atlas.py           # public representation evaluation
+data/                      # local OHLCV files; large data remains untracked
+temp/                      # local experiment state; untracked
 ```
-data/
-├── ES_3min.csv      # datetime, open, high, low, close, volume
-├── ES_5min.csv
-└── ...
-```
 
-**Fixed-interval OHLCV bars — not tick/quote data.** Every CSV is one row per closed bar at a
-chosen timeframe; there is no tick-level or order-book input path in the pipeline today
-(tick and order-book support is on the roadmap, not yet implemented).
-If your source data is tick-by-tick, aggregate it into bars first — `databento/build_continuous.py`
-resamples raw 1-min bars to any coarser timeframe (it does not build bars from ticks); a
-tick→1-min aggregation step is on you before that. To extend the dataset, use
-`databento/append_update.py`: despite its compatibility name, it never splices derived CSVs.
-It hash-checks the recorded raw lineage, merges the overlapping raw contract bars, rebuilds
-the back-adjusted 1/3/5/15-minute streams together, verifies exact resampling parity in a
-staging directory, and only then promotes them. Run without `--commit` for a dry run. A
-configurable `data_dir` (e.g. a Google-Drive mount on Colab) lets pretraining and finetuning
-read the same CSVs anywhere.
+## Scope
 
-### Features
-
-Raw OHLCV is the backbone's input—the foundation learns market context directly from price and volume, with no derived features fed into SSL. Public causal primitives for pivots, barriers, indicators, and sessions are available to downstream labelers and are held to the same no-look-ahead parity rule (streaming output must equal batch output at every bar).
-
----
-
-## Project Structure
-
-```
-Futures-Foundation-Model/
-├── futures_foundation/                # Foundation package (torch-free to import)
-│   ├── finetune/                      # ★ The model-agnostic classification pipeline
-│   │   ├── ssl.py / ssl_data.py       #   SSL orchestrator + leakage-safe data assembly
-│   │   ├── related_series.py          #   closed-bar multi-TF/sibling group alignment
-│   │   ├── pretext/                   #   mask / contrastive / forecast / NextLeg tasks
-│   │   │   ├── base.py                #     PretextTask interface (reserve / train / gate)
-│   │   │   └── _torch/                #     per-stage GPU trainers + shared BaseTrainer (save/resume/freeze)
-│   │   ├── _ssl_torch.py              #   back-compat shim → re-exports pretext/_torch (frozen embed, ONNX)
-│   │   ├── ssl_probe.py               #   linear probe: regime / vol / structure (soft signal)
-│   │   ├── classifier.py              #   Classifier ABC + get_classifier registry (the seam)
-│   │   ├── classifiers/               #   end-to-end FT + frozen head-only (cached embeddings) + logistic
-│   │   ├── wf.py                      #   streamed walk-forward honest ruler + overfit→Optuna
-│   │   ├── produce.py                 #   production trainer + 2026 OOS + ONNX + contract
-│   │   ├── tune.py / loop.py          #   Optuna search + overfit-driven loop
-│   │   ├── _memmap.py                 #   featurize-to-disk streaming (bounded RAM)
-│   │   └── base.py / health.py        #   task-labeling contract + fold health checks
-│   └── primitives/                    #   certified causal trigger primitives (pivots / barriers / indicators)
-├── scripts/                           # ★ local/MPS and GPU SSL runners + data audits
-├── databento/                         # Continuous-contract build + incremental update
-├── tests/                             # Unit tests (pre-commit gated; torch-free by contract)
-└── data/                              # Raw OHLCV CSVs (gitignored)
-```
----
-
-## License
-
-Apache 2.0 — See [LICENSE](LICENSE) for details.
-
----
-
-## Disclaimer
-
-This software is for **research and educational purposes only**. It does not constitute financial advice. Trading futures involves substantial risk of loss. Past performance of any model does not guarantee future results.
+FFM is the public representation and validation foundation. Strategy-specific
+labels, economic targets, trade selection, risk, execution, and live telemetry
+belong in downstream repositories. A strong representation is necessary, but
+profitability must still be demonstrated with causal temporal evaluation and
+realistic trading economics.
