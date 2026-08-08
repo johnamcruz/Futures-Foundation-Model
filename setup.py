@@ -17,7 +17,7 @@ setup(
         "pandas>=2.0",
         "numpy>=1.24",
         "scikit-learn>=1.3",
-        "ml-training-loop @ git+https://github.com/johnamcruz/ML-training-loop.git@3644eab5a753cba29d73e92991edcd85b8e2ca8f",
+        "ml-training-loop @ git+https://github.com/johnamcruz/ML-training-loop.git@9150279a179598484ff284b116ef990e6c206a37",
     ],
     extras_require={
         "foundation": [
