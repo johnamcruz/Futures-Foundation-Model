@@ -29,6 +29,7 @@ CHRONOS2_STAGE_SCHEMAS = {
     "ffm_chronos2_contrastive_v2": "contrastive",
     "ffm_chronos2_volume_structure_ssl_v3": "volume_structure_ssl",
     "ffm_chronos2_balanced_kaufman_ssl_v1": "balanced_kaufman_ssl",
+    "ffm_chronos2_forecast_direction_ssl_v1": "forecast_direction",
 }
 CHRONOS2_MODEL_ID = "autogluon/chronos-2-small"
 VOLUME_STRUCTURE_TRAINER_SCHEMA = (
@@ -585,19 +586,22 @@ def _stage_identity(
         "base_revision": (
             config["base_model"]["revision"]
             if expected_stage in {
-                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE,
+                "forecast_direction",
             } else None
         ),
         "base_weights_sha256": (
             config["base_model"]["weights_sha256"]
             if expected_stage in {
-                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE,
+                "forecast_direction",
             } else None
         ),
         "base_config_sha256": (
             config["base_model"]["config_sha256"]
             if expected_stage in {
-                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE
+                "volume_structure_ssl", BALANCED_KAUFMAN_STAGE,
+                "forecast_direction",
             } else None
         ),
     }
@@ -768,6 +772,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--chunk-windows", type=int, default=1024)
     value.add_argument("--train-per-stream", type=int, default=6000)
     value.add_argument("--eval-per-stream", type=int, default=3000)
+    value.add_argument(
+        "--eval-start", default="2025-01-01",
+        help="first evaluation decision close; later than 2025-01-01 excludes "
+             "periods a candidate trained on")
     value.add_argument("--preflight-only", action="store_true")
     return value
 
@@ -853,6 +861,7 @@ def main() -> dict:
         "ATLAS_CHUNK": str(args.chunk_windows),
         "ATLAS_TRAIN_PER_STREAM": str(args.train_per_stream),
         "ATLAS_EVAL_PER_STREAM": str(args.eval_per_stream),
+        "ATLAS_EVAL_START": args.eval_start,
         "DEVICE": args.device,
         "PYTORCH_ENABLE_MPS_FALLBACK": "1",
     }

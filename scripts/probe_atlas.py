@@ -65,7 +65,7 @@ BASE_CONFIG_SHA256 = os.environ.get("ATLAS_BASE_CONFIG_SHA256")
 TICKERS = ("ES", "NQ", "RTY", "YM", "GC", "SI", "CL", "ZB", "ZN")
 TIMEFRAMES = ("1min", "3min", "5min", "15min")
 FIT_END = pd.Timestamp("2024-01-01", tz="UTC")
-EVAL_START = pd.Timestamp("2025-01-01", tz="UTC")
+EVAL_START = pd.Timestamp(os.environ.get("ATLAS_EVAL_START", "2025-01-01"), tz="UTC")
 EVAL_END = pd.Timestamp("2026-01-01", tz="UTC")
 WINDOW = int(os.environ.get("ATLAS_WINDOW", "128"))
 PROBE_HORIZONS = tuple(
@@ -105,6 +105,8 @@ if (
     raise ValueError("ATLAS_POOL is incompatible with ATLAS_BACKBONE")
 if WINDOW < 2:
     raise ValueError("ATLAS_WINDOW must be >=2")
+if not FIT_END <= EVAL_START < EVAL_END:
+    raise ValueError("ATLAS_EVAL_START must lie in [fit end, eval end)")
 if (
     not PROBE_HORIZONS
     or any(value <= 0 for value in PROBE_HORIZONS)
@@ -639,7 +641,8 @@ def main() -> dict:
             "base_revision": BASE_REVISION,
             "base_weights_sha256": BASE_WEIGHTS_SHA256,
             "base_config_sha256": BASE_CONFIG_SHA256,
-            "embedding_cache": str(EMB_CACHE), "fit": "<2024", "eval": "2025",
+            "embedding_cache": str(EMB_CACHE), "fit": "<2024",
+            "eval": f"{EVAL_START.isoformat()}..{EVAL_END.isoformat()}",
             "window": WINDOW, "horizons": list(PROBE_HORIZONS), "pool": POOL,
             "target_reserve_bars": MAX_FORWARD,
             "pool_rows": len(keys), "probes": results,

@@ -689,3 +689,30 @@ def test_public_lifecycle_marks_breaks_without_strategy_imports():
     assert labels[2]["role_kind"] == "start"
     assert labels[3]["kind"] == "end"
     assert labels[4]["role_kind"] == "start"
+
+
+def test_atlas_eval_start_defaults_to_2025_and_accepts_a_later_override(monkeypatch):
+    monkeypatch.delenv("ATLAS_EVAL_START", raising=False)
+    atlas = _load("public_probe_atlas_eval_default", ROOT / "scripts" / "probe_atlas.py")
+    assert str(atlas.EVAL_START) == "2025-01-01 00:00:00+00:00"
+    monkeypatch.setenv("ATLAS_EVAL_START", "2025-07-15")
+    later = _load("public_probe_atlas_eval_later", ROOT / "scripts" / "probe_atlas.py")
+    assert str(later.EVAL_START) == "2025-07-15 00:00:00+00:00"
+    assert later.EVAL_END > later.EVAL_START >= later.FIT_END
+
+
+def test_atlas_eval_start_cannot_overlap_the_fit_period(monkeypatch):
+    monkeypatch.setenv("ATLAS_EVAL_START", "2023-06-01")
+    with pytest.raises(ValueError):
+        _load("public_probe_atlas_eval_overlap", ROOT / "scripts" / "probe_atlas.py")
+
+
+def test_chronos2_atlas_launcher_forwards_eval_start():
+    launcher = _load("chronos2_probe_atlas_eval_start",
+                     ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py")
+    args = launcher.parser().parse_args(
+        ["--base-snapshot", "/s", "--eval-start", "2025-07-15"])
+    assert args.eval_start == "2025-07-15"
+    assert launcher.parser().parse_args(["--base-snapshot", "/s"]).eval_start == "2025-01-01"
+    source = (ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py").read_text()
+    assert '"ATLAS_EVAL_START": args.eval_start' in source
