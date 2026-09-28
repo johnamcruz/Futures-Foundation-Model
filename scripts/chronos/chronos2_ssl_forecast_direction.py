@@ -5,7 +5,8 @@ Frozen contract: docs/chronos2_forecast_direction_ssl.md.
 
   preflight  authenticate streams and count anchors per period
   evaluate   score a checkpoint (``base`` or a PEFT adapter) per stream x horizon
-  train      continue the parent LoRA: A1 native pinball, A2 + direction BCE
+  train      continue the parent LoRA: A1 native pinball, A2 + direction BCE,
+             A3 = A2 + past-only bar-structure inputs
   select     choose λ from select-period reports and freeze the choice
   gate       forecast (A1 vs A0), direction (A2 vs A1) or retention (Atlas) gate
 
@@ -59,6 +60,8 @@ def parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--baseline-train", type=int, default=3000)
     evaluate.add_argument("--batch-windows", type=int, default=256)
     evaluate.add_argument("--confirm-outer-frozen", action="store_true")
+    evaluate.add_argument("--bar-features", action="store_true",
+                          help="append past-only bar-structure inputs (A3 checkpoints)")
 
     train = commands.add_parser("train")
     common(train)
@@ -175,7 +178,9 @@ def _evaluate(model, streams, name, periods, settings, args, identity) -> dict:
             model, streams, period, device=args.device,
             anchors_per_stream=settings["anchors_per_stream"],
             baseline_train_per_stream=settings["baseline_train"],
-            batch_windows=getattr(args, "batch_windows", 256) if args.command == "evaluate" else 256)
+            batch_windows=getattr(args, "batch_windows", 256) if args.command == "evaluate" else 256,
+            bar_features=(args.bar_features if args.command == "evaluate"
+                          else fs.uses_bar_features(args.arm)))
         report.update({"name": name, **identity})
         destination = settings["out_dir"] / "eval"
         _write(destination / f"{name}_{period}.json", report)

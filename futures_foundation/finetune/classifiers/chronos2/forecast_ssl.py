@@ -51,7 +51,15 @@ PERIODS: dict[str, tuple[str | None, str]] = {
     "select": ("2025-07-15T00:00:00+00:00", "2025-10-01T00:00:00+00:00"),
     "outer": ("2025-10-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
 }
-ARMS = ("a1", "a2")
+ARMS = ("a1", "a2", "a3")
+BAR_FEATURES = ("close_location", "body", "upper_wick", "lower_wick",
+                "scaled_return", "relative_volume")
+BAR_LOOKBACK = 20
+
+
+def uses_bar_features(arm: str) -> bool:
+    """A3 = A2 plus past-only bar-structure inputs; A1/A2 read OHLCV only."""
+    return arm == "a3"
 
 
 @dataclass(frozen=True)
@@ -136,18 +144,57 @@ def evenly_spaced(lo: int, hi: int, limit: int) -> np.ndarray:
     return np.unique(np.linspace(lo, hi - 1, min(limit, hi - lo)).astype(np.int64))
 
 
+def bar_structure(values: np.ndarray) -> np.ndarray:
+    """How each completed bar traded, from that bar and earlier bars only [N, 6].
+
+    Columns follow ``BAR_FEATURES``: close location in the range, body, upper and
+    lower wick (all as fractions of the bar range; a zero-range bar is 0.5/0/0/0),
+    the bar's log return scaled by the std of the previous 20 returns, and log
+    volume relative to the median of the previous 20 bars.  Warmup rows without
+    that history are NaN so Chronos masks them instead of seeing invented data.
+    """
+    values = np.asarray(values, np.float64)
+    o, h, low, c, volume = values.T
+    span = h - low
+    flat = span <= 0
+    safe = np.where(flat, 1.0, span)
+    location = np.where(flat, 0.5, (c - low) / safe)
+    body = np.where(flat, 0.0, (c - o) / safe)
+    upper = np.where(flat, 0.0, (h - np.maximum(o, c)) / safe)
+    lower = np.where(flat, 0.0, (np.minimum(o, c) - low) / safe)
+    returns = pd.Series(np.log(c)).diff()
+    sigma = returns.shift(1).rolling(BAR_LOOKBACK, min_periods=BAR_LOOKBACK).std(ddof=0)
+    scaled = (returns / sigma.clip(lower=1e-12)).to_numpy()
+    median = pd.Series(volume).shift(1).rolling(
+        BAR_LOOKBACK, min_periods=BAR_LOOKBACK).median().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        relative = np.log(np.maximum(volume, 1e-12) / np.maximum(median, 1e-12))
+    relative = np.where(np.isnan(median), np.nan, np.clip(relative, -5.0, 5.0))
+    return np.column_stack([location, body, upper, lower,
+                            np.clip(scaled, -10.0, 10.0), relative])
+
+
 def gather(
         values: np.ndarray,
         anchors: np.ndarray,
         *,
+        features: np.ndarray | None = None,
         context_length: int = CONTEXT_LENGTH,
         forecast_length: int = FORECAST_LENGTH,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return context [B,5,L], future close [B,H], and decision close [B]."""
+    """Return context [B,5(+K),L], future close [B,H], and decision close [B].
+
+    Optional ``features`` [N,K] (e.g. ``bar_structure``) are appended after the
+    OHLCV series as past-only inputs over the same context bars.
+    """
+    anchors = np.asarray(anchors, np.int64)
     offsets = np.arange(-context_length + 1, forecast_length + 1, dtype=np.int64)
-    block = values[np.asarray(anchors, np.int64)[:, None] + offsets[None, :]]
-    context = np.ascontiguousarray(block[:, :context_length].transpose(0, 2, 1))
-    return (context, block[:, context_length:, CLOSE],
+    block = values[anchors[:, None] + offsets[None, :]]
+    context = block[:, :context_length].transpose(0, 2, 1)
+    if features is not None:
+        extra = features[anchors[:, None] + offsets[None, :context_length]]
+        context = np.concatenate([context, extra.transpose(0, 2, 1)], axis=1)
+    return (np.ascontiguousarray(context), block[:, context_length:, CLOSE],
             block[:, context_length - 1, CLOSE])
 
 
@@ -366,7 +413,8 @@ def _levels(model) -> np.ndarray:
 
 
 def predict_period(model, stream: Stream, anchors: np.ndarray, *, device: str,
-                   batch_windows: int = 256, horizons: Sequence[int] = HORIZONS):
+                   batch_windows: int = 256, horizons: Sequence[int] = HORIZONS,
+                   features: np.ndarray | None = None):
     """Close quantiles at each horizon [n,Q,K], P(up) [n,K], decision and future closes."""
     import torch
 
@@ -375,7 +423,7 @@ def predict_period(model, stream: Stream, anchors: np.ndarray, *, device: str,
     with torch.no_grad():
         for start in range(0, len(anchors), batch_windows):
             chunk = anchors[start:start + batch_windows]
-            context, future_close, last_close = gather(stream.values, chunk)
+            context, future_close, last_close = gather(stream.values, chunk, features=features)
             _, close_q = forecast_close(
                 model, torch.from_numpy(context.astype(np.float32)).to(device))
             last_t = torch.from_numpy(last_close.astype(np.float32)).to(device)
@@ -390,7 +438,8 @@ def predict_period(model, stream: Stream, anchors: np.ndarray, *, device: str,
 
 def evaluate(model, streams: Mapping[str, Stream], period: str, *, device: str,
              anchors_per_stream: int = 2000, baseline_train_per_stream: int = 3000,
-             batch_windows: int = 256, horizons: Sequence[int] = HORIZONS) -> dict:
+             batch_windows: int = 256, horizons: Sequence[int] = HORIZONS,
+             bar_features: bool = False) -> dict:
     """Score one model on one period, per stream × horizon, with controls."""
     if period not in PERIODS:
         raise ValueError(f"unknown period {period!r}")
@@ -406,7 +455,8 @@ def evaluate(model, streams: Mapping[str, Stream], period: str, *, device: str,
             raise RuntimeError(f"{name}: too few anchors in {period} or train")
         close_q, probability, last_close, future = predict_period(
             model, stream, anchors, device=device, batch_windows=batch_windows,
-            horizons=horizons)
+            horizons=horizons,
+            features=bar_structure(stream.values) if bar_features else None)
         baseline = causal_baseline_scores(stream, train_anchors, anchors, horizons)
         per_stream[name] = score_stream(
             close_q, last_close, future, anchors, levels, baseline, probability,
@@ -420,6 +470,7 @@ def evaluate(model, streams: Mapping[str, Stream], period: str, *, device: str,
         "period_bounds": PERIODS[period],
         "horizons": list(horizons),
         "anchors_per_stream": anchors_per_stream,
+        "bar_features": bool(bar_features),
         "summary": summarize(per_stream, horizons),
         "per_stream": per_stream,
         "elapsed_seconds": time.monotonic() - started,
@@ -595,7 +646,7 @@ def train_forecast_direction(
     if arm not in ARMS:
         raise ValueError(f"arm must be one of {ARMS}")
     if (arm == "a1") != (direction_weight == 0.0) or direction_weight < 0.0:
-        raise ValueError("A1 requires direction_weight=0; A2 requires direction_weight>0")
+        raise ValueError("A1 requires direction_weight=0; A2/A3 require direction_weight>0")
     out_dir, parent = Path(out_dir), Path(parent)
     checkpoint = out_dir / "checkpoint"
     if checkpoint.exists():
@@ -614,6 +665,8 @@ def train_forecast_direction(
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
 
     names = sorted(streams)
+    features = ({name: bar_structure(streams[name].values) for name in names}
+                if uses_bar_features(arm) else {name: None for name in names})
     train_bounds = {name: period_bounds(streams[name].close_ns, *PERIODS["train"])
                     for name in names}
     if any(hi - lo < 1000 for lo, hi in train_bounds.values()):
@@ -640,7 +693,8 @@ def train_forecast_direction(
                 native_sum, direction_sum = 0.0, 0.0
                 for start in range(0, len(anchors), eval_batch_windows):
                     chunk = anchors[start:start + eval_batch_windows]
-                    native, direction = batch_loss(*tensors(gather(streams[name].values, chunk)))
+                    native, direction = batch_loss(*tensors(gather(
+                        streams[name].values, chunk, features=features[name])))
                     native_sum += float(native) * len(chunk)
                     direction_sum += float(direction) * len(chunk)
                 native_by_stream.append(native_sum / len(anchors))
@@ -667,7 +721,8 @@ def train_forecast_direction(
                 name = names[int(pick)]
                 lo, hi = train_bounds[name]
                 anchors = rng.integers(lo, hi, size=int((picks == pick).sum()))
-                context, future_close, last_close = gather(streams[name].values, anchors)
+                context, future_close, last_close = gather(
+                    streams[name].values, anchors, features=features[name])
                 contexts.append(context)
                 futures.append(future_close)
                 lasts.append(last_close)
@@ -716,6 +771,8 @@ def train_forecast_direction(
             "weight_decay": weight_decay, "patience": patience,
             "select_anchors_per_stream": select_anchors_per_stream,
             "horizons": list(horizons), "device": device,
+            "bar_features": uses_bar_features(arm),
+            "bar_feature_names": list(BAR_FEATURES) if uses_bar_features(arm) else [],
         },
         history=history, parent_select=parent_metric, best_select=best_metric,
         best_epoch=best_epoch, step_seconds=step_seconds,
@@ -726,7 +783,7 @@ def train_forecast_direction(
 
 __all__ = [
     "CONTEXT_LENGTH", "FORECAST_LENGTH", "HORIZONS", "PERIODS", "Stream",
-    "build_stage_report", "causal_baseline_scores", "causal_features", "direction_gate", "direction_labels",
+    "BAR_FEATURES", "bar_structure", "build_stage_report", "uses_bar_features", "causal_baseline_scores", "causal_features", "direction_gate", "direction_labels",
     "direction_loss", "evaluate", "evenly_spaced", "forecast_close", "forecast_gate",
     "retention_gate", "select_direction_weight",
     "gather", "load_streams", "p_up", "period_bounds", "quantile_cdf",

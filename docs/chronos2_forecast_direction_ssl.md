@@ -92,6 +92,35 @@ decision time.
 
 A0-base (untouched Chronos-2-small, zero-shot) is scored as a diagnostic only.
 
+**A3, registered 2026-09-28 before any full A3 run.** A3 = the chosen-λ A2
+plus six past-only bar-structure input series:
+
+- close location in the range;
+- body, upper wick and lower wick as fractions of the range;
+- the log return scaled by the previous 20 returns' std;
+- log volume relative to the previous 20 bars' median.
+
+Construction:
+
+- Each series is computed from the bar itself and earlier bars only, and is
+  appended to the stream's Chronos group.
+- Warmup rows are NaN, so Chronos masks them.
+- The target is still close only.
+
+Rationale: Chronos patches 16 bars per token, which blurs how the most recent
+bars closed. A3 makes that structure explicit.
+
+Evaluation:
+
+- Compared with A2 at the same λ and seed, on identical select rows, under the
+  §8 direction gate.
+- Retention is checked on Probe Atlas as for A2.
+- A3 is still SSL: every input and target is derived from the stream's own
+  raw bars.
+
+A3 costs about 2× A2 per step (11 series per group instead of 5). It runs only
+after λ is chosen.
+
 Frozen hyperparameters:
 
 - AdamW, lr 1e-5 (the `native_1000` rate), weight decay 0.01, gradient clip

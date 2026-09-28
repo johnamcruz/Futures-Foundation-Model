@@ -611,3 +611,113 @@ def test_cli_select_writes_a_frozen_selection_record(tmp_path):
     assert record["direction_weight"] == 3.0
     assert record["inputs"]["a2"] == {"3.0": str(lam)}
     assert "frozen_at" in record
+
+
+# ------------------------------------------------------------------ A3 bar-structure inputs
+
+def _bars(rows):
+    """rows of (open, high, low, close, volume)."""
+    return np.asarray(rows, dtype=float)
+
+
+def test_bar_structure_describes_how_each_bar_closed():
+    values = _bars([(10, 12, 8, 11, 100)] * 30 + [(10, 14, 10, 14, 300)])
+    features = fs.bar_structure(values)
+    assert features.shape == (31, len(fs.BAR_FEATURES))
+    last = dict(zip(fs.BAR_FEATURES, features[-1]))
+    assert last["close_location"] == pytest.approx(1.0)      # closed on the high
+    assert last["body"] == pytest.approx(1.0)                # open 10 -> close 14 over range 4
+    assert last["upper_wick"] == pytest.approx(0.0)
+    assert last["lower_wick"] == pytest.approx(0.0)
+    assert last["relative_volume"] == pytest.approx(np.log(3.0))
+    first = dict(zip(fs.BAR_FEATURES, features[0]))
+    assert first["close_location"] == pytest.approx(0.75)
+    assert first["upper_wick"] == pytest.approx(0.25) and first["lower_wick"] == pytest.approx(0.5)
+
+
+def test_bar_structure_handles_zero_range_bars():
+    values = _bars([(10, 10, 10, 10, 50)] * 25)
+    features = fs.bar_structure(values)
+    row = dict(zip(fs.BAR_FEATURES, features[-1]))
+    assert row["close_location"] == 0.5 and row["body"] == 0.0
+    assert row["upper_wick"] == 0.0 and row["lower_wick"] == 0.0
+    assert np.isfinite(features[-1]).all()
+
+
+def test_bar_structure_never_reads_future_bars():
+    stream = _stream(400)
+    base = fs.bar_structure(stream.values)
+    changed = stream.values.copy()
+    changed[301:] = changed[301:] * 1.7 + 5.0
+    after = fs.bar_structure(changed)
+    np.testing.assert_allclose(base[:301], after[:301], equal_nan=True)
+
+
+def test_bar_structure_marks_warmup_as_missing_not_invented():
+    features = fs.bar_structure(_stream(100).values)
+    scaled = [fs.BAR_FEATURES.index("scaled_return"), fs.BAR_FEATURES.index("relative_volume")]
+    assert np.isnan(features[:20, scaled]).all()
+    assert np.isfinite(features[25:]).all()
+
+
+def test_gather_appends_bar_features_after_ohlcv():
+    stream = _stream(600)
+    features = fs.bar_structure(stream.values)
+    context, future, last = fs.gather(stream.values, np.array([300]), features=features,
+                                      context_length=256, forecast_length=64)
+    assert context.shape == (1, 5 + len(fs.BAR_FEATURES), 256)
+    np.testing.assert_allclose(context[0, 5:, -1], features[300])
+    assert context[0, fs.CLOSE, -1] == stream.values[300, fs.CLOSE]
+    assert future[0, 0] == stream.values[301, fs.CLOSE]
+
+
+@needs_torch
+def test_forecast_close_targets_only_close_with_extra_input_series():
+    torch = _torch()
+    fake = _FakeChronos()
+    context = torch.zeros(2, 5 + len(fs.BAR_FEATURES), 32)
+    loss, quantiles = fs.forecast_close(fake, context, torch.ones(2, 32), forecast_length=32)
+    channels = 5 + len(fs.BAR_FEATURES)
+    target = fake.calls[0]["future_target"].reshape(2, channels, 32)
+    assert (target[:, fs.CLOSE] == 1).all()
+    others = [i for i in range(channels) if i != fs.CLOSE]
+    assert torch.isnan(target[:, others]).all()
+    assert fake.calls[0]["group_ids"].tolist() == [0] * channels + [1] * channels
+    assert quantiles[:, 0, 0].tolist() == [3.0, 3.0 + channels]
+    assert loss.item() == pytest.approx(0.2 * channels)
+
+
+def test_a3_requires_a_direction_term(tmp_path):
+    with pytest.raises(ValueError):
+        fs.train_forecast_direction({}, parent=tmp_path, base_snapshot=tmp_path,
+                                    out_dir=tmp_path, provenance={}, arm="a3",
+                                    direction_weight=0.0)
+
+
+def test_only_a3_uses_bar_structure_inputs():
+    assert fs.uses_bar_features("a3")
+    assert not fs.uses_bar_features("a1") and not fs.uses_bar_features("a2")
+
+
+def test_cli_a3_run_directory_and_eval_flag():
+    cli = _cli()
+    args = cli.parse(["train", "--arm", "a3", "--direction-weight", "3"])
+    assert cli.run_settings(args)["out_dir"].name == "a3_lam3_seed0"
+    evaluate = cli.parse(["evaluate", "--checkpoint", "x", "--name", "a3", "--bar-features"])
+    assert evaluate.bar_features
+
+
+@needs_torch
+def test_predict_period_feeds_bar_features_to_the_model():
+    torch = _torch()
+
+    class _Model(_FakeChronos):
+        chronos_config = SimpleNamespace(quantiles=[0.1, 0.5, 0.9])
+
+    stream = _stream(700)
+    model = _Model()
+    fs.predict_period(model, stream, np.array([300, 400]), device="cpu", horizons=(5,),
+                      features=fs.bar_structure(stream.values))
+    channels = 5 + len(fs.BAR_FEATURES)
+    assert model.calls[0]["context"].shape == (2 * channels, 256)
+    assert torch.isfinite(model.calls[0]["context"]).all()
