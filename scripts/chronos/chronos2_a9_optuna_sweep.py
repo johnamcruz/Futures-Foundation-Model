@@ -106,6 +106,14 @@ def trial_name(params: dict, seed: int) -> str:
             f"_h{horizons}_lr{params['learning_rate']:g}_seed{seed}")
 
 
+def find_duplicate(trials: list[dict], params: dict) -> dict | None:
+    """An earlier finished trial (complete or pruned) with exactly these settings."""
+    for trial in trials:
+        if trial.get("state") in ("COMPLETE", "PRUNED") and trial.get("params") == params:
+            return trial
+    return None
+
+
 def top_k_trials(trials: list[dict], k: int) -> list[dict]:
     """Best ``k`` completed trials by score (pruned/failed trials excluded)."""
     completed = [t for t in trials if t.get("state") == "COMPLETE" and t.get("score") is not None]
@@ -190,6 +198,10 @@ def run(args: argparse.Namespace) -> dict:
     study = optuna.create_study(study_name=study_name, storage=storage, direction="maximize",
                                 sampler=make_sampler(optuna, config),
                                 pruner=make_pruner(optuna, config), load_if_exists=True)
+    # a trial left RUNNING by an interrupted process is stale: mark it failed so TPE ignores it
+    for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+        study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+        print(f"[a9-sweep] marked interrupted trial {stale.number} as failed", flush=True)
     distributions = {key: optuna.distributions.CategoricalDistribution(tuple(values))
                      for key, values in config["search_space"].items()}
     known = {tuple(sorted(t.params.items())) for t in study.trials}
@@ -258,6 +270,17 @@ def run(args: argparse.Namespace) -> dict:
         params = {key: trial.suggest_categorical(key, tuple(values))
                   for key, values in config["search_space"].items()}
         name = trial_name(params, int(training["seed"]))
+        earlier = find_duplicate(
+            [{"number": t.number, "state": t.state.name, "params": t.params, "score": t.value}
+             for t in study.trials if t.number != trial.number], params)
+        if earlier is not None:
+            # same seed + same settings is deterministic: reuse, never retrain (saves ~1.5 h)
+            trial.set_user_attr("duplicate_of", earlier["number"])
+            print(f"[a9-sweep] trial {trial.number} duplicates trial {earlier['number']} "
+                  f"({name}); reusing its result", flush=True)
+            if earlier["state"] == "PRUNED":
+                raise optuna.TrialPruned(f"duplicate of pruned trial {earlier['number']}")
+            return earlier["score"]
         out_dir = sweep_dir / "trials" / f"t{trial.number:03d}_{name}"
         trial.set_user_attr("out_dir", str(out_dir))
 

@@ -117,3 +117,18 @@ def test_search_scoring_is_light_and_confirmation_is_full_size():
     assert config["evaluation"]["probe_eval_per_stream"] == 1000
     full = config["confirmation_evaluation"]
     assert full["anchors_per_stream"] == 2000 and full["probe_eval_per_stream"] == 1500
+
+
+def test_duplicate_settings_reuse_the_earlier_result():
+    sweep = _sweep()
+    trials = [{"number": 0, "state": "COMPLETE", "score": 0.5071,
+               "params": {"direction_weight": 3.0, "focal_gamma": 0.0}},
+              {"number": 1, "state": "COMPLETE", "score": 0.5098,
+               "params": {"direction_weight": 2.0, "focal_gamma": 2.0}},
+              {"number": 2, "state": "PRUNED", "score": None,
+               "params": {"direction_weight": 5.0, "focal_gamma": 1.0}}]
+    hit = sweep.find_duplicate(trials, {"focal_gamma": 2.0, "direction_weight": 2.0})
+    assert hit["number"] == 1 and hit["score"] == 0.5098
+    pruned = sweep.find_duplicate(trials, {"direction_weight": 5.0, "focal_gamma": 1.0})
+    assert pruned["state"] == "PRUNED"
+    assert sweep.find_duplicate(trials, {"direction_weight": 10.0, "focal_gamma": 0.0}) is None
