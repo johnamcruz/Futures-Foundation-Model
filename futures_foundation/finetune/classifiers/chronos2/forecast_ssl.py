@@ -51,7 +51,7 @@ PERIODS: dict[str, tuple[str | None, str]] = {
     "select": ("2025-07-15T00:00:00+00:00", "2025-10-01T00:00:00+00:00"),
     "outer": ("2025-10-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
 }
-ARMS = ("a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8")
+ARMS = ("a1", "a2", "a3", "a7", "a8")
 # Mirrored-future contrastive direction: the context must pick its real future
 # path over the same path sign-flipped.  The paths have identical magnitude, so
 # only direction can separate them.
@@ -72,8 +72,6 @@ LIQUIDITY_HORIZONS = (5, 10)
 # Candle Range Theory: what each candle did to the previous candle's range.
 CRT_CLASSES = ("inside", "bull_breakout", "bear_sweep", "bear_breakout", "bull_sweep",
                "outside")
-CRT_STEPS = 5
-CRT_WEIGHT = 1.0
 DIRECTION_HEAD_POLICY = "training_only_teacher_discarded"
 BAR_FEATURES = ("close_location", "body", "upper_wick", "lower_wick",
                 "scaled_return", "relative_volume")
@@ -90,18 +88,18 @@ FIRST_PASSAGE_LOOKBACK = 128
 
 
 def uses_bar_features(arm: str) -> bool:
-    """A3/A6 add past-only bar-structure inputs; the other arms read OHLCV only."""
-    return arm in ("a3", "a6")
+    """A3 adds past-only bar-structure inputs; the other arms read OHLCV only."""
+    return arm == "a3"
 
 
 def uses_direction_head(arm: str) -> bool:
-    """A4 teaches the encoder through a direction head on its forecast tokens.
+    """A7/A8 teach the encoder through a training-only head on its forecast tokens.
 
     The head is a training-only teacher: it is discarded after training and
     never ships.  Direction is evaluated from the model itself (native quantile
     P(up) and Probe Atlas REG probes), so the stage stays SSL-only.
     """
-    return arm in ("a4", "a5", "a6", "a7", "a8")
+    return arm in ("a7", "a8")
 
 
 def uses_liquidity_teacher(arm: str) -> bool:
@@ -113,18 +111,6 @@ def uses_liquidity_teacher(arm: str) -> bool:
 def uses_mirror_contrastive(arm: str) -> bool:
     """A8 (plan R3'): A1 plus a training-only mirrored-future contrastive teacher."""
     return arm == "a8"
-
-
-def uses_crt_teacher(arm: str) -> bool:
-    """A6 = A3 plus a training-only teacher that learns, candle by candle, what
-    each of the next ``CRT_STEPS`` candles does to its predecessor's range."""
-    return arm == "a6"
-
-
-def uses_first_passage(arm: str) -> bool:
-    """A5: the teacher learns P(hit) and P(up | hit) of symmetric ±k·σ barriers,
-    i.e. which side a coming expansion breaks first.  Still SSL and discarded."""
-    return arm == "a5"
 
 
 @dataclass(frozen=True)
@@ -379,24 +365,6 @@ def make_direction_head(d_model: int, n_patches: int, horizons: Sequence[int] = 
                          nn.GELU(), nn.Linear(128, outputs_per_horizon * len(horizons)))
 
 
-def first_passage_targets(future_close, last_close, sigma, barriers=FIRST_PASSAGE_BARRIERS):
-    """Torch twin of ``first_passage`` for a batch: (hit [B,K], up [B,K])."""
-    import torch
-
-    # log of the ratio, not a difference of logs: float32-safe (MPS has no float64)
-    log_move = torch.log(future_close / last_close[:, None])
-    hits, ups = [], []
-    for horizon, k in barriers:
-        progress = log_move[:, :horizon] / sigma[:, None]
-        steps = torch.arange(1, horizon + 1, device=progress.device)
-        never = torch.full_like(progress, horizon + 1, dtype=torch.long)
-        first_up = torch.where(progress >= k, steps, never).min(1).values
-        first_down = torch.where(progress <= -k, steps, never).min(1).values
-        hits.append(torch.minimum(first_up, first_down) <= horizon)
-        ups.append(first_up < first_down)
-    return torch.stack(hits, 1), torch.stack(ups, 1)
-
-
 def liquidity_teacher_loss(logits, up, valid):
     """BCE on P(up at h) over cells that are liquidity-event bars whose close moved."""
     import torch.nn.functional as F
@@ -483,39 +451,6 @@ def mirror_contrastive_loss(context_embedding, real_embedding, mirror_embedding,
         return losses[valid].mean()
     return losses.mean()
 
-
-def crt_teacher_loss(logits, targets):
-    """Cross-entropy of the teacher's per-candle CRT class logits [B, steps*C]."""
-    import torch.nn.functional as F
-
-    count = len(CRT_CLASSES)
-    return F.cross_entropy(logits.reshape(-1, count), targets.reshape(-1).long())
-
-
-def first_passage_teacher_loss(logits, hit, up):
-    """BCE on P(hit) plus BCE on P(up | hit) over rows where a barrier was hit."""
-    import torch.nn.functional as F
-
-    count = hit.shape[1]
-    hit_logits, side_logits = logits[:, :count], logits[:, count:]
-    loss = F.binary_cross_entropy_with_logits(hit_logits, hit.to(logits.dtype))
-    if hit.any():
-        loss = loss + F.binary_cross_entropy_with_logits(
-            side_logits[hit], up[hit].to(logits.dtype))
-    return loss
-
-
-def head_direction_loss(logits, last_close, future_close, horizons: Sequence[int] = HORIZONS):
-    """BCE-with-logits of the teacher head against ``close[t+h] > close[t]``."""
-    import torch
-    import torch.nn.functional as F
-
-    target = torch.stack([
-        (future_close[:, h - 1] > last_close) for h in horizons], dim=1).to(logits.dtype)
-    return F.binary_cross_entropy_with_logits(logits, target)
-
-
-# ----------------------------------------------------------------- numpy metrics
 
 def auc_with_se(labels: np.ndarray, scores: np.ndarray, n_effective: float) -> tuple[float, float]:
     """ROC AUC and a Hanley-McNeil SE computed on effective (non-overlapping) counts."""
@@ -650,12 +585,6 @@ def liquidity_break_events(stream: Stream) -> np.ndarray:
             classes == CRT_CLASSES.index("bear_breakout"),
         ])
     return events & np.isfinite(values).all(1)[:, None]
-
-
-def crt_targets(classes: np.ndarray, anchors: np.ndarray, steps: int = CRT_STEPS) -> np.ndarray:
-    """CRT classes of candles t+1..t+steps for each anchor t -> [B, steps]."""
-    anchors = np.asarray(anchors, np.int64)
-    return classes[anchors[:, None] + 1 + np.arange(steps)[None, :]]
 
 
 def recent_volatility(stream: Stream, anchors: np.ndarray, lookback: int = BAR_LOOKBACK) -> np.ndarray:
@@ -1270,10 +1199,7 @@ def build_stage_report(*, arm: str, direction_weight: float, seed: int, parent_p
         "config": {
             "arm": arm, "direction_weight": direction_weight, "seed": seed,
             "direction_head": DIRECTION_HEAD_POLICY if uses_direction_head(arm) else "none",
-            "direction_target": ("first_passage_side" if uses_first_passage(arm)
-                                 else "close_above_decision_close"),
-            "crt_teacher": ({"steps": CRT_STEPS, "classes": list(CRT_CLASSES),
-                             "weight": CRT_WEIGHT} if uses_crt_teacher(arm) else None),
+            "direction_target": "close_above_decision_close",
             "mirror_contrastive": ({"path_length": MIRROR_LENGTH, "dim": MIRROR_DIM,
                                     "logit_scale_init": MIRROR_LOGIT_SCALE_INIT,
                                     "logit_scale_cap": MIRROR_LOGIT_SCALE_CAP,
@@ -1359,17 +1285,9 @@ def train_forecast_direction(
     if uses_direction_head(arm):
         if uses_mirror_contrastive(arm):
             teacher = make_mirror_teacher(int(base.model_dim), FORECAST_LENGTH // 16).to(device)
-        elif uses_liquidity_teacher(arm):
-            teacher = make_direction_head(
-                int(base.model_dim), FORECAST_LENGTH // 16, LIQUIDITY_HORIZONS).to(device)
-        elif uses_crt_teacher(arm):
-            teacher = make_direction_head(
-                int(base.model_dim), FORECAST_LENGTH // 16, range(CRT_STEPS),
-                outputs_per_horizon=len(CRT_CLASSES)).to(device)
         else:
             teacher = make_direction_head(
-                int(base.model_dim), FORECAST_LENGTH // 16, horizons,
-                outputs_per_horizon=2 if uses_first_passage(arm) else 1).to(device)
+                int(base.model_dim), FORECAST_LENGTH // 16, LIQUIDITY_HORIZONS).to(device)
         parameters += list(teacher.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
 
@@ -1377,8 +1295,6 @@ def train_forecast_direction(
     features = ({name: bar_structure(streams[name].values) for name in names}
                 if uses_bar_features(arm) else {name: None for name in names})
     sigmas = {name: true_range_scale(streams[name].values) for name in names}
-    crts = ({name: candle_range_classes(streams[name].values) for name in names}
-            if uses_crt_teacher(arm) else None)
     liquidity = ({name: liquidity_break_events(streams[name]).any(1) for name in names}
                  if uses_liquidity_teacher(arm) else None)
     train_bounds = {name: period_bounds(streams[name].close_ns, *PERIODS["train"],
@@ -1391,7 +1307,7 @@ def train_forecast_direction(
                                            context_length=context_length),
                             select_anchors_per_stream) for name in names}
 
-    def batch_loss(context, future_close, last_close, sigma, crt=None, event=None):
+    def batch_loss(context, future_close, last_close, sigma, event=None):
         """-> (native, direction, extra); objective = native + λ·direction + extra."""
         zero = torch.zeros((), device=context.device)
         if uses_mirror_contrastive(arm):
@@ -1409,19 +1325,6 @@ def train_forecast_direction(
             valid = event[:, None] & (ends != last_close[:, None])
             return (native, liquidity_teacher_loss(
                 teacher(hidden), ends > last_close[:, None], valid), zero)
-        if uses_crt_teacher(arm):
-            native, close_q, hidden = forecast_close(
-                base, context, future_close, return_hidden=True)
-            direction = direction_loss(close_q, last_close, future_close, levels, horizons,
-                                       mask_ties=mask_ties)
-            return native, direction, CRT_WEIGHT * crt_teacher_loss(teacher(hidden), crt)
-        if teacher is not None:
-            native, _, hidden = forecast_close(base, context, future_close, return_hidden=True)
-            if uses_first_passage(arm):
-                hit, up = first_passage_targets(future_close, last_close, sigma)
-                return native, first_passage_teacher_loss(teacher(hidden), hit, up), zero
-            return (native, head_direction_loss(teacher(hidden), last_close, future_close,
-                                                horizons), zero)
         native, close_q = forecast_close(base, context, future_close)
         direction = direction_loss(close_q, last_close, future_close, levels, horizons,
                                    mask_ties=mask_ties)
@@ -1434,11 +1337,6 @@ def train_forecast_direction(
             return None
         return torch.from_numpy(overlap_false_negatives(
             streams_of_rows, anchors_of_rows)).to(device)
-
-    def crt_tensor(name, anchors):
-        if crts is None:
-            return None
-        return torch.from_numpy(crt_targets(crts[name], anchors)).to(device)
 
     def event_tensor(name, anchors):
         if uses_mirror_contrastive(arm):
@@ -1465,8 +1363,7 @@ def train_forecast_direction(
                     native, direction, extra = batch_loss(*tensors((*gather(
                         streams[name].values, chunk, features=features[name],
                         context_length=context_length),
-                        sigmas[name][chunk])), crt_tensor(name, chunk),
-                        event_tensor(name, chunk))
+                        sigmas[name][chunk])), event_tensor(name, chunk))
                     native_sum += float(native) * len(chunk)
                     direction_sum += float(direction) * len(chunk)
                     extra_sum += float(extra) * len(chunk)
@@ -1480,8 +1377,6 @@ def train_forecast_direction(
         extra = float(np.mean(extra_by_stream))
         metric = {"native": native, "direction_bce": direction,
                   "objective": native + direction_weight * direction + extra}
-        if uses_crt_teacher(arm):
-            metric["crt_ce"] = extra / CRT_WEIGHT
         return metric
 
     started = time.monotonic()
@@ -1496,7 +1391,7 @@ def train_forecast_direction(
         for _ in range(steps_per_epoch):
             tick = time.monotonic()
             picks = rng.integers(len(names), size=batch_windows)
-            contexts, futures, lasts, scales, candle_targets, events = [], [], [], [], [], []
+            contexts, futures, lasts, scales, events = [], [], [], [], []
             row_streams, row_anchors = [], []
             for pick in np.unique(picks):
                 name = names[int(pick)]
@@ -1509,8 +1404,6 @@ def train_forecast_direction(
                 futures.append(future_close)
                 lasts.append(last_close)
                 scales.append(sigmas[name][anchors])
-                if crts is not None:
-                    candle_targets.append(crt_targets(crts[name], anchors))
                 if liquidity is not None:
                     events.append(liquidity[name][anchors])
                 row_streams.append(np.full(len(anchors), int(pick)))
@@ -1518,14 +1411,11 @@ def train_forecast_direction(
             context, future_close, last_close, sigma = tensors((
                 np.concatenate(contexts), np.concatenate(futures), np.concatenate(lasts),
                 np.concatenate(scales)))
-            crt = (torch.from_numpy(np.concatenate(candle_targets)).to(device)
-                   if candle_targets else None)
             event = (torch.from_numpy(np.concatenate(events)).to(device) if events else None)
             if uses_mirror_contrastive(arm):
                 mirror_state["use_mirror"] = epoch >= MIRROR_WARMUP_EPOCHS
                 event = overlap_tensor(np.concatenate(row_streams), np.concatenate(row_anchors))
-            native, direction, extra = batch_loss(
-                context, future_close, last_close, sigma, crt, event)
+            native, direction, extra = batch_loss(context, future_close, last_close, sigma, event)
             loss = native + direction_weight * direction + extra
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite forecast training loss")
@@ -1586,9 +1476,8 @@ __all__ = [
     "CRT_CLASSES", "LIQUIDITY_EVENTS", "future_path", "make_mirror_teacher",
     "overlap_false_negatives", "mirror_contrastive_loss", "mirror_path",
     "uses_mirror_contrastive", "stack_gain", "stream_prediction_rows", "probe_side", "reg_embeddings", "reg_probe_report", "candle_range_classes", "liquidity_break_events",
-    "liquidity_teacher_loss", "uses_liquidity_teacher", "crt_targets", "crt_teacher_loss", "uses_crt_teacher",
-    "first_passage_targets", "first_passage_teacher_loss", "uses_first_passage",
-    "true_range_scale", "bar_structure", "head_direction_loss",
+    "liquidity_teacher_loss", "uses_liquidity_teacher",
+    "true_range_scale", "bar_structure",
     "make_direction_head", "recent_volatility", "uses_direction_head", "build_stage_report", "uses_bar_features", "causal_baseline_scores", "causal_features", "direction_gate", "direction_labels",
     "direction_loss", "evaluate", "evenly_spaced", "forecast_close", "forecast_gate",
     "rank_arms", "retention_gate", "select_direction_weight",

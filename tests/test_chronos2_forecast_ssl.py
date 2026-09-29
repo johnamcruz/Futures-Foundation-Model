@@ -831,32 +831,8 @@ def test_direction_head_maps_forecast_tokens_to_one_logit_per_horizon():
     assert tokens.grad is not None and tokens.grad.abs().sum() > 0
 
 
-@needs_torch
-def test_head_direction_loss_matches_bce_on_labels():
-    torch = _torch()
-    logits = torch.tensor([[2.0, -2.0]])
-    last = torch.tensor([100.0])
-    future = torch.full((1, 10), 101.0)              # up at both horizons
-    loss = fs.head_direction_loss(logits, last, future, horizons=(5, 10))
-    expected = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits, torch.tensor([[1.0, 1.0]]))
-    assert loss.item() == pytest.approx(expected.item())
-
-
-def test_only_a4_uses_a_direction_head():
-    assert fs.uses_direction_head("a4")
-    assert not any(fs.uses_direction_head(arm) for arm in ("a1", "a2", "a3"))
-
-
-def test_a4_requires_a_direction_term(tmp_path):
-    with pytest.raises(ValueError):
-        fs.train_forecast_direction({}, parent=tmp_path, base_snapshot=tmp_path,
-                                    out_dir=tmp_path, provenance={}, arm="a4",
-                                    direction_weight=0.0)
-
-
-def test_a4_head_is_a_training_only_teacher_and_never_ships():
-    """SSL-only: the A4 head teaches the encoder and is discarded. Evaluation
+def test_teacher_heads_are_training_only_and_never_ship():
+    """SSL-only: A7/A8 heads teach the encoder and are discarded. Evaluation
     reads direction from the model itself (native quantile P(up), Atlas REG)."""
     import inspect
 
@@ -865,21 +841,12 @@ def test_a4_head_is_a_training_only_teacher_and_never_ships():
     assert "direction_head" not in inspect.signature(fs.evaluate).parameters
 
 
-def test_cli_a4_run_directory_and_no_head_flag():
-    cli = _cli()
-    args = cli.parse(["train", "--arm", "a4", "--direction-weight", "3"])
-    assert cli.run_settings(args)["out_dir"].name == "a4_lam3_seed0"
-    with pytest.raises(SystemExit):
-        cli.parse(["evaluate", "--checkpoint", "x", "--name", "a4",
-                   "--direction-head", "x/direction_head.pt"])
-
-
-def test_a4_stage_report_records_the_discarded_teacher(tmp_path):
+def test_teacher_stage_report_records_the_discarded_teacher(tmp_path):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "adapter_model.safetensors").write_bytes(b"w")
     report = fs.build_stage_report(
-        arm="a4", direction_weight=3.0, seed=0, parent_path="/p", parent_sha256="c" * 64,
+        arm="a7", direction_weight=3.0, seed=0, parent_path="/p", parent_sha256="c" * 64,
         checkpoint=checkpoint, base_identity={}, provenance={}, timeframes=("3min",),
         streams=["NQ@3min"], code=None, training={}, history=[], parent_select={},
         best_select={}, best_epoch=0, step_seconds=[1.0], elapsed_seconds=1.0)
@@ -948,43 +915,6 @@ def test_first_passage_reads_only_the_next_horizon_bars():
     assert not hits[0]
 
 
-@needs_torch
-def test_torch_first_passage_targets_match_the_numpy_reference():
-    torch = _torch()
-    stream = _stream(900, seed=7)
-    sigma = fs.true_range_scale(stream.values)
-    anchors = np.arange(300, 700, 7)
-    _, future, last = fs.gather(stream.values, anchors, context_length=256, forecast_length=64)
-    hit_t, up_t = fs.first_passage_targets(
-        torch.tensor(future), torch.tensor(last), torch.tensor(sigma[anchors]))
-    for index, (horizon, k) in enumerate(fs.FIRST_PASSAGE_BARRIERS):
-        hit, up, _ = fs.first_passage(stream.values, anchors, sigma, horizon=horizon, k=k)
-        assert hit_t[:, index].numpy().tolist() == hit.tolist()
-        assert up_t[:, index].numpy()[hit].tolist() == up[hit].tolist()
-
-
-@needs_torch
-def test_first_passage_teacher_loss_learns_side_only_where_a_barrier_was_hit():
-    torch = _torch()
-    k = len(fs.FIRST_PASSAGE_BARRIERS)
-    hit = torch.tensor([[True] * k, [False] * k])
-    up = torch.tensor([[True] * k, [True] * k])
-    good = torch.cat([torch.full((2, k), 0.0), torch.tensor([[5.0] * k, [-5.0] * k])], 1)
-    # Changing the side logit of the no-hit row must not change the loss.
-    flipped = good.clone()
-    flipped[1, k:] = 5.0
-    a = fs.first_passage_teacher_loss(good, hit, up)
-    assert a.item() == pytest.approx(fs.first_passage_teacher_loss(flipped, hit, up).item())
-    wrong = good.clone()
-    wrong[0, k:] = -5.0
-    assert fs.first_passage_teacher_loss(wrong, hit, up) > a
-
-
-def test_a5_is_a_first_passage_teacher_arm():
-    assert fs.uses_direction_head("a5") and fs.uses_first_passage("a5")
-    assert not any(fs.uses_first_passage(arm) for arm in ("a1", "a2", "a3", "a4"))
-
-
 def test_score_stream_reports_side_given_first_passage():
     rng = np.random.default_rng(8)
     n, levels = 600, np.array([0.1, 0.5, 0.9])
@@ -999,33 +929,6 @@ def test_score_stream_reports_side_given_first_passage():
     side = rows["h5"]["first_passage_side"]
     assert side["n"] == int(hit.sum()) and side["auc"] == pytest.approx(1.0)
     assert {"baseline_auc", "hit_rate", "up_rate"} <= set(side)
-
-
-@needs_torch
-def test_first_passage_targets_stay_float32_and_precise_at_index_price_levels(monkeypatch):
-    """MPS has no float64. At NQ-like prices, float32 ratios must still match
-    the float64 numpy labels exactly."""
-    torch = _torch()
-    rng = np.random.default_rng(9)
-    n = 900
-    close = 29000.0 * np.exp(np.cumsum(rng.normal(0, 1.5e-4, n)))
-    close = np.round(close * 4) / 4                           # 0.25 tick
-    values = np.column_stack([close, close + 1.0, close - 1.0, close, np.full(n, 50.0)])
-    sigma = fs.true_range_scale(values)
-    anchors = np.arange(300, 800, 3)
-    _, future, last = fs.gather(values, anchors, context_length=256, forecast_length=64)
-
-    def _no_double(self, *args, **kwargs):
-        raise TypeError("float64 is unavailable on MPS")
-
-    monkeypatch.setattr(torch.Tensor, "double", _no_double)
-    hit_t, up_t = fs.first_passage_targets(
-        torch.tensor(future, dtype=torch.float32), torch.tensor(last, dtype=torch.float32),
-        torch.tensor(sigma[anchors], dtype=torch.float32))
-    for index, (horizon, k) in enumerate(fs.FIRST_PASSAGE_BARRIERS):
-        hit, up, _ = fs.first_passage(values, anchors, sigma, horizon=horizon, k=k)
-        assert hit_t[:, index].numpy().tolist() == hit.tolist()
-        assert up_t[:, index].numpy()[hit].tolist() == up[hit].tolist()
 
 
 # ------------------------------------------------------------------ A6 candle-range (CRT) teacher
@@ -1059,36 +962,6 @@ def test_candle_range_classes_are_causal():
     changed = stream.values.copy()
     changed[201:] *= 1.3
     np.testing.assert_array_equal(base[:201], fs.candle_range_classes(changed)[:201])
-
-
-def test_crt_targets_are_the_next_candles_classes():
-    classes = np.arange(100) % len(fs.CRT_CLASSES)
-    targets = fs.crt_targets(classes, np.array([10, 50]), steps=5)
-    assert targets.tolist() == [classes[11:16].tolist(), classes[51:56].tolist()]
-
-
-@needs_torch
-def test_crt_teacher_loss_prefers_the_realized_candle_classes():
-    torch = _torch()
-    steps, count = 5, len(fs.CRT_CLASSES)
-    targets = torch.tensor([[1, 2, 0, 4, 3]])
-    right = torch.full((1, steps * count), -3.0)
-    for step, cls in enumerate(targets[0].tolist()):
-        right[0, step * count + cls] = 3.0
-    wrong = torch.roll(right, 1, dims=1)
-    assert fs.crt_teacher_loss(right, targets) < fs.crt_teacher_loss(wrong, targets)
-
-
-def test_a6_is_a3_plus_a_crt_teacher():
-    assert fs.uses_crt_teacher("a6") and fs.uses_bar_features("a6")
-    assert fs.uses_direction_head("a6")
-    assert not any(fs.uses_crt_teacher(arm) for arm in ("a1", "a2", "a3", "a4", "a5"))
-
-
-def test_cli_a6_run_directory():
-    cli = _cli()
-    args = cli.parse(["train", "--arm", "a6", "--direction-weight", "3"])
-    assert cli.run_settings(args)["out_dir"].name == "a6_lam3_seed0"
 
 
 # ------------------------------------------------------------------ ties are not direction
@@ -1202,7 +1075,7 @@ def test_liquidity_teacher_loss_learns_only_on_event_bars_that_moved():
 def test_a7_is_a1_plus_a_liquidity_teacher():
     assert fs.uses_liquidity_teacher("a7") and fs.uses_direction_head("a7")
     assert not fs.uses_bar_features("a7")
-    assert not any(fs.uses_liquidity_teacher(arm) for arm in ("a1", "a2", "a3", "a4", "a5", "a6"))
+    assert not any(fs.uses_liquidity_teacher(arm) for arm in ("a1", "a2", "a3", "a8"))
 
 
 def test_score_stream_reports_direction_on_liquidity_event_bars():
@@ -1376,7 +1249,6 @@ def test_cli_train_mask_ties_flag_names_the_run():
     assert cli.run_settings(args)["out_dir"].name == "a2_lam3_ties-masked_seed0"
 
 
-
 def test_rank_arms_counts_only_generic_checks_and_reports_slices_as_diagnostics():
     """FFM is a generic market-context model: expansion-specific slices are
     reported but do not count toward the ranking."""
@@ -1467,7 +1339,7 @@ def test_mirror_contrastive_loss_only_rewards_the_right_direction():
 def test_r3_mirror_arm_flags():
     assert fs.uses_mirror_contrastive("a8") and fs.uses_direction_head("a8")
     assert not fs.uses_bar_features("a8")
-    assert not any(fs.uses_mirror_contrastive(a) for a in ("a1", "a2", "a3", "a4", "a5", "a6", "a7"))
+    assert not any(fs.uses_mirror_contrastive(a) for a in ("a1", "a2", "a3", "a7"))
 
 
 def test_cli_a8_run_directory():
