@@ -48,6 +48,8 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
         command.add_argument("--smoke", action="store_true",
                              help="NQ/ES@3min, tiny counts, writes under <out-root>/smoke")
+        command.add_argument("--context-length", type=int, default=fs.CONTEXT_LENGTH,
+                             help="bars of context (multiple of 16)")
 
     common(commands.add_parser("preflight"))
 
@@ -78,12 +80,28 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--select-anchors", type=int, default=100)
     train.add_argument("--anchors-per-stream", type=int, default=2000)
     train.add_argument("--baseline-train", type=int, default=3000)
+    train.add_argument("--mask-ties", action="store_true",
+                       help="ignore unchanged closes in the direction loss")
 
     select = commands.add_parser("select")
     select.add_argument("--a1", type=Path, required=True, help="A1 select-period eval JSON")
     select.add_argument("--a2", action="append", required=True, metavar="LAMBDA=PATH",
                         help="A2 select-period eval JSON per direction weight")
     select.add_argument("--out", type=Path, required=True)
+
+    probe = commands.add_parser("probe", help="REG-embedding side probe (consumer view)")
+    common(probe)
+    probe.add_argument("--checkpoint", required=True, help="'base' or a PEFT adapter dir")
+    probe.add_argument("--name", required=True)
+    probe.add_argument("--bar-features", action="store_true")
+    probe.add_argument("--train-per-stream", type=int, default=1500)
+    probe.add_argument("--eval-per-stream", type=int, default=1500)
+
+    rank = commands.add_parser("rank", help="rank arms by the pre-registered checks")
+    rank.add_argument("--eval-dir", type=Path, default=RUN_ROOT / "eval")
+    rank.add_argument("--prefix", default="rescore_")
+    rank.add_argument("--reference", default="a1")
+    rank.add_argument("--out", type=Path, default=RUN_ROOT / "ranking.json")
 
     gate = commands.add_parser("gate")
     gate.add_argument("--kind", choices=("forecast", "direction", "retention"), required=True)
@@ -123,7 +141,10 @@ def run_settings(args: argparse.Namespace) -> dict:
     root = args.out_root / "smoke" if smoke else args.out_root
     if args.command == "train":
         weight = "" if args.arm == "a1" else f"_lam{args.direction_weight:g}"
-        settings["out_dir"] = root / f"{args.arm}{weight}_seed{args.seed}"
+        ties = "_ties-masked" if getattr(args, "mask_ties", False) else ""
+        context = ("" if args.context_length == fs.CONTEXT_LENGTH
+                   else f"_ctx{args.context_length}")
+        settings["out_dir"] = root / f"{args.arm}{weight}{context}{ties}_seed{args.seed}"
     else:
         settings["out_dir"] = root
     return settings
@@ -161,13 +182,25 @@ def _write(path: Path, payload: dict) -> None:
 def _markdown(report: dict, name: str) -> str:
     lines = [f"# {name}: {report['period']}", "",
              "| horizon | mean AUC | min AUC | streams > 0.5 | baseline AUC | "
-             "shuffled AUC | scaled WQL | cov80 |", "|---|---|---|---|---|---|---|---|"]
+             "shuffled AUC | scaled WQL | cov80 | big-move AUC | big-move baseline | "
+             "breakout-side AUC | breakout-side baseline | liquidity-break AUC | "
+             "liquidity-break baseline | stack gain over baseline |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for key, row in report["summary"].items():
+        big = (f"{row['mean_expansion_auc']:.4f} | {row['mean_expansion_baseline_auc']:.4f}"
+               if "mean_expansion_auc" in row else "n/a | n/a")
+        event = (f"{row['mean_event_auc']:.4f} | {row['mean_event_baseline_auc']:.4f}"
+                 if "mean_event_auc" in row else "n/a | n/a")
+        stack = (f"{row['mean_stack_gain']:+.4f} ({row['streams_stack_gain_positive']}/{row['streams']})"
+                 if "mean_stack_gain" in row else "n/a")
+        side = (f"{row['mean_first_passage_side_auc']:.4f} | "
+                f"{row['mean_first_passage_side_baseline_auc']:.4f}"
+                if "mean_first_passage_side_auc" in row else "n/a | n/a")
         lines.append(
             f"| {key} | {row['mean_auc']:.4f} | {row['min_auc']:.4f} | "
             f"{row['streams_auc_above_half']}/{row['streams']} | "
             f"{row['mean_baseline_auc']:.4f} | {row['mean_shuffled_auc']:.4f} | "
-            f"{row['mean_scaled_wql']:.4f} | {row['mean_coverage_80']:.3f} |")
+            f"{row['mean_scaled_wql']:.4f} | {row['mean_coverage_80']:.3f} | {big} | {side} | {event} | {stack} |")
     return "\n".join(lines) + "\n"
 
 
@@ -180,9 +213,18 @@ def _evaluate(model, streams, name, periods, settings, args, identity) -> dict:
             baseline_train_per_stream=settings["baseline_train"],
             batch_windows=getattr(args, "batch_windows", 256) if args.command == "evaluate" else 256,
             bar_features=(args.bar_features if args.command == "evaluate"
-                          else fs.uses_bar_features(args.arm)))
+                          else fs.uses_bar_features(args.arm)),
+            context_length=args.context_length)
+        rows = report.pop("_rows", {})
         report.update({"name": name, **identity})
         destination = settings["out_dir"] / "eval"
+        if rows:
+            import numpy as np
+
+            destination.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(destination / f"{name}_{period}_rows.npz", **{
+                f"{stream}|{field}": value
+                for stream, arrays in rows.items() for field, value in arrays.items()})
         _write(destination / f"{name}_{period}.json", report)
         (destination / f"{name}_{period}.md").write_text(_markdown(report, name))
         print(_markdown(report, name), flush=True)
@@ -207,6 +249,18 @@ def main(argv=None) -> None:
         })
         _write(args.out, choice)
         print(json.dumps(choice, indent=2), flush=True)
+        return
+    if args.command == "rank":
+        evals = {path.name[len(args.prefix):-len("_select.json")]: json.loads(path.read_text())
+                 for path in sorted(args.eval_dir.glob(f"{args.prefix}*_select.json"))}
+        probes = {path.name[:-len("_regprobe_select.json")]: json.loads(path.read_text())
+                  for path in sorted(args.eval_dir.glob("*_regprobe_select.json"))}
+        table = fs.rank_arms(evals, probes, reference=args.reference)
+        _write(args.out, {"reference": args.reference, "ranking": table})
+        for row in table:
+            print(f"{row['arm']:>12} passes={row['passes']}/{len(row['checks'])} "
+                  + " ".join(f"{k}={'Y' if v else '-'}" for k, v in row["checks"].items())
+                  + f" dAUC={row['delta_vs_reference']}", flush=True)
         return
     if args.command == "gate":
         candidate = json.loads(args.candidate.read_text())
@@ -239,6 +293,23 @@ def main(argv=None) -> None:
               f"low_anchor_streams={sorted(low)}", flush=True)
         return
 
+    if args.command == "probe":
+        model = _load_model(args.checkpoint, args.base_snapshot, args.device)
+        report = fs.reg_probe_report(
+            model, streams, device=args.device, bar_features=args.bar_features,
+            context_length=args.context_length,
+            train_per_stream=300 if args.smoke else args.train_per_stream,
+            eval_per_stream=300 if args.smoke else args.eval_per_stream)
+        report.update({"name": args.name,
+                       **_checkpoint_identity(args.checkpoint, args.base_snapshot)})
+        _write(settings["out_dir"] / "eval" / f"{args.name}_regprobe_select.json", report)
+        for target, sources in report["targets"].items():
+            print(f"[reg-probe:{args.name}] {target}: " + " ".join(
+                f"{source}={row['mean_auc']:.4f}({row['streams_above_half']}/{row['streams']}"
+                f",shuf={row['mean_shuffled_auc']:.3f})" for source, row in sources.items()),
+                flush=True)
+        return
+
     if args.command == "evaluate":
         model = _load_model(args.checkpoint, args.base_snapshot, args.device)
         _evaluate(model, streams, args.name, args.periods, settings, args,
@@ -252,7 +323,8 @@ def main(argv=None) -> None:
         epochs=settings["epochs"], steps_per_epoch=settings["steps"],
         batch_windows=args.batch_windows, learning_rate=args.lr,
         weight_decay=args.weight_decay, patience=args.patience,
-        select_anchors_per_stream=settings["select_anchors"], repo_root=ROOT)
+        select_anchors_per_stream=settings["select_anchors"], repo_root=ROOT,
+        mask_ties=args.mask_ties, context_length=args.context_length)
     checkpoint = report["checkpoint"]["path"]
     model = _load_model(checkpoint, args.base_snapshot, args.device)
     _evaluate(model, streams, settings["out_dir"].name, ("select",), settings, args,
