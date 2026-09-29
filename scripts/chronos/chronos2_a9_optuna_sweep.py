@@ -209,8 +209,11 @@ def run(args: argparse.Namespace) -> dict:
                 user_attrs={"seeded_from": str(eval_path), **{k: v for k, v in result.items()
                                                              if k != "score"}}))
 
-    def train_score(params: dict, seed: int, out_dir: Path, report=None) -> dict:
-        """Train one A9 setup, evaluate and probe it on select, return the objective."""
+    def train_score(params: dict, seed: int, out_dir: Path, report=None,
+                    scoring: dict | None = None) -> dict:
+        """Train one A9 setup, evaluate and probe it on select, return the objective.
+        ``scoring`` overrides the evaluation sizes (full size for confirmation)."""
+        scoring = scoring or evaluation
         wait_until_idle()
         try:
             fs.train_forecast_direction(
@@ -232,13 +235,13 @@ def run(args: argparse.Namespace) -> dict:
         try:
             evaluation_report = fs.evaluate(
                 model, streams, "select", device=args.device,
-                anchors_per_stream=int(evaluation["anchors_per_stream"]),
-                baseline_train_per_stream=int(evaluation["baseline_train_per_stream"]))
+                anchors_per_stream=int(scoring["anchors_per_stream"]),
+                baseline_train_per_stream=int(scoring["baseline_train_per_stream"]))
             evaluation_report.pop("_rows", None)
             probe_report = fs.reg_probe_report(
                 model, streams, device=args.device,
-                train_per_stream=int(evaluation["probe_train_per_stream"]),
-                eval_per_stream=int(evaluation["probe_eval_per_stream"]), horizons=probe_horizons)
+                train_per_stream=int(scoring["probe_train_per_stream"]),
+                eval_per_stream=int(scoring["probe_eval_per_stream"]), horizons=probe_horizons)
         finally:
             del model
             _release(args.device)
@@ -302,11 +305,10 @@ def _confirm(args, config: dict, study, sweep_dir: Path, train_score) -> dict:
         key = trial_name(trial["params"], 0).rsplit("_seed", 1)[0]
         scores = []
         for seed in confirmation["seeds"]:
-            if int(seed) == int(config["training"]["seed"]) and trial["score"] is not None:
-                scores.append(float(trial["score"]))      # the sweep trial itself
-                continue
+            # every seed (including the sweep's own) is retrained and scored at full size
             out_dir = sweep_dir / "confirm" / f"{key}_seed{seed}"
-            result = train_score(trial["params"], int(seed), out_dir)
+            result = train_score(trial["params"], int(seed), out_dir,
+                                 scoring=config.get("confirmation_evaluation"))
             details[f"{key}_seed{seed}"] = result
             scores.append(float(result["score"]))
             print(f"[a9-confirm] {key} seed={seed} score={result['score']:.4f}", flush=True)

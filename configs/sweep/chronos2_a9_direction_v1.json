@@ -63,10 +63,10 @@
     "seed": 0
   },
   "evaluation": {
-    "anchors_per_stream": 2000,
+    "anchors_per_stream": 1000,
     "baseline_train_per_stream": 3000,
     "probe_train_per_stream": 1500,
-    "probe_eval_per_stream": 1500
+    "probe_eval_per_stream": 1000
   },
   "seed_trials": [
     {
@@ -89,5 +89,11 @@
       2
     ],
     "rule": "re-run the top-3 trials with 3 seeds each; pick the best mean score; outer period read once only after that"
+  },
+  "confirmation_evaluation": {
+    "anchors_per_stream": 2000,
+    "baseline_train_per_stream": 3000,
+    "probe_train_per_stream": 1500,
+    "probe_eval_per_stream": 1500
   }
 }

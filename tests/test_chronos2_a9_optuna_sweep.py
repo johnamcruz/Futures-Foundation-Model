@@ -108,3 +108,12 @@ def test_confirm_flag_parses():
 def test_smoke_runs_use_their_own_folder():
     source = (ROOT / "scripts/chronos/chronos2_a9_optuna_sweep.py").read_text()
     assert 'storage_path.parent / "smoke" / "study.db"' in source
+
+
+def test_search_scoring_is_light_and_confirmation_is_full_size():
+    sweep = _sweep()
+    config = sweep.load_config(sweep.DEFAULT_CONFIG)
+    assert config["evaluation"]["anchors_per_stream"] == 1000
+    assert config["evaluation"]["probe_eval_per_stream"] == 1000
+    full = config["confirmation_evaluation"]
+    assert full["anchors_per_stream"] == 2000 and full["probe_eval_per_stream"] == 1500
