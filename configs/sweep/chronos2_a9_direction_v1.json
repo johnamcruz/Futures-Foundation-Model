@@ -2,8 +2,8 @@
   "schema": "ffm_chronos2_a9_sweep_v1",
   "description": "TPE search over A9 (direction BCE on the consumer REG embedding): direction weight, focal gamma, horizon set and LoRA learning rate. Select period only; outer and the 2026 holdout stay untouched.",
   "study": {
-    "name": "a9_direction_v1",
-    "storage": "temp/chronos2_small_36stream/forecast_direction/sweep/a9_direction_v1/study.db",
+    "name": "a9_direction_v1b",
+    "storage": "temp/chronos2_small_36stream/forecast_direction/sweep/a9_direction_v1b/study.db",
     "sampler": {
       "type": "tpe",
       "seed": 0,
@@ -15,6 +15,11 @@
       "n_startup_trials": 5,
       "n_warmup_steps": 5,
       "interval_steps": 1
+    },
+    "carry_over_from": {
+      "study": "a9_direction_v1",
+      "storage": "temp/chronos2_small_36stream/forecast_direction/sweep/a9_direction_v1/study.db",
+      "reason": "v1 pruned on focal-scaled BCE (not comparable across focal settings); v1b prunes on plain BCE and keeps v1's distinct final scores"
     }
   },
   "search_space": {

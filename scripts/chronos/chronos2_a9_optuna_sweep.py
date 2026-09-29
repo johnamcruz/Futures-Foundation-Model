@@ -114,6 +114,12 @@ def find_duplicate(trials: list[dict], params: dict) -> dict | None:
     return None
 
 
+def carry_over_trials(trials: list[dict]) -> list[dict]:
+    """Distinct COMPLETE trials (duplicates, failed, pruned and running dropped)."""
+    return [t for t in trials if t.get("state") == "COMPLETE" and t.get("score") is not None
+            and (t.get("user_attrs") or {}).get("duplicate_of") is None]
+
+
 def top_k_trials(trials: list[dict], k: int) -> list[dict]:
     """Best ``k`` completed trials by score (pruned/failed trials excluded)."""
     completed = [t for t in trials if t.get("state") == "COMPLETE" and t.get("score") is not None]
@@ -198,13 +204,29 @@ def run(args: argparse.Namespace) -> dict:
     study = optuna.create_study(study_name=study_name, storage=storage, direction="maximize",
                                 sampler=make_sampler(optuna, config),
                                 pruner=make_pruner(optuna, config), load_if_exists=True)
+    distributions = {key: optuna.distributions.CategoricalDistribution(tuple(values))
+                     for key, values in config["search_space"].items()}
     # a trial left RUNNING by an interrupted process is stale: mark it failed so TPE ignores it
     for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
         study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
         print(f"[a9-sweep] marked interrupted trial {stale.number} as failed", flush=True)
-    distributions = {key: optuna.distributions.CategoricalDistribution(tuple(values))
-                     for key, values in config["search_space"].items()}
     known = {tuple(sorted(t.params.items())) for t in study.trials}
+    carry = config["study"].get("carry_over_from")
+    if carry and not smoke:
+        # final (probe-based) scores are comparable across studies; intermediate values are not
+        previous = optuna.load_study(study_name=carry["study"],
+                                     storage=f"sqlite:///{ROOT / carry['storage']}")
+        rows = [{"number": t.number, "state": t.state.name, "score": t.value,
+                 "params": t.params, "user_attrs": t.user_attrs} for t in previous.trials]
+        for row in carry_over_trials(rows):
+            if tuple(sorted(row["params"].items())) in known:
+                continue
+            study.add_trial(optuna.trial.create_trial(
+                params=row["params"], distributions=distributions, value=row["score"],
+                user_attrs={**row["user_attrs"], "carried_over_from": f"{carry['study']}#{row['number']}"}))
+            known.add(tuple(sorted(row["params"].items())))
+            print(f"[a9-sweep] carried over {carry['study']} trial {row['number']} "
+                  f"score={row['score']:.4f}", flush=True)
     if not smoke:
         for seed_trial in config.get("seed_trials", []):
             params = seed_trial["params"]

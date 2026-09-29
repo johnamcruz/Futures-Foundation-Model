@@ -132,3 +132,33 @@ def test_duplicate_settings_reuse_the_earlier_result():
     pruned = sweep.find_duplicate(trials, {"direction_weight": 5.0, "focal_gamma": 1.0})
     assert pruned["state"] == "PRUNED"
     assert sweep.find_duplicate(trials, {"direction_weight": 10.0, "focal_gamma": 0.0}) is None
+
+
+def test_carry_over_keeps_only_distinct_finished_trials():
+    sweep = _sweep()
+    trials = [
+        {"number": 0, "state": "COMPLETE", "score": 0.507, "params": {"a": 1}, "user_attrs": {}},
+        {"number": 1, "state": "COMPLETE", "score": 0.510, "params": {"a": 2}, "user_attrs": {}},
+        {"number": 3, "state": "FAIL", "score": None, "params": {"a": 2}, "user_attrs": {}},
+        {"number": 4, "state": "COMPLETE", "score": 0.510, "params": {"a": 2},
+         "user_attrs": {"duplicate_of": 1}},
+        {"number": 6, "state": "PRUNED", "score": -0.35, "params": {"a": 5}, "user_attrs": {}},
+        {"number": 7, "state": "RUNNING", "score": None, "params": {"a": 6}, "user_attrs": {}},
+    ]
+    kept = sweep.carry_over_trials(trials)
+    assert [t["number"] for t in kept] == [0, 1]
+
+
+def test_config_starts_a_clean_study_that_carries_over_final_scores():
+    sweep = _sweep()
+    config = sweep.load_config(sweep.DEFAULT_CONFIG)
+    assert config["study"]["name"] == "a9_direction_v1b"
+    carry = config["study"]["carry_over_from"]
+    assert carry["study"] == "a9_direction_v1" and carry["storage"].endswith("study.db")
+
+
+def test_select_direction_metric_is_plain_bce_for_every_trial():
+    """The pruner compares trials epoch by epoch, so the selection metric must be on
+    the same scale whatever focal gamma a trial trains with."""
+    source = (ROOT / "futures_foundation/finetune/classifiers/chronos2/forecast_ssl.py").read_text()
+    assert "focal_gamma=focal_gamma if base.training else 0.0" in source

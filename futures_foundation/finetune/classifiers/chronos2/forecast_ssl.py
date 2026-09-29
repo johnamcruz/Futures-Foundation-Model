@@ -1153,9 +1153,11 @@ def train_forecast_direction(
             native, _, reg = forecast_close(base, context, future_close, return_reg=True)
             ends = torch.stack([future_close[:, h - 1] for h in reg_horizons], 1)
             valid = ends != last_close[:, None]
+            # focal only while training; selection always scores plain BCE so the per-epoch
+            # metric (early stopping, sweep pruning) is comparable across focal settings
             return (native, masked_direction_bce(
                 teacher(reg), ends > last_close[:, None], valid,
-                focal_gamma=focal_gamma), zero)
+                focal_gamma=focal_gamma if base.training else 0.0), zero)
         if uses_mirror_contrastive(arm):
             native, _, hidden = forecast_close(base, context, future_close, return_hidden=True)
             path = future_path(future_close, last_close, MIRROR_LENGTH)
