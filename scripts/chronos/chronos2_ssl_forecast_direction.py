@@ -82,6 +82,10 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--baseline-train", type=int, default=3000)
     train.add_argument("--mask-ties", action="store_true",
                        help="ignore unchanged closes in the direction loss")
+    train.add_argument("--focal-gamma", type=float, default=0.0,
+                       help="A9: focal loss exponent on the direction BCE (0 = plain BCE)")
+    train.add_argument("--reg-horizons", default=",".join(str(h) for h in fs.REG_HORIZONS),
+                       help="A9: comma-separated direction horizons for the embedding head")
 
     select = commands.add_parser("select")
     select.add_argument("--a1", type=Path, required=True, help="A1 select-period eval JSON")
@@ -114,6 +118,14 @@ def parser() -> argparse.ArgumentParser:
 def parse(argv=None) -> argparse.Namespace:
     command = parser()
     args = command.parse_args(argv)
+    if args.command == "train":
+        try:
+            args.reg_horizons = tuple(int(h) for h in str(args.reg_horizons).split(",") if h.strip())
+        except ValueError:
+            command.error("--reg-horizons must be comma-separated integers")
+        if (not args.reg_horizons or min(args.reg_horizons) < 1
+                or max(args.reg_horizons) > fs.FORECAST_LENGTH):
+            command.error(f"--reg-horizons must lie in 1..{fs.FORECAST_LENGTH}")
     if args.command == "evaluate":
         args.periods = tuple(item.strip() for item in args.periods.split(",") if item.strip())
         unknown = set(args.periods) - {"select", "outer"}
@@ -144,7 +156,13 @@ def run_settings(args: argparse.Namespace) -> dict:
         ties = "_ties-masked" if getattr(args, "mask_ties", False) else ""
         context = ("" if args.context_length == fs.CONTEXT_LENGTH
                    else f"_ctx{args.context_length}")
-        settings["out_dir"] = root / f"{args.arm}{weight}{context}{ties}_seed{args.seed}"
+        focal = (f"_focal{getattr(args, 'focal_gamma', 0.0):g}"
+                 if getattr(args, "focal_gamma", 0.0) else "")
+        reg_horizons = tuple(getattr(args, "reg_horizons", fs.REG_HORIZONS))
+        horizons = ("" if reg_horizons == tuple(fs.REG_HORIZONS)
+                    else "_h" + "-".join(str(h) for h in reg_horizons))
+        settings["out_dir"] = root / (f"{args.arm}{weight}{context}{ties}{focal}{horizons}"
+                                      f"_seed{args.seed}")
     else:
         settings["out_dir"] = root
     return settings
@@ -182,25 +200,16 @@ def _write(path: Path, payload: dict) -> None:
 def _markdown(report: dict, name: str) -> str:
     lines = [f"# {name}: {report['period']}", "",
              "| horizon | mean AUC | min AUC | streams > 0.5 | baseline AUC | "
-             "shuffled AUC | scaled WQL | cov80 | big-move AUC | big-move baseline | "
-             "breakout-side AUC | breakout-side baseline | liquidity-break AUC | "
-             "liquidity-break baseline | stack gain over baseline |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "shuffled AUC | scaled WQL | cov80 | stack gain over baseline |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for key, row in report["summary"].items():
-        big = (f"{row['mean_expansion_auc']:.4f} | {row['mean_expansion_baseline_auc']:.4f}"
-               if "mean_expansion_auc" in row else "n/a | n/a")
-        event = (f"{row['mean_event_auc']:.4f} | {row['mean_event_baseline_auc']:.4f}"
-                 if "mean_event_auc" in row else "n/a | n/a")
         stack = (f"{row['mean_stack_gain']:+.4f} ({row['streams_stack_gain_positive']}/{row['streams']})"
                  if "mean_stack_gain" in row else "n/a")
-        side = (f"{row['mean_first_passage_side_auc']:.4f} | "
-                f"{row['mean_first_passage_side_baseline_auc']:.4f}"
-                if "mean_first_passage_side_auc" in row else "n/a | n/a")
         lines.append(
             f"| {key} | {row['mean_auc']:.4f} | {row['min_auc']:.4f} | "
             f"{row['streams_auc_above_half']}/{row['streams']} | "
             f"{row['mean_baseline_auc']:.4f} | {row['mean_shuffled_auc']:.4f} | "
-            f"{row['mean_scaled_wql']:.4f} | {row['mean_coverage_80']:.3f} | {big} | {side} | {event} | {stack} |")
+            f"{row['mean_scaled_wql']:.4f} | {row['mean_coverage_80']:.3f} | {stack} |")
     return "\n".join(lines) + "\n"
 
 
@@ -324,7 +333,8 @@ def main(argv=None) -> None:
         batch_windows=args.batch_windows, learning_rate=args.lr,
         weight_decay=args.weight_decay, patience=args.patience,
         select_anchors_per_stream=settings["select_anchors"], repo_root=ROOT,
-        mask_ties=args.mask_ties, context_length=args.context_length)
+        mask_ties=args.mask_ties, context_length=args.context_length,
+        focal_gamma=args.focal_gamma, reg_horizons=args.reg_horizons)
     checkpoint = report["checkpoint"]["path"]
     model = _load_model(checkpoint, args.base_snapshot, args.device)
     _evaluate(model, streams, settings["out_dir"].name, ("select",), settings, args,

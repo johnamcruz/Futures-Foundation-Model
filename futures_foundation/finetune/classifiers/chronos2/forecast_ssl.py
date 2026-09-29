@@ -51,7 +51,7 @@ PERIODS: dict[str, tuple[str | None, str]] = {
     "select": ("2025-07-15T00:00:00+00:00", "2025-10-01T00:00:00+00:00"),
     "outer": ("2025-10-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
 }
-ARMS = ("a1", "a2", "a3", "a7", "a8", "a9")
+ARMS = ("a1", "a2", "a3", "a8", "a9")
 # A9: direction BCE placed directly on the consumer embedding (the OHLCV REG
 # tokens, concatenated) so the gradient shapes what downstream models read.
 REG_HORIZONS = (5, 10, 20)
@@ -66,28 +66,13 @@ MIRROR_TEMPERATURE = 0.1
 MIRROR_WARMUP_EPOCHS = 3
 MIRROR_LOGIT_SCALE_INIT = float(np.log(1 / 0.07))
 MIRROR_LOGIT_SCALE_CAP = 100.0
-# Osler (2003, 2005): stops cluster beyond obvious levels; a close through one
-# triggers them and the overshoot tends to revert.  Event bars are detected from
-# bars <= t only; prior-day levels come from the completed previous RTH session.
-LIQUIDITY_EVENTS = ("break_20_high", "break_20_low", "break_prior_day_high",
-                    "break_prior_day_low", "crt_bull_breakout", "crt_bear_breakout")
-LIQUIDITY_HORIZONS = (5, 10)
-# Candle Range Theory: what each candle did to the previous candle's range.
-CRT_CLASSES = ("inside", "bull_breakout", "bear_sweep", "bear_breakout", "bull_sweep",
-               "outside")
 DIRECTION_HEAD_POLICY = "training_only_teacher_discarded"
 BAR_FEATURES = ("close_location", "body", "upper_wick", "lower_wick",
                 "scaled_return", "relative_volume")
 BAR_LOOKBACK = 20
-EXPANSION_QUANTILE = 0.8
 # Evaluation memory bound: 256 five-series windows per pass.  Groups with extra
-# input series (A3/A6: 11 series) get proportionally fewer windows per pass.
+# input series (A3: 11 series) get proportionally fewer windows per pass.
 MAX_SERIES_PER_PASS = 256 * 5
-# Symmetric ±k·σ barriers per horizon, k ≈ 0.95·√H: the scaling shared by the
-# downstream expansion labels (3.0σ in 10 bars on 3m, 5.35σ in 30 bars on 1m),
-# expressed as a generic family rather than any one private label point.
-FIRST_PASSAGE_BARRIERS = ((5, 2.1), (10, 3.0), (20, 4.2), (50, 6.7))
-FIRST_PASSAGE_LOOKBACK = 128
 
 
 def uses_bar_features(arm: str) -> bool:
@@ -96,19 +81,13 @@ def uses_bar_features(arm: str) -> bool:
 
 
 def uses_direction_head(arm: str) -> bool:
-    """A7/A8 teach the encoder through a training-only head on its forecast tokens.
+    """A8/A9 teach the encoder through a training-only head (discarded after training).
 
     The head is a training-only teacher: it is discarded after training and
     never ships.  Direction is evaluated from the model itself (native quantile
     P(up) and Probe Atlas REG probes), so the stage stays SSL-only.
     """
-    return arm in ("a7", "a8", "a9")
-
-
-def uses_liquidity_teacher(arm: str) -> bool:
-    """A7 = A1 plus a training-only teacher that learns direction over the next
-    5 and 10 bars only on liquidity-break bars (ties masked)."""
-    return arm == "a7"
+    return arm in ("a8", "a9")
 
 
 def uses_reg_teacher(arm: str) -> bool:
@@ -385,13 +364,25 @@ def make_direction_head(d_model: int, n_patches: int, horizons: Sequence[int] = 
                          nn.GELU(), nn.Linear(128, outputs_per_horizon * len(horizons)))
 
 
-def liquidity_teacher_loss(logits, up, valid):
-    """BCE on P(up at h) over cells that are liquidity-event bars whose close moved."""
+def masked_direction_bce(logits, up, valid, *, focal_gamma: float = 0.0):
+    """BCE on P(up at h) over the ``valid`` cells (e.g. rows whose close moved).
+
+    ``focal_gamma`` > 0 turns it into a focal loss: each cell is scaled by
+    (1 - p_true)^gamma, so confident correct calls fade and wrong-way calls
+    dominate the gradient.
+    """
+    import torch
     import torch.nn.functional as F
 
     if not valid.any():
         return logits.sum() * 0.0
-    return F.binary_cross_entropy_with_logits(logits[valid], up[valid].to(logits.dtype))
+    selected, target = logits[valid], up[valid].to(logits.dtype)
+    losses = F.binary_cross_entropy_with_logits(selected, target, reduction="none")
+    if focal_gamma > 0:
+        probability = torch.sigmoid(selected)
+        p_true = torch.where(target > 0.5, probability, 1.0 - probability)
+        losses = (1.0 - p_true).pow(focal_gamma) * losses
+    return losses.mean()
 
 
 def future_path(future_close, last_close, length: int | None = None):
@@ -524,108 +515,6 @@ def causal_features(stream: Stream, anchors: np.ndarray) -> np.ndarray:
         np.sin(hour), np.cos(hour)])
 
 
-def true_range_scale(values: np.ndarray, lookback: int = FIRST_PASSAGE_LOOKBACK) -> np.ndarray:
-    """Causal σ_t: trailing median (including bar t) of log true range; NaN in warmup."""
-    values = np.asarray(values, np.float64)
-    high, low, close = np.log(values[:, 1]), np.log(values[:, 2]), np.log(values[:, 3])
-    previous = np.concatenate([[close[0]], close[:-1]])
-    true_range = np.maximum.reduce([
-        high - low, np.abs(high - previous), np.abs(low - previous)])
-    true_range[0] = high[0] - low[0]
-    return pd.Series(true_range).rolling(lookback, min_periods=lookback).median().to_numpy()
-
-
-def first_passage(values: np.ndarray, anchors: np.ndarray, sigma: np.ndarray, *,
-                  horizon: int, k: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Which ±k·σ_t barrier a close in t+1..t+H reaches first.
-
-    Returns (hit, up, first_offset): ``up`` is meaningful only where ``hit``;
-    ``first_offset`` is 1..H, or 0 when neither barrier is reached.  Progress
-    is (log close[t+j] - log close[t]) / σ_t with σ held fixed at the anchor.
-    """
-    anchors = np.asarray(anchors, np.int64)
-    log_close = np.log(np.asarray(values, np.float64)[:, CLOSE])
-    offsets = np.arange(1, horizon + 1)
-    progress = ((log_close[anchors[:, None] + offsets[None, :]] - log_close[anchors][:, None])
-                / sigma[anchors][:, None])
-    never = horizon + 1
-    first_up = np.where((progress >= k).any(1), (progress >= k).argmax(1) + 1, never)
-    first_down = np.where((progress <= -k).any(1), (progress <= -k).argmax(1) + 1, never)
-    hit = np.minimum(first_up, first_down) <= horizon
-    return hit, first_up < first_down, np.where(hit, np.minimum(first_up, first_down), 0)
-
-
-def candle_range_classes(values: np.ndarray) -> np.ndarray:
-    """CRT class of every candle against the previous candle (index into CRT_CLASSES).
-
-    Took only the prior high: bull breakout if it closed above it, else bear
-    sweep.  Took only the prior low: bear breakout if it closed below it, else
-    bull sweep.  Took both: outside.  Took neither (or first candle): inside.
-    """
-    values = np.asarray(values, np.float64)
-    high, low, close = values[:, 1], values[:, 2], values[:, 3]
-    classes = np.zeros(len(values), dtype=np.int64)
-    if len(values) < 2:
-        return classes
-    prior_high, prior_low = high[:-1], low[:-1]
-    took_high, took_low = high[1:] > prior_high, low[1:] < prior_low
-    current = np.zeros(len(values) - 1, dtype=np.int64)
-    only_high, only_low = took_high & ~took_low, took_low & ~took_high
-    current[only_high & (close[1:] > prior_high)] = CRT_CLASSES.index("bull_breakout")
-    current[only_high & (close[1:] <= prior_high)] = CRT_CLASSES.index("bear_sweep")
-    current[only_low & (close[1:] < prior_low)] = CRT_CLASSES.index("bear_breakout")
-    current[only_low & (close[1:] >= prior_low)] = CRT_CLASSES.index("bull_sweep")
-    current[took_high & took_low] = CRT_CLASSES.index("outside")
-    classes[1:] = current
-    return classes
-
-
-def liquidity_break_events(stream: Stream) -> np.ndarray:
-    """Bool [N, len(LIQUIDITY_EVENTS)]: closes through a liquidity level at bar t.
-
-    20-bar levels use bars t-20..t-1.  Prior-day levels are the previous
-    trading day's RTH high/low (bars closing 09:31-16:00 ET; the trading day
-    rolls at 18:00 ET), so they are complete before the current session opens.
-    A prior-day break is the first close beyond the level (previous close was
-    not beyond it).
-    """
-    values = np.asarray(stream.values, np.float64)
-    high, low, close = values[:, 1], values[:, 2], values[:, 3]
-    previous_close = np.concatenate([[close[0]], close[:-1]])
-    high_20 = pd.Series(high).rolling(20, min_periods=20).max().shift(1).to_numpy()
-    low_20 = pd.Series(low).rolling(20, min_periods=20).min().shift(1).to_numpy()
-    et = pd.DatetimeIndex(stream.close_ns, tz="UTC").tz_convert("America/New_York")
-    minutes = (et.hour * 60 + et.minute).to_numpy()
-    regular = (minutes > 570) & (minutes <= 960)
-    trading_day = (et.tz_localize(None) - np.timedelta64(18, "h")).normalize()
-    frame = pd.DataFrame({"day": trading_day, "high": high, "low": low})
-    session = frame[regular].groupby("day").agg(high=("high", "max"), low=("low", "min"))
-    days = pd.Index(sorted(frame["day"].unique()))
-    session = session.reindex(days).shift(1)            # previous trading day's RTH
-    prior_high = pd.Series(trading_day).map(session["high"]).to_numpy(float)
-    prior_low = pd.Series(trading_day).map(session["low"]).to_numpy(float)
-    classes = candle_range_classes(values)
-    with np.errstate(invalid="ignore"):
-        events = np.column_stack([
-            close > high_20,
-            close < low_20,
-            (close > prior_high) & (previous_close <= prior_high),
-            (close < prior_low) & (previous_close >= prior_low),
-            classes == CRT_CLASSES.index("bull_breakout"),
-            classes == CRT_CLASSES.index("bear_breakout"),
-        ])
-    return events & np.isfinite(values).all(1)[:, None]
-
-
-def recent_volatility(stream: Stream, anchors: np.ndarray, lookback: int = BAR_LOOKBACK) -> np.ndarray:
-    """Price-unit std of the last ``lookback`` one-bar moves ending at each anchor."""
-    anchors = np.asarray(anchors, np.int64)
-    idx = anchors[:, None] + np.arange(-lookback, 1)[None, :]
-    close = np.log(stream.values[:, CLOSE])[idx]
-    sigma = np.diff(close, axis=1).std(axis=1)
-    return np.maximum(sigma * stream.values[anchors, CLOSE], 1e-12)
-
-
 def causal_baseline_scores(stream: Stream, train_anchors: np.ndarray, eval_anchors: np.ndarray,
                            horizons: Sequence[int] = HORIZONS) -> np.ndarray:
     """Per-horizon logistic regression fit on train anchors whose close moved
@@ -650,9 +539,7 @@ def causal_baseline_scores(stream: Stream, train_anchors: np.ndarray, eval_ancho
 def score_stream(close_q: np.ndarray, last_close: np.ndarray, future_at_h: np.ndarray,
                  anchors: np.ndarray, levels: np.ndarray, baseline: np.ndarray,
                  p_up_values: np.ndarray, horizons: Sequence[int] = HORIZONS,
-                 seed: int = 0, range_scale: np.ndarray | None = None,
-                 first_passage_labels: tuple[np.ndarray, np.ndarray] | None = None,
-                 event_mask: np.ndarray | None = None) -> dict:
+                 seed: int = 0) -> dict:
     """Metrics for one stream; close_q [n,Q,K], future_at_h [n,K], p_up_values [n,K].
 
     Direction metrics use only rows whose close moved: an unchanged close is not
@@ -661,7 +548,6 @@ def score_stream(close_q: np.ndarray, last_close: np.ndarray, future_at_h: np.nd
     ``auc_with_ties`` for continuity; forecast metrics use every row.
     """
     rng = np.random.default_rng(seed)
-    scale = np.asarray(last_close if range_scale is None else range_scale, float)
     low, high = int(np.argmin(np.abs(levels - 0.1))), int(np.argmin(np.abs(levels - 0.9)))
     median = int(np.argmin(np.abs(levels - 0.5)))
     rows = {}
@@ -699,51 +585,8 @@ def score_stream(close_q: np.ndarray, last_close: np.ndarray, future_at_h: np.nd
             "coverage_80": float(np.mean(
                 (close_q[:, low, k] <= future_at_h[:, k])
                 & (future_at_h[:, k] <= close_q[:, high, k]))),
-            "expansion_slice": _expansion_slice(
-                ((close_q[:, high, k] - close_q[:, low, k]) / scale)[moved], y, p_k,
-                base_k, kept, h),
         }
-        if event_mask is not None:
-            chosen = np.asarray(event_mask, bool)[moved]
-            picked = kept[chosen]
-            e_eff = min(int(chosen.sum()), (int(picked[-1] - picked[0]) // h + 1)
-                        if len(picked) > 1 else int(chosen.sum()))
-            e_auc, e_se = auc_with_se(y[chosen], p_k[chosen], e_eff)
-            e_base, _ = auc_with_se(y[chosen], base_k[chosen], e_eff)
-            rows[f"h{h}"]["event_slice"] = {
-                "n": int(chosen.sum()), "n_effective": int(e_eff),
-                "base_rate": float(y[chosen].mean()) if chosen.any() else float("nan"),
-                "auc": e_auc, "auc_se": e_se, "baseline_auc": e_base}
-        if first_passage_labels is not None:
-            hit, up = first_passage_labels[0][:, k], first_passage_labels[1][:, k]
-            picked = np.asarray(anchors)[hit]
-            n_eff = min(int(hit.sum()), (int(picked[-1] - picked[0]) // h + 1)
-                        if len(picked) > 1 else int(hit.sum()))
-            side_auc, side_se = auc_with_se(up[hit], p_up_values[hit, k], n_eff)
-            side_base, _ = auc_with_se(up[hit], baseline[hit, k], n_eff)
-            rows[f"h{h}"]["first_passage_side"] = {
-                "n": int(hit.sum()), "n_effective": int(n_eff),
-                "hit_rate": float(hit.mean()),
-                "up_rate": float(up[hit].mean()) if hit.any() else float("nan"),
-                "auc": side_auc, "auc_se": side_se, "baseline_auc": side_base}
     return rows
-
-
-def _expansion_slice(width: np.ndarray, y: np.ndarray, p_up_values: np.ndarray,
-                     baseline: np.ndarray, anchors: np.ndarray, h: int) -> dict:
-    """Direction on rows whose own predicted 10-90 range, relative to recent
-    volatility, is in the stream's top quintile: where a consumer expects a big
-    move and most needs the side.  Rows are chosen from the forecast and past
-    bars only, never from the realized move."""
-    chosen = width >= np.quantile(width, EXPANSION_QUANTILE)
-    picked = np.asarray(anchors)[chosen]
-    span = int(picked[-1] - picked[0]) if len(picked) > 1 else 0
-    n_eff = min(int(chosen.sum()), span // h + 1)
-    auc, se = auc_with_se(y[chosen], p_up_values[chosen], n_eff)
-    base_auc, _ = auc_with_se(y[chosen], baseline[chosen], n_eff)
-    return {"n": int(chosen.sum()), "n_effective": int(n_eff),
-            "threshold_quantile": EXPANSION_QUANTILE, "base_rate": float(y[chosen].mean()),
-            "auc": auc, "auc_se": se, "baseline_auc": base_auc}
 
 
 def stream_prediction_rows(last_close: np.ndarray, future_at_h: np.ndarray,
@@ -814,21 +657,6 @@ def summarize(per_stream: Mapping[str, Mapping[str, Mapping]],
             gains = np.array([row["stack"]["gain"] for row in rows], float)
             summary[key]["mean_stack_gain"] = float(np.nanmean(gains))
             summary[key]["streams_stack_gain_positive"] = int(np.sum(gains > 0))
-        if all("expansion_slice" in row for row in rows):
-            summary[key]["mean_expansion_auc"] = float(np.nanmean(
-                [row["expansion_slice"]["auc"] for row in rows]))
-            summary[key]["mean_expansion_baseline_auc"] = float(np.nanmean(
-                [row["expansion_slice"]["baseline_auc"] for row in rows]))
-        if all("event_slice" in row for row in rows):
-            summary[key]["mean_event_auc"] = float(np.nanmean(
-                [row["event_slice"]["auc"] for row in rows]))
-            summary[key]["mean_event_baseline_auc"] = float(np.nanmean(
-                [row["event_slice"]["baseline_auc"] for row in rows]))
-        if all("first_passage_side" in row for row in rows):
-            summary[key]["mean_first_passage_side_auc"] = float(np.nanmean(
-                [row["first_passage_side"]["auc"] for row in rows]))
-            summary[key]["mean_first_passage_side_baseline_auc"] = float(np.nanmean(
-                [row["first_passage_side"]["baseline_auc"] for row in rows]))
     return summary
 
 
@@ -890,17 +718,9 @@ def evaluate(model, streams: Mapping[str, Stream], period: str, *, device: str,
             features=bar_structure(stream.values) if bar_features else None,
             context_length=context_length)
         baseline = causal_baseline_scores(stream, train_anchors, anchors, horizons)
-        sigma = true_range_scale(stream.values)
-        passage = [first_passage(stream.values, anchors, sigma, horizon=h, k=k)
-                   for h, k in FIRST_PASSAGE_BARRIERS if h in horizons]
-        labels = ((np.column_stack([item[0] for item in passage]),
-                   np.column_stack([item[1] for item in passage]))
-                  if len(passage) == len(horizons) else None)
         per_stream[name] = score_stream(
             close_q, last_close, future, anchors, levels, baseline, probability,
-            horizons, seed=index, range_scale=recent_volatility(stream, anchors),
-            first_passage_labels=labels,
-            event_mask=liquidity_break_events(stream)[anchors].any(1))
+            horizons, seed=index)
         prediction_rows[name] = stream_prediction_rows(
             last_close, future, probability, baseline, anchors, horizons)
         print(f"[forecast-eval:{period}] {name} n={len(anchors)} "
@@ -973,20 +793,17 @@ def probe_side(x_train, y_train, x_eval, y_eval, streams, *, seed: int = 0,
 def reg_probe_report(model, streams: Mapping[str, Stream], *, device: str,
                      bar_features: bool = False, train_per_stream: int = 1500,
                      eval_per_stream: int = 1500, period: str = "select",
-                     horizons: Sequence[int] = LIQUIDITY_HORIZONS,
-                     side_barrier: tuple[int, float] = (10, 3.0),
+                     horizons: Sequence[int] = REG_HORIZONS,
                      context_length: int = CONTEXT_LENGTH) -> dict:
     """What the consumer embedding knows about side, against causal features.
 
-    Targets on ``period`` rows: all-bar direction (ties excluded), direction on
-    liquidity-break bars, and ±kσ breakout side on hit rows.  Probes are fit on
+    Target on ``period`` rows: all-bar direction at each horizon (ties excluded).  Probes are fit on
     train-period rows pooled across streams.
     """
     import torch
 
     def collect(split, limit):
-        rows = {"reg": [], "causal": [], "stream": [], "move": [], "event": [],
-                "hit": [], "up_first": []}
+        rows = {"reg": [], "causal": [], "stream": [], "move": []}
         for name, stream in sorted(streams.items()):
             lo, hi = period_bounds(stream.close_ns, *PERIODS[split],
                                    context_length=context_length)
@@ -1007,35 +824,21 @@ def reg_probe_report(model, streams: Mapping[str, Stream], *, device: str,
             rows["stream"].append(np.full(len(anchors), name))
             rows["move"].append(np.column_stack([close[anchors + h] - close[anchors]
                                                  for h in horizons]))
-            rows["event"].append(liquidity_break_events(stream)[anchors].any(1))
-            sigma = true_range_scale(stream.values)
-            hit, up, _ = first_passage(stream.values, anchors, sigma,
-                                       horizon=side_barrier[0], k=side_barrier[1])
-            rows["hit"].append(hit)
-            rows["up_first"].append(up)
         return {key: np.concatenate(value) for key, value in rows.items()}
 
     model.eval()
     train, evaluation = collect("train", train_per_stream), collect(period, eval_per_stream)
     report = {"schema": "ffm_chronos2_reg_probe_v1", "period": period,
-              "horizons": list(horizons), "side_barrier": list(side_barrier), "targets": {}}
+              "horizons": list(horizons), "targets": {}}
     for k, h in enumerate(horizons):
         for target, train_rows, eval_rows in (
-                ("all_bars", train["move"][:, k] != 0, evaluation["move"][:, k] != 0),
-                ("liquidity_break", (train["move"][:, k] != 0) & train["event"],
-                 (evaluation["move"][:, k] != 0) & evaluation["event"])):
+                ("all_bars", train["move"][:, k] != 0, evaluation["move"][:, k] != 0),):
             report["targets"][f"{target}_h{h}"] = {
                 source: probe_side(train[source][train_rows], train["move"][train_rows, k] > 0,
                                    evaluation[source][eval_rows],
                                    evaluation["move"][eval_rows, k] > 0,
                                    evaluation["stream"][eval_rows])
                 for source in ("reg", "causal")}
-    report["targets"][f"breakout_side_h{side_barrier[0]}"] = {
-        source: probe_side(train[source][train["hit"]], train["up_first"][train["hit"]],
-                           evaluation[source][evaluation["hit"]],
-                           evaluation["up_first"][evaluation["hit"]],
-                           evaluation["stream"][evaluation["hit"]])
-        for source in ("reg", "causal")}
     return report
 
 
@@ -1119,7 +922,6 @@ def rank_arms(evals: Mapping[str, Mapping], probes: Mapping[str, Mapping], *,
     3. embedding_probe: the REG-embedding probe beats both the random-side
        control and the causal-feature probe on all-bar direction at h5 and h10.
     4. forecast_not_degraded: mean scaled WQL ≤ reference × ``wql_budget``.
-    Liquidity-break and breakout-side slices are reported as diagnostics only.
     """
     ref = evals[reference]
     rows = []
@@ -1134,12 +936,6 @@ def rank_arms(evals: Mapping[str, Mapping], probes: Mapping[str, Mapping], *,
                               - ref["per_stream"][n][key]["auc"] for n in names])
             deltas[key], ups[key] = float(delta.mean()), int((delta > 0).sum())
         streams = len(report["per_stream"])
-        slices = {
-            "event_h5": (summary["h5"].get("mean_event_auc"),
-                         summary["h5"].get("mean_event_baseline_auc")),
-            "side_h10": (summary["h10"].get("mean_first_passage_side_auc"),
-                         summary["h10"].get("mean_first_passage_side_baseline_auc")),
-        }
         probe = probes.get(arm, {}).get("targets", {})
         probe_ok = bool(probe) and all(
             target in probe
@@ -1156,22 +952,35 @@ def rank_arms(evals: Mapping[str, Mapping], probes: Mapping[str, Mapping], *,
             "embedding_probe": probe_ok,
             "forecast_not_degraded": wql <= wql_budget,
         }
-        diagnostics = {"slices_above_baseline": all(
-            value is not None and base is not None and value > base
-            for value, base in slices.values())}
         rows.append({
             "arm": arm, "passes": int(sum(checks.values())), "checks": checks,
-            "diagnostics": diagnostics,
             "mean_auc": {key: summary[key]["mean_auc"] for key in primary},
             "delta_vs_reference": deltas, "streams_up": ups, "streams": streams,
-            "slices": {key: value for key, (value, _) in slices.items()},
-            "big_move_h5": summary["h5"].get("mean_expansion_auc"),
             "probe": {target: probe[target]["reg"]["mean_auc"] for target in probe},
             "wql_ratio": wql,
         })
     rows.sort(key=lambda row: (-row["passes"],
                                -np.mean(list(row["delta_vs_reference"].values()))))
     return rows
+
+
+def objective_score(probe: Mapping, evaluation: Mapping, reference: Mapping, *,
+                    horizons: Sequence[int] = REG_HORIZONS, wql_budget: float = 1.02,
+                    penalty_weight: float = 1.0) -> dict:
+    """Sweep objective on the select period: mean REG-embedding direction AUC over
+    ``horizons`` (all bars, ties excluded), minus a penalty only when the mean
+    scaled WQL exceeds ``wql_budget`` x the reference (A1)."""
+    for report in (evaluation, reference):
+        if report.get("period") != "select":
+            raise ValueError("the sweep objective may only read select-period reports")
+    aucs = [probe["targets"][f"all_bars_h{h}"]["reg"]["mean_auc"] for h in horizons]
+    wql_ratio = (_mean_over_horizons(evaluation, "mean_scaled_wql")
+                 / _mean_over_horizons(reference, "mean_scaled_wql"))
+    penalty = penalty_weight * max(0.0, wql_ratio - wql_budget)
+    direction = float(np.mean(aucs))
+    return {"score": direction - penalty, "direction_auc": direction,
+            "per_horizon_auc": dict(zip((f"h{h}" for h in horizons), aucs)),
+            "wql_ratio": wql_ratio, "penalty": penalty}
 
 
 def _is_forward_direction_probe(name: str) -> bool:
@@ -1230,7 +1039,7 @@ def build_stage_report(*, arm: str, direction_weight: float, seed: int, parent_p
             "arm": arm, "direction_weight": direction_weight, "seed": seed,
             "direction_head": DIRECTION_HEAD_POLICY if uses_direction_head(arm) else "none",
             "direction_target": "close_above_decision_close",
-            "reg_teacher": ({"horizons": list(REG_HORIZONS), "ties": "masked",
+            "reg_teacher": ({"ties": "masked",
                              "pooling": "OHLCV REG tokens concatenated (consumer embedding)"}
                             if uses_reg_teacher(arm) else None),
             "mirror_contrastive": ({"path_length": MIRROR_LENGTH, "dim": MIRROR_DIM,
@@ -1241,10 +1050,6 @@ def build_stage_report(*, arm: str, direction_weight: float, seed: int, parent_p
                                     "false_negatives": "same stream within path length",
                                     "negatives": "own mirrored future + in-batch futures"}
                                    if uses_mirror_contrastive(arm) else None),
-            "liquidity_teacher": ({"events": list(LIQUIDITY_EVENTS),
-                                   "horizons": list(LIQUIDITY_HORIZONS), "ties": "masked"}
-                                  if uses_liquidity_teacher(arm) else None),
-            "first_passage_barriers": [list(item) for item in FIRST_PASSAGE_BARRIERS],
             "timeframes": list(timeframes), "context_length": int(context_length),
             "forecast_length": FORECAST_LENGTH, "base_model": dict(base_identity),
             **training,
@@ -1289,6 +1094,9 @@ def train_forecast_direction(
         horizons: Sequence[int] = HORIZONS,
         mask_ties: bool = False,
         context_length: int = CONTEXT_LENGTH,
+        focal_gamma: float = 0.0,
+        reg_horizons: Sequence[int] = REG_HORIZONS,
+        epoch_callback=None,
 ) -> dict:
     """Continue the parent's LoRA on native pinball (A1) or pinball + λ·direction BCE (A2)."""
     import torch
@@ -1317,21 +1125,17 @@ def train_forecast_direction(
     teacher = None
     if uses_direction_head(arm):
         if uses_reg_teacher(arm):
-            teacher = make_reg_teacher(int(base.model_dim)).to(device)
+            if max(reg_horizons) > FORECAST_LENGTH or min(reg_horizons) < 1:
+                raise ValueError("reg_horizons must lie within the forecast length")
+            teacher = make_reg_teacher(int(base.model_dim), tuple(reg_horizons)).to(device)
         elif uses_mirror_contrastive(arm):
             teacher = make_mirror_teacher(int(base.model_dim), FORECAST_LENGTH // 16).to(device)
-        else:
-            teacher = make_direction_head(
-                int(base.model_dim), FORECAST_LENGTH // 16, LIQUIDITY_HORIZONS).to(device)
         parameters += list(teacher.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=weight_decay)
 
     names = sorted(streams)
     features = ({name: bar_structure(streams[name].values) for name in names}
                 if uses_bar_features(arm) else {name: None for name in names})
-    sigmas = {name: true_range_scale(streams[name].values) for name in names}
-    liquidity = ({name: liquidity_break_events(streams[name]).any(1) for name in names}
-                 if uses_liquidity_teacher(arm) else None)
     train_bounds = {name: period_bounds(streams[name].close_ns, *PERIODS["train"],
                                         context_length=context_length)
                     for name in names}
@@ -1342,15 +1146,16 @@ def train_forecast_direction(
                                            context_length=context_length),
                             select_anchors_per_stream) for name in names}
 
-    def batch_loss(context, future_close, last_close, sigma, event=None):
+    def batch_loss(context, future_close, last_close, event=None):
         """-> (native, direction, extra); objective = native + λ·direction + extra."""
         zero = torch.zeros((), device=context.device)
         if uses_reg_teacher(arm):
             native, _, reg = forecast_close(base, context, future_close, return_reg=True)
-            ends = torch.stack([future_close[:, h - 1] for h in REG_HORIZONS], 1)
+            ends = torch.stack([future_close[:, h - 1] for h in reg_horizons], 1)
             valid = ends != last_close[:, None]
-            return (native, liquidity_teacher_loss(
-                teacher(reg), ends > last_close[:, None], valid), zero)
+            return (native, masked_direction_bce(
+                teacher(reg), ends > last_close[:, None], valid,
+                focal_gamma=focal_gamma), zero)
         if uses_mirror_contrastive(arm):
             native, _, hidden = forecast_close(base, context, future_close, return_hidden=True)
             path = future_path(future_close, last_close, MIRROR_LENGTH)
@@ -1360,12 +1165,6 @@ def train_forecast_direction(
                 teacher["future"](mirror_path(path)), valid=moved,
                 logit_scale=teacher["scale"].value, symmetric=True,
                 use_mirror=mirror_state["use_mirror"], false_negatives=event), zero
-        if uses_liquidity_teacher(arm):
-            native, _, hidden = forecast_close(base, context, future_close, return_hidden=True)
-            ends = torch.stack([future_close[:, h - 1] for h in LIQUIDITY_HORIZONS], 1)
-            valid = event[:, None] & (ends != last_close[:, None])
-            return (native, liquidity_teacher_loss(
-                teacher(hidden), ends > last_close[:, None], valid), zero)
         native, close_q = forecast_close(base, context, future_close)
         direction = direction_loss(close_q, last_close, future_close, levels, horizons,
                                    mask_ties=mask_ties)
@@ -1382,9 +1181,7 @@ def train_forecast_direction(
     def event_tensor(name, anchors):
         if uses_mirror_contrastive(arm):
             return overlap_tensor(np.zeros(len(anchors)), anchors)
-        if liquidity is None:
-            return None
-        return torch.from_numpy(liquidity[name][anchors]).to(device)
+        return None
 
     def tensors(values):
         return tuple(torch.from_numpy(np.asarray(value, np.float32)).to(device)
@@ -1401,10 +1198,9 @@ def train_forecast_direction(
                 native_sum, direction_sum, extra_sum = 0.0, 0.0, 0.0
                 for start in range(0, len(anchors), eval_batch_windows):
                     chunk = anchors[start:start + eval_batch_windows]
-                    native, direction, extra = batch_loss(*tensors((*gather(
+                    native, direction, extra = batch_loss(*tensors(gather(
                         streams[name].values, chunk, features=features[name],
-                        context_length=context_length),
-                        sigmas[name][chunk])), event_tensor(name, chunk))
+                        context_length=context_length)), event_tensor(name, chunk))
                     native_sum += float(native) * len(chunk)
                     direction_sum += float(direction) * len(chunk)
                     extra_sum += float(extra) * len(chunk)
@@ -1432,7 +1228,7 @@ def train_forecast_direction(
         for _ in range(steps_per_epoch):
             tick = time.monotonic()
             picks = rng.integers(len(names), size=batch_windows)
-            contexts, futures, lasts, scales, events = [], [], [], [], []
+            contexts, futures, lasts, events = [], [], [], []
             row_streams, row_anchors = [], []
             for pick in np.unique(picks):
                 name = names[int(pick)]
@@ -1444,19 +1240,15 @@ def train_forecast_direction(
                 contexts.append(context)
                 futures.append(future_close)
                 lasts.append(last_close)
-                scales.append(sigmas[name][anchors])
-                if liquidity is not None:
-                    events.append(liquidity[name][anchors])
                 row_streams.append(np.full(len(anchors), int(pick)))
                 row_anchors.append(anchors)
-            context, future_close, last_close, sigma = tensors((
-                np.concatenate(contexts), np.concatenate(futures), np.concatenate(lasts),
-                np.concatenate(scales)))
+            context, future_close, last_close = tensors((
+                np.concatenate(contexts), np.concatenate(futures), np.concatenate(lasts)))
             event = (torch.from_numpy(np.concatenate(events)).to(device) if events else None)
             if uses_mirror_contrastive(arm):
                 mirror_state["use_mirror"] = epoch >= MIRROR_WARMUP_EPOCHS
                 event = overlap_tensor(np.concatenate(row_streams), np.concatenate(row_anchors))
-            native, direction, extra = batch_loss(context, future_close, last_close, sigma, event)
+            native, direction, extra = batch_loss(context, future_close, last_close, event)
             loss = native + direction_weight * direction + extra
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite forecast training loss")
@@ -1469,6 +1261,8 @@ def train_forecast_direction(
             step_seconds.append(time.monotonic() - tick)
         mirror_state["use_mirror"] = True
         metric = selection_metric()
+        if epoch_callback is not None:
+            epoch_callback(epoch, metric)            # may raise to stop (e.g. Optuna prune)
         improved = metric["objective"] < best_metric["objective"] - 1e-6
         if improved:
             best_metric, best_adapter, best_epoch, bad = metric, _adapter_state(model), epoch, 0
@@ -1500,6 +1294,8 @@ def train_forecast_direction(
             "weight_decay": weight_decay, "patience": patience,
             "select_anchors_per_stream": select_anchors_per_stream,
             "horizons": list(horizons), "device": device,
+            "reg_horizons": list(reg_horizons) if uses_reg_teacher(arm) else None,
+            "focal_gamma": float(focal_gamma) if uses_reg_teacher(arm) else None,
             "bar_features": uses_bar_features(arm),
             "mask_ties": bool(mask_ties),
             "bar_feature_names": list(BAR_FEATURES) if uses_bar_features(arm) else [],
@@ -1513,16 +1309,16 @@ def train_forecast_direction(
 
 __all__ = [
     "CONTEXT_LENGTH", "FORECAST_LENGTH", "HORIZONS", "PERIODS", "Stream",
-    "BAR_FEATURES", "DIRECTION_HEAD_POLICY", "FIRST_PASSAGE_BARRIERS", "MAX_SERIES_PER_PASS", "first_passage",
-    "CRT_CLASSES", "LIQUIDITY_EVENTS", "REG_HORIZONS", "future_path", "make_mirror_teacher",
+    "BAR_FEATURES", "DIRECTION_HEAD_POLICY", "MAX_SERIES_PER_PASS",
+    "REG_HORIZONS", "future_path", "make_mirror_teacher",
     "make_reg_teacher", "uses_reg_teacher",
     "overlap_false_negatives", "mirror_contrastive_loss", "mirror_path",
-    "uses_mirror_contrastive", "stack_gain", "stream_prediction_rows", "probe_side", "reg_embeddings", "reg_probe_report", "candle_range_classes", "liquidity_break_events",
-    "liquidity_teacher_loss", "uses_liquidity_teacher",
-    "true_range_scale", "bar_structure",
-    "make_direction_head", "recent_volatility", "uses_direction_head", "build_stage_report", "uses_bar_features", "causal_baseline_scores", "causal_features", "direction_gate", "direction_labels",
+    "uses_mirror_contrastive", "stack_gain", "stream_prediction_rows", "probe_side", "reg_embeddings", "reg_probe_report",
+    "masked_direction_bce",
+    "bar_structure",
+    "make_direction_head", "uses_direction_head", "build_stage_report", "uses_bar_features", "causal_baseline_scores", "causal_features", "direction_gate", "direction_labels",
     "direction_loss", "evaluate", "evenly_spaced", "forecast_close", "forecast_gate",
-    "rank_arms", "retention_gate", "select_direction_weight",
+    "objective_score", "rank_arms", "retention_gate", "select_direction_weight",
     "gather", "load_streams", "p_up", "period_bounds", "quantile_cdf",
     "train_forecast_direction",
 ]

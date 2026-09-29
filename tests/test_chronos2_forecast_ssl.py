@@ -725,66 +725,6 @@ def test_predict_period_feeds_bar_features_to_the_model():
 
 # ------------------------------------------------------------------ direction where a big move is expected
 
-def test_score_stream_reports_direction_on_the_widest_predicted_ranges():
-    rng = np.random.default_rng(3)
-    n, levels = 1000, np.array([0.1, 0.5, 0.9])
-    last = np.full(n, 100.0)
-    width = rng.uniform(0.5, 5.0, n)                  # model's predicted range per row
-    wide = width >= np.quantile(width, 0.8)
-    sign = np.where(rng.random(n) > 0.5, 1.0, -1.0)
-    future = (last + sign * width)[:, None]           # one horizon
-    # P(up) is informative only on the wide rows, random elsewhere.
-    p_up = np.where(wide, (sign > 0) * 0.8 + 0.1, rng.random(n))[:, None]
-    close_q = (last[:, None] + np.outer(width, [-1.0, 0.0, 1.0]))[:, :, None]
-    rows = fs.score_stream(close_q, last, future, np.arange(n) * 5, levels,
-                           baseline=rng.random((n, 1)), p_up_values=p_up, horizons=(5,))
-    slice_ = rows["h5"]["expansion_slice"]
-    assert slice_["n"] == int(wide.sum())
-    assert slice_["auc"] > 0.95 > rows["h5"]["auc"]
-    assert {"base_rate", "baseline_auc", "auc_se", "threshold_quantile"} <= set(slice_)
-
-
-def test_summary_includes_expansion_slice_means():
-    rng = np.random.default_rng(4)
-    n, levels = 400, np.array([0.1, 0.5, 0.9])
-    last = np.full(n, 100.0)
-    close_q = (last[:, None] + np.outer(rng.uniform(1, 3, n), [-1, 0, 1]))[:, :, None]
-    rows = {name: fs.score_stream(close_q, last, (last + rng.normal(0, 2, n))[:, None],
-                                  np.arange(n) * 5, levels, rng.random((n, 1)),
-                                  rng.random((n, 1)), horizons=(5,))
-            for name in ("A", "B")}
-    summary = fs.summarize(rows, (5,))["h5"]
-    assert {"mean_expansion_auc", "mean_expansion_baseline_auc"} <= set(summary)
-
-
-def test_expansion_slice_ranks_predicted_range_relative_to_recent_volatility():
-    """Same raw width, but half the rows come from a calm regime: relative to
-    recent volatility those are the expected expansions."""
-    rng = np.random.default_rng(5)
-    n, levels = 1000, np.array([0.1, 0.5, 0.9])
-    last = np.full(n, 100.0)
-    calm = np.arange(n) % 2 == 0
-    recent_vol = np.where(calm, 0.5, 5.0)             # price units of recent 1-bar moves
-    width = np.full(n, 2.0) + rng.uniform(0, 0.1, n)
-    sign = np.where(rng.random(n) > 0.5, 1.0, -1.0)
-    close_q = (last[:, None] + np.outer(width, [-1.0, 0.0, 1.0]))[:, :, None]
-    rows = fs.score_stream(close_q, last, (last + sign)[:, None], np.arange(n) * 5, levels,
-                           baseline=rng.random((n, 1)), p_up_values=rng.random((n, 1)),
-                           horizons=(5,), range_scale=recent_vol)
-    assert rows["h5"]["expansion_slice"]["n"] == 200
-
-
-def test_recent_volatility_scale_uses_only_bars_up_to_the_anchor():
-    stream = _stream(400)
-    anchors = np.array([200, 300])
-    before = fs.recent_volatility(stream, anchors)
-    changed = stream.values.copy()
-    changed[301:] *= 2.0
-    np.testing.assert_allclose(before, fs.recent_volatility(
-        fs.Stream(stream.name, stream.close_ns, changed), anchors))
-    assert (before > 0).all()
-
-
 # ------------------------------------------------------------------ A4 separate direction head
 
 class _HookedChronos:
@@ -832,7 +772,7 @@ def test_direction_head_maps_forecast_tokens_to_one_logit_per_horizon():
 
 
 def test_teacher_heads_are_training_only_and_never_ship():
-    """SSL-only: A7/A8 heads teach the encoder and are discarded. Evaluation
+    """SSL-only: A8/A9 heads teach the encoder and are discarded. Evaluation
     reads direction from the model itself (native quantile P(up), Atlas REG)."""
     import inspect
 
@@ -846,7 +786,7 @@ def test_teacher_stage_report_records_the_discarded_teacher(tmp_path):
     checkpoint.mkdir()
     (checkpoint / "adapter_model.safetensors").write_bytes(b"w")
     report = fs.build_stage_report(
-        arm="a7", direction_weight=3.0, seed=0, parent_path="/p", parent_sha256="c" * 64,
+        arm="a9", direction_weight=3.0, seed=0, parent_path="/p", parent_sha256="c" * 64,
         checkpoint=checkpoint, base_identity={}, provenance={}, timeframes=("3min",),
         streams=["NQ@3min"], code=None, training={}, history=[], parent_select={},
         best_select={}, best_epoch=0, step_seconds=[1.0], elapsed_seconds=1.0)
@@ -856,113 +796,7 @@ def test_teacher_stage_report_records_the_discarded_teacher(tmp_path):
 
 # ------------------------------------------------------------------ A5 first-passage side (expansion-aligned SSL target)
 
-def _path_stream(closes, n_before: int = 200, bar_range: float = 1.0) -> np.ndarray:
-    """Flat history of 1-point bars, then the given close path."""
-    base = [100.0] * n_before + list(closes)
-    c = np.asarray(base, float)
-    return np.column_stack([c, c + bar_range / 2, c - bar_range / 2, c, np.full(len(c), 10.0)])
-
-
-def test_first_passage_barriers_follow_the_expansion_scaling():
-    assert dict(fs.FIRST_PASSAGE_BARRIERS) == {5: 2.1, 10: 3.0, 20: 4.2, 50: 6.7}
-    for horizon, k in fs.FIRST_PASSAGE_BARRIERS:
-        assert k == pytest.approx(0.95 * np.sqrt(horizon), abs=0.05)
-
-
-def test_causal_true_range_scale_is_a_trailing_median_including_the_bar():
-    values = _path_stream([100.0] * 10)
-    sigma = fs.true_range_scale(values, lookback=128)
-    assert np.isnan(sigma[:127]).all()
-    tr = np.log(100.5) - np.log(99.5)
-    assert sigma[200] == pytest.approx(tr)
-    changed = values.copy()
-    changed[201:] *= 1.5
-    assert fs.true_range_scale(changed, lookback=128)[200] == pytest.approx(sigma[200])
-
-
-def test_first_passage_labels_up_down_and_none():
-    tr = np.log(100.5) - np.log(99.5)
-    step = np.exp(tr)                                   # one sigma per bar in log space
-    up = [100.0 * step ** j for j in range(1, 11)]
-    down = [100.0 / step ** j for j in range(1, 11)]
-    flat = [100.0] * 10
-    for path, hit, side in ((up, True, True), (down, True, False), (flat, False, None)):
-        values = _path_stream(path)
-        sigma = fs.true_range_scale(values, lookback=128)
-        hits, ups, first = fs.first_passage(values, np.array([199]), sigma, horizon=5, k=2.1)
-        assert bool(hits[0]) is hit
-        if hit:
-            assert bool(ups[0]) is side and first[0] == 3   # 3 sigma >= 2.1 at bar 3
-        else:
-            assert first[0] == 0
-
-
-def test_first_passage_takes_whichever_barrier_is_reached_first():
-    tr = np.log(100.5) - np.log(99.5)
-    down_then_up = [100.0 * np.exp(-3 * tr), 100.0 * np.exp(5 * tr)]
-    values = _path_stream(down_then_up + [100.0] * 8)
-    sigma = fs.true_range_scale(values, lookback=128)
-    hits, ups, first = fs.first_passage(values, np.array([199]), sigma, horizon=5, k=2.1)
-    assert hits[0] and not ups[0] and first[0] == 1
-
-
-def test_first_passage_reads_only_the_next_horizon_bars():
-    tr = np.log(100.5) - np.log(99.5)
-    late_jump = [100.0] * 5 + [100.0 * np.exp(10 * tr)]
-    values = _path_stream(late_jump + [100.0] * 5)
-    sigma = fs.true_range_scale(values, lookback=128)
-    hits, _, _ = fs.first_passage(values, np.array([199]), sigma, horizon=5, k=2.1)
-    assert not hits[0]
-
-
-def test_score_stream_reports_side_given_first_passage():
-    rng = np.random.default_rng(8)
-    n, levels = 600, np.array([0.1, 0.5, 0.9])
-    last = np.full(n, 100.0)
-    hit = rng.random((n, 1)) < 0.3
-    up = rng.random((n, 1)) < 0.5
-    p_up = np.where(up, 0.9, 0.1)
-    close_q = (last[:, None] + np.outer(np.ones(n), [-1.0, 0.0, 1.0]))[:, :, None]
-    rows = fs.score_stream(close_q, last, (last + 1)[:, None], np.arange(n) * 5, levels,
-                           rng.random((n, 1)), p_up, horizons=(5,),
-                           first_passage_labels=(hit, up))
-    side = rows["h5"]["first_passage_side"]
-    assert side["n"] == int(hit.sum()) and side["auc"] == pytest.approx(1.0)
-    assert {"baseline_auc", "hit_rate", "up_rate"} <= set(side)
-
-
 # ------------------------------------------------------------------ A6 candle-range (CRT) teacher
-
-def _candles(rows):
-    """rows of (high, low, close); open = previous close, volume constant."""
-    rows = np.asarray(rows, float)
-    opens = np.concatenate([[rows[0, 2]], rows[:-1, 2]])
-    return np.column_stack([opens, rows[:, 0], rows[:, 1], rows[:, 2], np.full(len(rows), 10.0)])
-
-
-def test_candle_range_classes_label_each_candle_against_the_previous_one():
-    prior = (10.0, 8.0, 9.0)
-    cases = {
-        (11.0, 8.5, 10.5): "bull_breakout",   # took high, closed above it
-        (11.0, 8.5, 9.5): "bear_sweep",       # took high, closed back inside
-        (9.5, 7.0, 7.5): "bear_breakout",     # took low, closed below it
-        (9.5, 7.0, 8.5): "bull_sweep",        # took low, closed back inside
-        (9.5, 8.5, 9.0): "inside",
-        (11.0, 7.0, 9.0): "outside",
-    }
-    for candle, expected in cases.items():
-        classes = fs.candle_range_classes(_candles([prior, candle]))
-        assert fs.CRT_CLASSES[classes[1]] == expected
-    assert classes[0] == fs.CRT_CLASSES.index("inside")      # first candle has no prior
-
-
-def test_candle_range_classes_are_causal():
-    stream = _stream(300)
-    base = fs.candle_range_classes(stream.values)
-    changed = stream.values.copy()
-    changed[201:] *= 1.3
-    np.testing.assert_array_equal(base[:201], fs.candle_range_classes(changed)[:201])
-
 
 # ------------------------------------------------------------------ ties are not direction
 
@@ -1015,81 +849,22 @@ def test_predict_period_caps_series_per_forward_pass_with_extra_inputs():
     assert sum(rows) == 300 * (5 + len(fs.BAR_FEATURES))
 
 
-# ------------------------------------------------------------------ A7 liquidity-break teacher (Osler: stops beyond levels)
-
-def _session_stream(days: int = 4, minutes: int = 30) -> fs.Stream:
-    """30-min bars over several ET days, flat at 100 with 1-point ranges."""
-    times = pd.date_range("2025-03-03 00:00", periods=days * 48, freq=f"{minutes}min",
-                          tz="America/New_York").tz_convert("UTC")
-    close = np.full(len(times), 100.0)
-    values = np.column_stack([close, close + 0.5, close - 0.5, close, np.full(len(times), 10.0)])
-    return fs.Stream("NQ@30min", times.asi8, values)
-
-
-def test_rolling_break_events_use_only_prior_bars():
-    values = _bars([(10, 10.5, 9.5, 10, 1)] * 30 + [(10, 12, 10, 11.5, 1)] + [(10, 10.5, 9.5, 10, 1)] * 5)
-    events = fs.liquidity_break_events(fs.Stream("X@1min", np.arange(len(values)) * 60_000_000_000,
-                                                 values))
-    names = list(fs.LIQUIDITY_EVENTS)
-    assert events[30, names.index("break_20_high")] and not events[30, names.index("break_20_low")]
-    assert not events[29].any()
-    changed = values.copy()
-    changed[31:] *= 3.0
-    later = fs.liquidity_break_events(fs.Stream("X@1min", np.arange(len(values)) * 60_000_000_000,
-                                                changed))
-    np.testing.assert_array_equal(events[:31], later[:31])
-
-
-def test_prior_day_levels_come_from_the_completed_previous_session():
-    stream = _session_stream()
-    values = stream.values.copy()
-    et = pd.DatetimeIndex(stream.close_ns, tz="UTC").tz_convert("America/New_York")
-    day2_rth = (et.date == pd.Timestamp("2025-03-04").date()) & (et.hour >= 10) & (et.hour < 16)
-    values[day2_rth, 1] = 105.0                         # day-2 RTH high = 105
-    probe = np.flatnonzero((et.date == pd.Timestamp("2025-03-05").date()) & (et.hour == 11))[0]
-    values[probe, 1], values[probe, 3] = 106.5, 106.0   # day-3 close above day-2 high
-    events = fs.liquidity_break_events(fs.Stream(stream.name, stream.close_ns, values))
-    names = list(fs.LIQUIDITY_EVENTS)
-    assert events[probe, names.index("break_prior_day_high")]
-    # before day 3 the day-2 high is not known yet
-    early = np.flatnonzero((et.date == pd.Timestamp("2025-03-04").date()) & (et.hour == 15))[0]
-    assert not events[early, names.index("break_prior_day_high")]
-
+# ------------------------------------------------------------------ masked direction BCE (used by A9)
 
 @needs_torch
-def test_liquidity_teacher_loss_learns_only_on_event_bars_that_moved():
+def test_masked_direction_bce_learns_only_on_valid_cells():
     torch = _torch()
     logits = torch.tensor([[4.0, 4.0], [-4.0, -4.0], [4.0, -4.0]])
     up = torch.tensor([[True, True], [True, True], [False, False]])
     valid = torch.tensor([[True, True], [False, False], [True, False]])
-    loss = fs.liquidity_teacher_loss(logits, up, valid)
+    loss = fs.masked_direction_bce(logits, up, valid)
     flipped = logits.clone()
-    flipped[1] = 4.0                                    # non-event row: must not matter
+    flipped[1] = 4.0                                    # invalid row: must not matter
     flipped[2, 1] = 4.0                                 # tie / masked cell: must not matter
-    assert loss.item() == pytest.approx(fs.liquidity_teacher_loss(flipped, up, valid).item())
+    assert loss.item() == pytest.approx(fs.masked_direction_bce(flipped, up, valid).item())
     wrong = logits.clone()
     wrong[0] = -4.0
-    assert fs.liquidity_teacher_loss(wrong, up, valid) > loss
-
-
-def test_a7_is_a1_plus_a_liquidity_teacher():
-    assert fs.uses_liquidity_teacher("a7") and fs.uses_direction_head("a7")
-    assert not fs.uses_bar_features("a7")
-    assert not any(fs.uses_liquidity_teacher(arm) for arm in ("a1", "a2", "a3", "a8"))
-
-
-def test_score_stream_reports_direction_on_liquidity_event_bars():
-    rng = np.random.default_rng(12)
-    n, levels = 600, np.array([0.1, 0.5, 0.9])
-    last = np.full(n, 100.0)
-    move = rng.choice([-1.0, 1.0], size=n)
-    event = rng.random(n) < 0.25
-    p_up = np.where(event, (move > 0) * 0.8 + 0.1, rng.random(n))[:, None]
-    close_q = (last[:, None] + np.outer(np.ones(n), [-1.0, 0.0, 1.0]))[:, :, None]
-    row = fs.score_stream(close_q, last, (last + move)[:, None], np.arange(n) * 5, levels,
-                          rng.random((n, 1)), p_up, horizons=(5,), event_mask=event)["h5"]
-    assert row["event_slice"]["n"] == int(event.sum())
-    assert row["event_slice"]["auc"] == pytest.approx(1.0)
+    assert fs.masked_direction_bce(wrong, up, valid) > loss
 
 
 # ------------------------------------------------------------------ REG-probe side check (what the expansion head reads)
@@ -1140,13 +915,10 @@ def test_cli_probe_command_parses():
 
 # ------------------------------------------------------------------ arm ranking (pre-registered checks)
 
-def _arm_eval(auc: float, wql: float = 0.63, event: float = 0.52, side: float = 0.52,
-              big: float = 0.52, baseline: float = 0.525, names=("A", "B", "C")) -> dict:
+def _arm_eval(auc: float, wql: float = 0.63, baseline: float = 0.525,
+              names=("A", "B", "C")) -> dict:
     per_stream = {n: {f"h{h}": {"auc": auc + 0.001 * i, "baseline_auc": baseline,
-                                "scaled_wql": wql, "shuffled_auc": 0.5, "coverage_80": 0.8,
-                                "expansion_slice": {"auc": big, "baseline_auc": baseline},
-                                "event_slice": {"auc": event, "baseline_auc": baseline},
-                                "first_passage_side": {"auc": side, "baseline_auc": baseline}}
+                                "scaled_wql": wql, "shuffled_auc": 0.5, "coverage_80": 0.8}
                       for h in fs.HORIZONS} for i, n in enumerate(names)}
     return {"period": "select", "per_stream": per_stream, "summary": fs.summarize(per_stream)}
 
@@ -1155,12 +927,11 @@ def _arm_probe(reg: float, causal: float = 0.52, shuffled: float = 0.5) -> dict:
     row = lambda auc: {"mean_auc": auc, "mean_shuffled_auc": shuffled, "streams_above_half": 3,
                        "streams": 3}
     return {"targets": {name: {"reg": row(reg), "causal": row(causal)}
-                        for name in ("all_bars_h5", "all_bars_h10", "liquidity_break_h5",
-                                     "breakout_side_h10")}}
+                        for name in ("all_bars_h5", "all_bars_h10", "all_bars_h20")}}
 
 
 def test_rank_arms_applies_the_preregistered_checks_against_a1():
-    evals = {"a1": _arm_eval(0.514), "good": _arm_eval(0.535, event=0.55, side=0.55, big=0.54),
+    evals = {"a1": _arm_eval(0.514), "good": _arm_eval(0.535),
              "weak": _arm_eval(0.517), "broken": _arm_eval(0.54, wql=0.70)}
     probes = {"a1": _arm_probe(0.50), "good": _arm_probe(0.56), "weak": _arm_probe(0.51),
               "broken": _arm_probe(0.56)}
@@ -1168,7 +939,6 @@ def test_rank_arms_applies_the_preregistered_checks_against_a1():
     by_arm = {row["arm"]: row for row in table}
     assert table[0]["arm"] == "good"
     assert all(by_arm["good"]["checks"].values())
-    assert by_arm["good"]["diagnostics"]["slices_above_baseline"]
     assert not by_arm["weak"]["checks"]["direction_vs_reference"]
     assert not by_arm["broken"]["checks"]["forecast_not_degraded"]
     assert "a1" not in by_arm
@@ -1185,7 +955,7 @@ def test_cli_rank_reads_rescore_and_probe_files(tmp_path):
     cli = _cli()
     (tmp_path / "rescore_a1_select.json").write_text(json.dumps(_arm_eval(0.514)))
     (tmp_path / "rescore_good_select.json").write_text(json.dumps(
-        _arm_eval(0.535, event=0.55, side=0.55, big=0.54)))
+        _arm_eval(0.535)))
     (tmp_path / "good_regprobe_select.json").write_text(json.dumps(_arm_probe(0.56)))
     out = tmp_path / "ranking.json"
     cli.main(["rank", "--eval-dir", str(tmp_path), "--out", str(out)])
@@ -1249,17 +1019,15 @@ def test_cli_train_mask_ties_flag_names_the_run():
     assert cli.run_settings(args)["out_dir"].name == "a2_lam3_ties-masked_seed0"
 
 
-def test_rank_arms_counts_only_generic_checks_and_reports_slices_as_diagnostics():
-    """FFM is a generic market-context model: expansion-specific slices are
-    reported but do not count toward the ranking."""
-    evals = {"a1": _arm_eval(0.514),
-             "generic": _arm_eval(0.535, event=0.49, side=0.49, big=0.49)}
+def test_rank_arms_counts_only_generic_checks():
+    """FFM is a strategy-agnostic market-context model: only generic direction counts."""
+    evals = {"a1": _arm_eval(0.514), "generic": _arm_eval(0.535)}
     probes = {"generic": _arm_probe(0.56)}
     row = fs.rank_arms(evals, probes, reference="a1")[0]
     assert set(row["checks"]) == {"direction_vs_reference", "beats_causal_baseline",
                                   "embedding_probe", "forecast_not_degraded"}
     assert row["passes"] == 4
-    assert row["diagnostics"]["slices_above_baseline"] is False
+    assert "diagnostics" not in row and "slices" not in row
 
 
 # ------------------------------------------------------------------ context length is a parameter (A8: longer context)
@@ -1339,7 +1107,7 @@ def test_mirror_contrastive_loss_only_rewards_the_right_direction():
 def test_r3_mirror_arm_flags():
     assert fs.uses_mirror_contrastive("a8") and fs.uses_direction_head("a8")
     assert not fs.uses_bar_features("a8")
-    assert not any(fs.uses_mirror_contrastive(a) for a in ("a1", "a2", "a3", "a7"))
+    assert not any(fs.uses_mirror_contrastive(a) for a in ("a1", "a2", "a3", "a9"))
 
 
 def test_cli_a8_run_directory():
@@ -1454,7 +1222,7 @@ def test_a9_targets_the_consumer_embedding():
     assert fs.uses_reg_teacher("a9") and fs.uses_direction_head("a9")
     assert not fs.uses_bar_features("a9")
     assert fs.REG_HORIZONS == (5, 10, 20)
-    assert not any(fs.uses_reg_teacher(a) for a in ("a1", "a2", "a3", "a7", "a8"))
+    assert not any(fs.uses_reg_teacher(a) for a in ("a1", "a2", "a3", "a8"))
 
 
 def test_a9_requires_a_direction_term(tmp_path):
@@ -1468,3 +1236,66 @@ def test_cli_a9_run_directory():
     cli = _cli()
     args = cli.parse(["train", "--arm", "a9", "--direction-weight", "1"])
     assert cli.run_settings(args)["out_dir"].name == "a9_lam1_seed0"
+
+
+# ------------------------------------------------------------------ A9 sweep options: focal loss and horizon focus
+
+@needs_torch
+def test_focal_direction_loss_downweights_easy_correct_calls():
+    torch = _torch()
+    up = torch.tensor([[True], [True]])
+    valid = torch.ones(2, 1, dtype=torch.bool)
+    logits = torch.tensor([[4.0], [-1.0]])             # one easy-correct, one wrong
+    bce = fs.masked_direction_bce(logits, up, valid)
+    focal = fs.masked_direction_bce(logits, up, valid, focal_gamma=2.0)
+    assert focal < bce                                   # easy row almost vanishes
+    easy_bce = fs.masked_direction_bce(logits[:1], up[:1], valid[:1])
+    easy_focal = fs.masked_direction_bce(logits[:1], up[:1], valid[:1], focal_gamma=2.0)
+    assert easy_focal < 0.01 * easy_bce
+    assert fs.masked_direction_bce(logits, up, valid, focal_gamma=0.0).item() == pytest.approx(
+        bce.item())
+
+
+def test_cli_a9_sweep_options_name_the_run():
+    cli = _cli()
+    args = cli.parse(["train", "--arm", "a9", "--direction-weight", "3",
+                      "--focal-gamma", "2", "--reg-horizons", "5,10"])
+    assert args.focal_gamma == 2.0 and args.reg_horizons == (5, 10)
+    assert cli.run_settings(args)["out_dir"].name == "a9_lam3_focal2_h5-10_seed0"
+    default = cli.parse(["train", "--arm", "a9", "--direction-weight", "3"])
+    assert default.reg_horizons == fs.REG_HORIZONS
+    assert cli.run_settings(default)["out_dir"].name == "a9_lam3_seed0"
+
+
+def test_cli_rejects_reg_horizons_beyond_the_forecast():
+    with pytest.raises(SystemExit):
+        _cli().parse(["train", "--arm", "a9", "--direction-weight", "3", "--reg-horizons", "5,80"])
+
+
+# ------------------------------------------------------------------ Optuna sweep objective (select period only)
+
+def _probe_with(values):
+    return {"targets": {f"all_bars_h{h}": {"reg": {"mean_auc": v, "mean_shuffled_auc": 0.5},
+                                            "causal": {"mean_auc": 0.53}}
+                        for h, v in values.items()}}
+
+
+def _eval_with_wql(wql):
+    per_stream = {"A": {f"h{h}": {"auc": 0.5, "baseline_auc": 0.5, "scaled_wql": wql,
+                                  "shuffled_auc": 0.5, "coverage_80": 0.8} for h in fs.HORIZONS}}
+    return {"period": "select", "per_stream": per_stream, "summary": fs.summarize(per_stream)}
+
+
+def test_objective_score_is_mean_embedding_direction_with_forecast_guardrail():
+    probe = _probe_with({5: 0.53, 10: 0.52, 20: 0.51})
+    ok = fs.objective_score(probe, _eval_with_wql(0.64), _eval_with_wql(0.63))
+    assert ok["score"] == pytest.approx(0.52)
+    assert ok["penalty"] == 0.0
+    degraded = fs.objective_score(probe, _eval_with_wql(0.70), _eval_with_wql(0.63))
+    assert degraded["penalty"] > 0 and degraded["score"] < ok["score"]
+
+
+def test_objective_score_refuses_non_select_reports():
+    bad = dict(_eval_with_wql(0.63), period="outer")
+    with pytest.raises(ValueError):
+        fs.objective_score(_probe_with({5: 0.53, 10: 0.52, 20: 0.51}), bad, _eval_with_wql(0.63))
