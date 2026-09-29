@@ -51,7 +51,10 @@ PERIODS: dict[str, tuple[str | None, str]] = {
     "select": ("2025-07-15T00:00:00+00:00", "2025-10-01T00:00:00+00:00"),
     "outer": ("2025-10-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
 }
-ARMS = ("a1", "a2", "a3", "a7", "a8")
+ARMS = ("a1", "a2", "a3", "a7", "a8", "a9")
+# A9: direction BCE placed directly on the consumer embedding (the OHLCV REG
+# tokens, concatenated) so the gradient shapes what downstream models read.
+REG_HORIZONS = (5, 10, 20)
 # Mirrored-future contrastive direction: the context must pick its real future
 # path over the same path sign-flipped.  The paths have identical magnitude, so
 # only direction can separate them.
@@ -99,13 +102,19 @@ def uses_direction_head(arm: str) -> bool:
     never ships.  Direction is evaluated from the model itself (native quantile
     P(up) and Probe Atlas REG probes), so the stage stays SSL-only.
     """
-    return arm in ("a7", "a8")
+    return arm in ("a7", "a8", "a9")
 
 
 def uses_liquidity_teacher(arm: str) -> bool:
     """A7 = A1 plus a training-only teacher that learns direction over the next
     5 and 10 bars only on liquidity-break bars (ties masked)."""
     return arm == "a7"
+
+
+def uses_reg_teacher(arm: str) -> bool:
+    """A9: A1 plus a training-only direction head on the consumer REG embedding
+    (BCE on close[t+h] > close[t], ties masked, h in REG_HORIZONS)."""
+    return arm == "a9"
 
 
 def uses_mirror_contrastive(arm: str) -> bool:
@@ -315,7 +324,8 @@ def direction_loss(close_quantiles, last_close, future_close, levels,
 
 
 def forecast_close(model, context, future_close=None, *, forecast_length=FORECAST_LENGTH,
-                   patch_size: int = 16, return_hidden: bool = False):
+                   patch_size: int = 16, return_hidden: bool = False,
+                   return_reg: bool = False, ohlcv_series: int = 5):
     """Run one stream-group per window; return (close pinball or None, close quantiles).
 
     ``context`` is [B,5,L].  Only the close variate carries a target, so the
@@ -335,19 +345,29 @@ def forecast_close(model, context, future_close=None, *, forecast_length=FORECAS
         target[:, CLOSE] = future_close
         target = target.reshape(batch * channels, forecast_length)
     captured = {}
-    handle = (model.output_patch_embedding.register_forward_pre_hook(
-        lambda _module, args: captured.__setitem__("tokens", args[0]))
-        if return_hidden else None)
+    handles = []
+    if return_hidden:
+        handles.append(model.output_patch_embedding.register_forward_pre_hook(
+            lambda _module, args: captured.__setitem__("tokens", args[0])))
+    if return_reg:
+        handles.append(model.encoder.register_forward_hook(
+            lambda _module, _args, out: captured.__setitem__("sequence", out.last_hidden_state)))
     try:
         output = model(context=flat, group_ids=groups,
                        num_output_patches=forecast_length // patch_size,
                        future_target=target)
     finally:
-        if handle is not None:
+        for handle in handles:
             handle.remove()
     quantiles = output.quantile_preds.reshape(
         batch, channels, output.quantile_preds.shape[1], -1)[:, CLOSE, :, :forecast_length]
     loss = None if output.loss is None else output.loss * channels
+    if return_reg:
+        # sequence = [context patches | REG | forecast patches]; REG is the consumer token
+        sequence = captured["sequence"]
+        reg = sequence[:, sequence.shape[1] - 1 - forecast_length // patch_size]
+        reg = reg.reshape(batch, channels, -1)[:, :ohlcv_series].reshape(batch, -1)
+        return loss, quantiles, reg
     if not return_hidden:
         return loss, quantiles
     tokens = captured["tokens"]
@@ -385,6 +405,16 @@ def future_path(future_close, last_close, length: int | None = None):
 def mirror_path(path):
     """Same path, opposite direction: identical magnitude and shape of moves."""
     return -path
+
+
+def make_reg_teacher(d_model: int, horizons: Sequence[int] = REG_HORIZONS,
+                     ohlcv_series: int = 5):
+    """Training-only head: consumer REG embedding [B, 5*D] -> one logit per horizon."""
+    import torch.nn as nn
+
+    width = ohlcv_series * d_model
+    return nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 128), nn.GELU(),
+                         nn.Linear(128, len(horizons)))
 
 
 def make_mirror_teacher(d_model: int, n_patches: int):
@@ -1200,6 +1230,9 @@ def build_stage_report(*, arm: str, direction_weight: float, seed: int, parent_p
             "arm": arm, "direction_weight": direction_weight, "seed": seed,
             "direction_head": DIRECTION_HEAD_POLICY if uses_direction_head(arm) else "none",
             "direction_target": "close_above_decision_close",
+            "reg_teacher": ({"horizons": list(REG_HORIZONS), "ties": "masked",
+                             "pooling": "OHLCV REG tokens concatenated (consumer embedding)"}
+                            if uses_reg_teacher(arm) else None),
             "mirror_contrastive": ({"path_length": MIRROR_LENGTH, "dim": MIRROR_DIM,
                                     "logit_scale_init": MIRROR_LOGIT_SCALE_INIT,
                                     "logit_scale_cap": MIRROR_LOGIT_SCALE_CAP,
@@ -1283,7 +1316,9 @@ def train_forecast_direction(
     parameters = [value for value in model.parameters() if value.requires_grad]
     teacher = None
     if uses_direction_head(arm):
-        if uses_mirror_contrastive(arm):
+        if uses_reg_teacher(arm):
+            teacher = make_reg_teacher(int(base.model_dim)).to(device)
+        elif uses_mirror_contrastive(arm):
             teacher = make_mirror_teacher(int(base.model_dim), FORECAST_LENGTH // 16).to(device)
         else:
             teacher = make_direction_head(
@@ -1310,6 +1345,12 @@ def train_forecast_direction(
     def batch_loss(context, future_close, last_close, sigma, event=None):
         """-> (native, direction, extra); objective = native + λ·direction + extra."""
         zero = torch.zeros((), device=context.device)
+        if uses_reg_teacher(arm):
+            native, _, reg = forecast_close(base, context, future_close, return_reg=True)
+            ends = torch.stack([future_close[:, h - 1] for h in REG_HORIZONS], 1)
+            valid = ends != last_close[:, None]
+            return (native, liquidity_teacher_loss(
+                teacher(reg), ends > last_close[:, None], valid), zero)
         if uses_mirror_contrastive(arm):
             native, _, hidden = forecast_close(base, context, future_close, return_hidden=True)
             path = future_path(future_close, last_close, MIRROR_LENGTH)
@@ -1473,7 +1514,8 @@ def train_forecast_direction(
 __all__ = [
     "CONTEXT_LENGTH", "FORECAST_LENGTH", "HORIZONS", "PERIODS", "Stream",
     "BAR_FEATURES", "DIRECTION_HEAD_POLICY", "FIRST_PASSAGE_BARRIERS", "MAX_SERIES_PER_PASS", "first_passage",
-    "CRT_CLASSES", "LIQUIDITY_EVENTS", "future_path", "make_mirror_teacher",
+    "CRT_CLASSES", "LIQUIDITY_EVENTS", "REG_HORIZONS", "future_path", "make_mirror_teacher",
+    "make_reg_teacher", "uses_reg_teacher",
     "overlap_false_negatives", "mirror_contrastive_loss", "mirror_path",
     "uses_mirror_contrastive", "stack_gain", "stream_prediction_rows", "probe_side", "reg_embeddings", "reg_probe_report", "candle_range_classes", "liquidity_break_events",
     "liquidity_teacher_loss", "uses_liquidity_teacher",

@@ -1401,3 +1401,70 @@ def test_same_stream_overlap_mask():
     mask = fs.overlap_false_negatives(streams, anchors, window=20)
     assert mask.tolist() == [[False, True, False, False], [True, False, False, False],
                              [False, False, False, False], [False, False, False, False]]
+
+
+# ------------------------------------------------------------------ A9: direction BCE directly on the consumer REG embedding
+
+class _EncoderChronos:
+    """Fake Chronos whose forward runs ``encoder`` over [context | REG | forecast] tokens.
+    Hidden value of series r at token j is 1000*r + j."""
+
+    def __init__(self, d_model=4):
+        torch = _torch()
+        self.d_model = d_model
+        self.encoder = torch.nn.Identity()
+        self.output_patch_embedding = torch.nn.Identity()
+        self.chronos_config = SimpleNamespace(quantiles=[0.1, 0.5, 0.9])
+
+    def __call__(self, *, context, group_ids, num_output_patches, future_target):
+        torch = _torch()
+        rows, length = context.shape
+        tokens = length // 16 + 1 + num_output_patches
+        hidden = (1000 * torch.arange(rows, dtype=torch.float32)[:, None, None]
+                  + torch.arange(tokens, dtype=torch.float32)[None, :, None]).expand(
+                      rows, tokens, self.d_model).clone()
+        hidden = self.encoder(SimpleNamespace(last_hidden_state=hidden)).last_hidden_state
+        self.output_patch_embedding(hidden[:, -num_output_patches:])
+        preds = torch.zeros(rows, 3, num_output_patches * 16)
+        loss = None if future_target is None else torch.tensor(0.1)
+        return SimpleNamespace(loss=loss, quantile_preds=preds)
+
+
+@needs_torch
+def test_forecast_close_returns_the_consumer_reg_embedding_from_the_same_pass():
+    torch = _torch()
+    model = _EncoderChronos()
+    _, _, reg = fs.forecast_close(model, torch.zeros(2, 5, 32), torch.ones(2, 64),
+                                  forecast_length=64, return_reg=True)
+    assert reg.shape == (2, 5 * 4)
+    # 32-bar context = 2 patches, so REG is token 2; window 1's series are rows 5..9
+    assert reg[0, 0].item() == 0 * 1000 + 2
+    assert reg[1, 0].item() == 5 * 1000 + 2 and reg[1, -1].item() == 9 * 1000 + 2
+
+
+@needs_torch
+def test_reg_teacher_maps_the_consumer_embedding_to_one_logit_per_horizon():
+    torch = _torch()
+    head = fs.make_reg_teacher(d_model=8, horizons=fs.REG_HORIZONS)
+    logits = head(torch.randn(4, 5 * 8))
+    assert logits.shape == (4, len(fs.REG_HORIZONS))
+
+
+def test_a9_targets_the_consumer_embedding():
+    assert fs.uses_reg_teacher("a9") and fs.uses_direction_head("a9")
+    assert not fs.uses_bar_features("a9")
+    assert fs.REG_HORIZONS == (5, 10, 20)
+    assert not any(fs.uses_reg_teacher(a) for a in ("a1", "a2", "a3", "a7", "a8"))
+
+
+def test_a9_requires_a_direction_term(tmp_path):
+    with pytest.raises(ValueError):
+        fs.train_forecast_direction({}, parent=tmp_path, base_snapshot=tmp_path,
+                                    out_dir=tmp_path, provenance={}, arm="a9",
+                                    direction_weight=0.0)
+
+
+def test_cli_a9_run_directory():
+    cli = _cli()
+    args = cli.parse(["train", "--arm", "a9", "--direction-weight", "1"])
+    assert cli.run_settings(args)["out_dir"].name == "a9_lam1_seed0"
