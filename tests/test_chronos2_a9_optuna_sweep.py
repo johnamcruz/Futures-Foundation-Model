@@ -103,3 +103,8 @@ def test_confirmation_winner_is_best_mean_across_seeds():
 def test_confirm_flag_parses():
     args = _sweep().parser().parse_args(["--confirm"])
     assert args.confirm
+
+
+def test_smoke_runs_use_their_own_folder():
+    source = (ROOT / "scripts/chronos/chronos2_a9_optuna_sweep.py").read_text()
+    assert 'storage_path.parent / "smoke" / "study.db"' in source

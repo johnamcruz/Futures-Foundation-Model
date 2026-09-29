@@ -171,8 +171,8 @@ def run(args: argparse.Namespace) -> dict:
                                                   "probe_train_per_stream", "probe_eval_per_stream")})
     study_name = config["study"]["name"] + ("_smoke" if smoke else "")
     storage_path = ROOT / config["study"]["storage"]
-    if smoke:
-        storage_path = storage_path.with_name("study_smoke.db")
+    if smoke:                     # never share trial folders or the study with the real sweep
+        storage_path = storage_path.parent / "smoke" / "study.db"
     sweep_dir = storage_path.parent
     sweep_dir.mkdir(parents=True, exist_ok=True)
     if smoke and storage_path.exists():
