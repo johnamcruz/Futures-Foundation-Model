@@ -418,6 +418,7 @@ def train_mask(
     if resume and state_path.is_file():
         saved = torch.load(state_path, map_location="cpu")
         _check_resume_identity(saved, run_identity, bool(all_flags.any()))
+        counters["cross_without_flow"] = int(saved.get("cross_without_flow", 0))
         _restore_adapter(model, saved["adapter"])
         decoder.load_state_dict(saved["decoder"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -569,6 +570,7 @@ def train_mask(
         )
         _atomic_torch(state_path, {
             "run_identity": run_identity,
+            "cross_without_flow": counters["cross_without_flow"],
             "epoch": epoch,
             "adapter": _adapter_state(model),
             "decoder": decoder.state_dict(),

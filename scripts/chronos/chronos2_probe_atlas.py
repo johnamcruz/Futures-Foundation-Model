@@ -536,7 +536,7 @@ def _stage_identity(
         if stage_report is not None:
             raise SystemExit(
                 "--stage-report cannot authenticate a remote checkpoint")
-        return {
+        identity = {
             "stage_report_path": None,
             "stage_report_sha256": None,
             "parent_checkpoint_sha256": None,
@@ -545,6 +545,9 @@ def _stage_identity(
             "base_weights_sha256": None,
             "base_config_sha256": None,
         }
+        if allow_partial_timeframes:
+            identity["allow_partial_timeframes"] = True
+        return identity
     report_path = (
         Path(stage_report).expanduser()
         if stage_report is not None

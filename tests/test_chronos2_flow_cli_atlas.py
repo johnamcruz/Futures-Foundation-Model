@@ -102,3 +102,10 @@ def test_cross_mode_without_flow_channels_is_refused_before_any_model_is_loaded(
 
     with pytest.raises(ValueError, match="needs flow channels"):
         train_mask(Item(), parent=tmp_path / "missing", out_dir=tmp_path / "o", mask_mode="cross")
+
+
+def test_remote_checkpoint_identity_records_the_partial_opt_in():
+    atlas = _load("chronos2_probe_atlas_remote", ROOT / "scripts" / "chronos" / "chronos2_probe_atlas.py")
+    plain = atlas._stage_identity("org/model", "remote:org/model", None, context_length=256)
+    opted = atlas._stage_identity("org/model", "remote:org/model", None, context_length=256, allow_partial_timeframes=True)
+    assert "allow_partial_timeframes" not in plain and opted["allow_partial_timeframes"] is True

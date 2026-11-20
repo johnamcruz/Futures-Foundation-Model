@@ -325,7 +325,10 @@ def _load_flow(path, columns, timeframe, timeframe_delta):
     """Raw bar-open flow table -> timeframe bars indexed by bar CLOSE time."""
     if not path.is_file():
         raise RuntimeError(f"flow file is missing: {path}")
-    frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    try:
+        frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    except ImportError as error:        # pandas names the missing engine; say how to get it
+        raise RuntimeError("reading the flow parquet needs pyarrow (pip install pyarrow, or the 'flow' extra)") from error
     stamp = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="coerce")
     if stamp.isna().any() or stamp.duplicated().any() or not stamp.is_monotonic_increasing:
         raise RuntimeError("flow timestamps must be valid, unique and ordered (bar open, UTC)")
