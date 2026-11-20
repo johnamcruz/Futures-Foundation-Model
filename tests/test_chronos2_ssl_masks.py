@@ -94,3 +94,11 @@ def test_a_variate_never_loses_every_visible_step():
 def test_selection_masks_rejects_other_modes():
     with pytest.raises(ValueError):
         selection_masks(np.ones((1, 8, 16), bool), flow_flags(NAMES), "time", 0.4, np.random.default_rng(0))
+
+
+def test_redraw_gives_back_a_visible_step_to_a_variate_whose_only_finite_step_is_the_first():
+    finite = np.ones((50, 8, 64), bool); finite[:, 5:, 1:] = False        # flow finite only at step 0
+    sel, vis = selection_masks(finite, flow_flags(NAMES), "cross", 0.5, np.random.default_rng(0))
+    assert vis[:, 5:, 0].all() and not sel[:, 5:, 0].any()
+    sel, vis = selection_masks(finite, flow_flags(NAMES), "tail", 0.5, np.random.default_rng(0))
+    assert vis[:, 5:, 0].all() and not sel[:, 5:, :].any()

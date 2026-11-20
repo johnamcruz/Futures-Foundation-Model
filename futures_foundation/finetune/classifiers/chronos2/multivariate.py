@@ -212,13 +212,22 @@ def prepare_multivariate(
         holdout_cut = pd.Timestamp(holdout_start)
         holdout_cut = (holdout_cut.tz_localize("UTC") if holdout_cut.tzinfo is None
                        else holdout_cut.tz_convert("UTC"))
+        if len(flow_frame) == 0 or flow_frame.index.max() < holdout_cut - pd.Timedelta(days=1):
+            raise ValueError(
+                "holdout_start is after the end of the flow data: pass an earlier holdout_start so every "
+                "arm (flow, shuffled, proxy, price-only) trains and validates on identical rows")
+        flow_info["first_close"] = flow_frame.index.min().isoformat()
+        flow_info["last_close"] = flow_frame.index.max().isoformat()
         flow_frame = flow_frame[flow_frame.index < holdout_cut]    # nothing past the holdout can enter a control
+        real_flow = flow_frame
         position = tickers.index(flow_ticker)
         target = aligned_frames[position]
         if flow_control == "shuf":
             flow_frame = _shuffle_sessions(flow_frame, flow_control_seed)
         elif flow_control == "proxy":
-            flow_frame = _price_proxy(target, flow_columns)
+            # available exactly where the real flow is, so every arm keeps the same windows
+            flow_frame = _price_proxy(target, flow_columns).where(
+                real_flow.reindex(target.index).notna().to_numpy())
         elif flow_control != "flow":
             raise ValueError("flow_control must be flow, shuf or proxy")
         flow_frame = flow_frame.reindex(target.index)
@@ -316,7 +325,10 @@ def _load_flow(path, columns, timeframe, timeframe_delta):
     """Raw bar-open flow table -> timeframe bars indexed by bar CLOSE time."""
     if not path.is_file():
         raise RuntimeError(f"flow file is missing: {path}")
-    frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    try:
+        frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    except ImportError as error:        # pandas names the missing engine; say how to get it
+        raise RuntimeError("reading the flow parquet needs pyarrow (pip install pyarrow, or the 'flow' extra)") from error
     stamp = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="coerce")
     if stamp.isna().any() or stamp.duplicated().any() or not stamp.is_monotonic_increasing:
         raise RuntimeError("flow timestamps must be valid, unique and ordered (bar open, UTC)")
@@ -353,6 +365,8 @@ def _shuffle_sessions(frame, seed):
     source_for = {}
     for weekday in range(7):
         group = sessions[sessions.day_of_week == weekday]
+        if len(group) == 1:
+            raise ValueError("shuffle control needs at least two sessions per weekday present")
         order = rng.permutation(len(group))
         for position, pick in enumerate(order):
             # a cyclic hand-over of a random order: no session keeps its own flow (unless it is alone on its weekday)

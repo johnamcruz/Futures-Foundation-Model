@@ -28,6 +28,7 @@ setup(
             "safetensors>=0.4,<0.5",
         ],
         "heads": ["xgboost>=2.0", "joblib>=1.3"],
+        "flow": ["pyarrow>=14"],
         "regime": ["hmmlearn>=0.3"],   # futures_foundation.regime market-state HMM
         "onnx": ["onnxmltools", "skl2onnx"],
         "data": ["databento>=0.76", "zstandard>=0.23"],
