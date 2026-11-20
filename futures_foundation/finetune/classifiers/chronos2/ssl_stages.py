@@ -322,6 +322,7 @@ def train_mask(
         seed: int = 0,
         single_ticker_probability: float = 0.25,
         resume: bool = False,
+        mask_mode: str = "time",
 ) -> dict:
     """Masked-patch reconstruction, saving only the best Chronos-2 adapter."""
     import torch
@@ -329,6 +330,8 @@ def train_mask(
 
     if not 0.0 < mask_ratio < 1.0:
         raise ValueError("mask_ratio must be between 0 and 1")
+    if mask_mode not in ("time", "cross", "tail"):
+        raise ValueError("mask_mode must be 'time', 'cross' or 'tail'")
     if not 0.0 <= single_ticker_probability <= 1.0:
         raise ValueError("single_ticker_probability must be between 0 and 1")
     corpus = _as_corpus(prepared)
@@ -402,12 +405,33 @@ def train_mask(
 
     def loss_for(raw, mask_generator):
         standardized, finite = _standardize(raw)
-        time_mask = torch.rand(
-            (raw.shape[0], raw.shape[-1]), device=device,
-            generator=mask_generator) < mask_ratio
-        time_mask[:, 0] = True
-        selected = finite & time_mask[:, None, :]
-        visible = finite & ~time_mask[:, None, :]
+        if mask_mode == "cross" and raw.shape[1] > 5:
+            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import modal_time_mask
+            seed_value = int(torch.randint(
+                0, 2 ** 31 - 1, (1,), device=device, generator=mask_generator).item())
+            cross = torch.from_numpy(modal_time_mask(
+                raw.shape[0], raw.shape[1], raw.shape[-1], mask_ratio,
+                np.random.default_rng(seed_value))).to(device)
+            selected = finite & cross
+            visible = finite & ~cross
+        elif mask_mode == "tail":
+            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import tail_mask
+            seed_value = int(torch.randint(
+                0, 2 ** 31 - 1, (1,), device=device, generator=mask_generator).item())
+            tail = torch.from_numpy(tail_mask(
+                raw.shape[0], raw.shape[1], raw.shape[-1],
+                np.random.default_rng(seed_value))).to(device)
+            price_only = torch.zeros_like(tail)
+            price_only[:, :5, :] = True                      # loss on the five price variates only
+            selected = finite & tail & price_only
+            visible = finite & ~tail
+        else:
+            time_mask = torch.rand(
+                (raw.shape[0], raw.shape[-1]), device=device,
+                generator=mask_generator) < mask_ratio
+            time_mask[:, 0] = True
+            selected = finite & time_mask[:, None, :]
+            visible = finite & ~time_mask[:, None, :]
         flat = standardized.reshape(-1, context_length)
         visible_flat = visible.reshape(-1, context_length)
         batch, channels, _ = standardized.shape
@@ -546,6 +570,7 @@ def train_mask(
             "timeframes": list(timeframes),
             "context_length": context_length,
             "mask_ratio": mask_ratio,
+            "mask_mode": mask_mode,
             "epochs": epochs,
             "steps_per_epoch": steps_per_epoch,
             "batch_windows": batch_windows,

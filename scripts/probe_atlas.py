@@ -210,7 +210,7 @@ def _load_bars(ticker: str, timeframe: str) -> dict:
     frame = pd.read_csv(
         source_path,
         usecols=["datetime", "open", "high", "low", "close", "volume"])
-    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True)
+    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True).dt.as_unit("ns")
     frame = frame[frame["datetime"] < EVAL_END].reset_index(drop=True)
     timestamps = pd.DatetimeIndex(frame["datetime"])
     o, h, l, c = (frame[name].to_numpy(float)
@@ -285,7 +285,7 @@ def _load_pool() -> tuple[dict[tuple[str, str], dict], list[tuple], dict[str, np
     bars_by_stream = {}
     corpus_ticker = corpus["ticker"].astype(str)
     corpus_tf = corpus["tf"].astype(str)
-    corpus_ts = pd.to_datetime(corpus["ts"], utc=True)
+    corpus_ts = pd.to_datetime(corpus["ts"], utc=True).as_unit("ns")
 
     for ticker in TICKERS:
         for timeframe in TIMEFRAMES:

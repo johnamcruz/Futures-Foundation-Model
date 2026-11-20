@@ -515,6 +515,7 @@ def _stage_identity(
     stage_report: Path | None,
     *,
     context_length: int,
+    allow_partial_timeframes: bool = False,
 ) -> dict:
     checkpoint_path = Path(checkpoint).expanduser()
     if not checkpoint_path.exists():
@@ -569,8 +570,11 @@ def _stage_identity(
         or saved_checkpoint.get("sha256") != checkpoint_sha256
         or not isinstance(config, dict)
         or config.get("context_length") != context_length
-        or set(config.get("timeframes", ()))
-        != {"1min", "3min", "5min", "15min"}
+        or not (
+            set(config.get("timeframes", ()))
+            == {"1min", "3min", "5min", "15min"}
+            or (allow_partial_timeframes and config.get("timeframes"))
+        )
         or not isinstance(parent_sha256, str)
         or len(parent_sha256) != 64
         or not isinstance(data_sha256, str)
@@ -776,6 +780,10 @@ def parser() -> argparse.ArgumentParser:
         "--eval-start", default="2025-01-01",
         help="first evaluation decision close; later than 2025-01-01 excludes "
              "periods a candidate trained on")
+    value.add_argument(
+        "--allow-partial-timeframes", action="store_true",
+        help="accept a stage trained on a subset of timeframes (e.g. the NQ-only "
+             "flow stream); the evaluation itself is unchanged")
     value.add_argument("--preflight-only", action="store_true")
     return value
 
@@ -831,6 +839,7 @@ def main() -> dict:
         checkpoint_hash,
         args.stage_report,
         context_length=args.window,
+        allow_partial_timeframes=args.allow_partial_timeframes,
     )
     _validate_stage_base_identity(stage_identity, base_identity)
     if not labels.is_file():

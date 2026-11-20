@@ -52,6 +52,9 @@ def parser() -> argparse.ArgumentParser:
              "proxy = price-derived stand-in channels (control)")
     value.add_argument("--nq-only", action="store_true",
                        help="NQ OHLCV only, no flow channels (control)")
+    value.add_argument("--mask-mode", choices=("time", "cross", "tail"), default="time",
+                       help="time = FFM shared time mask; cross = per-window shared / flow-block / price-block masks; "
+                            "tail = hide the last 2-12 bars of every variate, loss on price only")
     value.add_argument("--resume", action="store_true")
     value.add_argument("--preflight-only", action="store_true")
     return value
@@ -98,6 +101,7 @@ def main() -> None:
         context_length=args.context_length,
         prediction_length=args.prediction_length,
         mask_ratio=args.mask_ratio,
+        mask_mode=args.mask_mode,
         epochs=args.epochs,
         steps_per_epoch=args.steps,
         batch_windows=args.batch_windows,
