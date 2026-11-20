@@ -234,6 +234,24 @@ def _ticker_indices(prepared, *, allow_flow: bool = False) -> dict[str, np.ndarr
     return result
 
 
+def _check_resume_identity(saved: dict, run_identity: dict, has_flow: bool) -> None:
+    """Refuse to resume a trainer state from a different data/mask/seed identity.
+
+    A state without an identity (written before it was recorded) is accepted only for the plain time mask on a corpus with no
+    flow channel, where it cannot hide a mixed objective.
+    """
+    found = saved.get("run_identity")
+    if found is None:
+        if run_identity.get("mask_mode") == "time" and not has_flow:
+            return
+        raise RuntimeError(
+            "trainer.pt has no run identity; refusing to resume a flow or non-default mask run (use a fresh out_dir)")
+    if found != run_identity:
+        raise RuntimeError(
+            "trainer.pt was written by a different data/mask/seed identity; "
+            "refusing to resume (use a fresh out_dir)")
+
+
 def _as_corpus(prepared) -> dict[str, object]:
     if isinstance(prepared, Mapping):
         corpus = {str(key): value for key, value in prepared.items()}
@@ -335,6 +353,10 @@ def train_mask(
     if not 0.0 <= single_ticker_probability <= 1.0:
         raise ValueError("single_ticker_probability must be between 0 and 1")
     corpus = _as_corpus(prepared)
+    from futures_foundation.finetune.classifiers.chronos2.ssl_masks import flow_flags
+    all_flags = flow_flags(next(iter(corpus.values())).channel_names)
+    if mask_mode == "cross" and not all_flags.any():
+        raise ValueError("mask_mode='cross' needs flow channels in the corpus (pass a flow stream)")
     timeframes = tuple(corpus)
     out_dir, parent = Path(out_dir), Path(parent)
     checkpoint = out_dir / "checkpoint"
@@ -395,10 +417,7 @@ def train_mask(
     }
     if resume and state_path.is_file():
         saved = torch.load(state_path, map_location="cpu")
-        if saved.get("run_identity", run_identity) != run_identity:
-            raise RuntimeError(
-                "trainer.pt was written by a different data/mask/seed identity; "
-                "refusing to resume (use a fresh out_dir)")
+        _check_resume_identity(saved, run_identity, bool(all_flags.any()))
         _restore_adapter(model, saved["adapter"])
         decoder.load_state_dict(saved["decoder"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -411,12 +430,7 @@ def train_mask(
         rng.bit_generator.state = saved["numpy_rng"]
         generator.set_state(saved["torch_generator"])
 
-    from futures_foundation.finetune.classifiers.chronos2.ssl_masks import flow_flags
-    first_item = next(iter(corpus.values()))
-    all_flags = flow_flags(first_item.channel_names)
-    if mask_mode == "cross" and not all_flags.any():
-        raise ValueError("mask_mode='cross' needs flow channels in the corpus (pass a flow stream)")
-    counters = {"cross_without_flow": 0}
+    counters = {"cross_without_flow": 0}      # training and validation draws of a cross-mode run that had no flow variate
 
     def loss_for(raw, mask_generator, flags=None):
         flow_flags_now = all_flags if flags is None else flags
