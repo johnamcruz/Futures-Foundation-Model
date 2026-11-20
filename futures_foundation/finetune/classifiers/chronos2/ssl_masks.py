@@ -93,4 +93,9 @@ def selection_masks(finite: np.ndarray, is_flow: np.ndarray, mode: str, ratio: f
         hide[b, :, :] = shared[None, :]
         selected[b] = finite[b] & hide[b] & (~is_flow[:, None] if mode == "tail" else True)
         visible[b] = finite[b] & ~hide[b]
+        # the shared mask always hides step 0: give any variate still without a visible step its first finite one back
+        for c in np.flatnonzero(finite[b].any(-1) & ~visible[b].any(-1)):
+            first = int(np.flatnonzero(finite[b, c])[0])
+            visible[b, c, first] = True
+            selected[b, c, first] = False
     return selected, visible

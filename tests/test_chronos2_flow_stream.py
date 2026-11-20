@@ -141,24 +141,64 @@ def test_shuffle_control_moves_whole_exchange_sessions_with_same_weekday():
     assert out.equals(_shuffle_sessions(frame, 0)) and not out.equals(_shuffle_sessions(frame, 1))
 
 
-def test_shuffle_keeps_clock_alignment_across_the_daylight_saving_change():
+def test_shuffle_keeps_local_clock_time_across_the_daylight_saving_change():
     from futures_foundation.finetune.classifiers.chronos2.multivariate import _shuffle_sessions
-    idx = pd.date_range("2025-03-02T23:00:00Z", periods=21 * 1440, freq="1min")   # spans 2025-03-09 US DST start
-    frame = pd.DataFrame({"flow_buy_vol": np.ones(len(idx))}, index=idx)
+    # exchange-like hours in America/Chicago (17:00 -> 16:00 next day, Sun-Thu evenings), spanning the 2025-03-09 change
+    parts = []
+    for day in pd.date_range("2025-02-02", "2025-04-12", freq="D"):
+        if day.dayofweek == 4 or day.dayofweek == 5:        # no Friday-evening / Saturday-evening session
+            continue
+        start = (day + pd.Timedelta(hours=17)).tz_localize("America/Chicago")
+        local = pd.date_range(start, periods=23 * 60, freq="1min")
+        parts.append(pd.Series((local.hour * 60 + local.minute).to_numpy(float), index=local.tz_convert("UTC")))
+    series = pd.concat(parts).sort_index()
+    frame = pd.DataFrame({"flow_buy_vol": series.to_numpy()}, index=series.index)
     out = _shuffle_sessions(frame, 0)
-    assert out.flow_buy_vol.notna().mean() > 0.99
-    assert len(out) >= len(frame) - 2 * 60 * 3        # at most a few DST-gap hours go missing, not a whole shifted hour per session
+    local_tod = out.index.tz_convert("America/Chicago")
+    assert ((local_tod.hour * 60 + local_tod.minute).to_numpy() == out.flow_buy_vol.to_numpy()).all()   # value = its source's local clock
+    assert out.index.equals(frame.index)
+
+
+def test_shuffle_needs_two_sessions_per_weekday():
+    from futures_foundation.finetune.classifiers.chronos2.multivariate import _shuffle_sessions
+    with pytest.raises(ValueError, match="two sessions per weekday"):
+        _shuffle_sessions(_sessions_frame(days=3), 0)
+
+
+def _long_streams(tmp_path):
+    _write_streams(tmp_path, rows=13440)
+    return _flow(tmp_path / "flow.parquet", minutes=13440 * 3 + 30)
 
 
 def test_shuffle_never_uses_flow_at_or_after_the_holdout(tmp_path):
-    frame = _flow(tmp_path / "flow.parquet")
-    _write_streams(tmp_path)
-    marker = frame.copy(); marker.loc[marker.timestamp >= pd.Timestamp("2024-12-31T12:00:00"), "buy_vol"] = 7e9
-    marker.to_parquet(tmp_path / "late.parquet")
+    frame = _long_streams(tmp_path)
+    marked = frame.copy()
+    marked.loc[marked.timestamp >= pd.Timestamp("2025-01-20T00:00:00"), "buy_vol"] = 7e9
+    marked.to_parquet(tmp_path / "late.parquet")
     r = prepare_multivariate(tmp_path, flow_path=tmp_path / "late.parquet", flow_control="shuf",
-                             **dict(KW, holdout_start="2024-12-31T06:00:00Z"))
-    assert not (r.train[5 + FLOW_COLS.index("buy_vol")] > 1e9).any()
-    assert not (r.validation_matrix[5 + FLOW_COLS.index("buy_vol")] > 1e9).any()
+                             **dict(KW, holdout_start="2025-01-20T00:00:00Z"))
+    col = 5 + FLOW_COLS.index("buy_vol")
+    assert not (r.train[col] > 1e9).any() and not (r.validation_matrix[col] > 1e9).any()
+
+
+def test_holdout_after_the_flow_data_is_refused(tmp_path):
+    _long_streams(tmp_path)
+    with pytest.raises(ValueError, match="earlier holdout_start"):
+        prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet",
+                             **dict(KW, holdout_start="2025-06-01T00:00:00Z"))
+
+
+def test_every_arm_keeps_the_same_validation_rows_and_proxy_follows_the_flow_gaps(tmp_path):
+    _write_streams(tmp_path, rows=13440)
+    _flow(tmp_path / "flow.parquet", minutes=13440 * 3 + 30, hole=list(range(9000, 9400)))
+    kw = dict(KW, holdout_start="2025-01-25T00:00:00Z")
+    arms = {c: prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet", flow_control=c, **kw)
+            for c in ("flow", "shuf", "proxy")}
+    price_only = prepare_multivariate(tmp_path, **kw)
+    ranges = {c: a.report["validation_target_ranges"] for c, a in arms.items()}
+    assert ranges["flow"] == ranges["proxy"] == price_only.report["validation_target_ranges"]
+    assert np.array_equal(np.isfinite(arms["flow"].train[5:]), np.isfinite(arms["proxy"].train[5:]))
+    assert arms["flow"].report["flow"]["last_close"] and arms["flow"].report["flow"]["first_close"]
 
 
 def test_shuffle_control_wires_through_prepare_and_changes_the_flow_rows(tmp_path):

@@ -516,6 +516,8 @@ def _timeframes_ok(value, allow_partial: bool) -> bool:
     """A stage must cover all four timeframes; with the opt-in, a non-empty list drawn from them."""
     if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
         return False
+    if len(set(value)) != len(value):
+        return False
     if set(value) == set(ATLAS_TIMEFRAMES):
         return True
     return allow_partial and set(value) <= set(ATLAS_TIMEFRAMES)
