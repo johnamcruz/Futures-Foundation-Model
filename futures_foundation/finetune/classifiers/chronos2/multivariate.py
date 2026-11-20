@@ -25,6 +25,18 @@ from futures_foundation.finetune.ssl_data import OHLCV_COLS, TICKERS_9
 
 
 SCHEMA = "ffm_chronos2_multivariate_v1"
+FLOW_SCHEMA = "ffm_chronos2_multivariate_v2_flow"
+# Optional order-flow stream (one ticker only). Raw series, no derived features:
+# FFM's own per-window z-score is the only scaling. Column -> aggregation to the bar.
+FLOW_AGGREGATION = {
+    "buy_vol": "sum",
+    "sell_vol": "sum",
+    "delta": "sum",
+    "n_trades": "sum",
+    "n_quotes": "sum",
+    "spread_mean_ticks": "mean",
+}
+FLOW_COLS = tuple(FLOW_AGGREGATION)
 TIMEFRAME = "3min"
 TIMEFRAME_MINUTES = {
     "1min": 1,
@@ -129,6 +141,9 @@ def prepare_multivariate(
         prediction_length: int = 32,
         validation_windows: int = 8,
         report_path: str | Path | None = None,
+        flow_path: str | Path | None = None,
+        flow_ticker: str = "NQ",
+        flow_columns: Sequence[str] = FLOW_COLS,
 ) -> Chronos2MultivariateData:
     """Build one aligned ``ticker x OHLCV`` Chronos-2 task for one timeframe.
 
@@ -136,6 +151,13 @@ def prepare_multivariate(
     ``open + timeframe``, the first instant at which the complete bar is
     observable.  The aligned timeline is the union of close times; absent bars
     remain NaN and are never imputed.
+
+    ``flow_path`` adds an optional order-flow stream (schema v2) for ONE ticker:
+    raw bar-open-indexed flow series appended after that ticker's OHLCV as
+    ``<ticker>.flow_<column>`` channels.  Flow is aggregated to ``timeframe``
+    with no look-ahead (a bar holds only its own interval), left NaN where the
+    source has no value, and never filled.  Without ``flow_path`` the output is
+    unchanged.
     """
     if not 0.0 < val_frac < 1.0:
         raise ValueError("val_frac must be between 0 and 1")
@@ -170,12 +192,35 @@ def prepare_multivariate(
         aligned_frames.append(values)
         source_rows[ticker] = len(values)
 
+    flow_info = None
+    if flow_path is not None:
+        if flow_ticker not in tickers:
+            raise ValueError("flow_ticker must be one of tickers")
+        flow_columns = tuple(flow_columns)
+        if not flow_columns or len(set(flow_columns)) != len(flow_columns):
+            raise ValueError("flow_columns must be a non-empty unique sequence")
+        unknown = sorted(set(flow_columns) - set(FLOW_COLS))
+        if unknown:
+            raise ValueError(f"unsupported flow columns: {unknown}")
+        flow_frame, flow_info = _load_flow(
+            Path(flow_path), flow_columns, timeframe, timeframe_delta)
+        position = tickers.index(flow_ticker)
+        target = aligned_frames[position]
+        flow_frame = flow_frame.reindex(target.index)
+        flow_frame.columns = [f"{flow_ticker}.{name}" for name in flow_frame.columns]
+        aligned_frames[position] = pd.concat([target, flow_frame], axis=1)
+
     aligned = pd.concat(aligned_frames, axis=1, join="outer").sort_index()
     if aligned.index.has_duplicates or not aligned.index.is_monotonic_increasing:
         raise RuntimeError("aligned close-time index is not unique and ordered")
     channel_names = tuple(aligned.columns)
     expected_channels = tuple(
-        f"{ticker}.{column}" for ticker in tickers for column in OHLCV_COLS)
+        name
+        for ticker in tickers
+        for name in (
+            [f"{ticker}.{column}" for column in OHLCV_COLS]
+            + ([f"{ticker}.flow_{column}" for column in flow_columns]
+               if flow_info and ticker == flow_ticker else [])))
     if channel_names != expected_channels:
         raise RuntimeError("aligned channel order changed unexpectedly")
 
@@ -202,7 +247,7 @@ def prepare_multivariate(
     )
 
     identity_payload = {
-        "schema": SCHEMA,
+        "schema": FLOW_SCHEMA if flow_info else SCHEMA,
         "timeframe": timeframe,
         "tickers": list(tickers),
         "channels": list(channel_names),
@@ -213,6 +258,9 @@ def prepare_multivariate(
         "prediction_length": prediction_length,
         "source_provenance": provenance,
     }
+    if flow_info:
+        identity_payload["flow"] = {
+            "ticker": flow_ticker, "columns": list(flow_columns), **flow_info}
     identity = hashlib.sha256(
         json.dumps(identity_payload, sort_keys=True).encode()).hexdigest()
     finite = np.isfinite(matrix)
@@ -245,6 +293,34 @@ def prepare_multivariate(
         validation_target_ranges=validation_ranges,
         report=report,
     )
+
+
+def _load_flow(path, columns, timeframe, timeframe_delta):
+    """Raw bar-open flow table -> timeframe bars indexed by bar CLOSE time."""
+    if not path.is_file():
+        raise RuntimeError(f"flow file is missing: {path}")
+    frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    stamp = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="coerce")
+    if stamp.isna().any() or stamp.duplicated().any() or not stamp.is_monotonic_increasing:
+        raise RuntimeError("flow timestamps must be valid, unique and ordered (bar open, UTC)")
+    frame.index = pd.DatetimeIndex(stamp)
+    frame = frame.astype(np.float64)
+    if timeframe != "1min":
+        grouped = frame.resample(
+            timeframe, label="left", closed="left")
+        parts = []
+        for column in columns:
+            how = FLOW_AGGREGATION[column]
+            # min_count=1: a bar with no source minute stays NaN, never 0.
+            parts.append(
+                grouped[column].sum(min_count=1) if how == "sum"
+                else grouped[column].mean())
+        frame = pd.concat(parts, axis=1)
+    frame.index = frame.index + timeframe_delta
+    frame = frame.astype(np.float32)
+    frame.columns = [f"flow_{column}" for column in columns]
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return frame, {"source_sha256": digest, "rows": int(len(frame))}
 
 
 def prepare_3min_multivariate(

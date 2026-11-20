@@ -42,6 +42,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--patience", type=int, default=3)
     value.add_argument("--seed", type=int, default=0)
     value.add_argument("--single-ticker-probability", type=float, default=0.25)
+    value.add_argument(
+        "--flow-path", type=Path, default=None,
+        help="optional NQ order-flow parquet (bar-open UTC); adds raw NQ.flow_* "
+             "channels (schema v2) and trains on NQ only")
     value.add_argument("--resume", action="store_true")
     value.add_argument("--preflight-only", action="store_true")
     return value
@@ -57,11 +61,13 @@ def main() -> None:
         raise SystemExit("timeframes must be a non-empty unique list")
     if set(timeframes) - set(TIMEFRAMES):
         raise SystemExit(f"unsupported timeframes: {sorted(set(timeframes) - set(TIMEFRAMES))}")
+    tickers = ("NQ",) if args.flow_path else TICKERS
     prepared = {
         timeframe: prepare_multivariate(
             args.data_dir,
             repo_root=ROOT,
-            tickers=TICKERS,
+            tickers=tickers,
+            flow_path=args.flow_path,
             timeframe=timeframe,
             context_length=args.context_length,
             prediction_length=args.prediction_length,

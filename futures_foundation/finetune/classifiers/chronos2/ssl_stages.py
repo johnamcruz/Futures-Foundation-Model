@@ -207,7 +207,12 @@ def _reg_embeddings(base, windows, finite):
     return reg.reshape(batch, channels, reg.shape[-1]).mean(dim=1)
 
 
-def _ticker_indices(prepared) -> dict[str, np.ndarray]:
+def _ticker_indices(prepared, *, allow_flow: bool = False) -> dict[str, np.ndarray]:
+    """Channel indices per ticker; every ticker has five OHLCV channels.
+
+    With ``allow_flow`` a ticker may also carry optional ``<ticker>.flow_*``
+    channels (schema v2 flow stream) after its OHLCV; only mask training opts in.
+    """
     tickers = tuple(dict.fromkeys(name.split(".", 1)[0] for name in prepared.channel_names))
     result = {
         ticker: np.asarray([
@@ -216,7 +221,15 @@ def _ticker_indices(prepared) -> dict[str, np.ndarray]:
         ], dtype=np.int64)
         for ticker in tickers
     }
-    if not result or any(len(indices) != 5 for indices in result.values()):
+
+    def valid(ticker, indices):
+        names = [prepared.channel_names[i] for i in indices]
+        if len(indices) == 5:
+            return True
+        return (allow_flow and len(indices) > 5 and all(
+            n.startswith(f"{ticker}.flow_") for n in names[5:]))
+
+    if not result or any(not valid(t, i) for t, i in result.items()):
         raise RuntimeError("every ticker must have exactly five OHLCV channels")
     return result
 
@@ -345,7 +358,7 @@ def train_mask(
         for timeframe, item in corpus.items()
     }
     ticker_indices = {
-        timeframe: _ticker_indices(item)
+        timeframe: _ticker_indices(item, allow_flow=True)
         for timeframe, item in corpus.items()
     }
     ticker_names = tuple(next(iter(ticker_indices.values())))
