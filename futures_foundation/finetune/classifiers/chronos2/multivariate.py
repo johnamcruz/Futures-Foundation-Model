@@ -25,6 +25,18 @@ from futures_foundation.finetune.ssl_data import OHLCV_COLS, TICKERS_9
 
 
 SCHEMA = "ffm_chronos2_multivariate_v1"
+FLOW_SCHEMA = "ffm_chronos2_multivariate_v2_flow"
+# Optional order-flow stream (one ticker only). Raw series, no derived features:
+# FFM's own per-window z-score is the only scaling. Column -> aggregation to the bar.
+FLOW_AGGREGATION = {
+    "buy_vol": "sum",
+    "sell_vol": "sum",
+    "delta": "sum",
+    "n_trades": "sum",
+    "n_quotes": "sum",
+    "spread_mean_ticks": "mean",
+}
+FLOW_COLS = tuple(FLOW_AGGREGATION)
 TIMEFRAME = "3min"
 TIMEFRAME_MINUTES = {
     "1min": 1,
@@ -129,6 +141,11 @@ def prepare_multivariate(
         prediction_length: int = 32,
         validation_windows: int = 8,
         report_path: str | Path | None = None,
+        flow_path: str | Path | None = None,
+        flow_ticker: str = "NQ",
+        flow_columns: Sequence[str] = FLOW_COLS,
+        flow_control: str = "flow",
+        flow_control_seed: int = 0,
 ) -> Chronos2MultivariateData:
     """Build one aligned ``ticker x OHLCV`` Chronos-2 task for one timeframe.
 
@@ -136,6 +153,14 @@ def prepare_multivariate(
     ``open + timeframe``, the first instant at which the complete bar is
     observable.  The aligned timeline is the union of close times; absent bars
     remain NaN and are never imputed.
+
+    ``flow_path`` adds an optional order-flow stream (schema v2) for ONE ticker (a bar built from only some of its
+    source minutes holds the partial sum of those minutes; a bar with none is NaN):
+    raw bar-open-indexed flow series appended after that ticker's OHLCV as
+    ``<ticker>.flow_<column>`` channels.  Flow is aggregated to ``timeframe``
+    with no look-ahead (a bar holds only its own interval), left NaN where the
+    source has no value, and never filled.  Without ``flow_path`` the output is
+    unchanged.
     """
     if not 0.0 < val_frac < 1.0:
         raise ValueError("val_frac must be between 0 and 1")
@@ -170,12 +195,47 @@ def prepare_multivariate(
         aligned_frames.append(values)
         source_rows[ticker] = len(values)
 
+    flow_info = None
+    if flow_path is None and flow_control != "flow":
+        raise ValueError("flow_control other than 'flow' needs flow_path")
+    if flow_path is not None:
+        if flow_ticker not in tickers:
+            raise ValueError("flow_ticker must be one of tickers")
+        flow_columns = tuple(flow_columns)
+        if not flow_columns or len(set(flow_columns)) != len(flow_columns):
+            raise ValueError("flow_columns must be a non-empty unique sequence")
+        unknown = sorted(set(flow_columns) - set(FLOW_COLS))
+        if unknown:
+            raise ValueError(f"unsupported flow columns: {unknown}")
+        flow_frame, flow_info = _load_flow(
+            Path(flow_path), flow_columns, timeframe, timeframe_delta)
+        holdout_cut = pd.Timestamp(holdout_start)
+        holdout_cut = (holdout_cut.tz_localize("UTC") if holdout_cut.tzinfo is None
+                       else holdout_cut.tz_convert("UTC"))
+        flow_frame = flow_frame[flow_frame.index < holdout_cut]    # nothing past the holdout can enter a control
+        position = tickers.index(flow_ticker)
+        target = aligned_frames[position]
+        if flow_control == "shuf":
+            flow_frame = _shuffle_sessions(flow_frame, flow_control_seed)
+        elif flow_control == "proxy":
+            flow_frame = _price_proxy(target, flow_columns)
+        elif flow_control != "flow":
+            raise ValueError("flow_control must be flow, shuf or proxy")
+        flow_frame = flow_frame.reindex(target.index)
+        flow_frame.columns = [f"{flow_ticker}.{name}" for name in flow_frame.columns]
+        aligned_frames[position] = pd.concat([target, flow_frame], axis=1)
+
     aligned = pd.concat(aligned_frames, axis=1, join="outer").sort_index()
     if aligned.index.has_duplicates or not aligned.index.is_monotonic_increasing:
         raise RuntimeError("aligned close-time index is not unique and ordered")
     channel_names = tuple(aligned.columns)
     expected_channels = tuple(
-        f"{ticker}.{column}" for ticker in tickers for column in OHLCV_COLS)
+        name
+        for ticker in tickers
+        for name in (
+            [f"{ticker}.{column}" for column in OHLCV_COLS]
+            + ([f"{ticker}.flow_{column}" for column in flow_columns]
+               if flow_info and ticker == flow_ticker else [])))
     if channel_names != expected_channels:
         raise RuntimeError("aligned channel order changed unexpectedly")
 
@@ -202,7 +262,7 @@ def prepare_multivariate(
     )
 
     identity_payload = {
-        "schema": SCHEMA,
+        "schema": FLOW_SCHEMA if flow_info else SCHEMA,
         "timeframe": timeframe,
         "tickers": list(tickers),
         "channels": list(channel_names),
@@ -213,6 +273,11 @@ def prepare_multivariate(
         "prediction_length": prediction_length,
         "source_provenance": provenance,
     }
+    if flow_info:
+        identity_payload["flow"] = {
+            "ticker": flow_ticker, "columns": list(flow_columns),
+            "control": flow_control, "control_seed": flow_control_seed,
+            **flow_info}
     identity = hashlib.sha256(
         json.dumps(identity_payload, sort_keys=True).encode()).hexdigest()
     finite = np.isfinite(matrix)
@@ -245,6 +310,77 @@ def prepare_multivariate(
         validation_target_ranges=validation_ranges,
         report=report,
     )
+
+
+def _load_flow(path, columns, timeframe, timeframe_delta):
+    """Raw bar-open flow table -> timeframe bars indexed by bar CLOSE time."""
+    if not path.is_file():
+        raise RuntimeError(f"flow file is missing: {path}")
+    frame = pd.read_parquet(path, columns=["timestamp", *columns])
+    stamp = pd.to_datetime(frame.pop("timestamp"), utc=True, errors="coerce")
+    if stamp.isna().any() or stamp.duplicated().any() or not stamp.is_monotonic_increasing:
+        raise RuntimeError("flow timestamps must be valid, unique and ordered (bar open, UTC)")
+    frame.index = pd.DatetimeIndex(stamp)
+    frame = frame.astype(np.float64)
+    if timeframe != "1min":
+        grouped = frame.resample(
+            timeframe, label="left", closed="left")
+        parts = []
+        for column in columns:
+            how = FLOW_AGGREGATION[column]
+            # min_count=1: a bar with no source minute stays NaN, never 0.
+            parts.append(
+                grouped[column].sum(min_count=1) if how == "sum"
+                else grouped[column].mean())
+        frame = pd.concat(parts, axis=1)
+    frame.index = frame.index + timeframe_delta
+    frame = frame.astype(np.float32)
+    frame.columns = [f"flow_{column}" for column in columns]
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return frame, {"source_sha256": digest, "rows": int(len(frame))}
+
+
+def _shuffle_sessions(frame, seed):
+    """Control: each exchange session's flow moves to another session with the same weekday.
+
+    A session is the exchange-local trading day (America/Chicago, 17:00 roll).  Rows keep their local wall-clock time in
+    the target session, so a session never straddles two source days and the daylight-saving hour does not move.
+    """
+    local = frame.index.tz_convert("America/Chicago")
+    session = (local + pd.Timedelta(hours=7)).normalize().tz_localize(None)
+    sessions = pd.DatetimeIndex(session.unique())
+    rng = np.random.default_rng(seed)
+    source_for = {}
+    for weekday in range(7):
+        group = sessions[sessions.day_of_week == weekday]
+        order = rng.permutation(len(group))
+        for position, pick in enumerate(order):
+            # a cyclic hand-over of a random order: no session keeps its own flow (unless it is alone on its weekday)
+            source_for[group[pick]] = group[order[(position + 1) % len(order)]]
+    parts = []
+    naive_local = local.tz_localize(None)
+    for target, source in source_for.items():
+        rows = np.asarray(session == source)
+        block = frame[rows].copy()
+        moved = naive_local[rows] + (target - source)
+        block.index = moved.tz_localize("America/Chicago", ambiguous="NaT", nonexistent="NaT")
+        parts.append(block[block.index.notna()])
+    out = pd.concat(parts)
+    out.index = out.index.tz_convert("UTC")
+    return out[~out.index.duplicated()].sort_index()
+
+
+def _price_proxy(target, columns):
+    """Control: flow-shaped channels that are deterministic functions of OHLCV."""
+    o, h, l, c, v = (target[f"{target.columns[0].split('.')[0]}.{n}"].astype(np.float64)
+                     for n in OHLCV_COLS)
+    up = (c > o).astype(np.float64)
+    buy, sell = v * up, v * (1.0 - up)
+    table = {
+        "buy_vol": buy, "sell_vol": sell, "delta": buy - sell,
+        "n_trades": v, "n_quotes": h - l, "spread_mean_ticks": (c - o).abs(),
+    }
+    return pd.DataFrame({f"flow_{k}": table[k] for k in columns}, index=target.index).astype(np.float32)
 
 
 def prepare_3min_multivariate(

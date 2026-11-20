@@ -509,12 +509,25 @@ def _balanced_kaufman_stage_contract(
     )
 
 
+ATLAS_TIMEFRAMES = ("1min", "3min", "5min", "15min")
+
+
+def _timeframes_ok(value, allow_partial: bool) -> bool:
+    """A stage must cover all four timeframes; with the opt-in, a non-empty list drawn from them."""
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        return False
+    if set(value) == set(ATLAS_TIMEFRAMES):
+        return True
+    return allow_partial and set(value) <= set(ATLAS_TIMEFRAMES)
+
+
 def _stage_identity(
     checkpoint: str,
     checkpoint_sha256: str,
     stage_report: Path | None,
     *,
     context_length: int,
+    allow_partial_timeframes: bool = False,
 ) -> dict:
     checkpoint_path = Path(checkpoint).expanduser()
     if not checkpoint_path.exists():
@@ -569,8 +582,7 @@ def _stage_identity(
         or saved_checkpoint.get("sha256") != checkpoint_sha256
         or not isinstance(config, dict)
         or config.get("context_length") != context_length
-        or set(config.get("timeframes", ()))
-        != {"1min", "3min", "5min", "15min"}
+        or not _timeframes_ok(config.get("timeframes"), allow_partial_timeframes)
         or not isinstance(parent_sha256, str)
         or len(parent_sha256) != 64
         or not isinstance(data_sha256, str)
@@ -578,7 +590,7 @@ def _stage_identity(
     ):
         raise SystemExit(
             f"Chronos-2 stage report contract is invalid: {report_path}")
-    return {
+    identity = {
         "stage_report_path": str(report_path),
         "stage_report_sha256": _file_sha256(report_path),
         "parent_checkpoint_sha256": parent_sha256,
@@ -605,6 +617,10 @@ def _stage_identity(
             } else None
         ),
     }
+    if allow_partial_timeframes:      # recorded only for the opt-in; the default identity is unchanged
+        identity["stage_timeframes"] = list(config["timeframes"])
+        identity["allow_partial_timeframes"] = True
+    return identity
 
 
 def _file_sha256(path: Path) -> str:
@@ -776,6 +792,11 @@ def parser() -> argparse.ArgumentParser:
         "--eval-start", default="2025-01-01",
         help="first evaluation decision close; later than 2025-01-01 excludes "
              "periods a candidate trained on")
+    value.add_argument(
+        "--allow-partial-timeframes", action="store_true",
+        help="accept a stage trained on a subset of timeframes (e.g. the single-ticker "
+             "flow stream); the evaluation itself is unchanged: OHLCV only, so flow channels "
+             "are absent at evaluation. The flag and the stage timeframes are recorded in the preflight output")
     value.add_argument("--preflight-only", action="store_true")
     return value
 
@@ -831,6 +852,7 @@ def main() -> dict:
         checkpoint_hash,
         args.stage_report,
         context_length=args.window,
+        allow_partial_timeframes=args.allow_partial_timeframes,
     )
     _validate_stage_base_identity(stage_identity, base_identity)
     if not labels.is_file():
@@ -865,6 +887,9 @@ def main() -> dict:
         "DEVICE": args.device,
         "PYTORCH_ENABLE_MPS_FALLBACK": "1",
     }
+    environment["ATLAS_STAGE_TIMEFRAMES"] = json.dumps(stage_identity.get("stage_timeframes"))
+    environment["ATLAS_ALLOW_PARTIAL_TIMEFRAMES"] = (
+        "1" if stage_identity.get("allow_partial_timeframes") else "0")
     for field in (
         "stage_report_sha256",
         "parent_checkpoint_sha256",

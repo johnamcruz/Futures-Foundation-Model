@@ -207,7 +207,12 @@ def _reg_embeddings(base, windows, finite):
     return reg.reshape(batch, channels, reg.shape[-1]).mean(dim=1)
 
 
-def _ticker_indices(prepared) -> dict[str, np.ndarray]:
+def _ticker_indices(prepared, *, allow_flow: bool = False) -> dict[str, np.ndarray]:
+    """Channel indices per ticker; every ticker has five OHLCV channels.
+
+    With ``allow_flow`` a ticker may also carry optional ``<ticker>.flow_*``
+    channels (schema v2 flow stream) after its OHLCV; only mask training opts in.
+    """
     tickers = tuple(dict.fromkeys(name.split(".", 1)[0] for name in prepared.channel_names))
     result = {
         ticker: np.asarray([
@@ -216,7 +221,15 @@ def _ticker_indices(prepared) -> dict[str, np.ndarray]:
         ], dtype=np.int64)
         for ticker in tickers
     }
-    if not result or any(len(indices) != 5 for indices in result.values()):
+
+    def valid(ticker, indices):
+        names = [prepared.channel_names[i] for i in indices]
+        if len(indices) == 5:
+            return True
+        return (allow_flow and len(indices) > 5 and all(
+            n.startswith(f"{ticker}.flow_") for n in names[5:]))
+
+    if not result or any(not valid(t, i) for t, i in result.items()):
         raise RuntimeError("every ticker must have exactly five OHLCV channels")
     return result
 
@@ -309,6 +322,7 @@ def train_mask(
         seed: int = 0,
         single_ticker_probability: float = 0.25,
         resume: bool = False,
+        mask_mode: str = "time",
 ) -> dict:
     """Masked-patch reconstruction, saving only the best Chronos-2 adapter."""
     import torch
@@ -316,6 +330,8 @@ def train_mask(
 
     if not 0.0 < mask_ratio < 1.0:
         raise ValueError("mask_ratio must be between 0 and 1")
+    if mask_mode not in ("time", "cross", "tail"):
+        raise ValueError("mask_mode must be 'time', 'cross' or 'tail'")
     if not 0.0 <= single_ticker_probability <= 1.0:
         raise ValueError("single_ticker_probability must be between 0 and 1")
     corpus = _as_corpus(prepared)
@@ -345,7 +361,7 @@ def train_mask(
         for timeframe, item in corpus.items()
     }
     ticker_indices = {
-        timeframe: _ticker_indices(item)
+        timeframe: _ticker_indices(item, allow_flow=True)
         for timeframe, item in corpus.items()
     }
     ticker_names = tuple(next(iter(ticker_indices.values())))
@@ -373,8 +389,16 @@ def train_mask(
     best_loss, best_adapter, best_decoder = math.inf, None, None
     history, start_epoch, bad = [], 0, 0
 
+    run_identity = {
+        "data_identity_sha256": _corpus_identity(corpus), "mask_mode": mask_mode,
+        "mask_ratio": mask_ratio, "seed": seed,
+    }
     if resume and state_path.is_file():
         saved = torch.load(state_path, map_location="cpu")
+        if saved.get("run_identity", run_identity) != run_identity:
+            raise RuntimeError(
+                "trainer.pt was written by a different data/mask/seed identity; "
+                "refusing to resume (use a fresh out_dir)")
         _restore_adapter(model, saved["adapter"])
         decoder.load_state_dict(saved["decoder"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -387,14 +411,36 @@ def train_mask(
         rng.bit_generator.state = saved["numpy_rng"]
         generator.set_state(saved["torch_generator"])
 
-    def loss_for(raw, mask_generator):
+    from futures_foundation.finetune.classifiers.chronos2.ssl_masks import flow_flags
+    first_item = next(iter(corpus.values()))
+    all_flags = flow_flags(first_item.channel_names)
+    if mask_mode == "cross" and not all_flags.any():
+        raise ValueError("mask_mode='cross' needs flow channels in the corpus (pass a flow stream)")
+    counters = {"cross_without_flow": 0}
+
+    def loss_for(raw, mask_generator, flags=None):
+        flow_flags_now = all_flags if flags is None else flags
         standardized, finite = _standardize(raw)
-        time_mask = torch.rand(
-            (raw.shape[0], raw.shape[-1]), device=device,
-            generator=mask_generator) < mask_ratio
-        time_mask[:, 0] = True
-        selected = finite & time_mask[:, None, :]
-        visible = finite & ~time_mask[:, None, :]
+        picked = None
+        if mask_mode in ("cross", "tail"):
+            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import selection_masks
+            seed_value = int(torch.randint(
+                0, 2 ** 31 - 1, (1,), device=device, generator=mask_generator).item())
+            picked = selection_masks(
+                finite.cpu().numpy(), np.asarray(flow_flags_now), mask_mode,
+                mask_ratio, np.random.default_rng(seed_value))
+            if picked is None:                       # cross draw without any flow variate: shared time mask
+                counters["cross_without_flow"] += 1
+        if picked is not None:
+            selected = torch.from_numpy(picked[0]).to(device)
+            visible = torch.from_numpy(picked[1]).to(device)
+        else:
+            time_mask = torch.rand(
+                (raw.shape[0], raw.shape[-1]), device=device,
+                generator=mask_generator) < mask_ratio
+            time_mask[:, 0] = True
+            selected = finite & time_mask[:, None, :]
+            visible = finite & ~time_mask[:, None, :]
         flat = standardized.reshape(-1, context_length)
         visible_flat = visible.reshape(-1, context_length)
         batch, channels, _ = standardized.shape
@@ -422,13 +468,16 @@ def train_mask(
                 ticker = ticker_names[int(rng.integers(len(ticker_names)))]
                 train_matrix = item.train[ticker_indices[timeframe][ticker]]
                 starts = ticker_starts[timeframe][ticker]
+                draw_flags = all_flags[ticker_indices[timeframe][ticker]]
             else:
                 train_matrix = item.train
                 starts = joint_starts[timeframe]
+                draw_flags = all_flags
             chosen = rng.choice(starts, size=batch_windows, replace=True)
             loss = loss_for(
                 _sample_windows(train_matrix, chosen, context_length, device),
                 generator,
+                draw_flags,
             )
             if not torch.isfinite(loss):
                 raise RuntimeError(
@@ -462,6 +511,7 @@ def train_mask(
                         float(loss_for(
                             torch.from_numpy(value[indices][None]).to(device),
                             ticker_generator,
+                            all_flags[indices],
                         ))
                         for value in validation[timeframe]
                     ]))
@@ -504,6 +554,7 @@ def train_mask(
             flush=True,
         )
         _atomic_torch(state_path, {
+            "run_identity": run_identity,
             "epoch": epoch,
             "adapter": _adapter_state(model),
             "decoder": decoder.state_dict(),
@@ -533,6 +584,8 @@ def train_mask(
             "timeframes": list(timeframes),
             "context_length": context_length,
             "mask_ratio": mask_ratio,
+            "mask_mode": mask_mode,
+            "cross_without_flow_draws": counters["cross_without_flow"],
             "epochs": epochs,
             "steps_per_epoch": steps_per_epoch,
             "batch_windows": batch_windows,

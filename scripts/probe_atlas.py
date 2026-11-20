@@ -210,7 +210,7 @@ def _load_bars(ticker: str, timeframe: str) -> dict:
     frame = pd.read_csv(
         source_path,
         usecols=["datetime", "open", "high", "low", "close", "volume"])
-    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True)
+    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True).dt.as_unit("ns")
     frame = frame[frame["datetime"] < EVAL_END].reset_index(drop=True)
     timestamps = pd.DatetimeIndex(frame["datetime"])
     o, h, l, c = (frame[name].to_numpy(float)
@@ -285,7 +285,7 @@ def _load_pool() -> tuple[dict[tuple[str, str], dict], list[tuple], dict[str, np
     bars_by_stream = {}
     corpus_ticker = corpus["ticker"].astype(str)
     corpus_tf = corpus["tf"].astype(str)
-    corpus_ts = pd.to_datetime(corpus["ts"], utc=True)
+    corpus_ts = pd.to_datetime(corpus["ts"], utc=True).as_unit("ns")
 
     for ticker in TICKERS:
         for timeframe in TIMEFRAMES:
@@ -635,6 +635,8 @@ def main() -> dict:
             "backbone": BACKBONE, "control": CONTROL,
             "checkpoint": CKPT_NAME, "checkpoint_path": CKPT_PATH,
             "checkpoint_sha256": os.environ.get("CKPT_SHA256"),
+            "stage_timeframes": json.loads(os.environ.get("ATLAS_STAGE_TIMEFRAMES", "null")),
+            "allow_partial_timeframes": os.environ.get("ATLAS_ALLOW_PARTIAL_TIMEFRAMES") == "1",
             "stage_report_sha256": STAGE_REPORT_SHA256,
             "parent_checkpoint_sha256": PARENT_CHECKPOINT_SHA256,
             "data_identity_sha256": DATA_IDENTITY_SHA256,
