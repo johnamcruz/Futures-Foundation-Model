@@ -144,6 +144,8 @@ def prepare_multivariate(
         flow_path: str | Path | None = None,
         flow_ticker: str = "NQ",
         flow_columns: Sequence[str] = FLOW_COLS,
+        flow_control: str = "flow",
+        flow_control_seed: int = 0,
 ) -> Chronos2MultivariateData:
     """Build one aligned ``ticker x OHLCV`` Chronos-2 task for one timeframe.
 
@@ -206,6 +208,12 @@ def prepare_multivariate(
             Path(flow_path), flow_columns, timeframe, timeframe_delta)
         position = tickers.index(flow_ticker)
         target = aligned_frames[position]
+        if flow_control == "shuf":
+            flow_frame = _shuffle_sessions(flow_frame, flow_control_seed)
+        elif flow_control == "proxy":
+            flow_frame = _price_proxy(target, flow_columns)
+        elif flow_control != "flow":
+            raise ValueError("flow_control must be flow, shuf or proxy")
         flow_frame = flow_frame.reindex(target.index)
         flow_frame.columns = [f"{flow_ticker}.{name}" for name in flow_frame.columns]
         aligned_frames[position] = pd.concat([target, flow_frame], axis=1)
@@ -260,7 +268,9 @@ def prepare_multivariate(
     }
     if flow_info:
         identity_payload["flow"] = {
-            "ticker": flow_ticker, "columns": list(flow_columns), **flow_info}
+            "ticker": flow_ticker, "columns": list(flow_columns),
+            "control": flow_control, "control_seed": flow_control_seed,
+            **flow_info}
     identity = hashlib.sha256(
         json.dumps(identity_payload, sort_keys=True).encode()).hexdigest()
     finite = np.isfinite(matrix)
@@ -321,6 +331,39 @@ def _load_flow(path, columns, timeframe, timeframe_delta):
     frame.columns = [f"flow_{column}" for column in columns]
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return frame, {"source_sha256": digest, "rows": int(len(frame))}
+
+
+def _shuffle_sessions(frame, seed):
+    """Control: each UTC day's flow moves to another day with the same weekday."""
+    days = pd.DatetimeIndex(frame.index.normalize())
+    unique = pd.DatetimeIndex(days.unique())
+    rng = np.random.default_rng(seed)
+    source_for = {}
+    for weekday in range(7):
+        group = unique[unique.day_of_week == weekday]
+        order = rng.permutation(len(group))
+        for target, pick in zip(group, order):
+            source_for[target] = group[pick]
+    parts = []
+    for target, source in source_for.items():
+        block = frame[days == source]
+        block = block.copy()
+        block.index = block.index + (target - source)
+        parts.append(block)
+    return pd.concat(parts).sort_index()
+
+
+def _price_proxy(target, columns):
+    """Control: flow-shaped channels that are deterministic functions of OHLCV."""
+    o, h, l, c, v = (target[f"{target.columns[0].split('.')[0]}.{n}"].astype(np.float64)
+                     for n in OHLCV_COLS)
+    up = (c > o).astype(np.float64)
+    buy, sell = v * up, v * (1.0 - up)
+    table = {
+        "buy_vol": buy, "sell_vol": sell, "delta": buy - sell,
+        "n_trades": v, "n_quotes": h - l, "spread_mean_ticks": (c - o).abs(),
+    }
+    return pd.DataFrame({f"flow_{k}": table[k] for k in columns}, index=target.index).astype(np.float32)
 
 
 def prepare_3min_multivariate(

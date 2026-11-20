@@ -115,3 +115,47 @@ def test_ticker_indices_strict_by_default_flow_only_when_allowed(tmp_path):
         channel_names = ("NQ.open", "NQ.high", "NQ.low", "NQ.close", "NQ.volume", "NQ.extra")
     with pytest.raises(RuntimeError):
         _ticker_indices(Fake, allow_flow=True)
+
+
+def test_shuffle_control_keeps_values_but_breaks_the_time_link(tmp_path):
+    from futures_foundation.finetune.classifiers.chronos2.multivariate import _shuffle_sessions
+    idx = pd.date_range("2025-01-06T00:00:00Z", periods=28 * 24 * 60, freq="1min")
+    day = (np.arange(len(idx)) // 1440).astype(float)   # session number 0..27
+    frame = pd.DataFrame({"flow_buy_vol": day * 10000 + np.arange(len(idx)) % 1440}, index=idx)
+    out = _shuffle_sessions(frame, 0)
+    assert len(out) == len(frame) and out.index.equals(frame.index)
+    assert sorted(out.flow_buy_vol) == sorted(frame.flow_buy_vol)      # same data, moved
+    assert (out.flow_buy_vol.values != frame.flow_buy_vol.values).mean() > 0.4
+    # time-of-day within a session is preserved; the whole session comes from the same weekday
+    moved = out.iloc[600]
+    assert int(moved.flow_buy_vol) % 10000 == 600
+    src_day = int(moved.flow_buy_vol) // 10000
+    assert (src_day - int(day[600])) % 7 == 0 and src_day != int(day[600])
+    assert out.equals(_shuffle_sessions(frame, 0))
+    assert not out.equals(_shuffle_sessions(frame, 1))
+
+
+def test_shuffle_control_wires_through_prepare(tmp_path):
+    _flow(tmp_path / "flow.parquet")
+    r = _prepare(tmp_path, tmp_path / "flow.parquet")
+    s = prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet", flow_control="shuf", **KW)
+    assert np.array_equal(r.train[:5], s.train[:5])
+    assert s.report["flow"]["control"] == "shuf"
+
+
+def test_proxy_control_is_a_function_of_price_only(tmp_path):
+    _flow(tmp_path / "a.parquet", seed=1)
+    _flow(tmp_path / "b.parquet", seed=2)
+    a = _prepare(tmp_path, tmp_path / "a.parquet", flow_control="proxy")
+    b = prepare_multivariate(tmp_path, flow_path=tmp_path / "b.parquet",
+                             flow_control="proxy", **KW)
+    assert np.array_equal(a.train, b.train, equal_nan=True)  # file content irrelevant
+    o, c, v = a.train[0], a.train[3], a.train[4]
+    assert np.allclose(a.train[5 + FLOW_COLS.index("buy_vol")], np.where(c > o, v, 0.0))
+    assert np.allclose(a.train[5 + FLOW_COLS.index("n_trades")], v)
+
+
+def test_unknown_control_rejected(tmp_path):
+    _flow(tmp_path / "flow.parquet")
+    with pytest.raises(ValueError, match="flow_control"):
+        _prepare(tmp_path, tmp_path / "flow.parquet", flow_control="x")
