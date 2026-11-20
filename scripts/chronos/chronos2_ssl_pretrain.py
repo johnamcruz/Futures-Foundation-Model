@@ -48,13 +48,16 @@ def parser() -> argparse.ArgumentParser:
              "channels (schema v2) and trains on NQ only")
     value.add_argument(
         "--flow-control", choices=("flow", "shuf", "proxy"), default="flow",
-        help="flow = real flow; shuf = whole sessions of flow permuted (control); "
+        help="flow = real flow; shuf = whole exchange sessions of flow permuted (control); "
              "proxy = price-derived stand-in channels (control)")
     value.add_argument("--nq-only", action="store_true",
                        help="NQ OHLCV only, no flow channels (control)")
     value.add_argument("--mask-mode", choices=("time", "cross", "tail"), default="time",
                        help="time = FFM shared time mask; cross = per-window shared / flow-block / price-block masks; "
                             "tail = hide the last 2-12 bars of every variate, loss on price only")
+    value.add_argument("--holdout-start", default=None,
+                       help="override the data holdout start (use one value for every arm of a flow comparison so the "
+                            "arms train and validate on identical rows)")
     value.add_argument("--resume", action="store_true")
     value.add_argument("--preflight-only", action="store_true")
     return value
@@ -70,6 +73,10 @@ def main() -> None:
         raise SystemExit("timeframes must be a non-empty unique list")
     if set(timeframes) - set(TIMEFRAMES):
         raise SystemExit(f"unsupported timeframes: {sorted(set(timeframes) - set(TIMEFRAMES))}")
+    if args.flow_path and args.nq_only:
+        raise SystemExit("--nq-only and --flow-path are mutually exclusive")
+    if args.flow_control != "flow" and not args.flow_path:
+        raise SystemExit("--flow-control shuf|proxy needs --flow-path")
     tickers = ("NQ",) if (args.flow_path or args.nq_only) else TICKERS
     prepared = {
         timeframe: prepare_multivariate(
@@ -78,6 +85,7 @@ def main() -> None:
             tickers=tickers,
             flow_path=args.flow_path,
             flow_control=args.flow_control,
+            **({} if args.holdout_start is None else {"holdout_start": args.holdout_start}),
             timeframe=timeframe,
             context_length=args.context_length,
             prediction_length=args.prediction_length,

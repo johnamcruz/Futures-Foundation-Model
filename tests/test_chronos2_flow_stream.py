@@ -117,30 +117,76 @@ def test_ticker_indices_strict_by_default_flow_only_when_allowed(tmp_path):
         _ticker_indices(Fake, allow_flow=True)
 
 
-def test_shuffle_control_keeps_values_but_breaks_the_time_link(tmp_path):
+def _sessions_frame(days=28):
+    """One flow value per minute encoding (session number, minute of session); sessions roll at 17:00 America/Chicago."""
+    idx = pd.date_range("2025-01-05T23:00:00Z", periods=days * 1440, freq="1min")   # 17:00 CST
+    sess = (np.arange(len(idx)) // 1440).astype(float)
+    return pd.DataFrame({"flow_buy_vol": sess * 10000 + np.arange(len(idx)) % 1440}, index=idx)
+
+
+def test_shuffle_control_moves_whole_exchange_sessions_with_same_weekday():
     from futures_foundation.finetune.classifiers.chronos2.multivariate import _shuffle_sessions
-    idx = pd.date_range("2025-01-06T00:00:00Z", periods=28 * 24 * 60, freq="1min")
-    day = (np.arange(len(idx)) // 1440).astype(float)   # session number 0..27
-    frame = pd.DataFrame({"flow_buy_vol": day * 10000 + np.arange(len(idx)) % 1440}, index=idx)
+    frame = _sessions_frame()
     out = _shuffle_sessions(frame, 0)
     assert len(out) == len(frame) and out.index.equals(frame.index)
-    assert sorted(out.flow_buy_vol) == sorted(frame.flow_buy_vol)      # same data, moved
-    assert (out.flow_buy_vol.values != frame.flow_buy_vol.values).mean() > 0.4
-    # time-of-day within a session is preserved; the whole session comes from the same weekday
-    moved = out.iloc[600]
-    assert int(moved.flow_buy_vol) % 10000 == 600
-    src_day = int(moved.flow_buy_vol) // 10000
-    assert (src_day - int(day[600])) % 7 == 0 and src_day != int(day[600])
-    assert out.equals(_shuffle_sessions(frame, 0))
-    assert not out.equals(_shuffle_sessions(frame, 1))
+    assert sorted(out.flow_buy_vol) == sorted(frame.flow_buy_vol)
+    assert (out.flow_buy_vol.values != frame.flow_buy_vol.values).mean() > 0.95      # no session keeps its own flow
+    # every target session is built from exactly ONE source session, with the same minute-of-session
+    tgt_sess = (np.arange(len(out)) // 1440)
+    for t in (3, 10, 17):
+        rows = out.flow_buy_vol.values[tgt_sess == t]
+        assert len({int(v) // 10000 for v in rows}) == 1
+        assert (rows % 10000 == np.arange(1440)).all()
+        assert (int(rows[0]) // 10000 - t) % 7 == 0 and int(rows[0]) // 10000 != t      # never its own flow
+    assert out.equals(_shuffle_sessions(frame, 0)) and not out.equals(_shuffle_sessions(frame, 1))
 
 
-def test_shuffle_control_wires_through_prepare(tmp_path):
-    _flow(tmp_path / "flow.parquet")
-    r = _prepare(tmp_path, tmp_path / "flow.parquet")
-    s = prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet", flow_control="shuf", **KW)
+def test_shuffle_keeps_clock_alignment_across_the_daylight_saving_change():
+    from futures_foundation.finetune.classifiers.chronos2.multivariate import _shuffle_sessions
+    idx = pd.date_range("2025-03-02T23:00:00Z", periods=21 * 1440, freq="1min")   # spans 2025-03-09 US DST start
+    frame = pd.DataFrame({"flow_buy_vol": np.ones(len(idx))}, index=idx)
+    out = _shuffle_sessions(frame, 0)
+    assert out.flow_buy_vol.notna().mean() > 0.99
+    assert len(out) >= len(frame) - 2 * 60 * 3        # at most a few DST-gap hours go missing, not a whole shifted hour per session
+
+
+def test_shuffle_never_uses_flow_at_or_after_the_holdout(tmp_path):
+    frame = _flow(tmp_path / "flow.parquet")
+    _write_streams(tmp_path)
+    marker = frame.copy(); marker.loc[marker.timestamp >= pd.Timestamp("2024-12-31T12:00:00"), "buy_vol"] = 7e9
+    marker.to_parquet(tmp_path / "late.parquet")
+    r = prepare_multivariate(tmp_path, flow_path=tmp_path / "late.parquet", flow_control="shuf",
+                             **dict(KW, holdout_start="2024-12-31T06:00:00Z"))
+    assert not (r.train[5 + FLOW_COLS.index("buy_vol")] > 1e9).any()
+    assert not (r.validation_matrix[5 + FLOW_COLS.index("buy_vol")] > 1e9).any()
+
+
+def test_shuffle_control_wires_through_prepare_and_changes_the_flow_rows(tmp_path):
+    long_kw = dict(KW, holdout_start="2025-01-25T00:00:00Z")
+    _write_streams(tmp_path, rows=13440)
+    _flow(tmp_path / "flow.parquet", minutes=13440 * 3 + 30)
+    r = prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet", **long_kw)
+    s = prepare_multivariate(tmp_path, flow_path=tmp_path / "flow.parquet", flow_control="shuf", **long_kw)
     assert np.array_equal(r.train[:5], s.train[:5])
+    assert not np.array_equal(r.train[5:], s.train[5:], equal_nan=True)
     assert s.report["flow"]["control"] == "shuf"
+
+
+def test_control_without_a_flow_file_is_refused(tmp_path):
+    _write_streams(tmp_path)
+    for control in ("shuf", "proxy"):
+        with pytest.raises(ValueError, match="flow_path"):
+            prepare_multivariate(tmp_path, flow_control=control, **KW)
+
+
+def test_partial_source_minutes_give_the_partial_sum(tmp_path):
+    frame = _flow(tmp_path / "flow.parquet", hole=[300])      # one minute of a 3-minute bar missing
+    result = _prepare(tmp_path, tmp_path / "flow.parquet")
+    closes = pd.DatetimeIndex(result.train_close_times)
+    row = np.where(closes == pd.Timestamp("2024-12-30T05:00:00Z") + pd.Timedelta("3min"))[0]
+    open_ts = pd.Timestamp("2024-12-30T05:00:00")
+    want = frame[(frame.timestamp >= open_ts) & (frame.timestamp < open_ts + pd.Timedelta("3min"))].buy_vol.sum()
+    assert result.train[5 + FLOW_COLS.index("buy_vol"), row[0]] == pytest.approx(want)
 
 
 def test_proxy_control_is_a_function_of_price_only(tmp_path):

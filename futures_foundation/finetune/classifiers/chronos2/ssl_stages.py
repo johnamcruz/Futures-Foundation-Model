@@ -389,8 +389,16 @@ def train_mask(
     best_loss, best_adapter, best_decoder = math.inf, None, None
     history, start_epoch, bad = [], 0, 0
 
+    run_identity = {
+        "data_identity_sha256": _corpus_identity(corpus), "mask_mode": mask_mode,
+        "mask_ratio": mask_ratio, "seed": seed,
+    }
     if resume and state_path.is_file():
         saved = torch.load(state_path, map_location="cpu")
+        if saved.get("run_identity", run_identity) != run_identity:
+            raise RuntimeError(
+                "trainer.pt was written by a different data/mask/seed identity; "
+                "refusing to resume (use a fresh out_dir)")
         _restore_adapter(model, saved["adapter"])
         decoder.load_state_dict(saved["decoder"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -403,28 +411,29 @@ def train_mask(
         rng.bit_generator.state = saved["numpy_rng"]
         generator.set_state(saved["torch_generator"])
 
-    def loss_for(raw, mask_generator):
+    from futures_foundation.finetune.classifiers.chronos2.ssl_masks import flow_flags
+    first_item = next(iter(corpus.values()))
+    all_flags = flow_flags(first_item.channel_names)
+    if mask_mode == "cross" and not all_flags.any():
+        raise ValueError("mask_mode='cross' needs flow channels in the corpus (pass a flow stream)")
+    counters = {"cross_without_flow": 0}
+
+    def loss_for(raw, mask_generator, flags=None):
+        flow_flags_now = all_flags if flags is None else flags
         standardized, finite = _standardize(raw)
-        if mask_mode == "cross" and raw.shape[1] > 5:
-            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import modal_time_mask
+        picked = None
+        if mask_mode in ("cross", "tail"):
+            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import selection_masks
             seed_value = int(torch.randint(
                 0, 2 ** 31 - 1, (1,), device=device, generator=mask_generator).item())
-            cross = torch.from_numpy(modal_time_mask(
-                raw.shape[0], raw.shape[1], raw.shape[-1], mask_ratio,
-                np.random.default_rng(seed_value))).to(device)
-            selected = finite & cross
-            visible = finite & ~cross
-        elif mask_mode == "tail":
-            from futures_foundation.finetune.classifiers.chronos2.ssl_masks import tail_mask
-            seed_value = int(torch.randint(
-                0, 2 ** 31 - 1, (1,), device=device, generator=mask_generator).item())
-            tail = torch.from_numpy(tail_mask(
-                raw.shape[0], raw.shape[1], raw.shape[-1],
-                np.random.default_rng(seed_value))).to(device)
-            price_only = torch.zeros_like(tail)
-            price_only[:, :5, :] = True                      # loss on the five price variates only
-            selected = finite & tail & price_only
-            visible = finite & ~tail
+            picked = selection_masks(
+                finite.cpu().numpy(), np.asarray(flow_flags_now), mask_mode,
+                mask_ratio, np.random.default_rng(seed_value))
+            if picked is None:                       # cross draw without any flow variate: shared time mask
+                counters["cross_without_flow"] += 1
+        if picked is not None:
+            selected = torch.from_numpy(picked[0]).to(device)
+            visible = torch.from_numpy(picked[1]).to(device)
         else:
             time_mask = torch.rand(
                 (raw.shape[0], raw.shape[-1]), device=device,
@@ -459,13 +468,16 @@ def train_mask(
                 ticker = ticker_names[int(rng.integers(len(ticker_names)))]
                 train_matrix = item.train[ticker_indices[timeframe][ticker]]
                 starts = ticker_starts[timeframe][ticker]
+                draw_flags = all_flags[ticker_indices[timeframe][ticker]]
             else:
                 train_matrix = item.train
                 starts = joint_starts[timeframe]
+                draw_flags = all_flags
             chosen = rng.choice(starts, size=batch_windows, replace=True)
             loss = loss_for(
                 _sample_windows(train_matrix, chosen, context_length, device),
                 generator,
+                draw_flags,
             )
             if not torch.isfinite(loss):
                 raise RuntimeError(
@@ -499,6 +511,7 @@ def train_mask(
                         float(loss_for(
                             torch.from_numpy(value[indices][None]).to(device),
                             ticker_generator,
+                            all_flags[indices],
                         ))
                         for value in validation[timeframe]
                     ]))
@@ -541,6 +554,7 @@ def train_mask(
             flush=True,
         )
         _atomic_torch(state_path, {
+            "run_identity": run_identity,
             "epoch": epoch,
             "adapter": _adapter_state(model),
             "decoder": decoder.state_dict(),
@@ -571,6 +585,7 @@ def train_mask(
             "context_length": context_length,
             "mask_ratio": mask_ratio,
             "mask_mode": mask_mode,
+            "cross_without_flow_draws": counters["cross_without_flow"],
             "epochs": epochs,
             "steps_per_epoch": steps_per_epoch,
             "batch_windows": batch_windows,

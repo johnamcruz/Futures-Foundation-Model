@@ -154,7 +154,8 @@ def prepare_multivariate(
     observable.  The aligned timeline is the union of close times; absent bars
     remain NaN and are never imputed.
 
-    ``flow_path`` adds an optional order-flow stream (schema v2) for ONE ticker:
+    ``flow_path`` adds an optional order-flow stream (schema v2) for ONE ticker (a bar built from only some of its
+    source minutes holds the partial sum of those minutes; a bar with none is NaN):
     raw bar-open-indexed flow series appended after that ticker's OHLCV as
     ``<ticker>.flow_<column>`` channels.  Flow is aggregated to ``timeframe``
     with no look-ahead (a bar holds only its own interval), left NaN where the
@@ -195,6 +196,8 @@ def prepare_multivariate(
         source_rows[ticker] = len(values)
 
     flow_info = None
+    if flow_path is None and flow_control != "flow":
+        raise ValueError("flow_control other than 'flow' needs flow_path")
     if flow_path is not None:
         if flow_ticker not in tickers:
             raise ValueError("flow_ticker must be one of tickers")
@@ -206,6 +209,10 @@ def prepare_multivariate(
             raise ValueError(f"unsupported flow columns: {unknown}")
         flow_frame, flow_info = _load_flow(
             Path(flow_path), flow_columns, timeframe, timeframe_delta)
+        holdout_cut = pd.Timestamp(holdout_start)
+        holdout_cut = (holdout_cut.tz_localize("UTC") if holdout_cut.tzinfo is None
+                       else holdout_cut.tz_convert("UTC"))
+        flow_frame = flow_frame[flow_frame.index < holdout_cut]    # nothing past the holdout can enter a control
         position = tickers.index(flow_ticker)
         target = aligned_frames[position]
         if flow_control == "shuf":
@@ -334,23 +341,33 @@ def _load_flow(path, columns, timeframe, timeframe_delta):
 
 
 def _shuffle_sessions(frame, seed):
-    """Control: each UTC day's flow moves to another day with the same weekday."""
-    days = pd.DatetimeIndex(frame.index.normalize())
-    unique = pd.DatetimeIndex(days.unique())
+    """Control: each exchange session's flow moves to another session with the same weekday.
+
+    A session is the exchange-local trading day (America/Chicago, 17:00 roll).  Rows keep their local wall-clock time in
+    the target session, so a session never straddles two source days and the daylight-saving hour does not move.
+    """
+    local = frame.index.tz_convert("America/Chicago")
+    session = (local + pd.Timedelta(hours=7)).normalize().tz_localize(None)
+    sessions = pd.DatetimeIndex(session.unique())
     rng = np.random.default_rng(seed)
     source_for = {}
     for weekday in range(7):
-        group = unique[unique.day_of_week == weekday]
+        group = sessions[sessions.day_of_week == weekday]
         order = rng.permutation(len(group))
-        for target, pick in zip(group, order):
-            source_for[target] = group[pick]
+        for position, pick in enumerate(order):
+            # a cyclic hand-over of a random order: no session keeps its own flow (unless it is alone on its weekday)
+            source_for[group[pick]] = group[order[(position + 1) % len(order)]]
     parts = []
+    naive_local = local.tz_localize(None)
     for target, source in source_for.items():
-        block = frame[days == source]
-        block = block.copy()
-        block.index = block.index + (target - source)
-        parts.append(block)
-    return pd.concat(parts).sort_index()
+        rows = np.asarray(session == source)
+        block = frame[rows].copy()
+        moved = naive_local[rows] + (target - source)
+        block.index = moved.tz_localize("America/Chicago", ambiguous="NaT", nonexistent="NaT")
+        parts.append(block[block.index.notna()])
+    out = pd.concat(parts)
+    out.index = out.index.tz_convert("UTC")
+    return out[~out.index.duplicated()].sort_index()
 
 
 def _price_proxy(target, columns):

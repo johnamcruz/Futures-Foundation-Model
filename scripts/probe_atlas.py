@@ -635,6 +635,8 @@ def main() -> dict:
             "backbone": BACKBONE, "control": CONTROL,
             "checkpoint": CKPT_NAME, "checkpoint_path": CKPT_PATH,
             "checkpoint_sha256": os.environ.get("CKPT_SHA256"),
+            "stage_timeframes": json.loads(os.environ.get("ATLAS_STAGE_TIMEFRAMES", "null")),
+            "allow_partial_timeframes": os.environ.get("ATLAS_ALLOW_PARTIAL_TIMEFRAMES") == "1",
             "stage_report_sha256": STAGE_REPORT_SHA256,
             "parent_checkpoint_sha256": PARENT_CHECKPOINT_SHA256,
             "data_identity_sha256": DATA_IDENTITY_SHA256,
